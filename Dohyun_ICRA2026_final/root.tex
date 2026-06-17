@@ -1,0 +1,545 @@
+\documentclass[letterpaper, 10 pt, conference]{ieeeconf} 
+\IEEEoverridecommandlockouts
+\overrideIEEEmargins
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% For the author's convenience
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{cite}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb}
+\usepackage{amsthm}
+\usepackage{stfloats}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{algpseudocode}
+\usepackage[ruled,vlined]{algorithm2e}
+\usepackage{float}
+\graphicspath{{images/}}
+\newtheorem{assumption}{Assumption}
+\newtheorem{proposition}{Proposition}
+\usepackage{cleveref}
+\renewcommand{\qedsymbol}{$\blacksquare$}
+
+\algrenewcommand\algorithmiccomment[1]{\hfill{\footnotesize\textsf{#1}}} % inline notes
+%%% --------- command for Joel's old-fashioned note ---------- %%%
+\newcommand{\note}[2][NOTE]{\vspace{3 mm}\par \noindent \framebox{\color{red} \begin{minipage}[c]{0.97 \hsize} {\bf #1:} #2 \end{minipage}}\vspace{3 mm}\par}
+%%% --------- command for Dohyun's reply on Prof. note ---------- %%%
+\newcommand{\reply}[2][reply]{\vspace{0 mm}\par \noindent \framebox{\color{blue} \begin{minipage}[c]{0.97 \hsize} {\bf #1:} #2 \end{minipage}}\vspace{3 mm}\par}
+%\newcommand{\note}[1]{}
+%%% ------------------------------------------------------------ %%%
+%%% --------- command for Dohyun's note2 ---------- %%%
+\newcommand{\TODO}[2][TODO]{\vspace{0 mm}\par \noindent \framebox{\color{blue} \begin{minipage}[c]{0.97 \hsize} {\bf #1:} #2 \end{minipage}}\vspace{3 mm}\par}
+%\newcommand{\note}[1]{}
+%%% ------------------------------------------------------------ %%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\title{\LARGE \bf
+Generative Robotic Control with Tunable Safety: \\Flow Matching for Safety-Critical Tasks
+}
+% Safety-Tunable Generative Predictive Control: Flow Matching for Safety-Critical Tasks
+\author{Albert Author$^{1}$ and Bernard D. Researcher$^{2}$% <-this % stops a space
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+\pagestyle{empty}
+\vskip -0.25 true in
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{abstract}
+Sampling-based predictive control (SBPC) algorithms, such as model predictive path integral (MPPI), have become a popular method for robotic motion planning applications due to their computational efficiency on modern computing architectures. However, it is difficult to enforce hard safety constraints for such techniques because they average over samples to realize the final set of control inputs. While individual samples may satisfy a given constraint, the sample average can violate the safety requirement. Similarly, diffusion and flow matching algorithms have become a popular way to generate robot motion trajectories. In this paper, we introduce a novel strategy to learn a conditional generative model that allows for online tuning of a safety parameter. As for sampling-based controllers, it is difficult to enforce hard safety-critical constraints in these methods. To address these limitations, this paper proposes a safety-critical framework for SBPCs and generative trajectory generation, based on the framework of discrete-time control barrier functions (DCBFs). Our DCBF-based method ensures safety during both the sampling and averaging phases of SBPCs, efficiently producing a rich dataset of multi-modal, collision-free behaviors. We then train a conditional flow matching model on these data to learn a generative policy that can be modulated at inference time by a single safety parameter. We demonstrate our approach for cluttered environments for a double integrator and a quadrotor simulation. Our results indicate that the proposed MPPI-DCBF framework consistently achieves superior safety guarantees compared to baseline MPPI methods, together with a context-aware conditional flow matching model, paving the way for real-time, safe SBPC and generative robotic control.
+\end{abstract}
+% The averaging behavior inherent exploratory nature of MPPI leads to potential safety violations, particularly in collision-avoidance scenarios.
+% enhancement of MPPI by integrating convex discrete-time Control Barrier Functions (CBFs). Specifically, we introduce an affine. 
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Introduction}
+\IEEEPARstart{S}{ampling-based} predictive control (SBPC) has been gaining traction in the nonlinear optimal control community. Completely general optimal control approaches often suffer from computational complexity associated with solving stochastic Hamilton--Jacobi--Bellman equations backwards in time, commonly referred to as the curse of dimensionality. SBPC is an alternative to gradient-based model predictive control (MPC), where a simple sampling procedure is used in place of a sophisticated nonlinear optimizer \cite{posa2014direct, kurtz2023inverse, aydinoglu2024consensus}. Algorithms in this family include model predictive path integral control (MPPI) \cite{williams2016aggressive}, predictive sampling \cite{howell2022predictive}, and cross-entropy methods \cite{rubinstein1999cross}. MPPI, for example, circumvents computational complexity by employing forward sampling of stochastic dynamics combined with Monte Carlo approximation techniques \cite{williams2017model}. The optimal control is then computed as the exponentially weighted average of the sampled trajectories, enabling real-time implementation.
+SBPC algorithms are particularly well-suited to recent advances in parallel computing architectures and parallel simulation \cite{mjx, Genesis, makoviychuk2021isaac}, enabling them to scale to complex problems like in-hand dexterous manipulation \cite{li2025drop}, legged locomotion \cite{xue2025full}, and more \cite{kurtz2024hydrax, howell2022predictive}.
+
+Despite these advantages, SBPCs such as MPPI inherently struggle with safety guarantees, such as collision avoidance. Safety constraints are typically incorporated indirectly through penalty terms in the cost function that are inversely proportional to the robot's proximity to obstacles and heavily penalize the collision~\cite{williams2017model, mohamed2023gp}. However, relying solely on these penalties lacks explicit safety guarantees due to the nature of the sampling averaging procedure. This limitation motivates our goal to integrate safety-critical constraints explicitly into the SBPC frameworks.
+% \note{Need a brief sentence and an reference about safety filters at the beginning of the next paragraph.}
+A common method to ensure safety in collision avoidance tasks is to employ a safety filter, which minimally modifies the output of a potentially unsafe nominal controller to guarantee the satisfaction of the constraints \cite{ames2014cbf}. However, a simple safety filter applied \textit{only} to the control output is insufficient to guarantee safety due to the tight coupling between control objectives and long-term safety criteria that are potentially conflicting. Previous works have used control Lyapunov functions (CLF) and control barrier functions (CBF), often with relaxation factors, to solve this issue as an optimization problem, for mediating safety and feasibility \cite{ames2016control, zeng2021enhancing}, or solve the optimization problem in the context of model predictive control (MPC) to take future information into account over a longer horizon \cite{zeng2021safety}. Recent works have encoded this concept through predictive safety filters, which leverage predictive CBFs in layered control architectures \cite{compton2024learning}. However, in cluttered environments, this direct optimization often becomes non-convex and intractable.
+
+This computational burden motivates a shift from online constrained optimization to learning-based control, where complex planning is performed offline to curate datasets of safe, multi-modal behavior. Generative models, such as diffusion and flow matching, can synthesize motion trajectories from diverse, high-dimensional demonstrations \cite{kurtz2025generative, chi2023diffusion}. However, they do not natively provide formal safety guarantees during rollout. Previous work attempts to encode safety by conditioning or regularizing generation \cite{dai2025safefm, carvalho2023mpdiffusion}, but deployments still lack mechanisms to systematically trade off safety and feasibility. This can be critical in real-world tasks where the robot must adjust caution to context.
+
+This paper introduces a supervised learning framework that tightly connects generative modeling with a sampling-based planner, preserving computational efficiency while enabling real-time control at inference time with multi-modalities in obstacle avoidance tasks (see Fig.~\ref{fig:keystone}). Our generative policy builds upon generative predictive control (GPC), which learns a vector field to map noise to control actions conditioned on observations and then applies control in a receding horizon fashion~\cite{kurtz2025generative}. To achieve this, we introduce two key components. First, we propose a novel predictive planner, MPPI-DCBF, which uses an affine discrete-time control barrier function (DCBF) to filter unsafe rollouts within a sampling-based planner. This method generates a rich dataset where behaviors are implicitly modulated by a tunable safety parameter, $\gamma$. Second, we extend the GPC framework by training a conditional flow matching model that uses local geometric information, a sequential context vector, and the safety parameter $\gamma$ to learn a policy that explicitly modulates the trade-off between safety and feasibility at inference time, resolving ambiguities not addressed in the original GPC implementation.
+\vskip -0.05 true in
+
+\begin{figure*}[!t] % Use figure* instead of figure, and [!t] is recommended for placement
+  \centering
+  % Best practice is to use the width option of \includegraphics directly
+      \includegraphics[width=\textwidth]{images/Fig1_v4.png}
+    \caption{Overview of our end-to-end pipeline for learning a safety-tunable generative control policy. \textbf{(a)} Our safety-critical planner, MPPI-DCBF, uses an affine discrete-time control barrier function to reject unsafe rollouts. This process generates a rich dataset of multi-modal, collision-free trajectories whose behavior is modulated by the safety parameter, $\gamma$. \textbf{(b)} A conditional flow matching model learns a generative policy, where a sequential model generates a context vector to guide the learned vector field, enabling a real-time policy tunable by $\gamma$ at inference. \textbf{(c)} In sampling-based predictive control like MPPI, the final averaging of rollouts can be unsafe for systems with non-convex reachable sets ($\mathcal{R}_i$). \textbf{(d)} MPPI-DCBF solves this by ensuring a convex reachable subset of the safe set at each step, which also provides a safe warm-start to promote recursive feasibility.}
+  \label{fig:keystone}
+  \vskip -0.2 true in
+\end{figure*}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Preliminaries}
+\subsection{Model Predictive Path Integral control}
+In discrete time, MPPI solves the following non-convex optimization problem at time step $k$ and state ${x(0) \in \mathbb{R}^{n_x}}$ over the mean control sequence $\{ u_{k+i\mid k}\}\in\mathbb{R}^{n_u}$ for $i \in  \{0, ..., N-1\}$
+\begin{subequations}
+\label{eq:sc-mppi}
+\begin{align}
+\min_{\{u_{k+i\mid k}\}}
+& \mathbb{E}\!\left[
+\phi\!\left(x_{k+N\mid k}\right)
+\!+\!\!\sum_{i=0}^{N-1}\Big(q(x_{k+i\mid k})\!+\!\tfrac{1}{2}u_{k+i\mid k}^\top R\,u_{k+i\mid k}\Big)
+\right], \tag{1a}\\
+\text{s.t.}\quad
+& x_{k+i+1\mid k}=f\!\left(x_{k+i\mid k},\,u_{k+i\mid k}+\varepsilon_{k+i}\right), \tag{1b}\\
+& x_{k\mid k}=x(0),\qquad \varepsilon_{k+i}\sim\mathcal{N}(0,\,\Sigma), \tag{1c}
+\end{align}
+\end{subequations}
+Here, ${q: \mathbb{R}^{n_x} \rightarrow \mathbb{R}}$ is any running cost, ${\phi : \mathbb{R}^{n_x} \rightarrow \mathbb{R}}$ is a terminal cost, $\Sigma$ is the control disturbance variance, $R \in \mathbb{R}^{n_u \times n_u}$ is the control cost weight.
+For the collision avoidance task, the controller can reason about crashing by setting collision penalties using the signed clearance to the closest obstacle $d_{\min}(x)$ in their running cost function, such as
+\begin{equation}
+\begin{aligned}
+q(x)
+&=(x-x_{\mathrm{goal}})^\top Q (x-x_{\mathrm{goal}})\\
+&\quad+\kappa_{\text{soft}}\,e^{-\alpha\,d_{\min}(x)}
++\kappa_{\text{hard}}\,\mathbf{1}\!\bigl[d_{\min}(x)<0\bigr].
+\label{eq:mppisoftconstraint}
+\end{aligned}
+\end{equation}
+A critical assumption is that the system is affine in control and noise, and that the noise enters the dynamics via the control channel. The MPPI optimal control sequence is a path-integral approximation of reward-weighted average random variations, which is solved by Monte Carlo methods, centered on the optimal policy sequence at the previous time step \cite{williams2017model}. The unexecuted part of the sequence is shifted by one time step and acts as the warm start of the next optimization. 
+
+Let this warm start sequence from the previous time step be denoted by $\bar u_{k+i\mid k}$. For rollout $m=1,\dots,M$ with perturbations $\varepsilon^{(m)}_{k+i}\!\sim\!\mathcal{N}(0,\Sigma)$, MPPI measures cost per rollout via forward sampling of random controls and states that can be expressed as
+\begin{equation}
+\begin{aligned}
+u^{(m)}_{k+i\mid k}&=\bar u_{k+i\mid k}+\varepsilon^{(m)}_{k+i},\\
+x^{(m)}_{k+i+1\mid k}&=f\!\bigl(x^{(m)}_{k+i\mid k},\,u^{(m)}_{k+i\mid k}\bigr).
+\end{aligned}
+\end{equation}
+Then, the cost for each rollout is
+\begin{equation}
+S^{(m)}\!=\!\phi\bigl(x^{(m)}_{k+N\mid k}\bigr)
++\sum_{i=0}^{N-1}\Big(q\,\!\bigl(x^{(m)}_{k+i\mid k}\bigr)+\tfrac{1}{2}\,u^{(m)\top}_{k+i\mid k} R\,u^{(m)}_{k+i\mid k}\Big).
+\label{eq:mppicost}
+\end{equation}
+Information-theoretic MPPI uses soft-min importance weights \cite{williams2017info}:
+\begin{equation}
+\omega_m=\exp\Bigl(-\tfrac{1}{\lambda}\,[S^{(m)}-\beta]\Bigr),\qquad
+\beta=\min_m S^{(m)}, \label{eq:mppi-weights}
+\end{equation}
+where ${\lambda >0}$ is an inverse temperature which controls how heavily the optimal trajectory is weighted, and $\beta$ is the minimum cost, used to improve the numerical stability. Then, for $i \in \{0, ..., N-1\}$, the mean update that gives optimal control sequence is
+\begin{equation}
+\Delta u_{k+i\mid t}=
+\frac{\sum_{m=1}^{M}\omega_m\,\varepsilon^{(m)}_{k+i}}{\sum_{m=1}^{M}\omega_m},
+\quad
+u^*_{k+i\mid k}\leftarrow \bar u_{k+i\mid k}+\Delta u_{k+i\mid k}. \label{eq:mppi-update}
+\end{equation}
+Then the current optimal control $u^*_{k\mid k}$ is applied. 
+% & h^{\mathrm{aff}}\!\left(x_{k+i\mid k};\,x_{k\mid k}\right)\ \ge\ (1-\gamma)^i,\quad i=0,\dots,N. \tag{1d}\label{eq:safemppi}
+This parallelizable sampling process makes MPPI highly suitable for solving non-convex optimal control problems on modern GPU hardware. However, a key challenge arises in safety-critical applications. When obstacles are present, a cost for avoiding obstacles does not provide formal safety guarantees, as the final control is averaged over many trajectories. 
+% \note{Review SBPC or MPPI, specifically including the averaging process, and how that leads to a lack of safety guarantees.  Mention prior works that have tried to reduce the effect of this problem.}
+
+Several works have focused on incorporating safety into the forward sampling process by shaping the rollout distribution and by injecting feedback, rather than enforcing hard state constraints. For example, the covariance steering method solves this problem by controlling a desired terminal state covariance together with control disturbance variance. This algorithm encourages multi-modal detours around obstacles and avoids collision during the averaging phase \cite{yin2022}. On the other hand, safety-controlled MPPI used importance sampling under embedded barrier state-based feedback control during the forward sampling of MPPI \cite{gandhi2023safe}. These methods bias the sampling distribution toward safety, but do not enforce a rigorous safety definition. 
+
+\subsection{Flow Matching for trajectory generation}
+% ------------ I think it is okay to show the 2D MPPI-DCBF result + flow matching generation results here, other wise the results section is too packed! ----------% 
+\begin{figure}[!t]
+  \centering
+  \includegraphics[width=\linewidth]{images/rollouts_grid_v2.pdf}
+  \caption{Collected and generated trajectories under the scalar safety parameter $\gamma$. Curve color encodes $\gamma$, which induces distinct multi-modalities.}
+  \label{fig:results_2d}
+  \vskip -0.2 true in
+\end{figure}
+
+Flow matching is increasingly used in robotics for trajectory generation and policy generation. The trajectory generation process learns a mapping from noise to entire collision-free trajectories by end-to-end supervised learning, but it can struggle to generalize to out-of-distribution environments and may require complete retraining \cite{ye2024efficient, dai2025safefm}. In contrast, (conditional) flow matching-based policy generation is more flexible, focuses on learning a mapping to a lower-dimensional control action, conditioned on observations \cite{kurtz2025generative}.
+
+For collision avoidance, it is essential to generate a policy conditioned on geometric observations while benefiting from offline flow matching training and fast computation from SBPC. Here, we describe the important concept of conditional flow matching. For purposes of clarity, \(u_t(\cdot)\) denotes the flow matching vector field (distinct from the MPPI control sequence \(u\)). We use \(z\in\mathbb{R}^{n_u}\) for a target optimal control policy, \textit{i.e.,} the symbol \(u^*_{k\mid k}\) used in the previous section.
+
+Flow matching aims to learn a marginal vector field $u^*_t(x)$ that converts a simple distribution $x_0 \sim p_0$, such as a standard isotropic Gaussian, into a complex data distribution $z \sim p_{data}$. This is done by considering the marginal probability path $p_t(x)$ that evolves from $p_0$ to $p_{data}$. Then, by simulating an ordinary differential equation (ODE) characterized by a marginal vector field, we can generate a meaningful sample. 
+
+However, due to the intractable nature of the data distribution, one can only realize a conditional probability path $p_t(x|z)$ rather than $p_t(x)$.
+We then use a pre-defined conditional vector field $u^{*}_t(x|z)$ for training to approximate the ground truth ODE (\textit{i.e.,} marginal vector field $u^*_t(x)$) in a supervised regression fashion. This holds since the marginal vector field and the conditional vector field share the same minimizer \cite{lipman2022flow,lipman2024flow}. 
+Moreover, a marginal vector field can be reconstructed after training via marginalization
+\begin{equation}
+    u^{*}_t(x) = \int u^{*}_t(x|z)\frac{p_t(x|z)p_{data}(z)}{p_t(x)}dz 
+    \label{eq:marginalization},
+\end{equation}
+and be used for simulating an ODE to generate samples that adhere to the data. With an optimal transport probability path that drives noise $\epsilon$ to $z$ with constant direction and speed in time~\cite{lipman2022flow}, the conditional flow matching (CFM) model $u_t^\theta(x)$ learns the conditional vector field $u^*_t(x|z)$ per sampled point $x$ from conditional vector field by minimizing the mean-squared loss:
+\begin{align}
+\mathcal{L}(\theta)&=
+\mathbb{E}_{\substack{
+t\sim \mathrm{Unif}[0,1],\\
+z\sim p_{\mathrm{data}},\\ x\sim p_t(\cdot\mid z)
+}} \notag
+\!\Bigl[\bigl\|u_t^\theta(x)-u_t^*(x\mid z)\bigr\|^2\Bigr]
+\label{eq:cfm}\\
+&=\mathbb{E}_{\substack{
+t\sim \mathrm{Unif}[0,1],\\ \epsilon\sim\mathcal{N}(0,I_d),\\
+z\sim p_{\mathrm{data}}
+}}
+\!\Bigl[\bigl\|u_t^\theta(tz+(1-t)\epsilon)-(z-\epsilon)\bigr\|^2\Bigr].
+\end{align}
+Here, $d$ is the dimension of the noise $\epsilon$ and data $z$. At inference time, we sample from a simple distribution and simulate a learned marginal vector field to generate data. Flow matching for trajectory generation can be achieved through the conditional flow matching model, where the conditioning is on arbitrary variables or observations, such as a safety parameter and the distance to the obstacle.
+
+To generate a policy using the CFM model, we first assume there is a ground-truth marginal vector field that transforms noise into an optimal policy given observations. In our case, we view the task of generating safe robot motion trajectories as not merely to generate any valid guess, but to generate a control policy conditioned on local geometric observations and states $o$, a safety parameter $\gamma$, and a context vector $c$, as described in Fig.~\ref{fig:keystone}(b). In this case, we need to expand the expectation from \eqref{eq:cfm} over all possible $o$, $\gamma$, and $c$. Thus, we define our training objective as
+\begin{equation}
+\mathcal{L}(\theta)\!=\!
+\mathbb{E}_{\substack{
+t\sim \mathrm{Unif}[0,1],\\ \epsilon\sim\mathcal{N}(0,I_d),\\
+(z,o,\gamma,c)\sim p_{\mathrm{data}}(z,o,\gamma,c),\\ x\sim p_t(\cdot\mid z)
+}}
+\!\!\!\!\Bigl[\bigl\|u_t^\theta(x\!\mid\! o,\gamma, c)-(z-\epsilon)\bigr\|^2\Bigr].
+\label{eq:cfm_cost}
+\end{equation}
+
+\subsection{Discrete-Time Control Barrier Functions}
+Let $\mathcal{C}=\{x\in\mathbb{R}^n:\; h(x)\ge 0\}$ denote the safe set for a continuously differentiable $h$.
+For the discrete‐time control‐affine system
+\begin{equation}
+    x_{k+1}=f(x_k)+g(x_k)u_k, \label{eq:affinesystem}
+\end{equation}
+a function $h$ is a discrete‐time control barrier function (DCBF) associated with the control system \eqref{eq:affinesystem} if there exists $\gamma\in(0,1]$ such that for all $x_k$ there exists a control $u_k$ with
+\begin{equation}
+    \Delta h(x_k,u_k)\;:=\;h(x_{k+1})-h(x_k)\;\ge\;-\gamma\,h(x_k).
+    \label{eq:dtcbf}
+\end{equation}
+Condition \eqref{eq:dtcbf} implies the one‐step decay bound
+\begin{equation*}
+    h(x_{k+1})\;\ge\;(1-\gamma)\,h(x_k)
+    \, \Longrightarrow \,
+    h(x_k)\;\ge\;(1-\gamma)^{k}\,h(x_0),
+    \label{eq:exp_decay}
+\end{equation*}
+\textit{i.e.,} the lower bound on the barrier value decays exponentially with base $(1-\gamma)$, ensuring forward invariance of $\mathcal{C}$ \cite{ames2014cbf,agrawal2017discrete}.
+
+To be compatible with the averaging in MPPI, we use an affine DCBF derived from a supporting hyperplane to the obstacle boundary. For a convex obstacle, let $p$ be the point on its boundary closest to the current state $x_{k\mid k}$, with outward normal $n$. We define the control barrier function as
+\begin{equation}
+h^{\mathrm{aff}}(x_{k+i\mid k};\,x_{k\mid k}) :=
+\frac{n^\top(x_{k+i\mid k}-p)}{n^\top(x_{k\mid k}-p)}.
+\label{eq:aff_barrier}
+\end{equation}
+The safe set for each $i$-th step is defined as
+\begin{equation}
+\mathcal{C}_i^{\mathrm{aff}}=\{x \in \mathbb{R}^{n_x} \mid h^{\mathrm{aff}}(x_{k+i\mid k}; x_{k\mid k})\ge 0\},\label{eq:aff_safeset}
+\end{equation}
+is a half-space, which is convex. Applying the DCBF condition \eqref{eq:dtcbf} to this affine barrier function provides our safety specification for each rollout:
+\begin{equation}
+h^{\mathrm{aff}}(x_{k+i+1\mid k};x_{k\mid k}) \ge (1-\gamma) h^{\mathrm{aff}}(x_{k+i\mid k};x_{k\mid k}).
+\end{equation}
+Iterating this condition from $i=0$ with $h^{\mathrm{aff}}(x_{k\mid k};x_{k\mid k})=1$ yields an exponentially decaying lower bound on the safety margin along the prediction horizon:
+\begin{equation}
+h^{\mathrm{aff}}(x_{k+i\mid k};x_{k\mid k}) \ge (1-\gamma)^i.
+\label{eq:safetyspecification}
+\end{equation}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Problem Definition}
+% \note{The problem definition section always should occur before the methods section, and after the preliminaries  Perhaps you can combine the LTI and nonlinear system as one case, since the LTI system is also affine in control?}
+We consider a robot whose dynamics are described by the discrete-time control affine system in \eqref{eq:affinesystem}, evolving in a cluttered environment with static obstacles. This work has two primary objectives. First, we experimentally demonstrate that our proposed controller, MPPI-DCBF, achieves superior safety guarantees over a standard baseline MPPI with different choices of the safety parameter $\gamma$. We validate this approach and its scalability on both LTI systems and complex nonlinear models, such as a quadrotor. Second, we address the challenge of creating a real-time generative policy that can modulate the trade-off between safety and feasibility by continuously scheduling $\gamma$, based on observations.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Method}
+Having presented the necessary background of model predictive path integral control, discrete-time barrier functions, and conditional flow matching, we now formulate the proposed framework.
+
+\subsection{The MPPI-DCBF Algorithm}
+%%%%%%%%%%%%%%%%Start_of_Algorithm1-%%%%%%%%%%%%%%%%
+\begin{algorithm}[H]
+\caption{MPPI-DCBF Algorithm}\label{alg:safe-mppi}
+\SetKwInOut{Input}{Input}
+\SetKwInOut{Output}{Output}
+\Input{
+
+Initial state $x_{k\mid k}$, horizon $N$, samples $M$, warm-start $\bar u_{k+i\mid k}$, inverse temperature $\lambda$, noise variance $\Sigma$, rollout cost in~\eqref{eq:mppicost}, safety parameter $\gamma\!\in\!(0,1]$, system model $f(x,u)$
+}
+\Output{Optimal control policy $u^*_{k\mid k}$}
+
+\Repeat{control $u^*_{k\mid k}$ applied}{
+  \For{$m=1$ \KwTo $M$}{
+    \For{$i=0$ \KwTo $N-1$}{
+      sample $\varepsilon^{(m)}_{k+i}\!\sim\!\mathcal{N}(0,\Sigma)$\;
+      
+      set $u^{(m)}_{k+i\mid k}=\bar u_{k+i\mid k}+\varepsilon^{(m)}_{k+i}$\;
+      
+      % \tcp*[h]{$\triangleright$ MPPI sampling}
+      
+      rollout $x^{(m)}_{k+i+1\mid k}=f\!\bigl(x^{(m)}_{k+i\mid k},u^{(m)}_{k+i\mid k}\bigr)$\;
+      
+      \If{$\exists\, i:\, h^{\mathrm{aff}}\!\bigl(x^{(m)}_{k+i\mid k};x_{k\mid k}\bigr)<(1-\gamma)^i$}{
+        \textbf{reject} rollout $m$;\; $S^{(m)} \leftarrow \infty$\;
+        
+        \tcp*[h]{$\triangleright$ safety specification~\eqref{eq:safetyspecification}}
+      }
+    } % end inner For (i)
+  } % end For (m)
+  {
+    among safe samples, evaluate $S^{(m)}$ using~\eqref{eq:mppicost}
+        
+    $\hat\omega_m=\exp\!\big(-[S^{(m)}-\min_j S^{(j)}]/\lambda\big)$\;
+
+    $\Delta u_{k+i\mid k} = (\sum_{m=1}^{M}\hat\omega_m\,\varepsilon^{(m)}_{k+i}) / (\sum_{m=1}^{M}\hat\omega_m)$
+    
+    % \tcp*[h]{$\triangleright$ Weight for rollout}
+
+    $\bar u_{k+i\mid k}\leftarrow \bar u_{k+i\mid k}+\Delta u_{k+i\mid k}$\;
+  }
+  
+  $u^*_{k\mid k}=\bar u_{k\mid k}$;\; shift sequence
+} % end Repeat
+\end{algorithm}
+%%%%%%%%%%%%%%%%End_of_Algorithm1-%%%%%%%%%%%%%%%%
+Our proposed algorithm, model predictive path integral control with DCBF-based sample rejection (MPPI-DCBF), modifies the standard MPPI framework to formally enforce safety. The core of our method is the safety specification in \eqref{eq:safetyspecification}, which is designed to guarantee the forward invariance of the sequence of time-varying safe sets $\mathcal{C}_i^{\mathrm{aff}}$ defined in \eqref{eq:aff_safeset}. This is achieved by integrating the DCBF condition directly into the sampling step of the MPPI algorithm. Any sampled rollout that violates the condition \eqref{eq:safetyspecification} is rejected by assigning infinite cost to that rollout. Note that in the importance weighting of MPPI~\eqref{eq:mppi-weights}, an infinite cost is the same as a sample rejection. Consequently, the optimal control sequence \eqref{eq:mppi-update} is computed as a convex combination of only those rollouts that are certified to be safe. The complete procedure is detailed in Algorithm~\ref{alg:safe-mppi}.
+
+While the proper design of terminal ingredients (\textit{i.e.,} a terminal set and cost) can formally guarantee recursive feasibility in traditional MPC, the non-convex nature of the resulting optimization problem often makes real-time implementation computationally intractable \cite{rawlings2020model}. SBPC methods such as MPPI face similar challenges. Rather than proving recursive feasibility, our approach ensures safety by enforcing DCBF constraints at each time step, which relies on the weaker but more practical condition of pointwise feasibility, formalized in the following assumption.
+\begin{assumption}  \label{assumption_1}
+    For the discrete-time control affine system \eqref{eq:affinesystem} and for any initial state $x_{k|k} \in \mathcal{C}_i^\mathrm{aff}$, there exists at least one control sequence $\{u_{k+i|k}\}_{i=0}^{N-1}$ such that the resulting trajectory $\{x_{k+i|k}\}_{i=1}^{N}$ lies within the sequence of safe sets defined in \eqref{eq:aff_safeset}, i.e., $x_{k+i|k} \in \mathcal{C}_i^{\mathrm{aff}}$ for all $i \in \{1, \dots, N\}$.
+\end{assumption}
+
+Assumption 1 is the condition for pointwise feasibility of the MPPI-DCBF algorithm at the current state; it ensures that the set of valid trajectories for the planner to find is non-empty. It is important to note that the parameter $\gamma$ governs the trade-off between safety and feasibility. Although we assume there exists a valid trajectory, a smaller $\gamma$ yields more conservative (safer) behavior, but results in a smaller safe set \eqref{eq:aff_safeset}. Conversely, a larger $\gamma$ expands the safe set, making it easier to find a valid trajectory, but may result in safety violations in practice if modeling assumptions are violated. 
+
+Under the assumption of pointwise feasibility, we can formally analyze the properties of the MPPI-DCBF averaging process.
+
+\begin{proposition} \label{prop: 1}
+    For the discrete-time control affine system \eqref{eq:affinesystem}, if all contributing rollouts $(m)$ satisfy $x^{(m)}_{k+1\mid k} \in \mathcal{C}_1^{\mathrm{aff}}$, then the averaged state $x^*_{k+1|k}$ under the MPPI-DCBF control is also guaranteed to be in the safe set, \textit{i.e.,} $x^*_{k+1|k} \in \mathcal{C}_1^{\mathrm{aff}}$.
+    
+    \begin{proof}
+    Under the control affine dynamics, the state $x^{(m)}_{k+1\mid k}$ in the next time step is an affine function of the control inputs. Since the admissible inputs are a convex polytope and the control update of MPPI is a convex combination of control perturbations~\eqref{eq:mppi-update}, the resulting state $x^*_{k+1\mid k}$ is a convex combination of the rollout states:
+    \begin{align}
+    x^*_{k+1|k} = \sum_m \hat{\omega}_m x^{(m)}_{k+1|k}, \nonumber
+    \end{align}
+    where $\hat{\omega}_m \in \mathbb{R}_{> 0}$ and $\sum_m \hat{\omega}_m = 1$ are the importance weights derived from \eqref{eq:mppi-weights} after the rejection of unsafe samples. Moreover, since the safe set $\mathcal{C}_1^{\mathrm{aff}}$ is a convex half-space, any convex combination of points within it must also lie within the set. Thus, if $x^{(m)}_{k+1\mid k} \in \mathcal{C}_1^{\mathrm{aff}}$ for all $m$, it follows that $x^*_{k+1|k} \in \mathcal{C}_1^{\mathrm{aff}}$.
+    \end{proof}
+\end{proposition}
+% \vspace{1mm}
+% \noindent\textbf{Proposition 1.} \textit{For the discrete-time control affine system \eqref{eq:affinesystem}, with the convex set of admissible inputs, if all contributing rollouts $(m)$ satisfy $x^{(m)}_{k+1\mid k} \in \mathcal{C}_1^{\mathrm{aff}}$, then the resulting state $x^*_{k+1|k}$ under the MPPI-DCBF control is also guaranteed to be in the safe set, i.e., $x^*_{k+1|k} \in \mathcal{C}_1^{\mathrm{aff}}$.}
+
+% \vspace{1mm}
+% \begin{proof}
+% Under the control affine dynamics, the state $x^{(m)}_{k+1\mid k}$ in the next time step is an affine function of the control inputs. Since the admissible inputs are convex and the control update of MPPI is a convex combination of control perturbations~\eqref{eq:mppi-update}, the resulting state $x^*_{k+1\mid k}$ is a convex combination of the rollout states:
+% \begin{align}
+% x^*_{k+1|k} = \sum_m \hat{\omega}_m x^{(m)}_{k+1|k}, \nonumber
+% \end{align}
+% where $\hat{\omega}_m \ge 0$ and $\sum_m \hat{\omega}_m = 1$ are the importance weights derived from \eqref{eq:mppi-weights} after the rejection of unsafe samples. Moreover, since the safe set $\mathcal{C}_1^{\mathrm{aff}}$ is a convex half-space, any convex combination of points within it must also lie within the set. Thus, if $x^{(m)}_{k+1\mid k} \in \mathcal{C}_1^{\mathrm{aff}}$ for all $m$, it follows that $x^*_{k+1|k} \in \mathcal{C}_1^{\mathrm{aff}}$.
+% \end{proof}
+% \vspace{1mm}
+
+If the dynamics of the system of interest are linear time invariant (LTI) as
+\begin{equation}
+    x_{k+1}=Ax_k + Bu_k,\label{eq:lti}
+\end{equation}
+then we can make a similar statement about safety along the \textit{entire} trajectory, rather than just a single step in the MPPI averaging process.
+
+\begin{proposition} \label{prop:2}
+For the discrete LTI system \eqref{eq:lti} under Assumption~\ref{assumption_1}, if all contributing rollouts $(m)$ satisfy $x^{(m)}_{k+i\mid k} \in \mathcal{C}_i^{\mathrm{aff}}$ for all steps $i \in \{1, \dots, N\}$, then the entire averaged MPPI trajectory also remains within the sequence of safe sets, \textit{i.e.,} $x^*_{k+i\mid k} \in \mathcal{C}_i^{\mathrm{aff}}$ for all $i$.
+
+\begin{proof}
+    The proof extends the logic from \Cref{prop: 1} to the full horizon. For an LTI system, the state at any future step $i$ is an affine function of the control sequence:
+    \begin{align*}
+        x_{k+i}=A^{i}x_k + \sum^{i-1}_{j=0}A^{i-1-j}Bu_{k+j}.
+    \end{align*}
+    Thus, the averaged state is a convex combination of the individual rollout states at that same step:
+    \begin{align}
+    x^*_{k+i|k} = \sum_m \hat{\omega}_m x^{(m)}_{k+i|k}, \quad \forall i \in \{1, \dots, N\}, \nonumber
+    \end{align}
+    where $\hat{\omega}_m$ are the normalized importance weights. Because $\forall i \in \{1, \dots, N\}$, $x^{(m)}_{k+i\mid k}\in\mathcal{C}_i^{\mathrm{aff}}$ and $\mathcal{C}_i^{\mathrm{aff}}$ is a convex set, the convex combination, $x^*_{k+i|k}$, must also lie within $\mathcal{C}_i^{\mathrm{aff}}$. 
+    % As this holds for all steps $i$, the entire averaged trajectory is guaranteed to be safe.
+\end{proof}
+\end{proposition}
+%
+% \noindent\textbf{Proposition 2.} \textit{For the discrete LTI system \eqref{eq:lti}, \textbf{under Assumption 1}, if all contributing rollouts $(m)$ satisfy $x^{(m)}_{k+i\mid k} \in \mathcal{C}_i^{\mathrm{aff}}$ for all steps $i \in \{1, \dots, N\}$, then the entire averaged MPPI trajectory also remains within the sequence of safe sets, i.e., $x^*_{k+i\mid k} \in \mathcal{C}_i^{\mathrm{aff}}$ for all $i$.}
+%
+% \vspace{1mm}
+% \begin{proof}
+% The proof extends the logic from Proposition 1 to the full horizon. For an LTI system, the state at any future step $i$ is an affine function of the control sequence. This implies that the averaged state is a convex combination of the individual rollout states at that same step:
+% \begin{align}
+% x^*_{k+i|k} = \sum_m \hat{\omega}_m x^{(m)}_{k+i|k}, \quad \forall i \in \{1, \dots, N\}, \nonumber
+% \end{align}
+% where $\hat{\omega}_m$ are the normalized importance weights. By the proposition's premise, every rollout state $x^{(m)}_{k+i\mid k}$ is in the safe set $\mathcal{C}_i^{\mathrm{aff}}$. Since each $\mathcal{C}_i^{\mathrm{aff}}$ is a convex set, their convex combination, $x^*_{k+i|k}$, must also lie within that set. As this holds for all steps $i$, the entire averaged trajectory is guaranteed to be safe.
+% \end{proof}
+% \vspace{1mm}
+
+\Cref{prop:2} holds to ensure the full-horizon safety of the averaged plan as illustrated in Fig.~\ref{fig:keystone}(d). Despite the fact that only the current optimal control $u^*_{k\mid k}$ is applied, the full-horizon safety of the optimal control sequence is critical for the subsequent step. The remaining portion of the safe trajectory provides a warm start for the next optimization, anchoring the sampling distribution in a safe region of the state space. Our approach in leveraging DCBFs in a model predictive fashion draws a parallel to optimization-based methods, such as MPC-CBF~\cite{zeng2021safety}.
+
+\subsection{Conditional Flow Matching for Safety-tunable Policy Generation}
+To generate a policy that can modulate its behavior in real time, we train a generative model on the dataset from our MPPI-DCBF planner. As shown in Fig.~\ref{fig:keystone}(b), our model consists of a sequential encoder and a contextual conditional flow matching (CFM) head. The encoder, a gated recurrent unit (GRU), processes a history of states, observations, and controls to produce a context vector $c_t$. This context allows the model to capture long-term dependencies, which is critical for resolving ambiguities such as deciding which side of an obstacle to navigate around (see Fig.~\ref{fig:flowmatching}). The CFM head then learns a vector field conditioned on this context, the current state and observation, together denoted by $o_t$, and the desired safety level $\gamma_t$ to produce the ground truth control action $u^*_{t\mid t}$ by minimizing the conditional flow matching loss in \eqref{eq:cfm_cost}. The complete training and inference procedure is detailed in Algorithm~\ref{alg:cfm}, yielding a real-time policy that can be tuned by adjusting the input parameter $\gamma(k)$ without any online sampling.
+%%%%%%%%%%%%%%%%Start_of_Algorithm2-%%%%%%%%%%%%%%%%
+\begin{algorithm}[H]
+\caption{Conditional Flow Matching for Safety-tunable Policy Generation}\label{alg:cfm}
+\SetKwInOut{Input}{Input}\SetKwInOut{Training}{Training---}\SetKwInOut{Inference}{Inference---}
+
+\Training{
+
+Repeat for each collision-free trajectory with a moving horizon until convergence
+
+\Input{
+
+trajectory dataset $\mathcal{D}=\{(z_t=u^*_{t\mid t},o_t,\gamma_t)\}_{t=0}^{T-1}$, moving horizon $H$, initial $p_0=\mathcal{N}(0,I)$;\; sequential encoder $g_\psi$ (context), flow matching model $u_t^\theta(x\mid o,\gamma,c)$, step $\alpha$}
+
+}
+\ForEach{$\tau=\{(z_t,o_t,\gamma_t)\}_{t=0}^{T-1}\in\mathcal{D}$}{
+  \Repeat{scenario converged}{
+    \For{$t=0$ \KwTo $T-1$}{
+      $c_t \leftarrow g_\psi\!\big(\{(z_j,o_j,\gamma_j)\}_{j=\max(0,t-H+1)}^{t}\big)$ 
+      
+      \tcp*[h]{$\triangleright$ encode the context}
+      
+      sample $t\sim\mathrm{Unif}[0,1]$, $\epsilon\sim\mathcal{N}(0,I)$
+      
+      set $x=t\,z_t+(1-t)\epsilon$;
+
+      \tcp*[h]{$\triangleright$ optimal transport path}
+      
+      target $u_t^*(x\mid z_t)=z_t-\epsilon$
+
+      % \tcp*[h]{$\triangleright$ conditional flow matching}
+
+      
+      
+      $\theta\leftarrow\theta-\alpha\nabla_\theta\|u_t^\theta(x\mid o_t,\gamma_t,c_t)-u_t^*(x\mid z_t)\|^2$\;
+    }
+  }
+}
+
+\Inference{
+
+policy generation with scheduled $\gamma$ and online context}
+\Input{
+system model $f(x,u)$,\; observation map $o(x^{\mathrm{sys}})$, sequential encoder $g_\psi$, step size $\Delta t$, ODE step $L$, schedule $\gamma(k)$, initial robot state $x^{\mathrm{sys}}(0)$}
+
+\textbf{Output:}{ generated control policy $\hat u_{k}$.}
+
+Initialize: time step $k=0$, robot state $x^{\mathrm{sys}}_0=x^{\mathrm{sys}}(0)$
+
+\While{not converged}{
+
+    $o_k\leftarrow o(x_k^{\mathrm{sys}})$
+    
+    $c_k\leftarrow g_\psi\!\big(\hat u_j,o_j,\gamma_j)\}_{j=\max(0,k-H+1)}^{k}\big)$ 
+
+    $\gamma_k = \gamma (o_k)$
+    
+    \tcp*[h]{$\triangleright$ safety parameter scheduling}
+
+    Draw a sample $x_0\sim p_0$
+    
+    \For{$\ell=0$ \KwTo $L-1$}{
+    $t_\ell=\ell/L$; $x_{\ell+1}=x_\ell+\Delta t\,u_{t_\ell}^\theta\!\big(x_k\mid o_k,\gamma_k,c_k\big)$ 
+  
+  \tcp*[h]{$\triangleright$ simulate from learned ODE}
+  }
+  Set $\hat u_k = x_{L}$
+  
+  \tcp*[h]{$\triangleright$ generate policy}
+  
+  $x^{\mathrm{sys}}_{k+1}=f(x^{\mathrm{sys}}_k,\hat u_k)$; $k = k+1 $
+}
+\end{algorithm}
+%%%%%%%%%%%%%%%%Start_of_Algorithm2-%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Numerical Examples}
+In this section, we demonstrate the effectiveness of the
+proposed framework using two simulation examples. During the experiments, all data generation and model training were performed on a workstation equipped with an NVIDIA H100 NVL GPU.
+\subsection{2D Double Integrator model}
+Consider a linear discrete-time 2D double integrator
+\begin{equation}
+    x_{k+1}=Ax_k + Bu_k.
+\end{equation}
+To generate a dataset for policy learning, we first employ our proposed MPPI-DCBF planner (Algorithm~\ref{alg:safe-mppi}) with a sampling time of $\Delta t=0.1s$. The environment consists of a fixed start at $(-5,-5)$ and a goal at $(0,0)$, populated with 1 to 10 randomly positioned circular obstacles. This domain randomization creates a challenging scenario where a single set of tuned cost penalties for a baseline planner is unlikely to generalize effectively across all configurations. Our planner produces a rich dataset of multi-modal collision-free trajectories by varying the safety parameter $\gamma \in (0,1]$. As shown in the top row of Fig.~\ref{fig:results_2d}, lower values of $\gamma$ lead to more conservative, wide-berth maneuvers, while higher values produce more aggressive maneuvers with tighter obstacle clearance.
+\begin{figure}[!t]
+  \centering
+      \includegraphics[width=\linewidth]{images/flowmatching_v2.pdf}
+  \caption{
+      Flow matching transforms a simple noise distribution into a target data distribution of safe control policies. \textbf{Without context}, the learned vector field averages all behaviors into a single mode, leading to a greedy, goal-seeking policy (note the concentrated, goal-directed samples at $t=0.75$). \textbf{With context}, the model learns to distinguish between different situations (e.g., passing an obstacle on the left vs. right), enabling it to generate multi-modal, detouring maneuvers.
+    }
+    \vskip -0.4 true in
+  \label{fig:flowmatching}
+\end{figure}
+
+Before training a policy, we benchmark the performance of our MPPI-DCBF planner against a baseline MPPI controller for the single obstacle case, with results summarized in Table~\ref{tab:mppi_eval}. Both controllers solve the optimal control problem in \eqref{eq:sc-mppi} with identical quadratic cost weights ($Q_p=100I_2, Q_v=10I_2, R=0.05I_2, P_p=1000I_2,$ and $P_v=100I_2$, where the subscripts $p$ and $v$ denote position and velocity, respectively). The baseline MPPI uses an additional penalty-based running cost as in~\eqref{eq:mppisoftconstraint}, $q_{\text{obs}}(x) = 5\cdot10^4 \cdot \mathbf{1}[d_{min}(x)<0] + 100 e^{-d_{min}(x)}$. Analysis of the results reveals several key insights. Most notably, our MPPI-DCBF consistently achieves superior safety guarantees compared to the baseline MPPI method, even at a shorter prediction horizon with lower control cost. Importantly, this comes at a minor computational overhead (2-3 ms per step), indicating that safety is achieved without sacrificing performance.
+% However, we observed that for multi-obstacle cases, (Here say something about multi-obstacle failures)
+
+\begin{table}[t]
+\caption{MPPI~\cite{williams2017model} and MPPI-DCBF benchmark in terms of computation time, success rate, minimum clearance, and control cost integral. $N$ denotes the prediction horizon for both algorithms.}
+\label{tab:mppi_eval}
+\begin{center}
+\begin{tabular}{|l||c|c|c|c|}
+\hline
+% \multicolumn{5}{|c|}{\textbf{Task: Single obstacle}}\\
+% \hline
+$N=7$ & \shortstack{Comp.\\time [ms]} & \shortstack{Success\\rate [\%]} & \shortstack{Minimum\\distance [m]} & \shortstack{Cost\\Integral} \\
+\hline
+MPPI & 3.6±0.0 & 61.6 & 0.12±0.22 & 1.15±0.29 \\
+\shortstack{MPPI-DCBF\\$(\gamma{=}\,0.1)$} & 5.8±0.0 & 100.0 & 0.65±0.08 & 1.16±0.24 \\
+\shortstack{MPPI-DCBF\\$(\gamma{=}\,0.2)$} & 5.9±0.0  & 100.0 & 0.40±0.11 & 1.10±0.27 \\
+\shortstack{MPPI-DCBF\\$(\gamma{=}\,1.0)$} & 5.8±0.0  & 100.0 & 0.22±0.15 & 1.04±0.27 \\
+\hline
+$N=11$ & \shortstack{Comp.\\time [ms]} & \shortstack{Success\\rate [\%]} & \shortstack{Minimum\\distance [m]} & \shortstack{Cost\\Integral} \\
+\hline
+MPPI & 5.3±0.0 & 100.0 & 0.14±0.09 & 1.91±0.19 \\
+\shortstack{MPPI-DCBF\\$(\gamma{=}\,0.1)$} & 8.9±0.0 & 100.0 & 0.98±0.06 & 1.82±0.11 \\
+\shortstack{MPPI-DCBF\\$(\gamma{=}\,0.2)$} & 8.9±0.0 & 100.0 & 0.66±0.05 & 1.77±0.11 \\
+\shortstack{MPPI-DCBF\\$(\gamma{=}\,1.0)$} & 8.9±0.0 & 100.0 & 0.42±0.06 & 1.77±0.15 \\
+\hline
+\end{tabular}
+\end{center}
+\vskip -0.2 true in
+\end{table}
+
+We learn these multi-modal behaviors by training the conditional flow matching model, where the bottom row of Fig.~\ref{fig:results_2d} demonstrates that the generative policy successfully reproduces these distinct modalities for different fixed values of $\gamma$. Since the model learns a continuous mapping, it can interpolate between its distinct behaviors seen during training. This enables the synthesis of novel control strategies by implementing a dynamic schedule for $\gamma(k)$ at inference time. Here, we design a heuristic schedule:
+\begin{equation}
+\label{eq:gamma-schedule}
+\gamma(k)=\gamma_{\min}
++\big(\gamma_{\max}-\gamma_{\min}\big)\,\Big(1-e^{-\beta\, d(k)}\Big)\;e^{-\alpha\,\max\{0,\,v(k)\}}\,,
+\end{equation}
+where $d(k)$ is the distance to the nearest obstacle, $v(k)$ is the relative velocity towards it, and sensitivity parameters $\alpha, \beta$ were fine-tuned to be $0.136, 1.151$, respectively. This schedule is designed to increase conservatism (\textit{i.e.,} lowers $\gamma$) as the robot approaches an obstacle. Fig.~\ref{fig:result_chart} summarizes the performance of the policy over 1000 randomized trials, showing that our adaptive policy achieves a strong balance between safety and feasibility in terms of minimum clearance and success rate. An illustrative example of this behavior in a cluttered environment is shown in Fig.~\ref{fig:result_adaptive}. However, learning an optimal schedule remains an open problem.
+\subsection{Quadrotor}
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{images/results_chart_v1.pdf}
+\vspace{-.2cm}
+\caption{Performance of the learned generative policy over 1000 randomized trials across four key metrics. The first four bars in each plot correspond to policies using a fixed safety parameter (${\gamma\in\{0.1,0.2,0.5,1.0\}}$). The final hatched bar shows the performance of our adaptive schedule from~\eqref{eq:gamma-schedule}.}
+\label{fig:result_chart}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{images/results_adaptive_v2.png}
+  \vspace{-.2cm}
+  \caption{Trajectories generated by the learned generative policy in a single environment under fixed ($\gamma =0.1, 1.0$) and our adaptive $\gamma$ schedule from~\eqref{eq:gamma-schedule}.}
+  \label{fig:result_adaptive}
+  \vskip -0.2 true in
+\end{figure}
+
+To demonstrate the scalability of our data generation approach to more complex, nonlinear systems, we apply MPPI-DCBF to a simulated quadrotor. The dynamics follow \cite{lee2010geometric}, augmented with second-order motor dynamics:
+% Quadrotor with 2nd-order motor dynamics (compact form)
+\begin{align}
+\frac{d}{dt}\begin{bmatrix}
+    \mathbf{p}\\\mathbf{v}\\ \mathbf{q}\\ \boldsymbol{\omega}\\ \mathbf{w}\\ \dot{\mathbf{w}}\\
+\end{bmatrix}=
+\begin{bmatrix}
+\mathbf{v} \\[0.5mm]
+-\,g\,\mathbf{e}_3 +\frac{1}{m}\,\mathbf R(\mathbf{q})\mathbf{e}_3 \mathbf T(\mathbf{w})\\[0.5mm]
+\tfrac{1}{2}\,\mathbf{q}\otimes(0,\boldsymbol{\omega}) \\[0.5mm]
+-\,\mathbf{J}^{-1}\!\big(\boldsymbol{\omega}\times\mathbf{J}\boldsymbol{\omega}\big)+\mathbf{J}^{-1}\mathbf{M(\mathbf{w})} \\[0.5mm]
+\dot{\mathbf{w}} \\[0.5mm]
+-\tfrac{2\zeta}{\tau}\,\dot{\mathbf{w}} - \tfrac{1}{\tau^{2}}\,\mathbf{w}
+\end{bmatrix}
++
+\begin{bmatrix}
+\mathbf{0} \\ \mathbf{0} \\ \mathbf{0} \\ \mathbf{0} \\ \mathbf{0} \\ \mathbf{I}_4
+\end{bmatrix}\,\mathbf{u}.
+\label{eq:quad_affine}
+\end{align}
+\noindent where $\mathbf{p}=(x,y,z)\in \mathbb{R}^3$ is the quadrotor's center of mass in the inertial frame, $\mathbf{v}\in\mathbb{R}^3$ is its linear velocity, $\mathbf{q}\in\mathbb{S}^3$ is a quaternion representing body orientation, $\mathbf R(\mathbf{q})\in SO(3)$ is the rotation matrix corresponding to $\mathbf{q}$, $\boldsymbol{\omega}\in\mathbb{R}^3$ is the body angular velocity, $m$ is the total quadrotor mass, $g$ is the gravitational constant, and $\mathbf{J}$ is the matrix of inertia of the body, $\mathbf{e}_3$ is the inertial axis $z$. Motor dynamics are modeled as a second-order system with damping ratio $\zeta$ and time constant $\tau$. With proper scaling, we assume that the input command $\mathbf{u}$ drives the dynamics of the four rotor speeds $\mathbf{w}\in\mathbb{R}^4$. The total thrust $T(\mathbf{w})$, and body moments $\mathbf{M}(\mathbf{w})\in\mathbb{R}^3$, are functions of the resulting rotor speeds.
+
+Given the high dimensionality and nonlinearity of the system, we employ the one-step predictive safety check mode of our algorithm. In this model, the input command affects the system only through a linear second-order motor model. Since the thrust and moments are evaluated as a function of rotor speed, the discrete dynamics obtained from Euler discretization of the original dynamics are control affine in the current command for a single step. Therefore, the resulting state from the MPPI-DCBF controller remains safe for the next step, as established in Proposition~\ref{prop: 1}. Our planner effectively navigates the quadrotor through a dense field of spherical obstacles, as shown in Fig.~\ref{fig:result_3d}, demonstrating that our core principle can be extended to challenging, nonlinear systems.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{images/results_3d_v1.pdf}
+  \vspace{-.2cm}
+  \caption{Demonstration of the MPPI-DCBF planner on a quadrotor \eqref{eq:quad_affine} navigating a cluttered 3D environment.}
+  \label{fig:result_3d}
+  \vskip -0.2 true in
+\end{figure}
+
+\section{Conclusion}
+This paper presented a framework for creating safety-tunable generative control policies for safety-critical tasks. We introduced a novel MPPI-DCBF planner that uses DCBFs to generate a rich dataset of provably safe multi-modal trajectories for linear systems. By training a conditional flow matching model on this data, we produced a real-time policy that can modulate its safety and feasibility via a single parameter at inference time, without the need for online sampling. Our experiments on 2D and 3D systems validate the approach, demonstrating a practical method for deploying safe, adaptable, and high-performance learned controllers.
+
+A limitation of our current generative model is that it inherits safety statistically from the data and lacks its own formal certificate. Future work could explore combining our generative policy with a lightweight run-time safety filter to provide hard guarantees. Additionally, learning an optimal $\gamma$ schedule directly from data remains an interesting open problem.
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+\end{document}

@@ -2,8 +2,14 @@ import argparse
 import json
 import logging
 
-from models.model_configs import MODEL_CONFIGS
-from torchdiffeq._impl.odeint import SOLVERS
+try:
+    from models.model_configs import MODEL_CONFIGS
+except ImportError:
+    from cfm_mppi.models.model_configs import MODEL_CONFIGS
+try:
+    from torchdiffeq._impl.odeint import SOLVERS
+except ImportError:
+    SOLVERS = {"euler": None, "midpoint": None, "rk4": None}
 
 logger = logging.getLogger(__name__)
 

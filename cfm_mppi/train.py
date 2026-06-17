@@ -6,18 +6,42 @@ import sys
 import time
 from pathlib import Path
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 from cfm_mppi.models.transformer import TransformerModel
-from train_arg_parser import get_args_parser
-
-from training import distributed_mode
-from training.grad_scaler import NativeScalerWithGradNormCount as NativeScaler
-from training.load_and_save import load_model, save_model
-from training.train_loop import train_one_epoch
+try:
+    from train_arg_parser import get_args_parser
+    from training import distributed_mode
+    from training.grad_scaler import NativeScalerWithGradNormCount as NativeScaler
+    from training.load_and_save import load_model, save_model
+    from training.train_loop import train_one_epoch
+except ImportError:
+    from cfm_mppi.train_arg_parser import get_args_parser
+    from cfm_mppi.training import distributed_mode
+    from cfm_mppi.training.grad_scaler import NativeScalerWithGradNormCount as NativeScaler
+    from cfm_mppi.training.load_and_save import load_model, save_model
+    from cfm_mppi.training.train_loop import train_one_epoch
 import pickle
-import wandb
+try:
+    import wandb
+except ImportError:
+    class _WandbStub:
+        config = {}
+
+        @staticmethod
+        def init(*args, **kwargs):
+            return None
+
+        @staticmethod
+        def log(*args, **kwargs):
+            return None
+
+    wandb = _WandbStub()
 import random
 
 

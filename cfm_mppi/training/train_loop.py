@@ -11,11 +11,38 @@ from typing import Iterable
 
 import torch
 from cfm_mppi.flow_matching.path import CondOTProbPath
-from models.ema import EMA
+try:
+    from models.ema import EMA
+except ImportError:
+    from cfm_mppi.models.ema import EMA
 from torch.nn.parallel import DistributedDataParallel
-from torchmetrics.aggregation import MeanMetric
-from training.grad_scaler import NativeScalerWithGradNormCount
-from einops import rearrange, repeat
+try:
+    from torchmetrics.aggregation import MeanMetric
+except ImportError:
+    class MeanMetric(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("total", torch.tensor(0.0))
+            self.register_buffer("count", torch.tensor(0.0))
+
+        def update(self, value):
+            self.total += value.detach().float()
+            self.count += 1.0
+
+        def compute(self):
+            return self.total / self.count.clamp_min(1.0)
+
+        def reset(self):
+            self.total.zero_()
+            self.count.zero_()
+try:
+    from training.grad_scaler import NativeScalerWithGradNormCount
+except ImportError:
+    from cfm_mppi.training.grad_scaler import NativeScalerWithGradNormCount
+try:
+    from einops import rearrange, repeat  # noqa: F401
+except ImportError:
+    rearrange = repeat = None
 
 MASK_TOKEN = 256
 PRINT_FREQUENCY = 50

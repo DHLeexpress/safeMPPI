@@ -1,0 +1,12 @@
+method: drifting
+checkpoint: output_dir/drifting_generator/checkpoint_best.pth
+train_split: dataset/canonical/train.pt
+val_split: dataset/canonical/val.pt
+model:
+  d_model: 256
+  nhead: 4
+  num_layers: 6
+  dim_feedforward: 1024
+  history_len: 10
+inference:
+  nfe: 1

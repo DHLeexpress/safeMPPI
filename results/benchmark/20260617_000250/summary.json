@@ -1,0 +1,19 @@
+[
+  {
+    "dataset": "sfm",
+    "dynamics": "doubleintegrator",
+    "method": "mizuta_cfm_mppi",
+    "episodes": 2,
+    "success_rate": 0.0,
+    "collision_rate": 0.0,
+    "mean_min_clearance": 0.6815539002418518,
+    "median_min_clearance": 0.6815539002418518,
+    "p05_min_clearance": 0.629775732755661,
+    "mean_final_goal_distance": 6.368633508682251,
+    "mean_control_effort": 148.60903930664062,
+    "mean_control_smoothness": 194.14740753173828,
+    "mean_planning_time_ms": 7.7590701170265675,
+    "p95_planning_time_ms": 8.273339853622058,
+    "mean_nfe": 1.0
+  }
+]

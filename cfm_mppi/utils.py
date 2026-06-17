@@ -2,12 +2,22 @@ import os
 import torch
 
 import sys
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
 import numpy as np
 import pickle
-import cvxpy as cp
-import jax
-import jax.numpy as jnp
+try:
+    import cvxpy as cp
+except ImportError:
+    cp = None
+try:
+    import jax
+    import jax.numpy as jnp
+except ImportError:
+    jax = None
+    jnp = None
 
 def evaluate(states, controls, pos_obs, goal, r):
     """
@@ -27,25 +37,48 @@ def evaluate(states, controls, pos_obs, goal, r):
     return collision, distance
 
 
-@jax.jit
-def barrier(r_ab, v_rel, dt):
-    dist = jnp.linalg.norm(r_ab)
-    
-    r_ab_pred = r_ab - v_rel * dt
-    pred_dist = jnp.linalg.norm(r_ab_pred)
-    v_rel_dt_sq = jnp.dot(v_rel * dt, v_rel * dt)
-    
-    expr = (dist + pred_dist)**2 - v_rel_dt_sq
-    b = 0.5 * jnp.sqrt(jnp.maximum(expr, 1e-6))
-    return b
+if jax is not None:
+    @jax.jit
+    def barrier(r_ab, v_rel, dt):
+        dist = jnp.linalg.norm(r_ab)
+        
+        r_ab_pred = r_ab - v_rel * dt
+        pred_dist = jnp.linalg.norm(r_ab_pred)
+        v_rel_dt_sq = jnp.dot(v_rel * dt, v_rel * dt)
+        
+        expr = (dist + pred_dist)**2 - v_rel_dt_sq
+        b = 0.5 * jnp.sqrt(jnp.maximum(expr, 1e-6))
+        return b
 
-@jax.jit
-def grad_barrier_exp(r_ab, v_rel, dt):
-    def rep_potential(barrier_val, A=2.1, B=0.5):
-        return A * jnp.exp(-barrier_val / B)
+    @jax.jit
+    def grad_barrier_exp(r_ab, v_rel, dt):
+        def rep_potential(barrier_val, A=2.1, B=0.5):
+            return A * jnp.exp(-barrier_val / B)
 
-    V = lambda r: rep_potential(barrier(r, v_rel, dt))
-    return jax.grad(V)(r_ab)
+        V = lambda r: rep_potential(barrier(r, v_rel, dt))
+        return jax.grad(V)(r_ab)
+else:
+    def barrier(r_ab, v_rel, dt):
+        r_ab = np.asarray(r_ab, dtype=np.float32)
+        v_rel = np.asarray(v_rel, dtype=np.float32)
+        dist = np.linalg.norm(r_ab)
+        pred_dist = np.linalg.norm(r_ab - v_rel * dt)
+        expr = (dist + pred_dist) ** 2 - float(np.dot(v_rel * dt, v_rel * dt))
+        return 0.5 * np.sqrt(max(expr, 1e-6))
+
+    def grad_barrier_exp(r_ab, v_rel, dt):
+        r_ab = np.asarray(r_ab, dtype=np.float32)
+        eps = 1e-3
+
+        def potential(r):
+            return 2.1 * np.exp(-barrier(r, v_rel, dt) / 0.5)
+
+        grad = np.zeros_like(r_ab, dtype=np.float32)
+        for i in range(r_ab.shape[0]):
+            step = np.zeros_like(r_ab, dtype=np.float32)
+            step[i] = eps
+            grad[i] = (potential(r_ab + step) - potential(r_ab - step)) / (2 * eps)
+        return grad
 
 class HumanAgent:
     def __init__(self, robot_goal, radius=0.5, dt=0.1, random_generator=None):
@@ -86,7 +119,10 @@ class HumanAgent:
             r_ab = self.state - o_x
             v_rel = self.control - o_u
             
-            grad = grad_barrier_exp(jnp.array(r_ab), jnp.array(v_rel), self.dt)
+            if jnp is not None:
+                grad = grad_barrier_exp(jnp.array(r_ab), jnp.array(v_rel), self.dt)
+            else:
+                grad = grad_barrier_exp(np.array(r_ab), np.array(v_rel), self.dt)
             repulsive_force += -1.0 * np.array(grad)
 
         total_acceleration = goal_force + repulsive_force

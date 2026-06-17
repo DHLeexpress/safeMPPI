@@ -1,5 +1,12 @@
 from pathlib import Path
 import json
+import sys
+import os
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 from cfm_mppi.models.transformer import TransformerModel
 import torch
 import numpy as np
@@ -11,8 +18,8 @@ from cfm_mppi.mppi.flowmppi import FlowMPPI
 from cfm_mppi.mppi.utils import stage_cost, terminal_cost, unicycle_dynamics
 from cfm_mppi.utils import AgentHistory, evaluate, HumanAgent
 from cfm_mppi.evaluation.eval_utils import synthesize_control, CFMConfig
-import sys
 
+dataset = "sfm"
 if len(sys.argv) > 1:
     dataset = sys.argv[1]
 
@@ -28,7 +35,8 @@ GOAL_COEF = 0.1
 
 ODE_TIMES = [0.5, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
 ODE_TIMES2 = [0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
-NOISE_LEVEL = torch.tensor([0.8]).cuda()
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+NOISE_LEVEL = torch.tensor([0.8], device=device)
 
 # MPPI
 MPPI_SIGMA = torch.tensor([0.3, 0.6])
@@ -37,7 +45,6 @@ U_MIN = torch.tensor([-2.0, -2.0])  # Minimum control inputs
 U_MAX = torch.tensor([2.0, 2.0])  # Maximum control inputs
 D=0.1
 
-device = 'cuda'
 SCALE = 10
 dt = 0.1
 n_sample = 200
@@ -74,7 +81,8 @@ all_distances = []
 state_trajectories = torch.zeros([batch_ego.shape[0], 3, horizon+1], dtype=torch.float32)
 control_trajectories = torch.zeros([batch_ego.shape[0], 2, horizon], dtype=torch.float32)
 
-for idx in range(batch_ego.shape[0]):
+eval_limit = min(batch_ego.shape[0], int(os.environ.get("CFM_MPPI_EVAL_LIMIT", batch_ego.shape[0])))
+for idx in range(eval_limit):
     if dataset == 'ucy' or dataset == 'sdd':
         state_obs = batch_obs[idx]
         nan_mask = torch.isnan(state_obs).any(dim=(0,2,3))

@@ -1,0 +1,36 @@
+[
+  {
+    "dataset": "sfm",
+    "dynamics": "doubleintegrator",
+    "method": "safe_cfm",
+    "episodes": 2,
+    "success_rate": 0.0,
+    "collision_rate": 0.0,
+    "mean_min_clearance": 2.785921812057495,
+    "median_min_clearance": 2.785921812057495,
+    "p05_min_clearance": 2.0897709846496584,
+    "mean_final_goal_distance": 8.927719116210938,
+    "mean_control_effort": 20.858132362365723,
+    "mean_control_smoothness": 25.590434074401855,
+    "mean_planning_time_ms": 49.01503948494792,
+    "p95_planning_time_ms": 51.83904266450558,
+    "mean_nfe": 8.0
+  },
+  {
+    "dataset": "sfm",
+    "dynamics": "doubleintegrator",
+    "method": "drifting",
+    "episodes": 2,
+    "success_rate": 0.0,
+    "collision_rate": 0.0,
+    "mean_min_clearance": 2.836985468864441,
+    "median_min_clearance": 2.836985468864441,
+    "p05_min_clearance": 2.1811485648155213,
+    "mean_final_goal_distance": 8.728545188903809,
+    "mean_control_effort": 3.7583203315734863,
+    "mean_control_smoothness": 2.24018657207489,
+    "mean_planning_time_ms": 7.5909542152658105,
+    "p95_planning_time_ms": 8.350812573917233,
+    "mean_nfe": 1.0
+  }
+]

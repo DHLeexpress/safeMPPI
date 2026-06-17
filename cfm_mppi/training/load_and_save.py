@@ -6,7 +6,10 @@
 from pathlib import Path
 
 import torch
-from training.distributed_mode import is_main_process
+try:
+    from training.distributed_mode import is_main_process
+except ImportError:
+    from cfm_mppi.training.distributed_mode import is_main_process
 
 
 def save_on_master(*args, **kwargs):

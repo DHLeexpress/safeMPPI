@@ -1,0 +1,3 @@
+dataset,dynamics,method,episodes,success_rate,collision_rate,mean_min_clearance,median_min_clearance,p05_min_clearance,mean_final_goal_distance,mean_control_effort,mean_control_smoothness,mean_planning_time_ms,p95_planning_time_ms,mean_nfe
+sfm,doubleintegrator,safe_cfm,2,0.0,0.0,2.785921812057495,2.785921812057495,2.0897709846496584,8.927719116210938,20.858132362365723,25.590434074401855,49.01503948494792,51.83904266450558,8.0
+sfm,doubleintegrator,drifting,2,0.0,0.0,2.836985468864441,2.836985468864441,2.1811485648155213,8.728545188903809,3.7583203315734863,2.24018657207489,7.5909542152658105,8.350812573917233,1.0

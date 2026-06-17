@@ -1,0 +1,5 @@
+dynamics: doubleintegrator
+safety_guarantee_scope: linear_system_theorem_relevant
+dt: 0.1
+state_dim: 4
+control_dim: 2

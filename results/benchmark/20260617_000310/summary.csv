@@ -1,0 +1,2 @@
+dataset,dynamics,method,episodes,success_rate,collision_rate,mean_min_clearance,median_min_clearance,p05_min_clearance,mean_final_goal_distance,mean_control_effort,mean_control_smoothness,mean_planning_time_ms,p95_planning_time_ms,mean_nfe
+sfm,unicycle,safemppi_gamma,2,0.0,0.0,1.134100615978241,1.134100615978241,0.6869479954242707,7.287219285964966,127.18485260009766,7.193078517913818,5.1299784099683166,5.387154011987152,0.0

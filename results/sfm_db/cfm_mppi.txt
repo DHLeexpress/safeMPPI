@@ -1,0 +1,25 @@
+===== SIMULATION RESULTS =====
+
+Date and Time: 2026-06-17 00:08:48
+===== HYPERPARAMETERS =====
+SAFE_MARGIN: 0.5
+SAFE_COEF: [0.1, 0.3, 0.5, 0.7, 0.9]
+GOAL_COEF: 0.1
+MPPI_SIGMA: tensor([0.4000, 0.4000])
+MPPI_LAMBDA: 0.1
+ODE_TIMES: [0.5, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
+ODE_TIMES2: [0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
+===== SUMMARY STATISTICS =====
+Average Time:
+  Mean: 0.1307
+  Variance: nan
+
+Collision Rate:
+ : 0.0000
+
+Distance:
+  Mean: 0.5518
+  Variance: nan
+
+===== DETAILED RESULTS =====
+1	0.0000

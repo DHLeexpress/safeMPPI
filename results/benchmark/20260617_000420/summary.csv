@@ -1,0 +1,2 @@
+dataset,dynamics,method,episodes,success_rate,collision_rate,mean_min_clearance,median_min_clearance,p05_min_clearance,mean_final_goal_distance,mean_control_effort,mean_control_smoothness,mean_planning_time_ms,p95_planning_time_ms,mean_nfe
+sfm,doubleintegrator,mizuta_cfm_mppi,2,0.0,0.0,0.6815539002418518,0.6815539002418518,0.629775732755661,6.368633508682251,148.60903930664062,194.14740753173828,9.068617038428783,9.39863403327767,1.0

@@ -1,0 +1,16 @@
+dataset: sfm
+dynamics: doubleintegrator
+methods:
+  - mizuta_cfm_mppi
+  - safemppi_gamma
+  - safe_cfm
+  - drifting
+num_episodes: 100
+seed: 0
+output_root: results/benchmark
+horizon: 80
+dt: 0.1
+safety_margin: 0.5
+success_threshold: 0.5
+u_min: [-2.0, -2.0]
+u_max: [2.0, 2.0]

@@ -1,0 +1,5 @@
+dynamics: unicycle
+safety_guarantee_scope: empirical_only_unicycle
+dt: 0.1
+state_dim: 3
+control_dim: 2

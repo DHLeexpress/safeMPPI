@@ -1,0 +1,11 @@
+method: safemppi_gamma
+gamma_grid: [0.01, 0.03, 0.05, 0.1, 0.2, 0.4, 0.7, 0.9, 0.99]
+gamma_schedules:
+  safeGPC_v4_1: [0.05, 0.069748, 0.097264, 0.135721, 0.189371, 0.264202, 0.368694, 0.514158, 0.717049, 1.0]
+  safeGPC_v4_2: [0.1, 0.129155, 0.166810, 0.215443, 0.278256, 0.359381, 0.464159, 0.599484, 0.774264, 1.0]
+adaptive_schedule:
+  formula: gamma = g_min + (g_max - g_min) * (1 - exp(-beta * d)) * exp(-alpha * max(0, v_proj))
+  g_min: 0.1
+  g_max: 1.0
+  alpha: 0.1541
+  beta: 1.5826

@@ -1,0 +1,19 @@
+[
+  {
+    "dataset": "sfm",
+    "dynamics": "doubleintegrator",
+    "method": "safemppi_gamma",
+    "episodes": 4,
+    "success_rate": 0.0,
+    "collision_rate": 1.0,
+    "mean_min_clearance": -0.4383503794670105,
+    "median_min_clearance": -0.4383503794670105,
+    "p05_min_clearance": -0.6394312381744385,
+    "mean_final_goal_distance": 3.7621512413024902,
+    "mean_control_effort": 121.72803497314453,
+    "mean_control_smoothness": 4.315025806427002,
+    "mean_planning_time_ms": 4.958430794067681,
+    "p95_planning_time_ms": 5.286862095817924,
+    "mean_nfe": 0.0
+  }
+]
