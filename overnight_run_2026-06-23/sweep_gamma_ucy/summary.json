@@ -1,0 +1,310 @@
+{
+  "summary": [
+    {
+      "method": "mizuta_cfm_mppi",
+      "gamma": null,
+      "episodes": 25,
+      "success_rate": 1.0,
+      "success_ci": [
+        1.0,
+        1.0
+      ],
+      "collision_rate": 0.0,
+      "collision_ci": [
+        0.0,
+        0.0
+      ],
+      "goal_reached_rate": 1.0,
+      "mean_min_clearance": 0.9541600179672242,
+      "median_min_clearance": 0.6018900871276855,
+      "mean_final_goal_distance": 0.061296142116189,
+      "mean_path_length": 10.49980827331543,
+      "mean_control_effort": 187.3113262939453,
+      "mean_planning_time_ms": 106.11504652164875
+    },
+    {
+      "method": "safemppi_gamma",
+      "gamma": 0.3,
+      "episodes": 25,
+      "success_rate": 0.4,
+      "success_ci": [
+        0.2,
+        0.6
+      ],
+      "collision_rate": 0.6,
+      "collision_ci": [
+        0.4,
+        0.8
+      ],
+      "goal_reached_rate": 0.96,
+      "mean_min_clearance": 0.39287002325057985,
+      "median_min_clearance": -0.1017448902130127,
+      "mean_final_goal_distance": 0.17308639332652093,
+      "mean_path_length": 10.190528507232665,
+      "mean_control_effort": 110.51382598876953,
+      "mean_planning_time_ms": 36.253009270876646
+    },
+    {
+      "method": "safemppi_gamma",
+      "gamma": 0.5,
+      "episodes": 25,
+      "success_rate": 0.4,
+      "success_ci": [
+        0.2,
+        0.6
+      ],
+      "collision_rate": 0.6,
+      "collision_ci": [
+        0.4,
+        0.8
+      ],
+      "goal_reached_rate": 1.0,
+      "mean_min_clearance": 0.3912698245048523,
+      "median_min_clearance": -0.1017448902130127,
+      "mean_final_goal_distance": 0.13718397438526153,
+      "mean_path_length": 10.187754650115966,
+      "mean_control_effort": 110.9822836303711,
+      "mean_planning_time_ms": 36.278921021614224
+    },
+    {
+      "method": "safemppi_gamma",
+      "gamma": 0.7,
+      "episodes": 25,
+      "success_rate": 0.4,
+      "success_ci": [
+        0.2,
+        0.6
+      ],
+      "collision_rate": 0.6,
+      "collision_ci": [
+        0.4,
+        0.8
+      ],
+      "goal_reached_rate": 1.0,
+      "mean_min_clearance": 0.39274235248565675,
+      "median_min_clearance": -0.1017448902130127,
+      "mean_final_goal_distance": 0.13460897587239742,
+      "mean_path_length": 10.1877561378479,
+      "mean_control_effort": 110.54326446533203,
+      "mean_planning_time_ms": 36.1532568866387
+    },
+    {
+      "method": "safemppi_gamma",
+      "gamma": 1.0,
+      "episodes": 25,
+      "success_rate": 0.4,
+      "success_ci": [
+        0.2,
+        0.6
+      ],
+      "collision_rate": 0.6,
+      "collision_ci": [
+        0.4,
+        0.8
+      ],
+      "goal_reached_rate": 1.0,
+      "mean_min_clearance": 0.40426849961280825,
+      "median_min_clearance": -0.07611697912216187,
+      "mean_final_goal_distance": 0.16083238020539284,
+      "mean_path_length": 10.177622547149658,
+      "mean_control_effort": 111.08495361328124,
+      "mean_planning_time_ms": 36.10619679279626
+    },
+    {
+      "method": "guided_safemppi",
+      "gamma": 0.3,
+      "episodes": 25,
+      "success_rate": 0.8,
+      "success_ci": [
+        0.64,
+        0.96
+      ],
+      "collision_rate": 0.08,
+      "collision_ci": [
+        0.0,
+        0.2
+      ],
+      "goal_reached_rate": 0.84,
+      "mean_min_clearance": 0.7381788659095764,
+      "median_min_clearance": 0.44930797815322876,
+      "mean_final_goal_distance": 0.3713847178220749,
+      "mean_path_length": 10.126742038726807,
+      "mean_control_effort": 137.9954800415039,
+      "mean_planning_time_ms": 77.07913874648511
+    },
+    {
+      "method": "guided_safemppi",
+      "gamma": 0.5,
+      "episodes": 25,
+      "success_rate": 0.64,
+      "success_ci": [
+        0.44,
+        0.84
+      ],
+      "collision_rate": 0.28,
+      "collision_ci": [
+        0.12,
+        0.48
+      ],
+      "goal_reached_rate": 0.84,
+      "mean_min_clearance": 0.5995600390434265,
+      "median_min_clearance": 0.3478981852531433,
+      "mean_final_goal_distance": 0.4085406766831875,
+      "mean_path_length": 10.19774580001831,
+      "mean_control_effort": 155.56082214355467,
+      "mean_planning_time_ms": 77.06826802436262
+    },
+    {
+      "method": "guided_safemppi",
+      "gamma": 0.7,
+      "episodes": 25,
+      "success_rate": 0.68,
+      "success_ci": [
+        0.5190000000000001,
+        0.84
+      ],
+      "collision_rate": 0.2,
+      "collision_ci": [
+        0.08,
+        0.36
+      ],
+      "goal_reached_rate": 0.76,
+      "mean_min_clearance": 0.5861813831329346,
+      "median_min_clearance": 0.26934814453125,
+      "mean_final_goal_distance": 0.39164121717214584,
+      "mean_path_length": 10.308035278320313,
+      "mean_control_effort": 150.50679290771484,
+      "mean_planning_time_ms": 77.05107451695949
+    },
+    {
+      "method": "guided_safemppi",
+      "gamma": 1.0,
+      "episodes": 25,
+      "success_rate": 0.84,
+      "success_ci": [
+        0.68,
+        0.96
+      ],
+      "collision_rate": 0.12,
+      "collision_ci": [
+        0.0,
+        0.24
+      ],
+      "goal_reached_rate": 0.96,
+      "mean_min_clearance": 0.6265358555316926,
+      "median_min_clearance": 0.38364744186401367,
+      "mean_final_goal_distance": 0.23601516872644424,
+      "mean_path_length": 10.251083908081055,
+      "mean_control_effort": 150.40567657470703,
+      "mean_planning_time_ms": 77.04508733283728
+    }
+  ],
+  "paired_vs_mizuta": [
+    {
+      "method": "safemppi_gamma",
+      "gamma": 0.3,
+      "success_ours_minus_mizuta": -0.6,
+      "mcnemar_ours_win": 0,
+      "mcnemar_mizuta_win": 15,
+      "mcnemar_p": 6.103515625e-05,
+      "clearance_median_diff_ours_minus_mizuta": -0.561833381652832,
+      "wilcoxon_p": 0.0001404763683291566
+    },
+    {
+      "method": "safemppi_gamma",
+      "gamma": 0.5,
+      "success_ours_minus_mizuta": -0.6,
+      "mcnemar_ours_win": 0,
+      "mcnemar_mizuta_win": 15,
+      "mcnemar_p": 6.103515625e-05,
+      "clearance_median_diff_ours_minus_mizuta": -0.561833381652832,
+      "wilcoxon_p": 0.0001404763683291566
+    },
+    {
+      "method": "safemppi_gamma",
+      "gamma": 0.7,
+      "success_ours_minus_mizuta": -0.6,
+      "mcnemar_ours_win": 0,
+      "mcnemar_mizuta_win": 15,
+      "mcnemar_p": 6.103515625e-05,
+      "clearance_median_diff_ours_minus_mizuta": -0.561833381652832,
+      "wilcoxon_p": 0.0001404763683291566
+    },
+    {
+      "method": "safemppi_gamma",
+      "gamma": 1.0,
+      "success_ours_minus_mizuta": -0.6,
+      "mcnemar_ours_win": 0,
+      "mcnemar_mizuta_win": 15,
+      "mcnemar_p": 6.103515625e-05,
+      "clearance_median_diff_ours_minus_mizuta": -0.561833381652832,
+      "wilcoxon_p": 0.0001404763683291566
+    },
+    {
+      "method": "guided_safemppi",
+      "gamma": 0.3,
+      "success_ours_minus_mizuta": -0.19999999999999996,
+      "mcnemar_ours_win": 0,
+      "mcnemar_mizuta_win": 5,
+      "mcnemar_p": 0.0625,
+      "clearance_median_diff_ours_minus_mizuta": -0.14216279983520508,
+      "wilcoxon_p": 0.0094174249558602
+    },
+    {
+      "method": "guided_safemppi",
+      "gamma": 0.5,
+      "success_ours_minus_mizuta": -0.36,
+      "mcnemar_ours_win": 0,
+      "mcnemar_mizuta_win": 9,
+      "mcnemar_p": 0.00390625,
+      "clearance_median_diff_ours_minus_mizuta": -0.18697810173034668,
+      "wilcoxon_p": 0.0018851854386615463
+    },
+    {
+      "method": "guided_safemppi",
+      "gamma": 0.7,
+      "success_ours_minus_mizuta": -0.31999999999999995,
+      "mcnemar_ours_win": 0,
+      "mcnemar_mizuta_win": 8,
+      "mcnemar_p": 0.0078125,
+      "clearance_median_diff_ours_minus_mizuta": -0.29631465673446655,
+      "wilcoxon_p": 0.000733297062909113
+    },
+    {
+      "method": "guided_safemppi",
+      "gamma": 1.0,
+      "success_ours_minus_mizuta": -0.16000000000000003,
+      "mcnemar_ours_win": 0,
+      "mcnemar_mizuta_win": 4,
+      "mcnemar_p": 0.125,
+      "clearance_median_diff_ours_minus_mizuta": -0.14216279983520508,
+      "wilcoxon_p": 0.003215932097506622
+    }
+  ],
+  "config": {
+    "dataset": "ucy",
+    "dynamics": "doubleintegrator",
+    "pedestrian_source": "validation",
+    "methods": [
+      "mizuta_cfm_mppi",
+      "safemppi_gamma",
+      "guided_safemppi"
+    ],
+    "gamma_grid": [
+      0.3,
+      0.5,
+      0.7,
+      1.0
+    ],
+    "num_episodes": 25,
+    "episode_list": null,
+    "steps": 80,
+    "seed": 0,
+    "device": "cuda",
+    "safemppi_samples": 384,
+    "safemppi_horizon": 40,
+    "num_pedestrians": 20,
+    "output": "overnight_run_2026-06-23/sweep_gamma_ucy"
+  },
+  "episodes": 25
+}

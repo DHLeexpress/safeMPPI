@@ -1,0 +1,7 @@
+scene,episode,method,gamma,success,collision,goal_reached,final_goal_distance,min_clearance,path_length,control_effort,planning_wall_time_mean,model_calls_per_step,nfe,backup_branch_count,backup_selected_count,checkpoint_path
+ucy validation episode 110,110,mizuta_cfm_mppi,,True,False,True,0.024153372272849083,0.345819354057312,8.137250900268555,81.93585968017578,0.11616102444240824,7,7,0,0,output_dir/cfm_transformer/checkpoint.pth
+ucy validation episode 110,110,mirror_mppi,0.6,False,True,False,2.408388614654541,-0.43800216913223267,6.04124641418457,238.46957397460938,0.3147259165998548,0,0,0,0,
+ucy validation episode 123,123,mizuta_cfm_mppi,,True,False,True,0.025333357974886894,0.37570422887802124,9.819991111755371,214.80807495117188,0.10648604831658304,7,7,0,0,output_dir/cfm_transformer/checkpoint.pth
+ucy validation episode 123,123,mirror_mppi,0.6,True,False,True,0.01447733398526907,1.2796416282653809,9.315199851989746,189.54055786132812,0.2464061373495497,0,0,0,0,
+ucy validation episode 41,41,mizuta_cfm_mppi,,True,False,True,0.06840278953313828,1.299595594406128,12.399192810058594,216.01800537109375,0.10582790672779083,7,7,0,0,output_dir/cfm_transformer/checkpoint.pth
+ucy validation episode 41,41,mirror_mppi,0.6,True,False,True,0.4440712630748749,0.3660077452659607,11.56110954284668,408.57269287109375,0.2550237551680766,0,0,0,0,

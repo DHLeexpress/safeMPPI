@@ -1,0 +1,6 @@
+method,gamma,success,collision,goal_reached,final_goal_distance,min_clearance,path_length,control_effort,planning_wall_time_mean,model_calls_per_step,nfe,checkpoint_path
+mizuta_cfm_mppi,,False,False,False,7.226037979125977,1.2052124738693237,0.8604728579521179,18.050962448120117,0.28359181229025127,7,7,output_dir/cfm_transformer/checkpoint.pth
+safemppi_gamma,0.1,False,False,False,7.120186805725098,1.2845430374145508,0.987378716468811,23.883533477783203,0.0030622391030192377,0,0,
+safemppi_gamma,1.0,False,False,False,7.109824180603027,1.292073369026184,0.9999999403953552,20.69647216796875,0.0029078131541609765,0,0,
+safe_cfm,0.1,False,False,False,7.584972381591797,1.4847208261489868,0.557448148727417,10.771395683288574,0.0881406594067812,8,8,output_dir/safe_contextual_cfm/checkpoint_best.pth
+safe_cfm,1.0,False,False,False,7.944005966186523,1.4847208261489868,0.24449296295642853,3.02536678314209,0.0701122784987092,8,8,output_dir/safe_contextual_cfm/checkpoint_best.pth

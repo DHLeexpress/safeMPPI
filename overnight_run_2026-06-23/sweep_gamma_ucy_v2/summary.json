@@ -1,0 +1,148 @@
+{
+  "summary": [
+    {
+      "method": "mizuta_cfm_mppi",
+      "gamma": null,
+      "episodes": 25,
+      "success_rate": 1.0,
+      "success_ci": [
+        1.0,
+        1.0
+      ],
+      "collision_rate": 0.0,
+      "collision_ci": [
+        0.0,
+        0.0
+      ],
+      "goal_reached_rate": 1.0,
+      "mean_min_clearance": 0.9547112655639648,
+      "median_min_clearance": 0.5662621259689331,
+      "mean_final_goal_distance": 0.0770464144134894,
+      "mean_path_length": 10.552525539398193,
+      "mean_control_effort": 191.85794677734376,
+      "mean_planning_time_ms": 102.14017019560562
+    },
+    {
+      "method": "guided_safemppi",
+      "gamma": 0.3,
+      "episodes": 25,
+      "success_rate": 0.76,
+      "success_ci": [
+        0.6,
+        0.92
+      ],
+      "collision_rate": 0.04,
+      "collision_ci": [
+        0.0,
+        0.12
+      ],
+      "goal_reached_rate": 0.76,
+      "mean_min_clearance": 0.7474364137649536,
+      "median_min_clearance": 0.5134274959564209,
+      "mean_final_goal_distance": 0.4033590330183506,
+      "mean_path_length": 10.209007148742677,
+      "mean_control_effort": 136.16343170166016,
+      "mean_planning_time_ms": 79.47957890992984
+    },
+    {
+      "method": "guided_safemppi",
+      "gamma": 0.5,
+      "episodes": 25,
+      "success_rate": 0.76,
+      "success_ci": [
+        0.6,
+        0.92
+      ],
+      "collision_rate": 0.12,
+      "collision_ci": [
+        0.0,
+        0.28
+      ],
+      "goal_reached_rate": 0.84,
+      "mean_min_clearance": 0.6927045524120331,
+      "median_min_clearance": 0.41399484872817993,
+      "mean_final_goal_distance": 0.3649590665102005,
+      "mean_path_length": 10.200761070251465,
+      "mean_control_effort": 144.8563201904297,
+      "mean_planning_time_ms": 79.77373399352653
+    },
+    {
+      "method": "guided_safemppi",
+      "gamma": 1.0,
+      "episodes": 25,
+      "success_rate": 0.88,
+      "success_ci": [
+        0.72,
+        1.0
+      ],
+      "collision_rate": 0.08,
+      "collision_ci": [
+        0.0,
+        0.2
+      ],
+      "goal_reached_rate": 0.96,
+      "mean_min_clearance": 0.6603257942199707,
+      "median_min_clearance": 0.3586667776107788,
+      "mean_final_goal_distance": 0.25918357223272326,
+      "mean_path_length": 10.279431495666504,
+      "mean_control_effort": 146.77799011230468,
+      "mean_planning_time_ms": 79.59622713411227
+    }
+  ],
+  "paired_vs_mizuta": [
+    {
+      "method": "guided_safemppi",
+      "gamma": 0.3,
+      "success_ours_minus_mizuta": -0.24,
+      "mcnemar_ours_win": 0,
+      "mcnemar_mizuta_win": 6,
+      "mcnemar_p": 0.03125,
+      "clearance_median_diff_ours_minus_mizuta": -0.10252237319946289,
+      "wilcoxon_p": 0.06933716127449288
+    },
+    {
+      "method": "guided_safemppi",
+      "gamma": 0.5,
+      "success_ours_minus_mizuta": -0.24,
+      "mcnemar_ours_win": 0,
+      "mcnemar_mizuta_win": 6,
+      "mcnemar_p": 0.03125,
+      "clearance_median_diff_ours_minus_mizuta": -0.10046464204788208,
+      "wilcoxon_p": 0.019941440619873844
+    },
+    {
+      "method": "guided_safemppi",
+      "gamma": 1.0,
+      "success_ours_minus_mizuta": -0.12,
+      "mcnemar_ours_win": 0,
+      "mcnemar_mizuta_win": 3,
+      "mcnemar_p": 0.25,
+      "clearance_median_diff_ours_minus_mizuta": -0.1583762764930725,
+      "wilcoxon_p": 0.0094174249558602
+    }
+  ],
+  "config": {
+    "dataset": "ucy",
+    "dynamics": "doubleintegrator",
+    "pedestrian_source": "validation",
+    "methods": [
+      "mizuta_cfm_mppi",
+      "guided_safemppi"
+    ],
+    "gamma_grid": [
+      0.3,
+      0.5,
+      1.0
+    ],
+    "num_episodes": 25,
+    "episode_list": null,
+    "steps": 80,
+    "seed": 0,
+    "device": "cuda",
+    "safemppi_samples": 384,
+    "safemppi_horizon": 40,
+    "num_pedestrians": 20,
+    "output": "overnight_run_2026-06-23/sweep_gamma_ucy_v2"
+  },
+  "episodes": 25
+}

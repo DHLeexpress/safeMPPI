@@ -19,6 +19,8 @@ from cfm_mppi.models.transformer import TransformerModel
 from cfm_mppi.mppi.flowmppi import FlowMPPI
 from cfm_mppi.mppi.utils import doubleintegrator_dynamics, stage_cost, terminal_cost, unicycle_dynamics
 from cfm_mppi.safegpc_adapter import SafeMPPIAdapter, resolve_gamma_schedule
+from cfm_mppi.safegpc_adapter.mirror_sampler import mirror_mppi_action
+from cfm_mppi.evaluation.run_tilted import load_tilted_flow, tilted_sample
 
 
 DEFAULTS = {
@@ -109,7 +111,16 @@ def _make_episode(seed: int, dynamics: str, dataset: str) -> Tuple[np.ndarray, n
     return start, goal, np.asarray(obs, dtype=np.float32)
 
 
-def _context_batch(state: np.ndarray, goal: np.ndarray, controls: List[np.ndarray], obstacles: np.ndarray, gamma: float, safety_margin: float, horizon: int) -> Dict[str, torch.Tensor]:
+def _context_batch(
+    state: np.ndarray,
+    goal: np.ndarray,
+    controls: List[np.ndarray],
+    obstacles: np.ndarray,
+    gamma: float,
+    safety_margin: float,
+    horizon: int,
+    obstacle_velocities: np.ndarray | None = None,
+) -> Dict[str, torch.Tensor]:
     state4 = np.zeros(4, dtype=np.float32)
     state4[: min(len(state), 4)] = state[: min(len(state), 4)]
     action_hist = np.zeros((10, 2), dtype=np.float32)
@@ -122,6 +133,8 @@ def _context_batch(state: np.ndarray, goal: np.ndarray, controls: List[np.ndarra
         d = np.linalg.norm(obstacles[:, :2] - state[:2][None, :], axis=1) - obstacles[:, 2]
         idx = int(np.argmin(d))
         rel[:2] = obstacles[idx, :2] - state[:2]
+        if obstacle_velocities is not None and obstacle_velocities.size:
+            rel[2:4] = obstacle_velocities[idx, :2]
     obs_hist = np.tile(rel[None, :], (10, 1)).astype(np.float32)
     states = np.tile(state4[None, None, :], (1, horizon + 1, 1)).astype(np.float32)
     return {
@@ -138,6 +151,43 @@ def _context_batch(state: np.ndarray, goal: np.ndarray, controls: List[np.ndarra
     }
 
 
+def _repeat_context_batch(batch: Dict[str, torch.Tensor], count: int) -> Dict[str, torch.Tensor]:
+    if count <= 1:
+        return batch
+    out: Dict[str, torch.Tensor] = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value) and value.shape[0] == 1:
+            out[key] = value.repeat((count,) + (1,) * (value.ndim - 1))
+        else:
+            out[key] = value
+    return out
+
+
+def _rollout_sequences_np(state: np.ndarray, controls: np.ndarray, dynamics: str, dt: float) -> np.ndarray:
+    trajectories = []
+    for seq in controls:
+        x = state.astype(np.float32).copy()
+        xs = [x.copy()]
+        for action in seq.T:
+            x = _dynamics_step(x, action, dynamics, dt)
+            xs.append(x.copy())
+        trajectories.append(xs)
+    return np.asarray(trajectories, dtype=np.float32)
+
+
+def _sequence_costs(trajectories: np.ndarray, controls: np.ndarray, goal: np.ndarray, obstacles: np.ndarray, safety_margin: float) -> np.ndarray:
+    final = np.linalg.norm(trajectories[:, -1, :2] - goal[:2][None, :], axis=1) ** 2
+    effort = 0.03 * np.sum(controls.transpose(0, 2, 1) ** 2, axis=(1, 2))
+    if obstacles.size:
+        centers = obstacles[:, :2]
+        radii = obstacles[:, 2] + safety_margin
+        d = np.linalg.norm(trajectories[:, :, None, :2] - centers[None, None, :, :], axis=3) - radii[None, None, :]
+        clearance_penalty = 25.0 * np.sum(np.maximum(-d.min(axis=2), 0.0) ** 2, axis=1)
+    else:
+        clearance_penalty = 0.0
+    return 80.0 * final + effort + clearance_penalty
+
+
 class BenchmarkPolicies:
     def __init__(self, args, device: torch.device):
         self.args = args
@@ -146,6 +196,9 @@ class BenchmarkPolicies:
         self._mizuta_episode = None
         self._safe_cfm = None
         self._drifting = None
+        self._guided_filter = None
+        self._proposal_adapter = None
+        self._tilted = None
 
     def _load_mizuta(self):
         if self._mizuta is not None:
@@ -210,6 +263,7 @@ class BenchmarkPolicies:
         controls: List[np.ndarray],
         dynamics: str,
         horizon: int,
+        obstacle_velocities: np.ndarray | None = None,
     ) -> Tuple[np.ndarray, Dict]:
         model = self._load_mizuta()
         if model is False:
@@ -225,7 +279,10 @@ class BenchmarkPolicies:
         histories = ep["histories"]
         n_sample = ep["n_sample"]
         pos_obs = torch.tensor(obstacles[:, :2], dtype=torch.float32, device=self.device).view(1, -1, 2)
-        vel_obs = torch.zeros_like(pos_obs)
+        if obstacle_velocities is not None and obstacle_velocities.size:
+            vel_obs = torch.tensor(obstacle_velocities[:, :2], dtype=torch.float32, device=self.device).view(1, -1, 2)
+        else:
+            vel_obs = torch.zeros_like(pos_obs)
 
         if ep["last_controls_sin"] is not None:
             control_history_len = len(histories["ego_control_sin"])
@@ -278,32 +335,190 @@ class BenchmarkPolicies:
             "nfe": len(ode_times),
         }
 
-    def action(self, method: str, state: np.ndarray, goal: np.ndarray, obstacles: np.ndarray, controls: List[np.ndarray], dynamics: str, gamma: float, horizon: int) -> Tuple[np.ndarray, Dict]:
+    def action(
+        self,
+        method: str,
+        state: np.ndarray,
+        goal: np.ndarray,
+        obstacles: np.ndarray,
+        controls: List[np.ndarray],
+        dynamics: str,
+        gamma: float,
+        horizon: int,
+        obstacle_velocities: np.ndarray | None = None,
+    ) -> Tuple[np.ndarray, Dict]:
         t0 = time.perf_counter()
         info: Dict = {"model_calls_per_step": 0, "nfe": 0}
         if method == "mizuta_cfm_mppi":
-            action, step_info = self._mizuta_action(state, goal, obstacles, controls, dynamics, horizon)
+            action, step_info = self._mizuta_action(
+                state,
+                goal,
+                obstacles,
+                controls,
+                dynamics,
+                horizon,
+                obstacle_velocities=obstacle_velocities,
+            )
             info.update(step_info)
         elif method == "safemppi_gamma":
+            sigma_default = (0.3, 0.6) if dynamics == "unicycle" else (0.4, 0.4)
             adapter = SafeMPPIAdapter(
-                horizon=min(20, horizon),
+                horizon=min(int(getattr(self.args, "safemppi_horizon", horizon)), horizon),
                 dt=DEFAULTS["dt"],
-                num_samples=32 if self.args.smoke else 128,
+                num_samples=int(getattr(self.args, "safemppi_samples", 64 if self.args.smoke else 512)),
                 gamma=gamma,
+                temperature=float(getattr(self.args, "safemppi_temperature", 0.1)),
+                noise_sigma=getattr(self.args, "safemppi_noise_sigma", sigma_default),
                 dynamics_type=dynamics,
                 u_min=DEFAULTS["u_min"],
                 u_max=DEFAULTS["u_max"],
+                safety_margin=DEFAULTS["safety_margin"],
+                running_goal_weight=float(getattr(self.args, "safemppi_running_goal_weight", 0.25)),
+                terminal_goal_weight=float(getattr(self.args, "safemppi_terminal_goal_weight", 80.0)),
+                control_weight=float(getattr(self.args, "safemppi_control_weight", 0.03)),
+                smooth_weight=float(getattr(self.args, "safemppi_smooth_weight", 0.12)),
+                soft_clearance_weight=float(getattr(self.args, "safemppi_soft_clearance_weight", 25.0)),
+                progress_weight=float(getattr(self.args, "safemppi_progress_weight", 2.0)),
+                debug_max_rollouts=int(getattr(self.args, "debug_rollouts", 80)),
+                use_sets_backup=bool(getattr(self.args, "safemppi_use_sets_backup", False)),
+                sets_num_modes=int(getattr(self.args, "safemppi_sets_num_modes", 3)),
+                sets_branch_scale=float(getattr(self.args, "safemppi_sets_branch_scale", 0.85)),
+                sets_include_cbf_backup=bool(getattr(self.args, "safemppi_sets_include_cbf_backup", True)),
+                sets_cbf_push=float(getattr(self.args, "safemppi_sets_cbf_push", 1.25)),
+                sets_reverse_speed=float(getattr(self.args, "safemppi_sets_reverse_speed", 0.75)),
+                sets_turn_rate=float(getattr(self.args, "safemppi_sets_turn_rate", 1.4)),
             )
             action_t, step_info = adapter.plan(
-                torch.tensor(state, dtype=torch.float32),
-                torch.tensor(goal, dtype=torch.float32),
-                torch.tensor(obstacles, dtype=torch.float32),
+                torch.tensor(state, dtype=torch.float32, device=self.device),
+                torch.tensor(goal, dtype=torch.float32, device=self.device),
+                torch.tensor(obstacles, dtype=torch.float32, device=self.device),
                 gamma=gamma,
+                obstacle_velocities=torch.tensor(obstacle_velocities, dtype=torch.float32, device=self.device)
+                if obstacle_velocities is not None
+                else None,
                 seed=self.args.seed + len(controls),
+                return_rollouts=bool(getattr(self.args, "collect_rollouts", False)),
             )
             action = action_t.detach().cpu().numpy()
             info.update(step_info)
             info.update({"model_calls_per_step": 0, "nfe": 0})
+        elif method == "mizuta_safe":
+            # Flavor A: wrap the SOTA policy (Mizuta) in our certificate => add a
+            # hard per-step safety guarantee + gamma knob to any policy (Props 3-4).
+            raw_action, step_info = self._mizuta_action(
+                state, goal, obstacles, controls, dynamics, horizon,
+                obstacle_velocities=obstacle_velocities,
+            )
+            info.update(step_info)
+            if self._guided_filter is None:
+                self._guided_filter = SafeMPPIAdapter(
+                    horizon=1, dt=DEFAULTS["dt"], num_samples=1, dynamics_type=dynamics,
+                    u_min=DEFAULTS["u_min"], u_max=DEFAULTS["u_max"], safety_margin=DEFAULTS["safety_margin"],
+                    use_ho_barrier=True, eta=float(getattr(self.args, "guided_eta", 0.6)),
+                    barrier_extra_margin=float(getattr(self.args, "guided_extra_margin", 0.25)),
+                    barrier_activation_radius=float(getattr(self.args, "guided_activation_radius", 3.5)),
+                )
+            safe_a, finfo = self._guided_filter.safety_filter_action(
+                torch.tensor(state, dtype=torch.float32, device=self.device),
+                torch.tensor(obstacles, dtype=torch.float32, device=self.device),
+                torch.tensor(raw_action, dtype=torch.float32, device=self.device),
+                gamma=gamma,
+                obstacle_velocities=torch.tensor(obstacle_velocities, dtype=torch.float32, device=self.device)
+                if obstacle_velocities is not None else None,
+            )
+            action = safe_a.detach().cpu().numpy()
+            info["filter_feasible"] = finfo["filter_feasible"]
+        elif method in ("guided_safemppi", "guided_adaptive"):
+            sigma_default = (0.3, 0.6) if dynamics == "unicycle" else (0.4, 0.4)
+            adapter = SafeMPPIAdapter(
+                horizon=min(int(getattr(self.args, "safemppi_horizon", horizon)), horizon),
+                dt=DEFAULTS["dt"],
+                num_samples=int(getattr(self.args, "safemppi_samples", 64 if self.args.smoke else 512)),
+                gamma=gamma,
+                temperature=float(getattr(self.args, "safemppi_temperature", 0.1)),
+                noise_sigma=getattr(self.args, "safemppi_noise_sigma", sigma_default),
+                dynamics_type=dynamics,
+                u_min=DEFAULTS["u_min"],
+                u_max=DEFAULTS["u_max"],
+                safety_margin=DEFAULTS["safety_margin"],
+                running_goal_weight=float(getattr(self.args, "guided_running_goal_weight", 0.6)),
+                terminal_goal_weight=float(getattr(self.args, "guided_terminal_goal_weight", 120.0)),
+                control_weight=float(getattr(self.args, "safemppi_control_weight", 0.03)),
+                smooth_weight=float(getattr(self.args, "safemppi_smooth_weight", 0.12)),
+                soft_clearance_weight=float(getattr(self.args, "safemppi_soft_clearance_weight", 25.0)),
+                progress_weight=float(getattr(self.args, "guided_progress_weight", 5.0)),
+                debug_max_rollouts=int(getattr(self.args, "debug_rollouts", 80)),
+                guidance_horizon=int(getattr(self.args, "guided_guidance_horizon", 12)),
+                use_ho_barrier=True,
+                filter_output=True,
+                eta=float(getattr(self.args, "guided_eta", 0.6)),
+                use_guidance=True,
+                guidance_relax=float(getattr(self.args, "guided_relax", 1.0)),
+                use_aniso_cov=bool(getattr(self.args, "guided_aniso", True)),
+                aniso_normal_scale=float(getattr(self.args, "guided_normal_scale", 0.5)),
+                aniso_tangent_scale=float(getattr(self.args, "guided_tangent_scale", 1.7)),
+                barrier_extra_margin=float(getattr(self.args, "guided_extra_margin", 0.2)),
+                barrier_activation_radius=float(getattr(self.args, "guided_activation_radius", 3.5)),
+                adaptive_gamma=(method == "guided_adaptive"),
+                gamma_min=float(getattr(self.args, "guided_gamma_min", 0.1)),
+                gamma_max=float(getattr(self.args, "guided_gamma_max", 1.0)),
+            )
+            action_t, step_info = adapter.plan(
+                torch.tensor(state, dtype=torch.float32, device=self.device),
+                torch.tensor(goal, dtype=torch.float32, device=self.device),
+                torch.tensor(obstacles, dtype=torch.float32, device=self.device),
+                gamma=gamma,
+                obstacle_velocities=torch.tensor(obstacle_velocities, dtype=torch.float32, device=self.device)
+                if obstacle_velocities is not None
+                else None,
+                seed=self.args.seed + len(controls),
+                return_rollouts=bool(getattr(self.args, "collect_rollouts", False)),
+            )
+            action = action_t.detach().cpu().numpy()
+            info.update(step_info)
+            info.update({"model_calls_per_step": 0, "nfe": 0})
+        elif method == "cfm_proposal_mppi":
+            # Learned-proposal Safe MPPI (THEORY §10 / IDEA_learned_proposal):
+            # sample the MPPI proposal from the gamma-CFM, then apply the hard
+            # DCBF rejection + averaging + output projection as the certificate.
+            ckpt_path = Path(self.args.safe_cfm_checkpoint)
+            M = int(getattr(self.args, "proposal_samples", 256))
+            if ckpt_path.exists():
+                if self._safe_cfm is None:
+                    self._safe_cfm = load_safe_cfm(ckpt_path, self.device)
+                batch = _context_batch(state, goal, controls, obstacles, gamma,
+                                       DEFAULTS["safety_margin"], horizon,
+                                       obstacle_velocities=obstacle_velocities)
+                batch = _repeat_context_batch(batch, M)
+                seq = sample_safe_cfm_controls(self._safe_cfm, batch, horizon=horizon, nfe=8, device=self.device)
+                proposal = seq.transpose(1, 2).contiguous()  # [M, H, 2]
+                ncalls = 8
+            else:
+                proposal = None
+                ncalls = 0
+            if self._proposal_adapter is None:
+                self._proposal_adapter = SafeMPPIAdapter(
+                    horizon=min(int(getattr(self.args, "safemppi_horizon", horizon)), horizon),
+                    dt=DEFAULTS["dt"], num_samples=M, dynamics_type=dynamics,
+                    u_min=DEFAULTS["u_min"], u_max=DEFAULTS["u_max"], safety_margin=DEFAULTS["safety_margin"],
+                    use_ho_barrier=True, eta=float(getattr(self.args, "guided_eta", 0.6)),
+                    barrier_extra_margin=float(getattr(self.args, "guided_extra_margin", 0.2)),
+                    barrier_activation_radius=float(getattr(self.args, "guided_activation_radius", 3.5)),
+                    filter_output=True, progress_weight=5.0, terminal_goal_weight=120.0, running_goal_weight=0.6,
+                )
+            action_t, step_info = self._proposal_adapter.plan(
+                torch.tensor(state, dtype=torch.float32, device=self.device),
+                torch.tensor(goal, dtype=torch.float32, device=self.device),
+                torch.tensor(obstacles, dtype=torch.float32, device=self.device),
+                gamma=gamma,
+                obstacle_velocities=torch.tensor(obstacle_velocities, dtype=torch.float32, device=self.device)
+                if obstacle_velocities is not None else None,
+                seed=self.args.seed + len(controls),
+                proposal_controls=proposal,
+            )
+            action = action_t.detach().cpu().numpy()
+            info.update(step_info)
+            info.update({"model_calls_per_step": ncalls, "nfe": ncalls, "checkpoint": str(ckpt_path)})
         elif method == "safe_cfm":
             ckpt_path = Path(self.args.safe_cfm_checkpoint)
             if not ckpt_path.exists() and not self.args.smoke:
@@ -311,10 +526,31 @@ class BenchmarkPolicies:
             if ckpt_path.exists():
                 if self._safe_cfm is None:
                     self._safe_cfm = load_safe_cfm(ckpt_path, self.device)
-                batch = _context_batch(state, goal, controls, obstacles, gamma, DEFAULTS["safety_margin"], horizon)
+                batch = _context_batch(
+                    state,
+                    goal,
+                    controls,
+                    obstacles,
+                    gamma,
+                    DEFAULTS["safety_margin"],
+                    horizon,
+                    obstacle_velocities=obstacle_velocities,
+                )
+                n_candidates = int(getattr(self.args, "safe_cfm_num_candidates", 1))
+                batch = _repeat_context_batch(batch, n_candidates)
                 seq = sample_safe_cfm_controls(self._safe_cfm, batch, horizon=horizon, nfe=8, device=self.device)
-                action = seq[0, :, 0].detach().cpu().numpy()
+                seq_np = seq.detach().cpu().numpy()
+                trajectories = _rollout_sequences_np(state, seq_np, dynamics, DEFAULTS["dt"])
+                costs = _sequence_costs(trajectories, seq_np, goal, obstacles, DEFAULTS["safety_margin"])
+                best = int(np.argmin(costs))
+                action = seq_np[best, :, 0]
                 info.update({"model_calls_per_step": 8, "nfe": 8, "checkpoint": str(ckpt_path)})
+                if bool(getattr(self.args, "collect_rollouts", False)):
+                    max_seq = int(getattr(self.args, "debug_rollouts", 80))
+                    info["debug_sequences"] = {
+                        "states": trajectories[:max_seq],
+                        "best_state": trajectories[best],
+                    }
             else:
                 action = _goal_action(state, goal, dynamics)
                 info.update({"smoke_fallback": "goal_controller_missing_checkpoint", "checkpoint": None})
@@ -325,13 +561,80 @@ class BenchmarkPolicies:
             if ckpt_path.exists():
                 if self._drifting is None:
                     self._drifting = load_drifting(ckpt_path, self.device)
-                batch = _context_batch(state, goal, controls, obstacles, gamma, DEFAULTS["safety_margin"], horizon)
+                batch = _context_batch(
+                    state,
+                    goal,
+                    controls,
+                    obstacles,
+                    gamma,
+                    DEFAULTS["safety_margin"],
+                    horizon,
+                    obstacle_velocities=obstacle_velocities,
+                )
                 seq = sample_drifting_controls(self._drifting, batch, horizon=horizon, device=self.device)
                 action = seq[0, :, 0].detach().cpu().numpy()
                 info.update({"model_calls_per_step": 1, "nfe": 1, "checkpoint": str(ckpt_path)})
             else:
                 action = _goal_action(state, goal, dynamics)
                 info.update({"smoke_fallback": "goal_controller_missing_checkpoint", "checkpoint": None, "nfe": 1, "model_calls_per_step": 1})
+        elif method == "guided_drifting":
+            ckpt_path = Path(self.args.drifting_checkpoint)
+            if ckpt_path.exists():
+                if self._drifting is None:
+                    self._drifting = load_drifting(ckpt_path, self.device)
+                batch = _context_batch(state, goal, controls, obstacles, gamma,
+                                       DEFAULTS["safety_margin"], horizon,
+                                       obstacle_velocities=obstacle_velocities)
+                seq = sample_drifting_controls(self._drifting, batch, horizon=horizon, device=self.device)
+                raw_action = seq[0, :, 0]
+            else:
+                raw_action = torch.tensor(_goal_action(state, goal, dynamics), dtype=torch.float32, device=self.device)
+            # runtime affine safety filter => hard per-step certificate (THEORY §7)
+            if self._guided_filter is None:
+                self._guided_filter = SafeMPPIAdapter(
+                    horizon=1, dt=DEFAULTS["dt"], num_samples=1, dynamics_type=dynamics,
+                    u_min=DEFAULTS["u_min"], u_max=DEFAULTS["u_max"], safety_margin=DEFAULTS["safety_margin"],
+                    use_ho_barrier=True, eta=float(getattr(self.args, "guided_eta", 0.6)),
+                    barrier_extra_margin=float(getattr(self.args, "guided_extra_margin", 0.2)),
+                    barrier_activation_radius=float(getattr(self.args, "guided_activation_radius", 3.5)),
+                )
+            safe_a, finfo = self._guided_filter.safety_filter_action(
+                torch.tensor(state, dtype=torch.float32, device=self.device),
+                torch.tensor(obstacles, dtype=torch.float32, device=self.device),
+                raw_action if torch.is_tensor(raw_action) else torch.tensor(raw_action, device=self.device),
+                gamma=gamma,
+                obstacle_velocities=torch.tensor(obstacle_velocities, dtype=torch.float32, device=self.device)
+                if obstacle_velocities is not None else None,
+            )
+            action = safe_a.detach().cpu().numpy()
+            info.update({"model_calls_per_step": 1, "nfe": 1, "filter_iters": finfo["filter_iters"],
+                         "checkpoint": str(ckpt_path)})
+        elif method == "mirror_mppi":
+            # Mirror-map proposal: samples feasible-by-construction in the per-step
+            # polytope (accept rate ~1.0 vs ~0.01 Gaussian); MPPI averages them.
+            ov = (torch.tensor(obstacle_velocities, dtype=torch.float32, device=self.device)
+                  if obstacle_velocities is not None else None)
+            a_t, minfo = mirror_mppi_action(
+                torch.tensor(state, dtype=torch.float32, device=self.device),
+                torch.tensor(goal, dtype=torch.float32, device=self.device),
+                torch.tensor(obstacles, dtype=torch.float32, device=self.device), ov,
+                horizon=min(int(getattr(self.args, "mirror_horizon", 25)), horizon),
+                num_samples=int(getattr(self.args, "mirror_samples", 320)),
+                dt=DEFAULTS["dt"], u_min=DEFAULTS["u_min"], u_max=DEFAULTS["u_max"],
+                safety_margin=DEFAULTS["safety_margin"],
+                eta=float(getattr(self.args, "mirror_eta", 1.0)),
+                dual_sigma=float(getattr(self.args, "mirror_dual_sigma", 1.2)),
+                temperature=float(getattr(self.args, "mirror_temperature", 0.3)),
+                clear_w=float(getattr(self.args, "mirror_clear_w", 40.0)),
+                terminal_w=float(getattr(self.args, "mirror_terminal_w", 15.0)),
+                margin_gain=float(getattr(self.args, "mirror_margin_gain", 0.2)),
+                sensing_range=float(getattr(self.args, "mirror_sensing_range", 5.0)),
+                gamma=gamma, seed=self.args.seed + len(controls),
+                return_rollouts=bool(getattr(self.args, "collect_rollouts", False)),
+                device=self.device)
+            action = a_t.detach().cpu().numpy()
+            info.update(minfo)
+            info.update({"model_calls_per_step": 0, "nfe": 0})
         else:
             raise ValueError(f"Unknown method: {method}")
         action = np.clip(action, np.asarray(DEFAULTS["u_min"]), np.asarray(DEFAULTS["u_max"]))
@@ -415,6 +718,22 @@ def get_parser():
     p.add_argument("--mizuta-checkpoint", default="output_dir/cfm_transformer/checkpoint.pth")
     p.add_argument("--safe-cfm-checkpoint", default="output_dir/safe_contextual_cfm/checkpoint_best.pth")
     p.add_argument("--drifting-checkpoint", default="output_dir/drifting_generator/checkpoint_best.pth")
+    p.add_argument("--safemppi-horizon", type=int, default=40)
+    p.add_argument("--safemppi-samples", type=int, default=512)
+    p.add_argument("--safemppi-running-goal-weight", type=float, default=0.25)
+    p.add_argument("--safemppi-terminal-goal-weight", type=float, default=80.0)
+    p.add_argument("--safemppi-control-weight", type=float, default=0.03)
+    p.add_argument("--safemppi-smooth-weight", type=float, default=0.12)
+    p.add_argument("--safemppi-soft-clearance-weight", type=float, default=25.0)
+    p.add_argument("--safemppi-progress-weight", type=float, default=2.0)
+    p.add_argument("--safemppi-use-sets-backup", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--safemppi-sets-num-modes", type=int, default=3)
+    p.add_argument("--safemppi-sets-branch-scale", type=float, default=0.85)
+    p.add_argument("--safemppi-sets-include-cbf-backup", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--safemppi-sets-cbf-push", type=float, default=1.25)
+    p.add_argument("--safemppi-sets-reverse-speed", type=float, default=0.75)
+    p.add_argument("--safemppi-sets-turn-rate", type=float, default=1.4)
+    p.add_argument("--debug-rollouts", type=int, default=80)
     return p
 
 

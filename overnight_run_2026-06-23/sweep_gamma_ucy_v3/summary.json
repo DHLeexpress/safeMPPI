@@ -1,0 +1,181 @@
+{
+  "summary": [
+    {
+      "method": "mizuta_cfm_mppi",
+      "gamma": null,
+      "episodes": 25,
+      "success_rate": 1.0,
+      "success_ci": [
+        1.0,
+        1.0
+      ],
+      "collision_rate": 0.0,
+      "collision_ci": [
+        0.0,
+        0.0
+      ],
+      "goal_reached_rate": 1.0,
+      "mean_min_clearance": 1.0261362981796265,
+      "median_min_clearance": 0.5969604253768921,
+      "mean_final_goal_distance": 0.080050247348845,
+      "mean_path_length": 10.54352466583252,
+      "mean_control_effort": 176.30284790039062,
+      "mean_planning_time_ms": 96.31739200511947
+    },
+    {
+      "method": "guided_safemppi",
+      "gamma": 0.3,
+      "episodes": 25,
+      "success_rate": 0.84,
+      "success_ci": [
+        0.68,
+        0.96
+      ],
+      "collision_rate": 0.0,
+      "collision_ci": [
+        0.0,
+        0.0
+      ],
+      "goal_reached_rate": 0.84,
+      "mean_min_clearance": 0.8588742995262146,
+      "median_min_clearance": 0.5784037113189697,
+      "mean_final_goal_distance": 0.43588984563946725,
+      "mean_path_length": 10.20625856399536,
+      "mean_control_effort": 142.96721801757812,
+      "mean_planning_time_ms": 78.50120404921472
+    },
+    {
+      "method": "guided_safemppi",
+      "gamma": 0.5,
+      "episodes": 25,
+      "success_rate": 0.68,
+      "success_ci": [
+        0.48,
+        0.84
+      ],
+      "collision_rate": 0.12,
+      "collision_ci": [
+        0.0,
+        0.28
+      ],
+      "goal_reached_rate": 0.76,
+      "mean_min_clearance": 0.746213617324829,
+      "median_min_clearance": 0.5093170404434204,
+      "mean_final_goal_distance": 0.36771300971508025,
+      "mean_path_length": 10.2602508354187,
+      "mean_control_effort": 145.74704864501953,
+      "mean_planning_time_ms": 78.5311759551987
+    },
+    {
+      "method": "guided_safemppi",
+      "gamma": 1.0,
+      "episodes": 25,
+      "success_rate": 0.72,
+      "success_ci": [
+        0.56,
+        0.88
+      ],
+      "collision_rate": 0.16,
+      "collision_ci": [
+        0.04,
+        0.32
+      ],
+      "goal_reached_rate": 0.8,
+      "mean_min_clearance": 0.6833389246463776,
+      "median_min_clearance": 0.4819868803024292,
+      "mean_final_goal_distance": 0.6613474467396736,
+      "mean_path_length": 9.987429370880127,
+      "mean_control_effort": 154.11623657226562,
+      "mean_planning_time_ms": 78.486905682832
+    },
+    {
+      "method": "guided_adaptive",
+      "gamma": null,
+      "episodes": 25,
+      "success_rate": 0.68,
+      "success_ci": [
+        0.48,
+        0.84
+      ],
+      "collision_rate": 0.2,
+      "collision_ci": [
+        0.08,
+        0.36
+      ],
+      "goal_reached_rate": 0.8,
+      "mean_min_clearance": 0.680180401802063,
+      "median_min_clearance": 0.44838523864746094,
+      "mean_final_goal_distance": 0.4444012375175953,
+      "mean_path_length": 10.250904636383057,
+      "mean_control_effort": 155.20916412353515,
+      "mean_planning_time_ms": 78.71197550976649
+    }
+  ],
+  "paired_vs_mizuta": [
+    {
+      "method": "guided_safemppi",
+      "gamma": 0.3,
+      "success_ours_minus_mizuta": -0.16000000000000003,
+      "mcnemar_ours_win": 0,
+      "mcnemar_mizuta_win": 4,
+      "mcnemar_p": 0.125,
+      "clearance_median_diff_ours_minus_mizuta": -0.07739770412445068,
+      "wilcoxon_p": 0.1500033100993646
+    },
+    {
+      "method": "guided_safemppi",
+      "gamma": 0.5,
+      "success_ours_minus_mizuta": -0.31999999999999995,
+      "mcnemar_ours_win": 0,
+      "mcnemar_mizuta_win": 8,
+      "mcnemar_p": 0.0078125,
+      "clearance_median_diff_ours_minus_mizuta": -0.10516947507858276,
+      "wilcoxon_p": 0.026430973778152598
+    },
+    {
+      "method": "guided_safemppi",
+      "gamma": 1.0,
+      "success_ours_minus_mizuta": -0.28,
+      "mcnemar_ours_win": 0,
+      "mcnemar_mizuta_win": 7,
+      "mcnemar_p": 0.015625,
+      "clearance_median_diff_ours_minus_mizuta": -0.18417859077453613,
+      "wilcoxon_p": 0.011876381887516073
+    },
+    {
+      "method": "guided_adaptive",
+      "gamma": null,
+      "success_ours_minus_mizuta": -0.31999999999999995,
+      "mcnemar_ours_win": 0,
+      "mcnemar_mizuta_win": 8,
+      "mcnemar_p": 0.0078125,
+      "clearance_median_diff_ours_minus_mizuta": -0.10252237319946289,
+      "wilcoxon_p": 0.010181304124490045
+    }
+  ],
+  "config": {
+    "dataset": "ucy",
+    "dynamics": "doubleintegrator",
+    "pedestrian_source": "validation",
+    "methods": [
+      "mizuta_cfm_mppi",
+      "guided_safemppi",
+      "guided_adaptive"
+    ],
+    "gamma_grid": [
+      0.3,
+      0.5,
+      1.0
+    ],
+    "num_episodes": 25,
+    "episode_list": null,
+    "steps": 80,
+    "seed": 0,
+    "device": "cuda",
+    "safemppi_samples": 384,
+    "safemppi_horizon": 40,
+    "num_pedestrians": 20,
+    "output": "overnight_run_2026-06-23/sweep_gamma_ucy_v3"
+  },
+  "episodes": 25
+}

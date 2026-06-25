@@ -6,9 +6,13 @@ images/
 *.pt
 *.pkl
 *.mp4
+*.gif
+*.png
 *.jpg
 *.jpeg
 *.pdf
+*.log
+*.jsonl
 .DS_Store
 
 
@@ -53,3 +57,5 @@ MANIFEST
 *logs/
 *.out
 *.err
+overnight_run_*/mirror_sweep/
+overnight_run_*/param_sweep/

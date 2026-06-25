@@ -1,0 +1,4 @@
+scene,episode,method,gamma,success,collision,goal_reached,final_goal_distance,min_clearance,path_length,control_effort,planning_wall_time_mean,model_calls_per_step,nfe,backup_branch_count,backup_selected_count,checkpoint_path
+ucy validation episode 110,110,mizuta_cfm_mppi,,False,False,False,6.648020267486572,1.3053948879241943,1.487290859222412,33.505096435546875,0.4608737650560215,7,7,0,0,output_dir/cfm_transformer/checkpoint.pth
+ucy validation episode 110,110,safemppi_gamma,0.1,False,False,False,6.828381538391113,1.319059133529663,1.2898012399673462,34.29158020019531,0.07031501980964094,0,0,12,5,
+ucy validation episode 110,110,safemppi_gamma,1.0,False,False,False,6.498483180999756,1.1391867399215698,1.5999999046325684,33.23495864868164,0.060314286849461496,0,0,12,7,
