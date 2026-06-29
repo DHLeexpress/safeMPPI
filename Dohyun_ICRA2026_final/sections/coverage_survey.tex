@@ -1,0 +1,28 @@
+% Compact one-paragraph literature survey on the meaning of "coverage" for generative
+% robot policies. Intended to be \input{sections/coverage_survey} inside the Introduction
+% or Related Work of root.tex. New citations are appended to references.bib.
+\subsection{What ``coverage'' means for a generative policy}
+Generative policies built on diffusion and flow matching have become standard for imitation and
+sampling-based control precisely because they natively represent \emph{multimodal} action
+distributions---capturing several valid ways to act rather than regressing to an unsafe average of
+them~\cite{chi2023diffusion, florence2021implicit, shafiullah2022behavior, kurtz2025generative};
+yet even recent flow-matching policies are observed to collapse toward averaged or ambiguous behaviors
+in cluttered tasks~\cite{zhang2025vfp}, which makes \emph{quantifying} how much of the valid behavior
+space a policy actually spans a central but unsettled question whose answer---``coverage''---is fractured
+across communities: generative-modeling practice scores diversity against a reference \emph{data}
+distribution via FID~\cite{heusel2017gans}, precision/recall~\cite{sajjadi2018assessing}, density-and-coverage~\cite{naeem2020reliable},
+or the reference-free Vendi score~\cite{friedman2023vendi}; quality-diversity instead defines coverage as
+the fraction of a hand-designed \emph{behavior-descriptor} space that high-performing solutions
+fill~\cite{mouret2015illuminating, lehman2011abandoning}, a view recently imported into imitation learning
+through behavior-entropy benchmarks over discrete descriptors~\cite{jia2024towards}; motion planning counts
+topologically distinct \emph{homotopy classes} of paths around obstacles~\cite{bhattacharya2012topological};
+reinforcement learning measures raw \emph{state-space} visitation~\cite{bellemare2016unifying}; and
+generative flow-expansion frames it as the overlap between a model's $\tau$-level \emph{generable set} and a
+black-box validity oracle, expanded until the two coincide~\cite{desanti2026active}---itself distinct from
+\emph{ergodic} coverage, where a single trajectory must tile a target spatial density over
+time~\cite{sun2025ergodic}. The common thread, and the gap we target, is that none of these is by itself the
+right object for a \emph{safety-tunable} generative policy: the control space is too high-dimensional to cover
+or even measure directly, so the meaningful quantity is the coverage of the \emph{valid}---safe and
+goal-reaching---behavior set, i.e., the generable set intersected with a constraint verifier and projected
+onto a low-dimensional, task-grounded behavior descriptor, reported jointly with validity and as a function
+of the safety parameter $\gamma$ that trades conservativeness for reach.

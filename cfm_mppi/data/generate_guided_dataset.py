@@ -44,10 +44,20 @@ def _di_step(state, action, dt):
     return s
 
 
+def _si_step(state, action, dt):
+    # single integrator: control IS velocity; position += dt*u, velocity channels track u
+    s = state.copy()
+    s[0] += dt * action[0]
+    s[1] += dt * action[1]
+    s[2] = action[0]
+    s[3] = action[1]
+    return s
+
+
 def run(cli):
     device = torch.device(cli.device)
     base = _render_parser().parse_args([])
-    base.dynamics = "doubleintegrator"
+    base.dynamics = cli.dynamics
     base.steps = cli.steps
     base.num_pedestrians = cli.num_pedestrians
     base.pedestrian_radius = 0.0
@@ -88,13 +98,26 @@ def run(cli):
             velocities_seq = (velocities_seq.reshape(-1, 2) @ R.T).reshape(velocities_seq.shape).astype(np.float32)
         for rep in range(cli.repeats):
           for gamma in gammas:
-            adapter = SafeMPPIAdapter(
-                horizon=cli.horizon, dt=DT, num_samples=cli.samples, gamma=gamma,
-                noise_sigma=(0.4, 0.4), u_min=(-3.0, -3.0), u_max=(3.0, 3.0),
-                safety_margin=0.5, dynamics_type="doubleintegrator",
-                use_ho_barrier=True, eta=cli.eta, use_guidance=True,
-                use_aniso_cov=True, barrier_topk=6,
-            )
+            if cli.dynamics == "singleintegrator":
+                # relative-degree-1: position-only affine DCBF (no HO/braking term).
+                # control IS velocity, so u bounds are speed limits and noise is in velocity.
+                adapter = SafeMPPIAdapter(
+                    horizon=cli.horizon, dt=DT, num_samples=cli.samples, gamma=gamma,
+                    noise_sigma=(0.5, 0.5), u_min=(-cli.umax, -cli.umax), u_max=(cli.umax, cli.umax),
+                    safety_margin=0.5, dynamics_type="singleintegrator",
+                    use_ho_barrier=False, eta=0.0, use_guidance=True,
+                    use_aniso_cov=True, barrier_topk=6,
+                    barrier_activation_radius=cli.sensing_range,
+                )
+            else:
+                adapter = SafeMPPIAdapter(
+                    horizon=cli.horizon, dt=DT, num_samples=cli.samples, gamma=gamma,
+                    noise_sigma=(0.4, 0.4), u_min=(-3.0, -3.0), u_max=(3.0, 3.0),
+                    safety_margin=0.5, dynamics_type="doubleintegrator",
+                    use_ho_barrier=True, eta=cli.eta, use_guidance=True,
+                    use_aniso_cov=True, barrier_topk=6,
+                    barrier_activation_radius=cli.sensing_range,
+                )
             T = cli.steps
             state = state0.astype(np.float32).copy()
             states = [state.copy()]
@@ -113,7 +136,7 @@ def run(cli):
                 )
                 a = a.detach().cpu().numpy()
                 obsrel.append(_nearest_rel(state[:2], obs_t, vel_t))
-                state = _di_step(state, a, DT)
+                state = _si_step(state, a, DT) if cli.dynamics == "singleintegrator" else _di_step(state, a, DT)
                 states.append(state.copy())
                 controls.append(a.astype(np.float32))
             states_arr = np.asarray(states, dtype=np.float32)
@@ -158,13 +181,14 @@ def run(cli):
         "nearest_obstacle_history": obs_hist,
         "obstacles": torch.zeros(n, 1, 3, dtype=torch.float32),
         "gamma": gamma,
-        "dynamics_type": ["doubleintegrator"] * n,
+        "dynamics_type": [cli.dynamics] * n,
         "safety_margin": torch.full((n,), 0.5, dtype=torch.float32),
-        "source": ["guided_safemppi_sfm"] * n,
-        "metadata": {"schema_version": 1, "source_format": "guided_safemppi_sfm",
+        "source": [f"guided_safemppi_{cli.scene_source}"] * n,
+        "metadata": {"schema_version": 1, "source_format": "guided_safemppi",
                      "dt": DT, "history_len": hist_len, "gamma_grid": gammas,
                      "eta": cli.eta, "num_scenes": len(scene_indices),
-                     "scene_source": cli.scene_source},
+                     "scene_source": cli.scene_source, "dynamics": cli.dynamics,
+                     "sensing_range": cli.sensing_range},
     }
     paths = save_canonical_splits(data, Path(cli.output_dir), seed=cli.seed)
     print(f"[gen] saved {n} items to {cli.output_dir}: {paths}")
@@ -193,6 +217,13 @@ def main():
                    help="keep only goal-reaching, collision-free trajectories")
     p.add_argument("--repeats", type=int, default=1,
                    help="stochastic rollouts per (episode, gamma) for data volume/diversity")
+    p.add_argument("--dynamics", default="doubleintegrator",
+                   choices=["singleintegrator", "doubleintegrator"],
+                   help="robot dynamics model (single integrator = control is velocity)")
+    p.add_argument("--umax", type=float, default=3.0,
+                   help="control bound; for single integrator this is the speed limit (m/s)")
+    p.add_argument("--sensing-range", type=float, default=3.5,
+                   help="finite sensing range: obstacle barriers activate within this radius")
     run(p.parse_args())
 
 

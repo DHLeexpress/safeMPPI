@@ -48,6 +48,16 @@ def get_parser() -> argparse.ArgumentParser:
     p.add_argument("--history-len", type=int, default=10)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--test-run", action="store_true")
+    # convergence-based termination + experiment tracking
+    p.add_argument("--patience", type=int, default=40,
+                   help="early stop after this many epochs without val-loss improvement")
+    p.add_argument("--min-delta", type=float, default=1e-4,
+                   help="minimum relative val-loss improvement to reset patience")
+    p.add_argument("--lr-schedule", default="cosine", choices=["none", "cosine"],
+                   help="cosine annealing LR over epochs")
+    p.add_argument("--wandb-mode", default="offline", choices=["offline", "online", "disabled"])
+    p.add_argument("--wandb-project", default="cfm-mppi-safe")
+    p.add_argument("--wandb-name", default=None)
     return p
 
 
@@ -90,32 +100,65 @@ def main() -> None:
     model = ContextualTransformerModel.from_mizuta_defaults(history_len=args.history_len).to(device)
     param_count = count_parameters(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs))
+                 if args.lr_schedule == "cosine" else None)
+
+    # Weights & Biases (offline by default: no API key needed; `wandb sync` later to upload)
+    run = None
+    try:
+        import os
+        import wandb
+        os.environ.setdefault("WANDB_MODE", args.wandb_mode)
+        run = wandb.init(project=args.wandb_project, name=args.wandb_name,
+                         mode=args.wandb_mode, dir=str(out), config=vars(args))
+    except Exception as exc:  # wandb missing/broken -> fall back to jsonl-only
+        print(f"[wandb] disabled ({exc})", flush=True)
+
     best = float("inf")
+    patience_left = args.patience
     log_path = out / "train_log.jsonl"
     for epoch in range(args.epochs):
         train_stats = train_one_epoch_safe_cfm(model, train_loader, optimizer, device, grad_clip=args.grad_clip)
         val_stats = evaluate_safe_cfm(model, val_loader, device)
         val_loss = val_stats["loss"]
+        cur_lr = optimizer.param_groups[0]["lr"]
+        if scheduler is not None:
+            scheduler.step()
         latest = out / "checkpoint_latest.pth"
         _save_checkpoint(latest, model, optimizer, epoch, args, val_loss, param_count)
-        if val_loss < best:
+        improved = val_loss < best * (1.0 - args.min_delta)
+        if improved:
             best = val_loss
+            patience_left = args.patience
             _save_checkpoint(out / "checkpoint_best.pth", model, optimizer, epoch, args, val_loss, param_count)
+        else:
+            patience_left -= 1
         record = {
             "epoch": epoch,
             "train_loss": train_stats["loss"],
             "val_loss": val_loss,
+            "best_val_loss": best,
             "gradient_norm": train_stats["gradient_norm"],
-            "lr": optimizer.param_groups[0]["lr"],
+            "lr": cur_lr,
+            "patience_left": patience_left,
             "epoch_time": train_stats["epoch_time"],
             "checkpoint_path": str(latest),
             "best_checkpoint_path": str(out / "checkpoint_best.pth"),
             "parameter_count": param_count,
         }
         _write_jsonl(log_path, record)
+        if run is not None:
+            run.log({k: v for k, v in record.items() if isinstance(v, (int, float))}, step=epoch)
         print(json.dumps(record), flush=True)
         if args.test_run:
             break
+        if patience_left <= 0:
+            print(f"[early-stop] no val-loss improvement for {args.patience} epochs "
+                  f"(best={best:.6f}); terminating at epoch {epoch}.", flush=True)
+            break
+    if run is not None:
+        run.summary["best_val_loss"] = best
+        run.finish()
 
 
 if __name__ == "__main__":
