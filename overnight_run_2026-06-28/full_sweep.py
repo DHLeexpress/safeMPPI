@@ -12,10 +12,11 @@ from polytope_explainer import rollout
 from cfm_mppi.mppi.sweep import _load, DT
 
 GAMMAS = [0.1, 0.3, 0.5, 0.7, 1.0]; NEPS = 300; DATASETS = ["ucy", "sdd"]
-CFG = dict(horizon=10, dt=DT, num_samples=128, noise_sigma=(0.5, 0.5), u_min=(-2., -2.), u_max=(2., 2.),
-           safety_margin=0.0, temperature=0.3, dynamics_type="singleintegrator", barrier_activation_radius=3.0,
+CFG = dict(horizon=10, dt=DT, num_samples=512, noise_sigma=(0.5, 0.5), u_min=(-2., -2.), u_max=(2., 2.),
+           safety_margin=0.0, temperature=0.3, dynamics_type="singleintegrator", barrier_activation_radius=2.0,
            use_polytope_barrier=True, use_goal_nominal=False, warm_start=True, centroid_gain=0.1,
-           centroid_horizon=3, sigma_volume_gain=1.0, predict_gain=0.4, polytope_nbase=16)
+           centroid_smooth=0.5, sigma_volume_gain=0.5, sigma_aniso=2.0, control_weight=0.03,
+           predict_gain=0.4, polytope_nbase=16)
 
 
 def metrics(ds, ep, g, dev):
