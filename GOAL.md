@@ -1,5 +1,14 @@
 # GOAL.md — Safe Flow Expansion for γ-conditioned generative path planning
 
+> **→ See `NOTE.md`** for the running **experiment log (trial-and-error)**, the MPPI option findings
+> (guidance/temperature/γ-coupling), the dataset recipe, and dataset references. GOAL.md = the plan; NOTE.md = what
+> we actually learned while doing it. Baseline (pre-experiment) code is archived under `experiments/baseline/`.
+
+> **DEFAULT MPPI VISUALIZATION** (style of `results/benchmark_videos/di_gamma.mp4`): always show the
+> **accepted (green) / rejected (red) ROLLOUT TRAJECTORIES** (not just endpoints), mark **rejected endpoints with
+> ✗**, show the **accept/reject COUNT** box, over the nested `{H≥(1−γ)^i}` level sets + the executed path (red),
+> robot-centered zoom. Reference impl: `overnight_run_2026-06-28/ep15_diagnostic.py::draw_cell`.
+
 ## Overarching goal
 Use the **scarce, conservative SafeMPPI dataset** to train a flow-matching (FM) policy, then **expand & verify** it
 with polytope-verifier ideas, to **quantitatively prove that exploration coverage increases while the generative
@@ -45,27 +54,46 @@ Mizuta UCY setup but with a **finite sensing range** (only obstacles within R ar
   data `dataset/eval80_{ego,obs}_ucy.{pt,pkl}`. Finite sensing already honored by polytope_v2 (clearance ≤ R).
   Demo: `overnight_run_2026-06-28/track1_polytope_v2_mizuta.py`.
 
-### 2) Verified polytope loop (Pillar 2) — nominal polytope + SafeMPPI γ-rejection
-Visualize the nominal polytope + nested `{H ≥ (1−γ)^i}` level sets as SafeMPPI control propagates over pedestrian
-eval data; **single-integrator** robot (matches Mizuta). SafeMPPI weight = **per-sample rejection** vs the polytope
-(reject rollout m if ∃i: `h^aff(x^m_{k+i}) < (1−γ)^i`) — γ-dependent.
-- Nominal polytope (current best): `cfm_mppi/safegpc_adapter/polytope_v2.py` (`build_polytope_v2` — robot-centered
-  K-gon disk + obstacle tangent faces, no head bias). **Can be improved → `polytope_v3.py`** (less-conservative /
-  max-volume refinement).
-- SafeMPPI: `cfm_mppi/safegpc_adapter/safemppi.py` (`SafeMPPIAdapter.plan`) · `barrier.py`
-  (`affine_barrier_h_ho_all`) · `gamma_schedule.py` (adaptive γ) · `mirror_sampler.py`.
-- Level-set viz: `track1_polytope_v2_mizuta.py` (`_norm_barrier`), `cfm_mppi/evaluation/visualize_mirror_episode.py`.
-- Single-integrator: `cfm_mppi/mppi/utils.py` (`singleintegrator_dynamics`).
+### 2) Verified polytope loop (Pillar 2) — nominal polytope + SafeMPPI γ-rejection  **[VALIDATED ✅]**
+Single-integrator robot. SafeMPPI weight = per-sample rejection vs the nominal polytope (reject rollout m if ∃i:
+`H_P(x^m_{k+i}) < (1−γ)^i`), γ-dependent; the executed action is the reward-weighted average of the survivors.
+
+**KEY UPDATES (Stage 2, validated — full detail + the trial-and-error in NOTE.md items 11–13):**
+- **MPPI done right (safeGPC `algs/mppi.py` parity):** nominal control = **0** (cold seed) + **WARM-START** the
+  reward-weighted sequence `mean_new = Σ w·controls` (`w = softmax(−J/temp)`, rejected weight 0); executed action =
+  the **weighted mean**, NOT the greedy argmin. We do **not** refine a goal-seeking nominal (that's Mizuta); the goal
+  lives in the cost (progress + terminal). Cold nominal=0 *without* warm-start makes the first action random ⇒ robot
+  oscillates — warm-start is essential.
+- **Rejection = the nominal POLYTOPE level sets** (`use_polytope_barrier=True`), NOT the affine single-nearest barrier
+  (jumpy/non-smooth ⇒ the "accept-0" all-rejection). Polytope built once at x0: smooth, all nearby obstacles.
+- **Mean/cov from the polytope:** mean = blend the warm-start with the free-space **centroid** `d̂=−Σ a_k/margin_k`
+  over the first **K** steps (weight ∝ `trapped=(R−size)/(size+ε)` "1/volume"-like, decayed for smoothness); σ scaled
+  by polytope size. **safety_margin = 0** (keep the per-obstacle `predict_gain` velocity inflation — the differential
+  per-hyperplane retreat; the constant offset only collapsed the polytope to ~0 in dense crowds).
+- **FINAL config:** `centroid_gain=0.1, sigma_volume_gain=0.5, control_weight=0.03, centroid_horizon=3, noise=0.5,
+  predict_gain=0.4, sensing=3.0, temperature=0.3, H=10`. **Result (300 eps/dataset × γ): SDD 90–100% succ / 0–4% col;
+  UCY 75–80% succ / 6–8% col; γ = clean DTCBF conservativeness knob.** SDD essentially solved; UCY the hard set.
+- Code: `cfm_mppi/safegpc_adapter/safemppi.py` (`SafeMPPIAdapter.plan` — polytope barrier + warm-start + centroid/
+  volume steering + safe fallback) · `polytope_v2.py` (`build_polytope_v2`). Viz/sweeps in `overnight_run_2026-06-28/`:
+  `polytope_explainer.py` (per-part explainer), `polytope_grid.py` (grid GIF), `param_finetune.py`, `full_sweep.py`.
 
 ### 3) Certified planning (Pillar 3) — efficient verifier polytope (less conservative)
 Verifier answers: *"does there EXIST a polytope with safety parameter γ such that this trajectory satisfies the
 recursive DTCBF constraints ⇒ intrinsically safe for upcoming steps?"* — crucially **less conservative** than the
 nominal polytope (certifies gap-threading the nominal rejects). For single-integrator there is no braking
 constraint, so gap-threading is genuinely certifiable.
-- Current best (**UNDER CONSTRUCTION**): `overnight_run_today/src/dtcbf.py` (`verify` — sound 2-D closed-form DTCBF
-  certificate sweeping normal angles; `build_candidate_polytope` — conservative baseline). No dedicated
-  verifier-polytope module yet → build an **efficient `verifier_polytope`** (note: the deleted v2 rectangle verifier
-  was UNSOUND for double-integrator braking; single-integrator removes that pitfall).
+- **HORIZON: the verifier horizon ≡ the MPPI horizon (= H = 10).** The verifier certifies exactly the H-step
+  trajectory the planner produces; the two are always equal.
+- **Geometric optimization (robot-centered level sets):** robot at center `c`; polytope `P={x:aₖ·(x−c)≤bₖ}`, `bₖ>0`
+  ⇒ robot interior, `H_P(c)=1`; barrier `H_P(x)=minₖ[1−aₖ·(x−c)/bₖ]`; level set `{H_P≥ℓ}` = `P` scaled by `(1−ℓ)`
+  about `c`. **The slope of the nested level sets (decay rate `1−γ`) is the decision variable tied to γ.** Find
+  `(A,b>0)` + minimal `γ≤γ_max` s.t. (i) safety: each obstacle excluded by some face, (ii) recursive DTCBF
+  `H_P(x_{i+1})≥(1−γ)H_P(x_i)`. Per-face this is **LINEAR in `b` (and γ)** ⇒ an **LP feasibility**; minimizing γ gives
+  `req_γ`. `req_γ≤γ_max` ⇒ certified (return `b*`); else **report INFEASIBILITY** (binding obstacle/step). Less
+  conservative because the verifier *chooses* `b`/normals to fit the trajectory vs the nominal's fixed tangents.
+- Current best (**UNDER CONSTRUCTION**): `overnight_run_today/src/dtcbf.py` (`verify` — sound closed-form DTCBF
+  certificate) + new `verifier_experiment/` (LP verifier + `validate_polytope_v2` + `design/VERIFIER_GEOMETRY.md`).
+  (Note: the deleted v2 rectangle verifier was UNSOUND for double-integrator braking; single-integrator removes it.)
 
 ### 4) Pretrain the FM policy (Pillar 4) — γ-conditioned, on scarce conservative data
 Use **Mizuta's model as the backbone** (do NOT re-derive the flow architecture). **Do NOT adapt the part that injects
@@ -83,6 +111,17 @@ goal, and γ**; train on the scarce conservative SafeMPPI dataset.
   `start, goal, ego_current, ego_history, action_history, nearest_obstacle_history, gamma (guidance role),
   safety_margin → safe control sequence`. **First task:** pin down the relation between `train80_ego.pt` and the
   polytope-based SafeMPPI rollout (which channels of the 9 map to start/goal/ego state; where obstacles come from).
+- **CROWD DATA (critical, provenance CONFIRMED):** `train80_ego` (273,989) is Mizuta's **ego-only sliding-window
+  snippets of the ETH/BIWI dataset** (Pellegrini et al., *You'll Never Walk Alone*, ICCV 2009; his paper: "276,874
+  trajectories 1–8 s") — downloaded from his Drive, **no in-repo builder, crowd discarded** ⇒ it cannot supply
+  SafeMPPI obstacles. Phase-4 real-crowd source = **NVlabs/trajdata** (`github.com/NVlabs/trajdata`; Mizuta himself
+  acknowledges trajdata, so this reproduces his pipeline): `pip install trajdata` (ETH/UCY + SDD need no
+  registration), `UnifiedDataset(desired_data=["eupeds_eth", "eupeds_zara1", …], centric="scene", desired_dt=0.1,
+  only_types=[PEDESTRIAN], history_sec=(3.9,3.9), future_sec=(4.0,4.0), standardize_data=False)` → each scene's
+  co-present agents are the moving obstacles. Build ego+crowd episodes (ego=one pedestrian, others=obstacles, 80
+  steps → ≫300 episodes) via **new** `cfm_mppi/data/build_crowd_scenes.py` → patched `generate_guided_dataset.py`.
+  (The exact ETH crowd is also recoverable from raw BIWI `obsmat.txt` by frame overlap.) **Phase-2 plot/eval uses
+  UCY/SDD (`eval80_obs_{ucy,sdd}.pkl`) which already include the real crowd — no recovery needed.**
 - Model (current best, **already γ-conditioned**): `cfm_mppi/models/contextual_transformer.py`
   (`ContextualTransformerModel`) via `cfm_mppi/models/context_encoder.py` (`ContextEncoder` stacks `[γ, safety_margin]`).
 - Training: `cfm_mppi/training/train_safe_cfm.py` (`main`), `train_loop_safe_cfm.py` (`safe_cfm_loss`); flow path

@@ -36,10 +36,18 @@ def build_polytope_v2(
     n_base: int = 16,                          # K base directions (>=4); larger K -> rounder disk
     margin: float = 0.0,                       # obstacle inflation (0 = tangent to the actual obstacle)
     max_obstacles: int = 12,
+    obstacle_velocities=None,                  # [N,2] pedestrian velocities (for the predictive offset)
+    robot_velocity=None,                       # [2] robot velocity
+    predict_gain: float = 0.0,                 # kappa: face retreats by kappa*tau*max(0,closing speed)
+    predict_tau: float = 1.0,                  # tau = H*dt prediction horizon (seconds)
 ) -> Tuple[Polytope, dict]:
     c = (pos.detach().cpu().numpy() if torch.is_tensor(pos) else np.asarray(pos, float)).astype(float).reshape(2)
     R = float(sensing_range)
     K = max(4, int(n_base))
+    vrob = (np.zeros(2) if robot_velocity is None else
+            (robot_velocity.detach().cpu().numpy() if torch.is_tensor(robot_velocity) else np.asarray(robot_velocity, float)).reshape(2))
+    vobs = (None if obstacle_velocities is None else
+            (obstacle_velocities.detach().cpu().numpy() if torch.is_tensor(obstacle_velocities) else np.asarray(obstacle_velocities, float)).reshape(-1, 2))
 
     # --- base: inner K-gon of the robot-centered disk (fixed axis-aligned orientation, no head bias) ---
     thetas = np.arange(K) * (2 * math.pi / K)
@@ -47,7 +55,7 @@ def build_polytope_v2(
     base_off = R * math.cos(math.pi / K)                      # apothem -> every face strictly inside the disk
     b_rows = [float(n @ c + base_off) for n in A_rows]
 
-    # --- one tangent half-space per detected (nearby) obstacle ---
+    # --- one tangent half-space per detected (nearby) obstacle (+ velocity-predictive retreat) ---
     obs = (obstacles.detach().cpu().numpy() if torch.is_tensor(obstacles) else np.asarray(obstacles, float))
     obs = obs.reshape(-1, 3).astype(float) if obs.size else np.zeros((0, 3))
     n_detected = 0
@@ -61,6 +69,9 @@ def build_polytope_v2(
                 continue
             m = (obs[j, :2] - c) / d[j]                       # robot -> obstacle (outward)
             off = float(d[j] - (obs[j, 2] + margin))          # tangent to inflated obstacle, robot side
+            if predict_gain > 0.0 and vobs is not None and j < vobs.shape[0]:
+                v_close = float(m @ (vrob - vobs[j]))         # >0: gap closing -> retreat the face
+                off -= predict_gain * predict_tau * max(0.0, v_close)
             A_rows.append(m); b_rows.append(float(m @ c + off)); n_detected += 1
 
     A = torch.tensor(np.stack(A_rows), dtype=torch.float32)

@@ -4,7 +4,6 @@ import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
-import numpy as np
 import torch
 
 from .barrier import (
@@ -13,7 +12,6 @@ from .barrier import (
     affine_barrier_h_ho_all,
     barrier_clearance,
 )
-from .polytope_v2 import build_polytope_v2
 
 
 @dataclass
@@ -26,24 +24,6 @@ class SafeMPPIConfig:
     noise_sigma: float | Tuple[float, float] = 0.6
     u_min: Tuple[float, float] = (-2.0, -2.0)
     u_max: Tuple[float, float] = (2.0, 2.0)
-    # --- BIMODAL polytope proposal: each control drawn from a mixture of two Gaussians over ALL steps ---
-    #   Mode A ~ N(warm, Sigma_iso)          (goal-ward, the warm-start)
-    #   Mode B ~ N(warm + B+ d_centroid, Sigma_aniso)   (opening-ward, toward the EXACT polytope centroid)
-    #   mixture weight p = clip(centroid_gain*trapped, 0, 1); trapped=(R-size)/(size+eps) ("1/volume"-like, 0 if open)
-    centroid_gain: float = 0.0             # Mode-B mixture weight gain (p = clip(gain*trapped,0,1)); 0=off
-    centroid_smooth: float = 0.5           # temporal low-pass on p across plan steps (smoothness; 0=off)
-    centroid_eps: float = 0.15             # numerical-stability floor in trapped=(R-size)/(size+eps)
-    sigma_volume_gain: float = 0.0         # widen sampling sigma when the polytope is small (trapped); 0=off
-    sigma_aniso: float = 2.0               # Mode-B ellipsoid anisotropy: wide (xPARALLEL opening) / narrow (xPERP)
-    sigma_max_mult: float = 3.0            # cap on the sigma blow-up (numerical stability)
-    use_polytope_barrier: bool = False     # reject on the nominal polytope level sets: H_P(x_{i+1}) >= (1-g) H_P(x_i)
-    polytope_nbase: int = 16               # K base faces of the robot-centered sensing disk
-    predict_gain: float = 0.0              # velocity-predictive face retreat (kappa) for the polytope (req 1)
-    # --- MPPI nominal: WE DON'T refine a goal-seeking nominal (Mizuta does); ours = polytope mean + cost ---
-    use_goal_nominal: bool = True          # False => base nominal = 0 (no goal-seeking); mean comes from the polytope,
-                                           #          the goal is handled by the progress/terminal cost (MPPI spirit)
-    warm_start: bool = False               # nominal = previous MPPI-averaged solution (shifted); samples explore it
-    nominal_speed: float = 0.0             # cap the goal-seeking nominal SPEED (0 = saturate at u_max, the old way)
     safety_margin: float = 0.5
     running_goal_weight: float = 0.25
     terminal_goal_weight: float = 80.0
@@ -97,8 +77,6 @@ class SafeMPPIAdapter:
         self.config = SafeMPPIConfig(**kwargs)
         self.u_min = torch.tensor(self.config.u_min, dtype=torch.float32)
         self.u_max = torch.tensor(self.config.u_max, dtype=torch.float32)
-        self._u_prev = None                # warm-start: previous MPPI-averaged control sequence [H,2]
-        self._p_prev = None                # temporal low-pass state for the Mode-B mixture weight p
 
     def _sigma(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         sigma = self.config.noise_sigma
@@ -122,56 +100,6 @@ class SafeMPPIAdapter:
         # keep isotropic noise instead of collapsing to zero.
         valid = (torch.linalg.norm(normal_axis, dim=1) > 1e-6).view(1, H, 1)
         return torch.where(valid, shaped, noise)
-
-    @staticmethod
-    def _polygon_centroid(A_np, b_np, interior):
-        """EXACT area-centroid of the convex polygon {A x <= b} via halfspace intersection + shoelace centroid.
-        Falls back to the interior point (robot) on degeneracy."""
-        interior = np.asarray(interior, float).reshape(2)
-        try:
-            from scipy.spatial import HalfspaceIntersection
-            hs = HalfspaceIntersection(np.hstack([A_np, -b_np[:, None]]).astype(float), interior)  # a.x - b <= 0
-            V = hs.intersections
-            if V.shape[0] < 3:
-                return interior
-            m = V.mean(0); V = V[np.argsort(np.arctan2(V[:, 1] - m[1], V[:, 0] - m[0]))]            # order CCW
-            x, y = V[:, 0], V[:, 1]; xs, ys = np.roll(x, -1), np.roll(y, -1)
-            cr = x * ys - xs * y; area = 0.5 * cr.sum()
-            if abs(area) < 1e-9:
-                return interior
-            return np.array([((x + xs) * cr).sum() / (6 * area), ((y + ys) * cr).sum() / (6 * area)])
-        except Exception:
-            return interior
-
-    def _polytope_proposal(self, state, safe_obstacles, obstacle_velocities):
-        """Build the NOMINAL robot-centered polytope at x0. Returns (A,b,c, margins, d_centroid, size, C):
-          A,b,c                : faces a_k.x <= b_k, robot center c (level-set rejection H_P).
-          margins[F]=b-A@c >0  : face clearances; size = min margin (trapped indicator).
-          C[2]                 : the EXACT geometric (area) centroid of the polytope.
-          d_centroid[2]        : unit direction robot -> C (free-space / opening direction)."""
-        c_np = state[0, :2].detach().cpu().numpy()
-        obs_np = safe_obstacles[:, :3].detach().cpu().numpy() if safe_obstacles.numel() else np.zeros((0, 3))
-        vrob = state[0, 2:4].detach().cpu().numpy() if state.shape[1] >= 4 else None
-        vobs = obstacle_velocities.detach().cpu().numpy() if obstacle_velocities is not None else None
-        poly, _ = build_polytope_v2(
-            c_np, obs_np, sensing_range=float(self.config.barrier_activation_radius) or 3.0,
-            n_base=int(self.config.polytope_nbase), margin=0.0, obstacle_velocities=vobs, robot_velocity=vrob,
-            predict_gain=float(self.config.predict_gain), predict_tau=float(self.config.horizon) * float(self.config.dt))
-        A = poly.A.to(device=state.device, dtype=state.dtype)
-        b = poly.b.to(device=state.device, dtype=state.dtype)
-        c = poly.ref.to(device=state.device, dtype=state.dtype)
-        margins = (b - A @ c).clamp_min(1e-3)
-        C_np = self._polygon_centroid(poly.A.numpy(), poly.b.numpy(), c_np)                 # exact area-centroid
-        C = torch.tensor(C_np, device=state.device, dtype=state.dtype)
-        d = C - c
-        dn = torch.linalg.norm(d)
-        d_centroid = d / dn if float(dn) > 1e-6 else torch.zeros(2, device=state.device, dtype=state.dtype)
-        return A, b, c, margins, d_centroid, float(margins.min()), C
-
-    @staticmethod
-    def _polytope_H(x_pts, A, b, margins):
-        """Robot-centered polytope barrier H_P(x) = min_k (b_k - a_k.x)/margin_k. =1 at robot, 0 on a face."""
-        return ((b.unsqueeze(0) - x_pts @ A.t()) / margins.unsqueeze(0)).min(dim=1).values
 
     def _step(self, state: torch.Tensor, control: torch.Tensor) -> torch.Tensor:
         dt = self.config.dt
@@ -245,9 +173,6 @@ class SafeMPPIAdapter:
             nominal = 0.45 * to_goal + 0.8 * vel_err
             return torch.clamp(nominal, u_min, u_max)
         nominal = to_goal / max(horizon * self.config.dt, 1e-6)
-        if self.config.nominal_speed > 0.0:                  # cap the cruise speed so the nominal does NOT saturate
-            sp = torch.linalg.norm(nominal).clamp_min(1e-9)
-            nominal = nominal / sp * torch.clamp(sp, max=float(self.config.nominal_speed))
         return torch.clamp(nominal, u_min, u_max)
 
     def _nominal_sequence(
@@ -563,15 +488,6 @@ class SafeMPPIAdapter:
         if seed is not None:
             gen.manual_seed(int(seed))
         sigma = self._sigma(device, dtype)
-        # --- nominal robot-centered polytope at x0: drives the level-set rejection + mean/sigma steering ---
-        poly = None; trapped = 0.0
-        if (self.config.use_polytope_barrier or self.config.centroid_gain > 0.0
-                or self.config.sigma_volume_gain > 0.0) and safe_obstacles.numel():
-            poly = self._polytope_proposal(state, safe_obstacles, obstacle_velocities)  # (A,b,c,margins,d_centroid,size)
-            R = float(self.config.barrier_activation_radius) or 3.0
-            trapped = max(0.0, (R - poly[5]) / (poly[5] + float(self.config.centroid_eps)))  # "1/volume"-like, 0 if open
-            if self.config.sigma_volume_gain > 0.0:                 # small polytope (trapped) -> wide sigma (capped)
-                sigma = sigma * min(1.0 + self.config.sigma_volume_gain * trapped, float(self.config.sigma_max_mult))
         gamma_value = float(self.config.gamma if gamma is None else gamma)
         if self.config.adaptive_gamma and safe_obstacles.numel():
             from .gamma_schedule import gamma_distance_velocity
@@ -593,7 +509,6 @@ class SafeMPPIAdapter:
             gamma_value = gamma_distance_velocity(
                 d, v_proj, g_min=float(self.config.gamma_min), g_max=float(self.config.gamma_max)
             )
-        mix_mean = None; mix_p = 0.0       # bimodal-mixture diagnostics (set in the polytope-proposal branch)
         if proposal_controls is not None:
             # Learned-proposal mode (THEORY §10): use externally-supplied control
             # sequences (e.g. from a gamma-conditioned flow) as the MPPI proposal;
@@ -622,41 +537,19 @@ class SafeMPPIAdapter:
                     state, goal, safe_obstacles, obstacle_velocities, gamma_value, u_min, u_max
                 )
             else:
-                if self.config.warm_start and self._u_prev is not None and self._u_prev.shape[0] == self.config.horizon:
-                    # MPPI spirit: nominal = the PREVIOUS reward-weighted sequence, shifted one step (repeat last).
-                    # Cold start is 0; it evolves into the goal-directed solution, so the random rollouts explore
-                    # around it and the executed 1st action stops being random.
-                    nominal_seq = torch.cat([self._u_prev[1:], self._u_prev[-1:]], dim=0).to(device=device, dtype=dtype)
-                elif self.config.use_goal_nominal:
-                    nominal_seq, _ = self._nominal_sequence(state, goal, self.config.horizon, u_min, u_max)
-                else:
-                    nominal_seq = torch.zeros(self.config.horizon, 2, device=device, dtype=dtype)  # cold seed = 0
+                nominal_seq, _ = self._nominal_sequence(state, goal, self.config.horizon, u_min, u_max)
                 normal_axis = None
-            # --- BIMODAL mixture proposal over ALL H steps (the "clever sampling" where safety comes from) ---
-            #   Mode A ~ N(warm, sigma)                     goal-ward (warm-start)
-            #   Mode B ~ N(warm + u_max*d_ctrl, sigma_aniso) opening-ward toward the EXACT polytope centroid
-            #   fraction p = clip(centroid_gain*trapped, 0, 1), temporally low-passed (smoothness). d_ctrl = B+ d_centroid.
-            H = int(self.config.horizon); N = int(self.config.num_samples)
-            mix_p = 0.0; u_target = torch.zeros(2, device=device, dtype=dtype); d_ctrl = None
-            if self.config.centroid_gain > 0.0 and poly is not None and float(torch.linalg.norm(poly[4])) > 1e-6:
-                _, B = self._linear_matrices(state[0], nominal_seq[0])
-                u_dir = torch.linalg.pinv(B[:2, :]) @ poly[4]            # B+ d_centroid (~ d_centroid for SI/DI)
-                if float(torch.linalg.norm(u_dir)) > 1e-9:
-                    d_ctrl = u_dir / torch.linalg.norm(u_dir); u_target = float(u_max.max()) * d_ctrl
-                    mix_p = min(self.config.centroid_gain * trapped, 1.0)
-                    if self.config.centroid_smooth > 0.0 and self._p_prev is not None:
-                        mix_p = (1 - self.config.centroid_smooth) * mix_p + self.config.centroid_smooth * float(self._p_prev)
-                    self._p_prev = mix_p
-            nB = int(round(mix_p * N)); nA = N - nB
-            noise = torch.randn(N, H, 2, generator=gen, device=device, dtype=dtype) * sigma.view(1, 1, 2)
-            ctr = nominal_seq.unsqueeze(0).expand(N, -1, -1).clone()
-            if nB > 0 and d_ctrl is not None:
-                ctr[nA:] = ctr[nA:] + u_target.view(1, 1, 2)             # shift Mode-B mean toward the opening (all steps)
-                n = d_ctrl.view(1, 1, 2); tg = torch.stack((-d_ctrl[1], d_ctrl[0])).view(1, 1, 2)
-                cn = (noise[nA:] * n).sum(-1, keepdim=True); ct = (noise[nA:] * tg).sum(-1, keepdim=True)
-                noise[nA:] = float(self.config.sigma_aniso) * cn * n + ct * tg   # ellipsoid: wide || opening, normal ⟂
-            controls = torch.clamp(ctr + noise, u_min, u_max)
-            mix_mean = nominal_seq[0] + mix_p * u_target                 # effective sampling mean (mixture), for viz
+            noise = torch.randn(
+                self.config.num_samples,
+                self.config.horizon,
+                2,
+                generator=gen,
+                device=device,
+                dtype=dtype,
+            ) * sigma.view(1, 1, 2)
+            if self.config.use_aniso_cov and normal_axis is not None:
+                noise = self._anisotropic(noise, normal_axis)
+            controls = torch.clamp(noise + nominal_seq.unsqueeze(0), u_min, u_max)
         branch_labels: list[str] = []
         branch_kinds: list[str] = []
         branch_indices = torch.empty(0, dtype=torch.long, device=device)
@@ -698,15 +591,7 @@ class SafeMPPIAdapter:
                 obstacles_batch = obstacles_batch0
                 obstacles_batch_next = obstacles_batch0
             x_next = self._step(x, controls[:, t])
-            if self.config.use_polytope_barrier and poly is not None:
-                # reject on the NOMINAL polytope level sets: H_P(x_{i+1}) >= (1-gamma) H_P(x_i). The polytope is FIXED
-                # at x0 and accounts for every nearby obstacle (K-gon ∩ tangents, smooth), so feasibility is not an
-                # artifact of a single jumpy nearest obstacle.
-                h_old = self._polytope_H(x[:, :2], poly[0], poly[1], poly[3])
-                h_new = self._polytope_H(x_next[:, :2], poly[0], poly[1], poly[3])
-                min_h = torch.minimum(min_h, h_new)
-                violation = h_new < (1.0 - gamma_value) * h_old
-            elif self.config.use_ho_barrier:
+            if self.config.use_ho_barrier:
                 eta_eff = self._eta_eff()
                 k = int(self.config.barrier_topk)
                 ar = float(self.config.barrier_activation_radius)
@@ -752,25 +637,9 @@ class SafeMPPIAdapter:
         raw_costs = costs.clone()
         costs = torch.where(infeasible, torch.full_like(costs, float("inf")), costs)
         if torch.isinf(costs).all():
-            # No feasible sample (degenerate dense moment): fall back to the SAFEST rollout (highest barrier min_h),
-            # NOT the lowest-cost (goal-seeking) one -- the latter drives straight into a pedestrian. A small goal
-            # term only breaks ties between equally-safe rollouts.
-            costs = -min_h + 1e-3 * raw_costs
+            costs = raw_costs + 1e4 * infeasible.float()
         best = torch.argmin(costs)
-        # MPPI temperature-weighted average over the SURVIVING (non-rejected) rollouts. Rejected samples have
-        # cost=inf -> weight 0, so gamma (which sets the surviving set) shapes the mean. temperature->0 recovers
-        # the argmin (cold) limit; larger temperature averages more broadly (hot).
-        temp = max(float(self.config.temperature), 1e-6)
-        w = torch.softmax(-(costs - costs.min()) / temp, dim=0)
-        w = torch.nan_to_num(w, nan=0.0)
-        if float(w.sum()) < 1e-8:
-            action = controls[best, 0].clamp(u_min, u_max)
-            u_avg_seq = controls[best]
-        else:
-            action = (w.unsqueeze(1) * controls[:, 0]).sum(0).clamp(u_min, u_max)
-            u_avg_seq = (w.view(-1, 1, 1) * controls).sum(0)            # full reward-weighted sequence
-        if self.config.warm_start:                                     # carry it forward (shifted) next step
-            self._u_prev = u_avg_seq.detach().clamp(u_min.view(1, 2), u_max.view(1, 2))
+        action = controls[best, 0].clamp(u_min, u_max)
         filt_info = None
         if self.config.filter_output and self.config.use_ho_barrier and obstacles.numel():
             # PSF guarantee on the APPLIED control: even if every sample was
@@ -792,18 +661,6 @@ class SafeMPPIAdapter:
             "num_backup_branches": int(branch_indices.numel()),
             "selected_backup_branch": None,
             "solve_time": time.perf_counter() - t0,
-            # control-space proposal diagnostics (for the sampling viz): first-step samples + accept/reject + mean + cov
-            "first_controls": controls[:, 0].detach().cpu().numpy(),       # [M,2]
-            "feasible": (~infeasible).detach().cpu().numpy(),              # [M] bool
-            "mean_control": action.detach().cpu().numpy(),                 # [2] executed (reward-weighted / safe-fallback)
-            "sample_mean": (mix_mean.detach().cpu().numpy() if mix_mean is not None else nominal.detach().cpu().numpy()),
-            "mixture_p": float(mix_p),                                      # Mode-B (opening) mixture fraction
-            "sigma": sigma.detach().cpu().reshape(-1).numpy(),            # [2] sampling std (control units)
-            # polytope diagnostics: faces (A,b,c,margins) + free-space centroid DIR + size + EXACT centroid POSITION
-            "polytope": None if poly is None else tuple(t.detach().cpu().numpy() for t in poly[:4]),
-            "centroid_dir": None if poly is None else poly[4].detach().cpu().numpy(),
-            "polytope_size": None if poly is None else float(poly[5]),
-            "centroid_pos": None if poly is None else poly[6].detach().cpu().numpy(),
         }
         if filt_info is not None:
             info["filter_feasible"] = filt_info["filter_feasible"]
