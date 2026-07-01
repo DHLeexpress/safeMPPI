@@ -166,13 +166,13 @@ Given the window $\{q_t\}_{t=0}^{H}$ (with $c=q_0$) and obstacle disks $\{(o_i,r
 \begin{equation}
 \begin{aligned}
 \max_{\{a_i,\,m_i\}}\;\; & \sum_i w_i\, m_i \\
-\text{s.t.}\;\; & a_i^\top(q_t-c)\;\le\;(1-\gamma)^{t}\, m_i, \quad t=1,\dots,H,\\
+\text{s.t.}\;\; & a_i^\top(q_t-c)\;\le\;\big(1-(1-\gamma)^{t}\big)\, m_i, \quad t=1,\dots,H,\\
 & r_i\,\|a_i\|_2 \;\le\; a_i^\top(o_i-c)-m_i,\\
 & \|a_i\|_2\le 1,\qquad m_i\ge m_{\min}.
 \end{aligned}
 \label{eq:socp}
 \end{equation}
-The first constraint keeps $q_t$ inside the $(1-\gamma)^t$-scaled polytope (the DCBF decay of \eqref{eq:dtcbf}); the second is a second-order cone that pushes obstacle $i$ (real or artificial) fully outside its tangent face; $\|a_i\|_2\le1$ fixes a unit normal so $m_i$ is a true margin. The window is \keyword{certified} iff \eqref{eq:socp} is feasible with all $m_i\ge m_{\min}>0$. With one positive-weight face per obstacle the blocks decouple, so each face admits an \emph{exact closed-form angular-interval} solution --- no numerical cone solver or $\theta$-sweep --- certifying a window in ${\sim}1$\,ms.
+The first constraint is the barrier decay $h_i(q_t)=\tfrac{m_i-a_i^\top(q_t-c)}{m_i}\ge(1-\gamma)^t$ rearranged --- it keeps $q_t$ inside the level set that shrinks as $(1-\gamma)^t$ (the DCBF schedule of \eqref{eq:dtcbf}); the second is a second-order cone that pushes obstacle $i$ (real or artificial) fully outside its tangent face; $\|a_i\|_2\le1$ fixes a unit normal so $m_i$ is a true margin. The window is \keyword{certified} iff \eqref{eq:socp} is feasible with all $m_i\ge m_{\min}>0$. With one positive-weight face per obstacle the blocks decouple, so each face admits an \emph{exact closed-form angular-interval} solution (we use $K{=}12$ anchors) --- no numerical cone solver or $\theta$-sweep --- certifying a window in ${\sim}1$\,ms.
 
 \begin{figure}[!t]
   \centering
