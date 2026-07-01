@@ -81,10 +81,21 @@ Single-integrator robot. SafeMPPI weight = per-sample rejection vs the nominal p
   90–92%/3–4% col, UCY 75–78%/6–8%; sensing=2.0/ns=512 → SDD 89–93%/4–7%, UCY 78–81%/6–13% (more reach but more
   high-γ collision). **γ = clean DTCBF conservativeness knob; SDD essentially solved, UCY the hard set.** Keep
   sensing≈3.0 for lower collision.
-- **Double-integrator works** (same bimodal steering via `B⁺`; polytope rejection on the rolled-out positions). DI
-  fine-tune (UCY+SDD): `cg=0.1/sv=1.0/aniso=2.5/sens=2.0` → **88% succ / 8% col / 60% acc** — reaches well but
-  collides more (momentum + the position-only barrier doesn't see braking). **Next fix = a velocity-aware
-  (higher-order) polytope barrier.**
+- **Double-integrator — FINAL (NOTE.md items 14–17).** The **3-mode categorical** proposal (A warm / B centroid /
+  C always-on backup) + an **interaction random-search** give the **BALANCED DI config → 92% succ / 7% col / 60% acc**
+  (`cg=0.2, sv=0, noise=0.3, predict=0.6, ns=512, temp=0.1, p_c=0.2, sensing=3, H=10`; `di_grid_current_best.gif`).
+  DI reach is QUADRATIC (`H=10√R`) — do NOT fully-activate the DTCBF (under-reaching + safe-fallback wins). A
+  **geometric importance-sampling variant** (Mode-4 polytope-area rays inside the retreated polytope,
+  `best_area_mode4.json`) keeps **≥1 accepted on 97.5% of steps** (89%/11%) — the fallback fires only on the
+  surrounded-choke frames; **mode-4 (shrink-rate urgency) > mode-1**.
+- **The remaining wall = a VELOCITY-AWARE polytope barrier.** The position-only polytope can't both anticipate moving
+  peds AND stay ≥1-accepted (predict=0 myopic ⇒ dense-moving collides, e.g. ep150; predict>0 anticipates but
+  degenerates). Every DI collision residual (7–12%) and ep150 trace here — the higher-order barrier is the next lever.
+- **FINAL GOAL (Stage 2 = the SafeMPPI data generator):** a validated γ-conditioned SafeMPPI rollout engine — **SI
+  75–92% / 0–8% col, DI 89–92% / 7–11% col, γ a clean DTCBF conservativeness knob** — that supplies the scarce,
+  conservative, *safe* training data for Pillar 4. **This config is provisional and WILL BE FINE-TUNED once the
+  training data is fixed:** the Pillar-4 SafeMPPI-deployment simulation (which channels/obstacles actually feed the
+  policy) + the final crowd data + the velocity-aware barrier may all shift the generator's settings.
 - Code: `cfm_mppi/safegpc_adapter/safemppi.py` (`SafeMPPIAdapter.plan` — bimodal mixture + warm-start + exact-centroid
   steering + polytope rejection + safe fallback; `_polygon_centroid`, `_polytope_proposal`) · `polytope_v2.py`.
   Viz/sweeps in `overnight_run_2026-06-28/`: `polytope_explainer.py`, `polytope_grid.py`, `ep16_study.py`,

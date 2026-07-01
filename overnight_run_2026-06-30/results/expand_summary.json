@@ -1,0 +1,41 @@
+{
+  "0.5": {
+    "pretrained": {
+      "validity": 0.004999999888241291,
+      "safe_rate": 0.2549999952316284,
+      "coverage": 0.0,
+      "spatial_coverage": 0.2185430463576159,
+      "mode_coverage": 1.0,
+      "mode_probs": [],
+      "vendi": 2.0,
+      "n_valid": 2
+    },
+    "final": {
+      "round": 11,
+      "n_pos": 98,
+      "n_neg": 741,
+      "yield": 0.015625,
+      "upd_loss": 0.9456616640090942,
+      "validity": 0.029999999329447746,
+      "safe_rate": 0.26249998807907104,
+      "coverage": 0.0,
+      "spatial_coverage": 0.5165562913907285,
+      "mode_coverage": 0.5,
+      "mode_probs": [],
+      "vendi": 8.499302864074707,
+      "n_valid": 12,
+      "ESS": 191.8153839111328,
+      "ESS_frac": 0.9990384578704834,
+      "sigma_sel_mean": 0.039215464144945145,
+      "sigma_all_mean": 0.03878143057227135,
+      "frac_broad_selected": 0.046875,
+      "rho": 0.050000000000000044,
+      "sigma_fresh_mean": 0.052405983209609985,
+      "sigma_fresh_std": 0.0023023721296340227,
+      "sigma_cov": 0.043933384120464325,
+      "sigma_buffer_mean": 0.03884441778063774,
+      "D4_novelty_corr": 0.4658157527446747,
+      "buffer_rank": 256
+    }
+  }
+}

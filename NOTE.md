@@ -349,6 +349,52 @@ Two paradigms to keep ≥1 accepted EVERY step (avoid the fallback entirely):
   minimum. So the floor fixes the SAMPLING-deactivation bug (real) but not the GEOMETRIC trap (raising floor→0.1 still
   stuck, Mode-B acc 13). Escaping ep150 needs a NON-local lever: back out of the pocket (go away from the goal), a
   longer horizon to see past it, or temp↑/anti-stall when `size` small + no progress. `di_grid_current_best.gif` kept.
+- **`temp_trapped_gain` param + ep150 VERDICT: not reweighting-escapable — it needs ANTICIPATION.** Added trapped-temp
+  (`temp_eff = temp·(1+temp_trapped_gain·(R−size)/(size+ε))`, softens the softmax when the polytope is small).
+  Exhaustively proven ep150 doesn't escape under ANY predict=0 lever: floor{0.05–0.3}, temp_trapped_gain{0–30},
+  Mode-C braking+random{0.1–0.3}, all combos ⇒ reach 0/3, collide 3/3 (flat — no accepted sample points OUT of the
+  pocket, so reweighting is powerless). Diagnostic: robot goes 4.7 m then hits a dense choke (polytope→0.03, 8 peds),
+  brushes a ped (min_clear −0.17), stalls. **BALANCED `predict=0.6` DOES reach ep150 at γ=0.1 (0 col)** ⇒ ep150 is an
+  ANTICIPATION problem (needs predict>0), which CONFLICTS with the ≥1-accepted priority (predict>0 degenerates the
+  polytope). Fundamental — needs a velocity-aware polytope.
+- **FINAL UCY+SDD fine-tune (`area_sweep_ucysdd.py`, 25 eps/ds × γ, mode{1,4}×cg×smooth, predict=0, floor=0.02):** the
+  strict priority (≥1 accepted EVERY step across ALL 50 eps) is **NOT achievable at dataset scale — 0/24** (a
+  dense-choke frame always exists in SOME episode). BUT the **fallback is RARE: 185/7461 = 2.48% of steps (≥1 accepted
+  on 97.5%)**. **Mode 4 > mode 1 (best 89% vs 87% succ).** ⇒ **BEST MODEL SAVED → `overnight_run_2026-06-28/
+  best_area_mode4.json`: `polytope_area_sampling=True, urgency_size_diff=True (mode-4), predict_gain=0,
+  centroid_gain=0.2, centroid_smooth=0.25, centroid_eps=0.15, urgency_floor=0.02, ns=512, temp=0.1` → 89% succ /
+  11% col (UCY+SDD, 200 steps).** Task terminated here.
+
+**17. DI + importance-sampling retrospective — mistakes and what we figured out (items 14–16).**
+
+*Mistakes / dead-ends (in order, user caught most):*
+1. **B⁺ over-engineering** — fussed over B⁺ vs Bᵀ for the centroid→control map; it's the SAME direction for SI/DI
+   (matters only for unicycle). Safety comes from the clever samples, not the B⁺ detail.
+2. **Mode C (random-360 backup) oversold** — proposed as the always-≥1-accepted fix; OAT said `p_c=0` best in
+   isolation (random-at-u_max never survives; braking is redundant with the safe-fallback). It only helped in the
+   INTERACTION (`p_c=0.2` + `noise=0.3`) — which a one-at-a-time sweep structurally can't see (⇒ do random-search).
+3. **"Fully-active DTCBF" (match H to sensing)** — first used the SI-linear `u_max·H·dt`; DI reach is QUADRATIC
+   (`H=10√R`). And empirically fully-active OVER-conservatizes (succ 92→72%); UNDER-reaching (H=10) is right for DI.
+4. **predict_gain "too sensitive" hypothesis** — thought pg>0 degenerates + hurts; OAT showed higher pg (0.6) CUTS
+   collision (17→12%). But for the AREA-sampling ≥1-accepted priority, pg=0 is REQUIRED — opposite regimes, real tension.
+5. **Trapped-temp + floor to escape ep150** — reasoned a soft temp + Mode-B floor would free the local minimum;
+   exhaustively FALSE (reach 0/3 for every floor×temp×Mode-C combo). ep150 is an ANTICIPATION problem, not a
+   reweighting-escapable minimum: once the robot is in the choke (polytope→0.03, surrounded) NO sample points out.
+6. **Optimism at small scale** (again) — the 4-episode area sweep looked like it held the ≥1-accepted priority; at
+   50 eps it's 0/24 (a dense-choke frame always exists in some episode). Honest number = fallback on 2.5% of steps.
+
+*What we figured out (validated):*
+- **3-mode categorical** (A warm / B centroid-opening / C always-on backup) generalizes the bimodal mixture; the
+  **interaction random-search** (not OAT) found **BALANCED DI = 92% succ / 7% col** (`cg=0.2, sv=0, noise=0.3,
+  predict=0.6, ns=512, temp=0.1, p_c=0.2, sensing=3, H=10`).
+- **DI reach is QUADRATIC** (`H=10√R`); do NOT fully-activate the DTCBF — under-reaching + the safe-fallback is safer.
+- **Geometric importance sampling (Mode-4 polytope-area)** = sample rays INSIDE the retreated polytope ⇒ **≥1 accepted
+  on 97.5% of steps** (fallback only on the ~2.5% surrounded-choke frames). Best mode-4 model saved
+  (`best_area_mode4.json`, 89%/11%); **mode 4 (shrink-rate urgency) > mode 1**; `urgency_floor` fixes the mode-4
+  `ρ→0` deactivation.
+- **The recurring wall = a VELOCITY-AWARE polytope.** The position-only polytope cannot both anticipate moving peds
+  AND stay ≥1-accepted (predict=0 myopic ⇒ dense-moving collides, e.g. ep150; predict>0 anticipates but degenerates).
+  Every DI collision residual (7–12%) and ep150 trace here — the higher-order barrier is the next real lever (deferred).
 
 ## Datasets & authoritative references (the "solid" papers)
 

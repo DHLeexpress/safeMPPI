@@ -212,14 +212,16 @@ def evaluate(policy, env, ctx, star_bins, ranges, cfg) -> dict:
 
 
 def run_safeflow(env: Env, ctx, policy: FlowPolicy, star_bins, ranges, cfg: SFConfig,
-                 device="cpu", log=print, snapshot_rounds=None):
+                 device="cpu", log=print, snapshot_rounds=None, init_pos=None):
     import copy
     snapshot_rounds = set(snapshot_rounds or [])
     snapshots = {}
     unc = GPUncertainty(kernel=cfg.kernel, lengthscale=cfg.lengthscale,
                         lam=cfg.lam, normalize=True)
     opt = torch.optim.Adam(policy.parameters(), lr=cfg.lr)
-    D_pos = torch.empty(0, env.T, 2, device=device)
+    # Optional seed buffer D_0 = verified-safe demos (paradigm's D_0); default = empty (unchanged).
+    D_pos = (init_pos.to(device) if init_pos is not None and init_pos.numel()
+             else torch.empty(0, env.T, 2, device=device))
     D_neg = torch.empty(0, env.T, 2, device=device)
     history = []
 
