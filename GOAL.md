@@ -66,16 +66,30 @@ Single-integrator robot. SafeMPPI weight = per-sample rejection vs the nominal p
   oscillates — warm-start is essential.
 - **Rejection = the nominal POLYTOPE level sets** (`use_polytope_barrier=True`), NOT the affine single-nearest barrier
   (jumpy/non-smooth ⇒ the "accept-0" all-rejection). Polytope built once at x0: smooth, all nearby obstacles.
-- **Mean/cov from the polytope:** mean = blend the warm-start with the free-space **centroid** `d̂=−Σ a_k/margin_k`
-  over the first **K** steps (weight ∝ `trapped=(R−size)/(size+ε)` "1/volume"-like, decayed for smoothness); σ scaled
-  by polytope size. **safety_margin = 0** (keep the per-obstacle `predict_gain` velocity inflation — the differential
-  per-hyperplane retreat; the constant offset only collapsed the polytope to ~0 in dense crowds).
-- **FINAL config:** `centroid_gain=0.1, sigma_volume_gain=0.5, control_weight=0.03, centroid_horizon=3, noise=0.5,
-  predict_gain=0.4, sensing=3.0, temperature=0.3, H=10`. **Result (300 eps/dataset × γ): SDD 90–100% succ / 0–4% col;
-  UCY 75–80% succ / 6–8% col; γ = clean DTCBF conservativeness knob.** SDD essentially solved; UCY the hard set.
-- Code: `cfm_mppi/safegpc_adapter/safemppi.py` (`SafeMPPIAdapter.plan` — polytope barrier + warm-start + centroid/
-  volume steering + safe fallback) · `polytope_v2.py` (`build_polytope_v2`). Viz/sweeps in `overnight_run_2026-06-28/`:
-  `polytope_explainer.py` (per-part explainer), `polytope_grid.py` (grid GIF), `param_finetune.py`, `full_sweep.py`.
+- **Mean/cov from the polytope = a BIMODAL Gaussian MIXTURE over ALL H steps** (replaces the K-step nominal blend,
+  which awkwardly pulled the 3rd step into the 2nd via warm-start): each control δu ~ a mix of **Mode A** `N(warm, Σ)`
+  (goal-ward) + **Mode B** `N(warm + u_max·B⁺d̂, Σ_aniso)` (opening-ward), fraction `p=clip(centroid_gain·trapped,0,1)`,
+  `trapped=(R−size)/(size+ε)`. **d̂ = direction to the EXACT polygon centroid** (scipy HalfspaceIntersection + shoelace
+  area-centroid), NOT the analytic-center gradient. **Smoothness = a temporal low-pass on `p`** across plan steps.
+  `Σ_aniso` = anisotropic ellipsoid, wide ∥ opening. `B⁺`≈`Bᵀ` direction for SI/DI (matters only for unicycle) —
+  **safety comes from the clever bimodal samples**, not the B⁺ detail. *Executed (navy) ≠ centroid (orange)*: we bias
+  the SAMPLING; the executed is the reward-weighted (goal-driven) mean, =centroid only in open space.
+  **safety_margin = 0** (keep the per-obstacle `predict_gain` velocity inflation; the constant offset collapsed the
+  polytope to ~0 in dense crowds).
+- **FINAL SI config:** `centroid_gain=0.1, sigma_volume_gain=0.5, control_weight=0.03, centroid_smooth=0.5,
+  sigma_aniso=2.0, predict_gain=0.4, temperature=0.3, H=10`. **300-ep/dataset × γ:** sensing=3.0/ns=128 → SDD
+  90–92%/3–4% col, UCY 75–78%/6–8%; sensing=2.0/ns=512 → SDD 89–93%/4–7%, UCY 78–81%/6–13% (more reach but more
+  high-γ collision). **γ = clean DTCBF conservativeness knob; SDD essentially solved, UCY the hard set.** Keep
+  sensing≈3.0 for lower collision.
+- **Double-integrator works** (same bimodal steering via `B⁺`; polytope rejection on the rolled-out positions). DI
+  fine-tune (UCY+SDD): `cg=0.1/sv=1.0/aniso=2.5/sens=2.0` → **88% succ / 8% col / 60% acc** — reaches well but
+  collides more (momentum + the position-only barrier doesn't see braking). **Next fix = a velocity-aware
+  (higher-order) polytope barrier.**
+- Code: `cfm_mppi/safegpc_adapter/safemppi.py` (`SafeMPPIAdapter.plan` — bimodal mixture + warm-start + exact-centroid
+  steering + polytope rejection + safe fallback; `_polygon_centroid`, `_polytope_proposal`) · `polytope_v2.py`.
+  Viz/sweeps in `overnight_run_2026-06-28/`: `polytope_explainer.py`, `polytope_grid.py`, `ep16_study.py`,
+  `di_gap.py`, `di_grid.py`, `full_sweep.py`, `param_finetune.py`, `param_finetune_di.py`. Theory:
+  `design/MEANCOV_STEERING.md`.
 
 ### 3) Certified planning (Pillar 3) — efficient verifier polytope (less conservative)
 Verifier answers: *"does there EXIST a polytope with safety parameter γ such that this trajectory satisfies the

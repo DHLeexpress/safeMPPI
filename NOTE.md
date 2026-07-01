@@ -203,6 +203,153 @@ re-reading `safeGPC/algs/mppi.py`:
 - **Final config** `cg=0.1, sv=0.5, cw=0.03, K=3` ⇒ **SDD 90–100% / 0–4% col, UCY 75–80% / 6–8% col**; γ = clean DTCBF
   conservativeness knob. **SDD essentially solved; UCY is the hard set.** sv=0.5 beat 1.0 (less covariance blow-up).
 
+**14. Bimodal mixture proposal + exact centroid + double-integrator (`ep16_study.py`, `di_gap.py`, `di_grid.py`,
+`design/MEANCOV_STEERING.md`).** Redesign of the mean/cov geometric steering:
+- **d_centroid = the EXACT polygon centroid** (`scipy HalfspaceIntersection` → shoelace area-centroid), not the
+  analytic-center gradient. **Proposal = a BIMODAL Gaussian mixture over ALL H steps**: Mode A `N(warm, Σ)` goal-ward
+  + Mode B `N(warm + u_max·B⁺d̂, Σ_aniso)` opening-ward, fraction `p=clip(centroid_gain·trapped,0,1)`. Replaces the
+  K-step nominal blend (which pulled the 3rd step into the 2nd via warm-start). **Smoothness = a temporal low-pass on
+  p** across plan steps. `Σ_aniso` = anisotropic ellipsoid (wide ∥ opening). B⁺ vs Bᵀ is the same direction for SI/DI
+  (matters only for unicycle) — **safety comes from the clever bimodal samples**, not the B⁺ detail.
+- *Executed (navy) ≠ centroid (orange)* because we bias the SAMPLING; the executed is the **reward-weighted** mean
+  (cost-driven), = centroid only in open space.
+- **Sensing × rollout-count:** more rollouts → higher success (sensing 2.0: 80%→95% for 128→512 on a 20-ep subset);
+  sensing should match the reachable range `u_max·H·dt≈2`. But the **full 300-ep headline (sensing=2.0, ns=512):
+  SDD 89–93%/4–7%, UCY 78–81%/6–13% col** — more collision at high γ than the old sensing=3.0/ns128 config; the
+  20-ep subset was optimistic. Keep sensing≈3.0 for lower collision.
+- **Double-integrator works** (the bimodal steering generalizes via B⁺; polytope rejection on rolled-out positions).
+  DI gap demo threads a 2-obstacle gap + detours a single obstacle. **DI fine-tune (UCY+SDD): best
+  cg=0.1/sv=1.0/aniso=2.5/sens=2.0 → 88% succ / 8% col / 60% acc** — reaches well but **collides more than SI**
+  (momentum + the position barrier doesn't see braking). Clean fix = a **velocity-aware (higher-order) polytope
+  barrier** (next step).
+- **Mechanism detail:** the EXACT centroid `C=(1/6A)Σ(vᵢ+vᵢ₊₁)(xᵢyᵢ₊₁−xᵢ₊₁yᵢ)` from the polygon vertices
+  (`HalfspaceIntersection`); `d̂=(C−robot)/‖·‖` points into the opening/gap (verified on synthetic polytopes). The
+  **smoothness** worry (user's "ramp-up / reinforce 1,2,3") is solved instead by the **consistent all-step mixture**
+  (no step-0-heavy blend) + the temporal low-pass on `p`; the K-step blend was the culprit (warm-start pulled the 3rd
+  step into the 2nd). The **cost provides the goal** (nominal=0 + warm-start; progress + terminal_goal pull to the
+  goal; the centroid is only for safety/exploration).
+- **B⁺ theory:** least-norm control for a position direction is `Δc=B⁺d̂`; `B⁺(SI)=(1/dt)I`, `B⁺(DI)=pinv([0.5dt²I;
+  dtI])` — same DIRECTION (isotropic position block) so SI/DI ≈ `d̂`; B⁺ matters only for non-isotropic systems
+  (unicycle). Cov maps the same: `Σ_u=B⁺ Σ_x B⁺ᵀ`.
+- **DI eval grid (4 eps, `di_grid.py`):** the mixture ADAPTS — ep90 open (size≈1.96 ⇒ `p=0`, single goal-ward mode),
+  ep150 dense (size 0.3–0.5 ⇒ `p=0.24–0.45`, opening mode active), ep16/47 between. The executed accel sits inside the
+  ACCEPTED cloud (not on the centroid arrow) — the reward-weighting picks the goal-ward *safe* sample.
+- **Files:** adapter `cfm_mppi/safegpc_adapter/safemppi.py`; theory `design/MEANCOV_STEERING.md`; SI viz
+  `overnight_run_2026-06-28/{ep16_study.py→figures/ep16_study.gif, polytope_grid.py, polytope_explainer.py}`; DI viz
+  `{di_gap.py→di_gap.gif, di_grid.py→di_grid.gif}`; sweeps `{full_sweep.py, param_finetune.py, param_finetune_di.py}`.
+
+**15. 3-mode mixture (Mode C: always-on random/braking backup) — the DI collision fix (NO higher-order barrier).**
+Two observed DI collision causes: (1) `predict_gain` too sensitive — in some frames it inflates an obstacle past the
+robot → the polytope **degenerates** (a face vanishes) → the exact-centroid fails → `p_t=0` → bimodal steering OFF;
+(2) **no sampling backup** — the polytope is fine but no rollout survives the rejection → fall back to warm-start MPPI.
+Fix = a 3rd proposal mode, `z ~ Categorical(p_a, p_b, p_c)`:
+- **Mode A** = warm isotropic (goal-ward), fraction `p_a = 1−p_b−p_c`.
+- **Mode B** = centroid/opening anisotropic, `warm + u_max·B⁺d̂`, fraction `p_b = p_t = clip(cg·trapped,0,1)`.
+- **Mode C** = always-on backup, fraction `p_c = random_backup_frac`. **Half BRAKING** (`u = clamp(−v/dt)`, full
+  deceleration ⇒ robot brakes/backs off ⇒ displacement shrinks ⇒ H preserved ⇒ ACCEPTED) **+ half random-360°**
+  (`warm − u_max·d_i`, even directions + per-plan offset, exploration). Fires EVERY frame (incl. open p_t=0 and
+  degenerate-polytope frames). Verified always-on (t=0 open A=497/B=0/C=15; trapped A=417/B=80/C=15).
+- **FINDING — "always ≥1 accepted" is NOT achievable for DI by sampling alone.** Iterating p_c∈{0.03..0.3} never
+  reaches 0 all-rejected frames (best ~22/960 ≈ 2%, all ep16/ep90). Two reasons: (i) random-at-u_max samples move too
+  far ⇒ rejected, AND they crowd out the accepted near-warm Mode-A samples (so higher p_c is WORSE, not better);
+  (ii) even max BRAKING, a DI robot drifts forward `½·dt·v` (relative-degree-2 momentum), so a cornered robot near a
+  moving obstacle has NO feasible control under the position-only level set ⇒ those ~2-4% frames hit the
+  **safe-fallback (= execute the safest = max braking)**, which is correct. A clean guarantee would need the
+  velocity-aware barrier (excluded). Braking is kept as the principled backup that IS accepted in feasible-but-tight
+  frames; `p_c` is now an OAT sweep param to measure its effect on collision.
+- `p_t` smoothing = receding-horizon ITERATION low-pass (`self._p_prev`), NOT horizon-step. `d̂_ctrl` = least-norm
+  control for a centroid-direction displacement (B⁺d̂, magnitude u_max), not "fastest direction."
+- Code: `safemppi.py` (new config `random_backup_frac`; `plan` 3-mode split + braking/random Mode C + `sample_mode`
+  info). Viz: `di_grid.py` (samples colored by mode A=blue/B=green/**C=magenta** large+on-top, accepted=o / rejected=✕,
+  navy ✗=executed). OAT sweep: `param_oat_di.py` (**11 params** incl. `random_backup_frac`{0,0.05,0.1,0.2}; UCY+SDD
+  50 eps × γ{0.1,0.5,1.0}, each param one-at-a-time around the di_grid center; γ=0.1 extra steps).
+- **OAT RESULT (50 eps/dataset × γ): combined-best DI = `predict_gain=0.6, temp=0.1, sensing=3.0, ns=512,
+  centroid_smooth=0.5, centroid_gain=0.3, random_backup_frac=0.0` → 88% succ / 12% col / 60% acc.** Key trends:
+  **`predict_gain` 0.0→0.6 cuts collision 17%→12%** (more velocity inflation HELPS — the OPPOSITE of the
+  "too-sensitive degeneration" hypothesis; reason-1 not borne out); `temperature` lower (0.1) better; `centroid_smooth`
+  0.5 > 0.0; `sensing` 2.5–3.0 (acc rises to ~60); `ns=512 > 256`; `centroid_gain` 0.2–0.3. **`random_backup_frac=0.0`
+  is best — Mode C does NOT improve the aggregate** (random-u_max crowds out accepted near-warm samples; the braking
+  half is REDUNDANT with the safe-fallback, which already executes max braking on all-rejected frames). So the
+  production default is Mode C OFF; it stays in the code as an option / for the chart. `sigma_volume_gain`,
+  `sigma_aniso`, `noise`, `centroid_eps` ~flat. **DI collision floor ≈ 12%** (the genuinely-hard moving-crowd frames;
+  `predict_gain`+`temperature` are the only real levers; a velocity-aware barrier would be needed to go lower).
+- **RANDOM-SEARCH RESULT (`param_random_di.py`, 160 configs = best ± 1-5 changed params; the FULL grid ≈295k configs
+  ≈380 GPU-days is infeasible). The combined search BEAT the OAT best and contradicts its p_c conclusion:**
+  **BALANCED DI = `centroid_gain=0.2, sigma_volume_gain=0.0, sigma_aniso=2.5, sensing=3.0, num_samples=512,
+  temperature=0.1, noise=0.3, predict_gain=0.6, centroid_smooth=0.5, centroid_eps=0.15, random_backup_frac=0.2`
+  → 91–92% succ / 7% col / ~60% acc** (search-set 91/7, held-out-50 92/7; base 88–91 / 9–12). **KEY INTERACTION OAT
+  MISSED: Mode C (`p_c=0.2`) HELPS when paired with low `noise=0.3` + `sigma_volume_gain=0.0`** (tighter sampling +
+  backup) — OAT varied `p_c` ALONE at the center (noise=0.5/sv=1.0) and wrongly concluded `p_c=0` best, so **Mode C is
+  NOT useless — it helps in the right combination** (the reason the combined search was worth 5 GPU-hours). New lever:
+  **`noise=0.3`** (tighter ⇒ fewer collisions); `predict_gain=0.6` / `ns=512` / `temp=0.1` confirmed everywhere.
+  ⇒ **Recommended DI config = BALANCED above.**
+- **(sensing, horizon) MATCHING — the DI reach is QUADRATIC, and "fully active" HURTS (`di_compare_sh.py`, 100
+  eps/dataset).** SI reach `= u_max·H·dt` (linear ⇒ H=5R); **DI reach `= ½·u_max·(H·dt)²`** (quadratic ⇒ **H=10√R**;
+  u_max=2,dt=0.1). The current `sensing=3/H=10` reaches only **1.0 m** ⇒ outer ⅔ of the polytope never binds
+  ("partially active"). Matching H up to reach the sensing radius (`s2.0/H14`, `s2.5/H16`, `s3.0/H17`) makes the DTCBF
+  fully active (acc 60%→43%) but the momentum-driven longer rollouts OVERSHOOT ⇒ over-conservative ⇒ **success
+  crashes 92%→64-72%** (col falls to 4% but not worth −20% succ). Shrinking sensing to match the short reach
+  (`s1.0/H10`) is catastrophic (myopic ⇒ 34% succ / 19% col). **Result (100 eps/ds): `s3.0/H10` (current) = 92/7/60
+  WINS**; `s3.0/H17` = 72/4/43. So **for DI you do NOT want the DTCBF fully active** — the executed first step + the
+  safe-fallback give safety, and under-reaching avoids over-conservatism. Same lesson as the SI H=15 test, now with
+  the correct quadratic relation. **FINAL DI config: BALANCED @ sensing=3, H=10.**
+- **H=15 PURPOSE-TUNED search (`param_random_h15.py`, 50 configs @ fixed sensing=3,H=15) — the long horizon CAN cut
+  collision, but as a Pareto TRADEOFF, not a win.** The earlier H=15 failure (78%) was unfair (it reused the
+  H=10-tuned config). Given its OWN tuning, the best H=15 config **r3** (`noise=0.7, centroid_smooth=0.0,
+  random_backup_frac=0.0, cg=0.3, sv=1.0, ns=512, temp=0.1, predict=0.6, eps=0.05`) = **89% succ / 5% col / 51% acc**
+  (100 eps/ds) vs H=10 BALANCED **92 / 7 / 60**. So H=15 is SAFER (5 vs 7 col) and STABLE (89/5 on BOTH 50- and
+  100-ep sets, while H=10 varies 88/12↔92/7) but lower success + much lower acceptance (more conservative). The
+  H=15-optimal config is the OPPOSITE of H=10's: **high noise=0.7 + Mode C OFF + no smoothing** — the long horizon
+  itself supplies the safety, so it wants MORE exploration, not a backup. **Decision (user): keep H=10 BALANCED
+  (92/7/60)** as the all-around winner; r3 stays on record as the safety-priority alternative. `di_grid.gif` unchanged.
+
+**16. Importance sampling — GEOMETRIC (Mode B → Mode-4) + BACKUP (Mode C) attempts to keep ≥1 accepted sample/step.**
+The DTCBF rejection can reject ALL N samples in a tight frame ⇒ the safe-fallback fires (execute the safest rollout).
+Two paradigms to keep ≥1 accepted EVERY step (avoid the fallback entirely):
+- **BACKUP (Mode C)** — always-on random/braking samples (`p_c=random_backup_frac`): ½ braking `clamp(-v/dt)` (the
+  reliably-accepted half) + ½ random-360. Cheap insurance, but random-at-u_max rarely survives and braking is
+  REDUNDANT with the safe-fallback ⇒ `p_c=0` best in isolation (helped only when paired with low `noise` in the
+  interaction search). It does NOT guarantee acceptance (cornered DI momentum is infeasible — item 15).
+- **GEOMETRIC (Mode-4 polytope-AREA importance sampling)** — `polytope_area_sampling`: instead of Mode B pointing only
+  at the centroid, sample random rays INSIDE the velocity-retreated polytope (`_polytope_ray_controls`: random θ,
+  radius `√U·r_max(θ)`, magnitude to reach the target over H ⇒ the Mode-B rollouts SPAN the whole safe set and land
+  inside ⇒ accepted by construction). If the polytope is a half-disk, the rays span its actual radius+θ. **Smoke
+  (UCY ep16, DI): standard centroid Mode-B hits min-acc/step = 0 (fallback); area sampling hits ≥3–21 (≥1 EVERY step)
+  and reaches faster.** This is the principled fix — the samples ARE the safe set, not Gaussian guesses around it.
+- **Urgency modes:** mode 1 `ρ=(R−size)/(size+ε)` (current, magnitude) vs **mode 4 `ρ=max(0,size_{k-1}−size_k)`**
+  (SHRINK RATE — fires only when an obstacle actually starts closing the polytope, "sensitive at onset";
+  `urgency_size_diff` flag, `self._size_prev` state). `p_b=clip(c_g·ρ,0,1)`, temporally low-passed (`centroid_smooth`).
+- Sweep `area_sweep.py`: predict_gain × centroid_smooth × centroid_eps × centroid_gain × mode{1,4} on the
+  `di_grid_current_best.gif` episodes (UCY 16,47,90,150) × γ. PRIORITY = worst min-accepted-per-step ≥ 1 over ALL
+  (ep,γ,step); then collision-free success on extended duration. **Recommend `predict_gain=0` first** (less face
+  retreat ⇒ bigger polytope ⇒ easier acceptance + avoids the degenerate-polytope p=0 frames). No `random_backup_frac`
+  / `sigma_aniso` (polytope sampling supplies Mode-B diversity); a base `noise_sigma` is kept ONLY for goal-seeking
+  (nominal=0 + no shrink ⇒ no movement otherwise).
+- **SWEEP RESULT (108 cfgs, 4 ep × γ):** the PRIORITY (≥1 accepted EVERY step, all ep×γ×step) is met by **ONLY
+  `predict_gain=0` + mode 4** — 8/108 (pg0.2→0/36, pg0.4→0/36; mode1→0/54, mode4→8/54). Confirms: face retreat
+  (pg>0) shrinks/degenerates the polytope ⇒ all-rejected frames; the shrink-rate urgency (mode 4) is what holds the
+  priority. **Extended 200-step check (best `pg=0,mode4,cg=0.1`): 9/12 collision-free + reach (ep16/47/90 ALL γ);
+  ep150 COLLIDES at all 3 γ** (min-acc/step still ≥1 — the priority holds, but the accepted samples are safe vs the
+  STATIC polytope, not the dense MOVING crowd). ⇒ **≥1-accepted ⇒ collision-free holds for static/sparse but NOT
+  dense-moving**; ep150 needs a small `predict_gain` (tension: anticipate motion vs degenerate polytope) or a
+  velocity-aware polytope. Next: UCY+SDD prevalence to see how often the static-safe-set guarantee suffices.
+- **predict_gain PROBE {0.0, 0.05, 0.1} (area, mode 4, cg=0.1, 4 ep × γ × 200 steps): NO sweet spot.** pg=0.0 holds
+  the priority (worst-acc=1) but ep150 collides (3/12); **pg=0.05 AND pg=0.1 BOTH break the priority (worst-acc=0)
+  AND ep150 still collides (3/12 unchanged)** — worst of both. So `predict_gain` is effectively binary here: 0
+  (priority, myopic) vs >0 (degenerate ⇒ fallback); even 0.1 m of retreat degenerates the polytope at the worst frame
+  in a dense crowd without covering ep150's fast peds. ⇒ **ep150 needs a VELOCITY-AWARE polytope/barrier, not a
+  predict_gain tweak.** Final stance: `predict=0 + mode-4 + cg=0.1` is the priority-preserving config (9/12
+  collision-free; ep150 the structural exception). UCY+SDD prevalence run pending user request.
+- **`urgency_floor` PARAMETER (`p_b=clip(c_g·ρ, urgency_floor, 1)`) — fixes the mode-4 deactivation, NOT the geometric
+  trap.** User insight: mode-4 `ρ=size_diff→0` once trapped ⇒ `p_b→0` ⇒ Mode B switches off ⇒ no escape. Fix = a
+  floor so `p_b ≥ urgency_floor` always (Mode B always points into the remaining polytope). Added `urgency_floor`
+  config; `di_grid_mode4.gif` (area+mode4+predict=0+cg=0.1+**floor=0.02**) confirms **p=0.02 every frame, Mode B always
+  active**, ep16/47/90 reach. BUT **ep150 still STUCK** — the GIF shows its polytope is a dead-end WEDGE pointing into
+  the obstacle cluster AWAY from the goal: the floor makes the executed enter the wedge, but the wedge IS the local
+  minimum. So the floor fixes the SAMPLING-deactivation bug (real) but not the GEOMETRIC trap (raising floor→0.1 still
+  stuck, Mode-B acc 13). Escaping ep150 needs a NON-local lever: back out of the pocket (go away from the goal), a
+  longer horizon to see past it, or temp↑/anti-stall when `size` small + no progress. `di_grid_current_best.gif` kept.
+
 ## Datasets & authoritative references (the "solid" papers)
 
 ### ETH / BIWI Walking Pedestrians (subsets: ETH, HOTEL)

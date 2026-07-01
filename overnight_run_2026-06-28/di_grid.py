@@ -39,8 +39,8 @@ def rollout(dataset, ep, g, cfg, steps=80, dev="cpu"):
             ntot = int(round(nrej / rate)) if rate > 1e-9 else cfg["num_samples"]
             rec.append(dict(p=st[:2].copy(), crowd=ob.copy(), traj=dr["states"], feas=np.asarray(dr["feasible"], bool),
                             n_acc=max(0, ntot - nrej), n_rej=nrej, fc=info["first_controls"], fcf=np.asarray(info["feasible"], bool),
-                            smean=info["sample_mean"], exec=info["mean_control"], sigma=info["sigma"], poly=info["polytope"],
-                            cpos=info["centroid_pos"], pmix=info["mixture_p"], size=info["polytope_size"]))
+                            mode=info.get("sample_mode"), smean=info["sample_mean"], exec=info["mean_control"], sigma=info["sigma"],
+                            poly=info["polytope"], cpos=info["centroid_pos"], pmix=info["mixture_p"], size=info["polytope_size"]))
             st = di_step(st, a.detach().cpu().numpy())
             if np.linalg.norm(st[:2] - goal) < 0.6:
                 reached = True
@@ -56,12 +56,21 @@ def main():
     ap.add_argument("--cg", type=float, default=0.2); ap.add_argument("--sv", type=float, default=0.5)
     ap.add_argument("--aniso", type=float, default=2.0); ap.add_argument("--sensing", type=float, default=2.0)
     ap.add_argument("--ns", type=int, default=256); ap.add_argument("--device", default="cpu")
+    ap.add_argument("--rbf", type=float, default=0.03)   # Mode-C always-on random backup fraction p_c
+    ap.add_argument("--temp", type=float, default=0.3); ap.add_argument("--noise", type=float, default=0.5)
+    ap.add_argument("--predict", type=float, default=0.4); ap.add_argument("--smooth", type=float, default=0.5)
+    ap.add_argument("--eps", type=float, default=0.15); ap.add_argument("--horizon", type=int, default=10)
+    ap.add_argument("--area", action="store_true"); ap.add_argument("--mode4", action="store_true")
+    ap.add_argument("--floor", type=float, default=0.0)   # urgency_floor (keep Mode B always active)
+    ap.add_argument("--out", default="di_grid")           # output basename (-> figures/<out>.gif/.png)
     args = ap.parse_args()
-    cfg = dict(horizon=10, dt=DT, num_samples=args.ns, noise_sigma=(0.5, 0.5), u_min=(-2., -2.), u_max=(2., 2.),
-               safety_margin=0.0, temperature=0.3, dynamics_type="doubleintegrator", barrier_activation_radius=args.sensing,
-               use_polytope_barrier=True, use_goal_nominal=False, warm_start=True, centroid_gain=args.cg, centroid_smooth=0.5,
-               sigma_volume_gain=args.sv, sigma_aniso=args.aniso, control_weight=0.03, predict_gain=0.4, polytope_nbase=16)
-    eps = args.episodes[:2]; data = {}
+    cfg = dict(horizon=args.horizon, dt=DT, num_samples=args.ns, noise_sigma=(args.noise, args.noise), u_min=(-2., -2.),
+               u_max=(2., 2.), safety_margin=0.0, temperature=args.temp, dynamics_type="doubleintegrator",
+               barrier_activation_radius=args.sensing, use_polytope_barrier=True, use_goal_nominal=False, warm_start=True,
+               centroid_gain=args.cg, centroid_smooth=args.smooth, sigma_volume_gain=args.sv, sigma_aniso=args.aniso,
+               random_backup_frac=args.rbf, control_weight=0.03, centroid_eps=args.eps, predict_gain=args.predict, polytope_nbase=16,
+               polytope_area_sampling=args.area, urgency_size_diff=args.mode4, urgency_floor=args.floor)
+    eps = args.episodes[:4]; data = {}
     lims = {}
     for ep in eps:
         for g in GAMMAS:
@@ -71,7 +80,7 @@ def main():
         lims[ep] = ((pts[:, 0].min() - pad, pts[:, 0].max() + pad), (pts[:, 1].min() - pad, pts[:, 1].max() + pad))
         print("rolled DI ep", ep, flush=True)
     R, C = 2 * len(eps), len(GAMMAS)
-    fig, axes = plt.subplots(R, C, figsize=(4.0 * C, 3.3 * R), squeeze=False)
+    fig, axes = plt.subplots(R, C, figsize=(3.7 * C, 2.7 * R), squeeze=False)
     nF = max(len(data[(eps[0], GAMMAS[0])][0]), 1)
 
     def draw(f):
@@ -105,22 +114,30 @@ def main():
                 if ei == 0: ax.set_title(f"γ={g}", fontsize=11)
                 if ci == 0: ax.set_ylabel(f"DI ep{ep}  trajectories", fontsize=8)
                 axc = axes[2 * ei + 1][ci]; axc.clear(); fc = st["fc"]; fcf = st["fcf"]; sm = st["smean"]; sg = st["sigma"]
+                mode = st.get("mode"); mode = np.zeros(len(fc), int) if mode is None else np.asarray(mode)
                 axc.axhline(0, color="#ddd", lw=0.5); axc.axvline(0, color="#ddd", lw=0.5)
-                axc.scatter(fc[fcf, 0], fc[fcf, 1], s=5, c="#00a000", alpha=0.5, zorder=2)
-                axc.scatter(fc[~fcf, 0], fc[~fcf, 1], s=5, c="#d62728", alpha=0.4, zorder=2)
+                MCOL = {0: "#1f77b4", 1: "#2ca02c", 2: "#ff00ff"}; MLAB = {0: "A warm", 1: "B opening", 2: "C backup(magenta)"}
+                SZ = {0: (7, 15, 2, 0.0), 1: (9, 16, 3, 0.0), 2: (44, 50, 6, 0.6)}   # acc_s, rej_s, zorder, edge_lw
+                for m in (0, 1, 2):                                    # color by mode; o=accepted, x=rejected (Mode C big+on top)
+                    sel = mode == m; acc = sel & fcf; rej = sel & ~fcf; sa, sr, zo, ew = SZ[m]
+                    axc.scatter(fc[acc, 0], fc[acc, 1], s=sa, c=MCOL[m], alpha=0.7, marker="o", zorder=zo, label=MLAB[m],
+                                edgecolors="k", linewidths=ew)
+                    axc.scatter(fc[rej, 0], fc[rej, 1], s=sr, c=MCOL[m], alpha=0.85, marker="x", linewidths=(1.5 if m == 2 else 0.9), zorder=zo)
                 axc.add_patch(Ellipse((sm[0], sm[1]), 2 * sg[0], 2 * sg[1], facecolor="none", edgecolor="#ff7f00", lw=1.3, zorder=3))
                 axc.annotate("", xy=(sm[0], sm[1]), xytext=(0, 0), arrowprops=dict(arrowstyle="-|>", color="#ff7f00", lw=1.5), zorder=4)
-                axc.scatter([st["exec"][0]], [st["exec"][1]], s=28, c="#08306b", marker="x", zorder=5)
-                axc.set_title(f"bimodal accel · size {st['size']:.2f} p {st['pmix']:.2f}", fontsize=8)
+                axc.scatter([st["exec"][0]], [st["exec"][1]], s=80, c="#08306b", marker="X", edgecolor="w", linewidths=0.9, zorder=6)
+                axc.set_title(f"3-mode accel · size {st['size']:.2f} p {st['pmix']:.2f}", fontsize=8)
                 axc.set_xlim(-2.3, 2.3); axc.set_ylim(-2.3, 2.3); axc.set_aspect("equal"); axc.set_xticks([-2, 0, 2]); axc.set_yticks([-2, 0, 2]); axc.tick_params(labelsize=6)
-                if ci == 0: axc.set_ylabel(f"DI ep{ep}  bimodal μ/Σ", fontsize=8)
-        fig.suptitle(f"Double-integrator on {args.dataset} (cg={args.cg} sv={args.sv} aniso={args.aniso} sens={args.sensing} ns={args.ns}) · "
-                     f"green=accepted/red=rejected · orange=centroid+μ/Σ · navy ✗=executed accel · t={f}", fontsize=9)
+                if ci == 0 and ei == 0: axc.legend(loc="upper left", fontsize=5, markerscale=1.1, framealpha=0.7)
+                if ci == 0: axc.set_ylabel(f"DI ep{ep}  3-mode μ/Σ", fontsize=8)
+        fig.suptitle(f"DI on {args.dataset} · H={args.horizon} cg={args.cg} sv={args.sv} aniso={args.aniso} "
+                     f"sens={args.sensing} ns={args.ns} temp={args.temp} noise={args.noise} predict={args.predict} p_c={args.rbf} · "
+                     f"samples: A(blue)/B(green)/C(magenta), o=accept/✕=reject · orange=μ/Σ · navy ✗=executed · t={f}", fontsize=7.5)
         return []
 
     anim = FuncAnimation(fig, draw, frames=nF, interval=200)
-    out = os.path.join(FIG, "di_grid.gif"); anim.save(out, writer=PillowWriter(fps=6), dpi=80)
-    print("saved", out); draw(nF // 2); fig.savefig(os.path.join(FIG, "di_grid.png"), dpi=110); print("saved png")
+    out = os.path.join(FIG, args.out + ".gif"); anim.save(out, writer=PillowWriter(fps=6), dpi=80)
+    print("saved", out); draw(nF // 2); fig.savefig(os.path.join(FIG, args.out + ".png"), dpi=110); print("saved png")
 
 
 if __name__ == "__main__":

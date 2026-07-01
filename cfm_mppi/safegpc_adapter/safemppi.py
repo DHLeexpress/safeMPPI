@@ -36,6 +36,18 @@ class SafeMPPIConfig:
     sigma_volume_gain: float = 0.0         # widen sampling sigma when the polytope is small (trapped); 0=off
     sigma_aniso: float = 2.0               # Mode-B ellipsoid anisotropy: wide (xPARALLEL opening) / narrow (xPERP)
     sigma_max_mult: float = 3.0            # cap on the sigma blow-up (numerical stability)
+    random_backup_frac: float = 0.0        # Mode-C: ALWAYS-ON random-backup fraction p_c (evenly-spread 360deg escape
+                                           #   samples every frame; fires even when p_b=0/degenerate). 0.03 ~= 15@512.
+    # --- importance-sampling experiment (mode {1,4}) ---
+    urgency_size_diff: bool = False        # mode 4: rho_k = max(0, size_{k-1}-size_k) (shrink rate) instead of
+                                           #   mode 1: rho_k = (R-size_k)/(size_k+eps). p_b = clip(centroid_gain*rho,0,1).
+    polytope_area_sampling: bool = False   # Mode B = random rays INSIDE the (retreated) polytope (span its whole area,
+                                           #   importance-sample the safe set) instead of pointing only at the centroid.
+    urgency_floor: float = 0.0             # lower clip on p_b: p_b = clip(c_g*rho, urgency_floor, 1). >0 keeps Mode B
+                                           #   ALWAYS slightly active so it escapes local minima (where mode-4 rho->0).
+    temp_trapped_gain: float = 0.0         # softmax temp softens when the polytope is SMALL: temp_eff =
+                                           #   temp*(1 + temp_trapped_gain*(R-size)/(size+eps)) — lets accepted ESCAPE
+                                           #   samples (Mode B) drive the executed action OUT of a local-minimum pocket.
     use_polytope_barrier: bool = False     # reject on the nominal polytope level sets: H_P(x_{i+1}) >= (1-g) H_P(x_i)
     polytope_nbase: int = 16               # K base faces of the robot-centered sensing disk
     predict_gain: float = 0.0              # velocity-predictive face retreat (kappa) for the polytope (req 1)
@@ -99,6 +111,7 @@ class SafeMPPIAdapter:
         self.u_max = torch.tensor(self.config.u_max, dtype=torch.float32)
         self._u_prev = None                # warm-start: previous MPPI-averaged control sequence [H,2]
         self._p_prev = None                # temporal low-pass state for the Mode-B mixture weight p
+        self._size_prev = None             # previous polytope size (for the mode-4 shrink-rate urgency)
 
     def _sigma(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         sigma = self.config.noise_sigma
@@ -172,6 +185,26 @@ class SafeMPPIAdapter:
     def _polytope_H(x_pts, A, b, margins):
         """Robot-centered polytope barrier H_P(x) = min_k (b_k - a_k.x)/margin_k. =1 at robot, 0 on a face."""
         return ((b.unsqueeze(0) - x_pts @ A.t()) / margins.unsqueeze(0)).min(dim=1).values
+
+    def _polytope_ray_controls(self, A, b, c, n, Bpos, u_max, gen, device, dtype):
+        """IMPORTANCE SAMPLING (Mode-4): n random rays from the robot center c into the polytope {A x <= b}. Each
+        returns a CONSTANT control [n,2] aiming at a random interior point (uniform-in-area along the ray), magnitude
+        set to ~reach it over the horizon => the Mode-B rollouts span the WHOLE (velocity-retreated) polytope and land
+        inside the safe set (more accepted). If the polytope is a half-disk, the rays span its actual radius+theta."""
+        two_pi = 2.0 * float(np.pi)
+        theta = torch.rand(n, generator=gen, device=device, dtype=dtype) * two_pi
+        dirs = torch.stack([torch.cos(theta), torch.sin(theta)], dim=1)              # [n,2] random unit directions
+        margins = (b - A @ c).clamp_min(1e-3)                                        # [F] face clearances (>0)
+        adir = dirs @ A.t()                                                          # [n,F] = a_k . dir
+        r_max = torch.where(adir > 1e-6, margins.unsqueeze(0) / adir.clamp_min(1e-6),
+                            torch.full_like(adir, 1e6)).min(dim=1).values            # [n] ray->boundary distance
+        r = torch.sqrt(torch.rand(n, generator=gen, device=device, dtype=dtype)) * r_max     # uniform-in-area radius
+        Hdt = float(self.config.horizon) * float(self.config.dt)
+        reach = (0.5 * Hdt * Hdt) if self.config.dynamics_type == "doubleintegrator" else Hdt   # per-unit-u reach over H
+        umag = (r / max(reach, 1e-6)).clamp(max=float(u_max.max()))                  # [n] magnitude to reach the target
+        cdir = (torch.linalg.pinv(Bpos) @ dirs.t()).t()                             # B+ dir -> control direction
+        cdir = cdir / torch.linalg.norm(cdir, dim=1, keepdim=True).clamp_min(1e-9)
+        return umag.unsqueeze(1) * cdir                                              # [n,2] per-sample constant control
 
     def _step(self, state: torch.Tensor, control: torch.Tensor) -> torch.Tensor:
         dt = self.config.dt
@@ -564,12 +597,18 @@ class SafeMPPIAdapter:
             gen.manual_seed(int(seed))
         sigma = self._sigma(device, dtype)
         # --- nominal robot-centered polytope at x0: drives the level-set rejection + mean/sigma steering ---
-        poly = None; trapped = 0.0
+        poly = None; trapped = 0.0; size_trapped = 0.0
         if (self.config.use_polytope_barrier or self.config.centroid_gain > 0.0
                 or self.config.sigma_volume_gain > 0.0) and safe_obstacles.numel():
             poly = self._polytope_proposal(state, safe_obstacles, obstacle_velocities)  # (A,b,c,margins,d_centroid,size)
             R = float(self.config.barrier_activation_radius) or 3.0
-            trapped = max(0.0, (R - poly[5]) / (poly[5] + float(self.config.centroid_eps)))  # "1/volume"-like, 0 if open
+            if self.config.urgency_size_diff:                          # mode 4: SHRINK RATE (sensitive to the onset)
+                sp = self._size_prev if self._size_prev is not None else poly[5]
+                trapped = max(0.0, sp - poly[5])                       # rho = max(0, size_{k-1}-size_k); p_b=clip(c_g*rho)
+                self._size_prev = poly[5]
+            else:                                                      # mode 1: (R-size)/(size+eps), "1/volume"-like, 0 if open
+                trapped = max(0.0, (R - poly[5]) / (poly[5] + float(self.config.centroid_eps)))
+            size_trapped = max(0.0, (R - poly[5]) / (poly[5] + float(self.config.centroid_eps)))   # size-based (for trapped-temp)
             if self.config.sigma_volume_gain > 0.0:                 # small polytope (trapped) -> wide sigma (capped)
                 sigma = sigma * min(1.0 + self.config.sigma_volume_gain * trapped, float(self.config.sigma_max_mult))
         gamma_value = float(self.config.gamma if gamma is None else gamma)
@@ -593,7 +632,7 @@ class SafeMPPIAdapter:
             gamma_value = gamma_distance_velocity(
                 d, v_proj, g_min=float(self.config.gamma_min), g_max=float(self.config.gamma_max)
             )
-        mix_mean = None; mix_p = 0.0       # bimodal-mixture diagnostics (set in the polytope-proposal branch)
+        mix_mean = None; mix_p = 0.0; sample_mode = None   # mixture diagnostics (set in the polytope-proposal branch)
         if proposal_controls is not None:
             # Learned-proposal mode (THEORY §10): use externally-supplied control
             # sequences (e.g. from a gamma-conditioned flow) as the MPPI proposal;
@@ -632,31 +671,61 @@ class SafeMPPIAdapter:
                 else:
                     nominal_seq = torch.zeros(self.config.horizon, 2, device=device, dtype=dtype)  # cold seed = 0
                 normal_axis = None
-            # --- BIMODAL mixture proposal over ALL H steps (the "clever sampling" where safety comes from) ---
-            #   Mode A ~ N(warm, sigma)                     goal-ward (warm-start)
-            #   Mode B ~ N(warm + u_max*d_ctrl, sigma_aniso) opening-ward toward the EXACT polytope centroid
-            #   fraction p = clip(centroid_gain*trapped, 0, 1), temporally low-passed (smoothness). d_ctrl = B+ d_centroid.
+            # --- 3-MODE categorical proposal over ALL H steps (the "clever sampling" where safety comes from) ---
+            #   Mode A ~ N(warm, sigma)                       goal-ward (warm-start);  p_a = 1 - p_b - p_c
+            #   Mode B ~ N(warm + u_max*d_ctrl, sigma_aniso)  opening-ward toward the EXACT polytope centroid;  p_b = p_t
+            #   Mode C = braking clamp(-v/dt) + random-360    ALWAYS-ON backup;  p_c = random_backup_frac
+            #   p_t = clip(centroid_gain*trapped, 0, 1), temporally low-passed (smoothness). d_ctrl = B+ d_centroid.
             H = int(self.config.horizon); N = int(self.config.num_samples)
-            mix_p = 0.0; u_target = torch.zeros(2, device=device, dtype=dtype); d_ctrl = None
-            if self.config.centroid_gain > 0.0 and poly is not None and float(torch.linalg.norm(poly[4])) > 1e-6:
-                _, B = self._linear_matrices(state[0], nominal_seq[0])
-                u_dir = torch.linalg.pinv(B[:2, :]) @ poly[4]            # B+ d_centroid (~ d_centroid for SI/DI)
-                if float(torch.linalg.norm(u_dir)) > 1e-9:
-                    d_ctrl = u_dir / torch.linalg.norm(u_dir); u_target = float(u_max.max()) * d_ctrl
-                    mix_p = min(self.config.centroid_gain * trapped, 1.0)
-                    if self.config.centroid_smooth > 0.0 and self._p_prev is not None:
-                        mix_p = (1 - self.config.centroid_smooth) * mix_p + self.config.centroid_smooth * float(self._p_prev)
-                    self._p_prev = mix_p
-            nB = int(round(mix_p * N)); nA = N - nB
+            mix_p = 0.0; u_target = torch.zeros(2, device=device, dtype=dtype); d_ctrl = None; Bpos = None
+            if poly is not None and (self.config.centroid_gain > 0.0 or self.config.random_backup_frac > 0.0
+                                     or self.config.polytope_area_sampling):
+                _, B = self._linear_matrices(state[0], nominal_seq[0]); Bpos = B[:2, :]   # control -> position map
+            if self.config.centroid_gain > 0.0 and poly is not None:
+                mix_p = min(max(self.config.centroid_gain * trapped, float(self.config.urgency_floor)), 1.0)  # p_b=clip(c_g*rho, floor, 1)
+                if self.config.centroid_smooth > 0.0 and self._p_prev is not None:
+                    mix_p = (1 - self.config.centroid_smooth) * mix_p + self.config.centroid_smooth * float(self._p_prev)
+                self._p_prev = mix_p
+                if float(torch.linalg.norm(poly[4])) > 1e-6:           # centroid direction (for the standard Mode B)
+                    u_dir = torch.linalg.pinv(Bpos) @ poly[4]          # B+ d_centroid (~ d_centroid for SI/DI)
+                    if float(torch.linalg.norm(u_dir)) > 1e-9:
+                        d_ctrl = u_dir / torch.linalg.norm(u_dir); u_target = float(u_max.max()) * d_ctrl
+            # 3-mode categorical: Mode A (warm iso) / Mode B (centroid aniso, p_b=p_t) / Mode C (ALWAYS-ON random
+            #   backup, p_c=random_backup_frac): even 360deg escape samples EVERY frame (incl. degenerate => p_t=0).
+            area = bool(self.config.polytope_area_sampling)
+            p_c = float(self.config.random_backup_frac) if poly is not None else 0.0   # Mode C (braking+random) may coexist with area
+            nC = min(int(round(p_c * N)), N)
+            p_b = mix_p if (d_ctrl is not None or area) else 0.0        # area Mode B needs no centroid dir (uses rays)
+            nB = min(int(round(p_b * N)), N - nC); nA = N - nB - nC
             noise = torch.randn(N, H, 2, generator=gen, device=device, dtype=dtype) * sigma.view(1, 1, 2)
             ctr = nominal_seq.unsqueeze(0).expand(N, -1, -1).clone()
-            if nB > 0 and d_ctrl is not None:
-                ctr[nA:] = ctr[nA:] + u_target.view(1, 1, 2)             # shift Mode-B mean toward the opening (all steps)
+            sample_mode = torch.zeros(N, dtype=torch.long, device=device)
+            if nB > 0 and area and Bpos is not None and poly is not None:  # Mode B = polytope-AREA rays (importance sampling)
+                sample_mode[nA:nA + nB] = 1
+                u_area = self._polytope_ray_controls(poly[0], poly[1], poly[2], nB, Bpos, u_max, gen, device, dtype)
+                ctr[nA:nA + nB] = ctr[nA:nA + nB] + u_area.view(nB, 1, 2)   # constant control toward a random interior point
+            elif nB > 0 and d_ctrl is not None:                         # Mode B: centroid/opening, anisotropic (standard)
+                sample_mode[nA:nA + nB] = 1
+                ctr[nA:nA + nB] = ctr[nA:nA + nB] + u_target.view(1, 1, 2)
                 n = d_ctrl.view(1, 1, 2); tg = torch.stack((-d_ctrl[1], d_ctrl[0])).view(1, 1, 2)
-                cn = (noise[nA:] * n).sum(-1, keepdim=True); ct = (noise[nA:] * tg).sum(-1, keepdim=True)
-                noise[nA:] = float(self.config.sigma_aniso) * cn * n + ct * tg   # ellipsoid: wide || opening, normal ⟂
+                seg = noise[nA:nA + nB]; cn = (seg * n).sum(-1, keepdim=True); ct = (seg * tg).sum(-1, keepdim=True)
+                noise[nA:nA + nB] = float(self.config.sigma_aniso) * cn * n + ct * tg   # ellipsoid wide || opening
+            if nC > 0:                                                   # Mode C backup = BRAKING + random-360 escape
+                sample_mode[nA + nB:] = 2; off = nA + nB; nBrake = nC // 2; nRand = nC - nBrake
+                vcur = state[0, 2:4] if state.shape[1] >= 4 else torch.zeros(2, device=device, dtype=dtype)
+                if nBrake > 0:                                           # full deceleration u=clamp(-v/dt): robot brakes/
+                    u_brake = torch.clamp(-vcur / float(self.config.dt), u_min, u_max)   # backs off => H preserved => accepted
+                    ctr[off:off + nBrake] = u_brake.view(1, 1, 2)        # override warm with sustained braking
+                if nRand > 0:                                            # even 360deg escape at u_max (exploration + visible spread)
+                    two_pi = 2.0 * float(np.pi)
+                    theta0 = float(torch.rand(1, generator=gen, device=device)[0]) * two_pi
+                    ang = theta0 + torch.arange(nRand, device=device, dtype=dtype) * (two_pi / nRand)
+                    rdir = torch.stack([torch.cos(ang), torch.sin(ang)], dim=1)
+                    rc = (torch.linalg.pinv(Bpos) @ rdir.t()).t() if Bpos is not None else rdir   # B+ -> control dirs
+                    rc = rc / torch.linalg.norm(rc, dim=1, keepdim=True).clamp_min(1e-9)
+                    ctr[off + nBrake:] = ctr[off + nBrake:] - float(u_max.max()) * rc.unsqueeze(1)
             controls = torch.clamp(ctr + noise, u_min, u_max)
-            mix_mean = nominal_seq[0] + mix_p * u_target                 # effective sampling mean (mixture), for viz
+            mix_mean = nominal_seq[0] + mix_p * u_target                 # effective Mode-B sampling mean, for viz
         branch_labels: list[str] = []
         branch_kinds: list[str] = []
         branch_indices = torch.empty(0, dtype=torch.long, device=device)
@@ -760,7 +829,7 @@ class SafeMPPIAdapter:
         # MPPI temperature-weighted average over the SURVIVING (non-rejected) rollouts. Rejected samples have
         # cost=inf -> weight 0, so gamma (which sets the surviving set) shapes the mean. temperature->0 recovers
         # the argmin (cold) limit; larger temperature averages more broadly (hot).
-        temp = max(float(self.config.temperature), 1e-6)
+        temp = max(float(self.config.temperature) * (1.0 + float(self.config.temp_trapped_gain) * size_trapped), 1e-6)  # trapped-temp
         w = torch.softmax(-(costs - costs.min()) / temp, dim=0)
         w = torch.nan_to_num(w, nan=0.0)
         if float(w.sum()) < 1e-8:
@@ -798,6 +867,7 @@ class SafeMPPIAdapter:
             "mean_control": action.detach().cpu().numpy(),                 # [2] executed (reward-weighted / safe-fallback)
             "sample_mean": (mix_mean.detach().cpu().numpy() if mix_mean is not None else nominal.detach().cpu().numpy()),
             "mixture_p": float(mix_p),                                      # Mode-B (opening) mixture fraction
+            "sample_mode": (sample_mode.detach().cpu().numpy() if sample_mode is not None else None),  # [N] 0=A/1=B/2=C
             "sigma": sigma.detach().cpu().reshape(-1).numpy(),            # [2] sampling std (control units)
             # polytope diagnostics: faces (A,b,c,margins) + free-space centroid DIR + size + EXACT centroid POSITION
             "polytope": None if poly is None else tuple(t.detach().cpu().numpy() for t in poly[:4]),

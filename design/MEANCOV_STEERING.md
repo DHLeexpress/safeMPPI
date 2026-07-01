@@ -29,24 +29,32 @@ All inside `SafeMPPIAdapter.plan`:
   `Δc = B⁺·d_centroid` (`B` from `_linear_matrices`). **SI** `B⁺=(1/dt)I`, **DI** `B⁺=pinv([0.5dt²I; dtI])` — the
   same DIRECTION for both (isotropic position block) so for SI/DI it ≈ `d_centroid`; B⁺ only matters for
   non-isotropic systems (unicycle). The covariance maps the same way: `Σ_u = B⁺ Σ_x B⁺ᵀ`.
-- **(3)+(2) BIMODAL mixture over ALL H steps** — each rollout's control δu is drawn from a 2-Gaussian mixture:
-  - **Mode A** `N(warm[t], Σ_iso)` — goal-ward (warm-start), fraction `1−p`.
-  - **Mode B** `N(warm[t] + u_max·d̂_ctrl, Σ_aniso)` — opening-ward (toward `C`), fraction `p`.
-  - `p = clip(centroid_gain·trapped, 0, 1)`, `trapped=(R−size)/(size+ε)` ("1/volume"-like; 0 in open space).
-  - **Smoothness regularization** = temporal low-pass on `p` across plan steps (`centroid_smooth`, `self._p_prev`):
-    `p ← (1−s)·p + s·p_prev` — so `trapped` jumps don't jerk the control (matters most for DI = acceleration). The
-    consistent ALL-step mixture (vs the old step-0-heavy K-blend, which pulled the 3rd step into the 2nd via
-    warm-start) removes the discontinuity.
-  - `Σ_aniso` = anisotropic ellipsoid (wide ∥ d̂_ctrl to explore the opening, narrow ⟂), ratio `sigma_aniso`.
+- **(3)+(2) 3-MODE categorical mixture over ALL H steps** — `z ~ Categorical(p_a, p_b, p_c)`:
+  - **Mode A** `N(warm[t], Σ_iso)` — goal-ward (warm-start), fraction `p_a = 1−p_b−p_c`.
+  - **Mode B** `N(warm[t] + u_max·d̂_ctrl, Σ_aniso)` — opening-ward (toward centroid `C`), fraction `p_b = p_t`.
+  - **Mode C** — ALWAYS-ON backup, fraction `p_c = random_backup_frac` (fixed): ½ braking `clamp(−v/dt)` (the
+    reliably-accepted backup) + ½ even-spaced random-360° (escape local minima / fast objects). `safemppi.py:680–693`.
+  - `p_t = clip(centroid_gain·ρ, 0, 1)`, **urgency `ρ`** has two modes: **mode 1** `ρ=(R−size)/(size+ε)` (magnitude,
+    `urgency_size_diff=False`) · **mode 4** `ρ=max(0,size_{k-1}−size_k)` (SHRINK RATE — fires at the onset of an
+    obstacle closing in; `urgency_size_diff=True`, `self._size_prev`).
+  - **Smoothness** = temporal low-pass on `p_b` across plan steps (`centroid_smooth`, `self._p_prev`):
+    `p ← (1−s)·p + s·p_prev` (matters most for DI = acceleration). Consistent ALL-step mixture (no step-0 jerk).
+  - `Σ_aniso` = anisotropic ellipsoid (wide ∥ d̂_ctrl, narrow ⟂), ratio `sigma_aniso`.
+- **(3b) GEOMETRIC importance sampling (`polytope_area_sampling`)** — the experimental Mode B: instead of pointing only
+  at the centroid, draw random rays INSIDE the velocity-retreated polytope (`_polytope_ray_controls`: random θ, radius
+  `√U·r_max(θ)`, magnitude to reach the target over H). The Mode-B rollouts **span the whole safe set and land inside
+  ⇒ accepted by construction** ⇒ keeps ≥1 accepted/step (no fallback). Disables Mode C + `sigma_aniso`; a base
+  `noise_sigma` is kept ONLY for Mode-A goal-seeking. See NOTE.md item 16.
 - **Why executed (navy ✗) ≠ centroid (orange):** we bias the SAMPLING, not the control. The **executed = the
-  reward-weighted mean** (cost = goal + clearance), so it is pulled to the goal-ward *safe* samples; it equals the
-  centroid only when the centroid IS the goal-ward safe direction (open space). The drawn "sampling mean" =
-  `warm[0] + p·u_max·d̂`.
+  reward-weighted mean** (cost = goal + clearance), pulled to the goal-ward *safe* samples; = centroid only in open
+  space. The sampling mean = `warm[0] + p_b·u_max·d̂`.
 
 ## Config knobs (`SafeMPPIConfig`)
-`centroid_gain` (Mode-B fraction gain), `centroid_smooth` (temporal low-pass), `sigma_volume_gain` (σ↑ when
-trapped), `sigma_aniso` (ellipsoid anisotropy), `centroid_eps` (stability), `use_polytope_barrier`,
-`predict_gain` (per-obstacle velocity inflation — keep; `safety_margin=0` constant offset), `warm_start`,
-`use_goal_nominal=False`, `num_samples` (≥256 helps acceptance — see the sensing×rollout analysis).
-Validated config (SI, 50-eps fine-tune): `centroid_gain=0.1, sigma_volume_gain=0.5, control_weight=0.03,
-predict_gain=0.4, sensing=3.0, temperature=0.3, H=10`.
+`centroid_gain` (Mode-B `p_b` gain), `centroid_smooth` (temporal low-pass), `sigma_volume_gain` (σ↑ when trapped),
+`sigma_aniso` (ellipsoid anisotropy), `centroid_eps` (stability), `random_backup_frac` (Mode-C `p_c`),
+`urgency_size_diff` (mode 1 vs 4), `polytope_area_sampling` (geometric importance sampling), `use_polytope_barrier`,
+`predict_gain` (per-obstacle velocity inflation; `safety_margin=0`), `warm_start`, `use_goal_nominal=False`.
+**Final DI config (BALANCED, 100-eps): `centroid_gain=0.2, sigma_volume_gain=0.0, sigma_aniso=2.5, sensing=3.0,
+num_samples=512, temperature=0.1, noise_sigma=0.3, predict_gain=0.6, centroid_smooth=0.5, centroid_eps=0.15,
+random_backup_frac=0.2, H=10` → 92% succ / 7% col / 60% acc.** SI (50-eps): `cg=0.1, sv=0.5, predict=0.4, sensing=3.0,
+temp=0.3`.
