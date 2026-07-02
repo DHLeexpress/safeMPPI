@@ -100,13 +100,17 @@ def broad_rollouts(env, n, seed=0):
     x_des = x0[0] + s * (goal[0] - x0[0])
     S, U = [], []
     for _ in range(n):
-        if env.name == "slalom" and rng.rand() < 0.4:          # dedicated gap-threading WEAVE proposal
+        pick = rng.rand()
+        if env.name == "slalom" and pick < 0.32:               # dedicated gap-threading WEAVE proposal
             ax, bx = float(obs[0, 0]), float(obs[1, 0])
             xmid, xsc = 0.5 * (ax + bx), max(0.3, 0.35 * (bx - ax))
             direction = rng.choice([-1.0, 1.0], p=[0.25, 0.75])  # +1: below-A→above-B (the weave)
             D = rng.uniform(0.7, 1.3)
             # tanh threads the gap; sin(pi s) window returns the path to the goal line (y=0) at the ends
             y_des = direction * D * np.tanh((x_des - xmid) / xsc) * np.sin(np.pi * s)
+        elif env.name == "slalom" and pick < 0.62:             # dedicated OVER-THE-TOP proposal (around_up)
+            D = rng.uniform(1.4, 2.1)                            # high single arc clears BOTH obstacles above
+            y_des = D * np.sin(np.pi * s)
         else:
             lat = rng.uniform(-1.8, 1.8)
             wamp = rng.uniform(-0.8, 0.8)

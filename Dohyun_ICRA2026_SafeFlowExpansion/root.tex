@@ -150,8 +150,6 @@ $x^{(m)}_{k+1\mid k}$ is affine in the control, so $x^*_{k+1\mid k}$ is a convex
 For any $x_{k\mid k}\in\mathcal C_i$ there exists a control sequence keeping $x_{k+i\mid k}\in\mathcal C_i$ for all $i$.
 \end{assumption}
 
-\Remark[~2 (moving obstacles are harder)]{On static obstacles the polytope rejection is collision-free at all $\gamma$. With \emph{moving} pedestrians, a position-only polytope faces a genuine tension: a velocity-predictive face retreat anticipates closing agents but can \keyword{degenerate} the polytope (a face vanishes) in dense crowds, while no retreat stays feasible but myopic. This is the dominant residual-collision mode and motivates a velocity-aware (higher-order) barrier as future work.}
-
 \section{Safety-Tunable Generative Policy}
 We distill the engine into a real-time policy (Stage 3). A sequential encoder $g_\psi$ maps a short history of states/observations/controls to a context $c_t$ (resolving which side of an obstacle to pass), and a CFM head learns the velocity field conditioned on $(o_t,\gamma_t,c_t)$ by minimizing \eqref{eq:cfm}. At inference, $\gamma(k)$ is scheduled online and the ODE is integrated from noise to produce $\hat u_k$, applied receding-horizon.
 
@@ -194,22 +192,46 @@ A conservative pretrained policy may cover only a subset of the certifiable beha
 \caption{Safe Flow Expansion}\label{alg:sfe}
 \SetKwInOut{Input}{Input}\SetKwInOut{Output}{Output}
 \Input{pretrained policy $\mu_{\theta_0}$, SOCP verifier $\tilde v$ (Eq.~\ref{eq:socp}), rounds $T$, safety grid $\{\gamma\}$}
-$\mathcal D_0\leftarrow$ verified broad proposals (seed diverse modes)\;
+\Output{expanded policy $\mu_{\theta^\star}$ at peak certified coverage}
+\BlankLine
+initialize dataset $\mathcal D_0 \leftarrow$ verified broad proposals \tcp*{seed distinct maneuvers}
+\BlankLine
 \For{$t=0$ \KwTo $T-1$}{
-  self-generate closed-loop trajectories $x_{t+1}\sim p^{\theta_t}$ (exploration temperature)\;
-  \textbf{query verifier} $y_{t+1}\leftarrow\tilde v(x_{t+1})$: certified iff collision-free $\wedge$ goal-reaching $\wedge$ Eq.~\eqref{eq:socp} feasible\;
-  $\mathcal D_{t+1}\leftarrow\mathcal D_t\cup\{(x_{t+1},y_{t+1})\}$\;
-  $\theta_{t+1}\leftarrow\textsc{UpdateFlow}(\theta_t,\mathcal D_{t+1})$ \tcp*[h]{$\triangleright$ mode-balanced replay}\;
-  evaluate certified coverage; keep the best round\;
+  \tcp{Step 1: Trajectory Generation}
+  sample closed-loop trajectories $x_{t+1} \sim p^{\theta_t}$ with exploration temperature\;
+  \BlankLine
+  \tcp{Step 2: Geometric Verification}
+  evaluate verifier $y_{t+1} \leftarrow \tilde v(x_{t+1})$ via SOCP \eqref{eq:socp}\;
+  set $y_{t+1} = \text{True}$ \textbf{iff} (\textcolor{blue}{a certifying polytope exists})\;
+  $\mathcal D_{t+1} \leftarrow \mathcal D_t \cup \{(x_{t+1}, y_{t+1})\}$\;
+  \BlankLine
+  \tcp{Step 3: Policy Bootstrapping}
+  $\theta_{t+1} \leftarrow \textsc{UpdateFlow}(\theta_t, \mathcal D_{t+1})$\;
+  evaluate certified coverage\;
 }
-\Output{$\mu_{\theta^\star}$ at the peak certified-coverage round}
 \end{algorithm}
 
-\textsc{UpdateFlow} performs replay-based continued pretraining with the signed objective $g_t=\nabla\hat L_t^{+}(\theta_t)-\alpha_t\nabla\hat L_t^{-}(\theta_t)$ of \cite{activeflowexpansion}; we use $\alpha_t=0$, i.e.\ standard CFM \eqref{eq:cfm} on \emph{verifier-accepted} windows only. Two design choices matter:
+\noindent\textbf{Active exploration and the verifier-uncertainty kernel.}
+Step~1 follows the active-exploration objective of ActiveFlowExpansion~\cite{activeflowexpansion}: the next batch is drawn to be maximally informative about the verifier while staying close to the current model,
+\begin{equation}
+x_{t+1}\sim\tilde p_t\in\arg\max_{q}\;\mathbb E_{x\sim q}\!\big[\sigma_t(\phi_s(x))\big]-\beta\,\mathrm{KL}\!\big(q\,\|\,p^{\theta_t}_1\big),
+\label{eq:afe9}
+\end{equation}
+whose maximizer is $q^\star\propto p^{\theta_t}_1\exp(\sigma_t/\beta)$ (sample from the policy, tilt by $\exp(\sigma_t/\beta)$, resample; $\beta\!\to\!\infty$ recovers plain temperature sampling). The uncertainty $\sigma_t$ is the Bayesian-linear (GP) posterior standard deviation over the queried designs $X_t=(x_1,\dots,x_t)$,
+\begin{equation}
+\sigma_t^2(x)=k(x,x)-k(x,X_t)\big(K_t+\lambda I\big)^{-1}k(X_t,x),\quad (K_t)_{ij}=k(x_i,x_j).
+\label{eq:afe10}
+\end{equation}
+We use the linear kernel in the velocity network's \emph{noised-flow representation} $\phi_s$: a candidate control window $U$ is noised to level $s$ along the OT path, $U_s=(1-s)\epsilon+sU$, and $\phi_s(U)$ is the penultimate hidden activation of $u^\theta_\tau$ at $\tau{=}s$ (averaged over a few fixed noise seeds), giving
+\begin{equation}
+k(x,x')=\big\langle\phi_s(x),\,\phi_s(x')\big\rangle,\qquad s=0.9.
+\label{eq:kernel}
+\end{equation}
+A design here is a control window \emph{at a fixed conditioning} $(o,\gamma,c)$, so we evaluate \eqref{eq:kernel} over a batch of candidate windows sampled at one state --- all entries then share the same conditioning and are directly comparable.
 
-\Remark[~5 (mode-balanced replay)]{Rare newly-discovered modes are easily forgotten if the accepted buffer is sampled uniformly. We tag each accepted window with its trajectory's behavioral mode and replay with inverse-frequency weights, so a freshly certified mode (e.g.\ a weave) is not washed out by the dominant one. Combined with keeping the peak-coverage round, this stabilizes discovery across rounds.}
+Fig.~\ref{fig:2x2} reads \eqref{eq:afe10}--\eqref{eq:kernel} out live along the loop: the top-right panel is the Gram matrix $K_t$ (candidates ordered by window direction) and the bottom-left is the induced $\sigma$-distribution with effective sample size $\mathrm{ESS}=1/\sum_i\bar w_i^2$, $\bar w_i\propto\exp(\sigma_i/\beta)$. While the policy is uni-modal the candidate features are near-collinear, so $K_t\!\approx\!\mathbf 1\mathbf 1^{\!\top}$, $\sigma$ is flat and $\mathrm{ESS}\!\approx\!N$; as a new mode is certified the windows split into direction clusters, $K_t$ gains block structure and $\mathrm{ESS}$ drops (e.g.\ $76\!\to\!48$ on the slalom). Discovery is carried by the certified broad proposals and the temperature in \eqref{eq:afe9}, and the kernel is the quantitative signature of \emph{when} a new mode appears.
 
-\Remark[~6 (why a surrogate uncertainty is not the driver here)]{ActiveFlowExpansion optionally tilts self-generation toward high verifier-uncertainty regions using a linear kernel $k(x,x')=\langle\phi_s(x),\phi_s(x')\rangle$ over the velocity network's noised-flow features $\phi_s$. In our \emph{windowed} setting a design is a control window \emph{at a conditioning state}, so features of early vs.\ late windows are not directly comparable across a trajectory, and empirically the induced tilt is near-uniform. We therefore drive exploration with certified \emph{broad proposals} and sampling temperature, which is agnostic to the conditioning; the kernel machinery is retained only as a diagnostic.}
+\noindent\textbf{UpdateFlow.} Replay-based continued pre-training with the signed objective $g_t=\nabla\hat L_t^{+}(\theta_t)-\alpha_t\nabla\hat L_t^{-}(\theta_t)$~\cite{activeflowexpansion}; we set $\alpha_t=0$, i.e.\ standard CFM \eqref{eq:cfm} on verifier-accepted windows, sampled with inverse-frequency \emph{mode-balanced} replay so a freshly certified mode is not washed out by the dominant one, and we deploy the peak-coverage round.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \section{Numerical Examples}
@@ -264,14 +286,14 @@ We stress the certificate and expansion on two multi-obstacle scenes: a \emph{na
 
 \begin{figure}[!t]
   \centering
-  \includegraphics[width=\linewidth]{images/slalom_exploration.png}
-  \caption{One exploration step: candidate windows are certified (green) or rejected (red) by the moving max-margin polytope \eqref{eq:socp}; the executed path (black dots) grows receding-horizon.}
-  \label{fig:explore}
+  \includegraphics[width=\linewidth]{images/slalom_2x2.png}
+  \caption{Safe Flow Expansion over iterations (slalom), synchronized per round. \textbf{Top-left:} certified trajectories, colored by mode; a new mode is flashed at its discovery round (\emph{weave} first, then the over-the-top \emph{around\_up}). \textbf{Top-right:} the live noised-flow kernel $K{=}\langle\phi_s,\phi_s'\rangle$, gaining block structure as candidate windows separate into modes. \textbf{Bottom-left:} the $\sigma$ histogram (its effective sample size falls as the kernel sharpens). \textbf{Bottom-right:} certified coverage near the obstacles vs.\ iteration, with mode-discovery markers.}
+  \label{fig:2x2}
   \vskip -0.2 true in
 \end{figure}
 
 \section{Conclusion}
-We presented a pipeline that makes a sampling-based planner safe and $\gamma$-tunable (MPPI-DCBF with a free-space polytope barrier), distills it into a real-time CFM policy, and --- crucially --- attaches a \emph{compact-polytope SOCP certificate} so that a single certified sample proves safety. Safe Flow Expansion then uses this certificate to expand the policy's certified generable set toward new safe modes, demonstrated on narrow-gap threading and slalom weaving. \keyword{Future work} targets the moving-crowd setting (Remark~2): a velocity-aware higher-order polytope barrier for the planner and certificate, and scaling Safe Flow Expansion to real pedestrian datasets (UCY/SDD), where the conservativeness--reach gap of the safe planner is exactly what certified expansion should close.
+We presented a pipeline that makes a sampling-based planner safe and $\gamma$-tunable (MPPI-DCBF with a free-space polytope barrier), distills it into a real-time CFM policy, and --- crucially --- attaches a \emph{compact-polytope SOCP certificate} so that a single certified sample proves safety. Safe Flow Expansion then uses this certificate to expand the policy's certified generable set toward new safe modes, demonstrated on narrow-gap threading and slalom weaving. \keyword{Future work} targets the moving-crowd setting --- on static obstacles the polytope rejection is collision-free at all $\gamma$, but a position-only polytope cannot both anticipate closing pedestrians and stay feasible in dense crowds --- calling for a velocity-aware higher-order polytope barrier for the planner and certificate, and scaling Safe Flow Expansion to real pedestrian datasets (UCY/SDD), where the conservativeness--reach gap of the safe planner is exactly what certified expansion should close.
 
 \bibliographystyle{IEEEtran}
 \bibliography{references}

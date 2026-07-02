@@ -449,3 +449,89 @@ Built by: `build_crowd_scenes.py` (raw → ego+crowd episodes) → `package_crow
 - `<split>_ego.pt`  : tensor `[N, 6, 80]` — channels `[x, y, vx, vy, sin(heading), cos(heading)]`, dt=0.1, 8 s.
 - `<split>_obs.pkl` : `list[N]` of tensor `[1, N_ped, 6, 80]` — same 6 channels per surrounding pedestrian;
   **NaN where a pedestrian is absent at a step** (downstream filters NaN, like `eval80_obs`).
+
+---
+
+## 18. Safe Flow Expansion — implementation report (pretrain → certified expansion, `overnight_run_2026-07-01`)
+
+How we **actively flow-expand the safe trajectory set**, in the notation of ActiveFlowExpansion (AFE, arXiv:2606.08802),
+and a disambiguation of the three live panels in `expansion_2x2.mp4` (the "live kernel / σ-histogram / certified
+coverage" the panels track *different* things). All symbols are defined before use.
+
+### 18.1 Notation (AFE-consistent)
+- **Design** `x` — a full closed-loop trajectory of the γ-conditioned flow policy. The policy emits short **control
+  windows** `U_{t:t+H}∈ℝ^{H×2}` (H = `H_pred` = 10) deployed receding-horizon (`H_exec`=1); the atomic unit the kernel
+  sees is one window `U` at conditioning `(o,γ,c)` — `o` = polar polytope-occupancy grid `[3,16,12]` (occupancy /
+  polytope-mask / clipped `H_P`), `c` = goal-aligned low-dim context `[7]`, `γ` = safety knob.
+- **Flow model** `μ_θ` — the CFM velocity field; `p_1^θ` its generation law (noise `ε`→`U` via the OT ODE).
+- **Verifier** `ṽ(x)∈{0,1}` — **our SOCP polytope certificate**: `ṽ=1` iff `x` is collision-free ∧ goal-reaching ∧ the
+  compact-polytope SOCP is feasible with margins `m_i ≥ m_min` (*a certifying polytope exists*). Replaces AFE's black box.
+- **Valid set** `Ω*` — the certifiable design set; estimated by a broad-proposal Monte-Carlo (1500 diverse paths gated
+  by `ṽ`), giving the reachable-safe cell set `C* = spatial_cells(Ω*)` used as the coverage denominator.
+- **Noised-flow representation** `φ_s(U)` — hidden feature of `μ_θ` at noise level `s∈(0,1)`: noise `U` to
+  `U_s=(1−s)ε+sU`, run the trunk, read the penultimate activation (averaged over fixed noise seeds), `s=0.9`
+  (`flow_policy.py:phi_s`).
+- **Kernel** `k(x,x') = ⟨φ_s(x),φ_s(x')⟩` (linear, AFE-faithful); **Gram matrix** `K_t=[k(x_i,x_j)]`.
+- **Uncertainty** `σ_t(x)` — GP / Bayesian-linear posterior std over the queried designs `X_t`.
+- **Buffer** `D_t={(x_i,y_i)}`; **signed update** `g_t = ∇L̂⁺ − α∇L̂⁻` (`α` = unlearning weight; we use `α=0`).
+
+### 18.2 The two AFE equations we build on
+- **(AFE-9) active exploration:** `x_{t+1} ∼ argmax_q  𝔼_{x∼q}[σ_t(φ_s(x))] − β·KL(q ‖ p_1^θ)`, optimum
+  `q* ∝ p_1^θ·exp(σ_t/β)` (sample from the policy, tilt by `exp(σ_t/β)`, resample; `β→∞` ⇒ plain sampling).
+- **(AFE-10) posterior variance:** `σ_t²(x) = k(x,x) − k(x,X_t)(K_t+λI)⁻¹k(X_t,x)`.
+- **Our instantiation:** exploration = sampling `p_1^θ` at raised temperature ∪ certified broad proposals (the finite-β,
+  *conditioning-agnostic* realization of AFE-9). (AFE-10) with our `φ_s`-kernel is computed as a live **diagnostic**, not
+  as the sampler — see 18.4/18.6 for why.
+
+### 18.3 The algorithm (`expansion_record.py` / `expansion.py`)
+`D_0 ← ` broad-proposal windows with `ṽ=1` (seed distinct maneuvers). For `t=0..T−1`:
+1. **Generate** — `n_traj` closed-loop rollouts per γ at temp 1.6 + `n_broad` broad proposals.
+2. **Verify** — keep windows of trajectories with `ṽ=1` (collision-free ∧ goal ∧ SOCP feasible).
+3. **UpdateFlow** — `g_t` with `α=0` = CFM loss on accepted windows, with **inverse-frequency mode-balanced replay** ∪
+   MPPI demos; 200 SGD steps.
+4. **Evaluate** certified coverage; **keep the peak-coverage round** (deployed model).
+Hyperparams: `T≤40, n_traj=24, n_broad=140, ft=200, lr=2e-4, batch=128, γ∈{0.1,0.5,1.0}`. A mode is counted "discovered"
+only when the policy generates it **≥2×** in a round (reliable, not a fluke).
+
+### 18.4 The three live panels of `expansion_2x2.mp4` — they measure DIFFERENT things
+| panel | symbol | what it *is* | what it tells you |
+|---|---|---|---|
+| **top-right — live kernel** | `K_t` | Gram matrix `⟨φ_s,φ_s'⟩` of ~90 candidate windows sampled at ONE pre-obstacle state, rows/cols sorted by window lateral direction | *feature-space geometry.* near-uniform (all bright) ⇒ policy uni-modal; **block structure** ⇒ candidate windows have split into distinct behavioral clusters (modes) |
+| **bottom-left — σ histogram** | `σ_t` + ESS | distribution of the AFE-10 posterior std over those candidates, plus `ESS = 1/Σ w̄_i²`, `w̄∝exp(σ/β)` of the AFE-9 tilt | *acquisition-informativeness.* `ESS≈N`(≈90) ⇒ tilt ≈ uniform (uninformative); `ESS↓` ⇒ σ discriminates (some candidates novel) |
+| **bottom-right — certified coverage** | `|C_acc∩C*| / |C*|` | fraction of reachable-safe cells **near the obstacles** covered by the policy's *certified* trajectories so far | the actual **task objective** — the generable-set expansion |
+
+**Key:** coverage is task-space (cells filled, 0→1, the objective); the kernel is feature-space (φ_s correlation); σ/ESS
+is acquisition informativeness. They are *not* the same metric — the kernel + σ/ESS are **diagnostics of *when* a new
+mode is emerging**, not the thing being optimized. Empirically (slalom, `T=27`): coverage `0.38→0.79` monotone; `K_t`
+goes near-uniform → block-structured; `ESS` high and noisy (`66→40→79`) ⇒ the σ-tilt is **not** the driver.
+
+### 18.5 What W&B actually says about FM learning
+- **Pretrain (Stage 3, 60 ep, ~12k windows/scene).** CFM loss: gap `1.317→0.678` (val 0.648), slalom `1.329→0.664`
+  (val 0.655). Converges to the **irreducible multi-modal-target floor ≈ 0.66** — at a fixed conditioning the target
+  `U` is multi-modal (down/weave/up all valid), so the velocity MSE cannot reach 0; val tracks train ⇒ no overfit. The
+  FM has learned the γ-conditional field.
+- **Grid / safety-encoding (aux head).** Aux reconstruction MSE: gap `0.206→0.0098`, slalom `0.195→0.0103` (val ≈ train).
+  The grid encoder reconstructs the polar safety grid (occupancy / polytope-mask / clipped `H_P`) to **~1 % MSE** ⇒ the
+  **"polytope → context" map is learned essentially perfectly**; the encoder *does* capture the safety geometry (it is
+  not ignored by the CFM head). This is the direct evidence that the "encode the safety function" step works.
+- **Expansion (Stage 5).** Certified coverage rises and **mode-coverage → 1.0 at all γ** (gap mode `0.33/1.0/1.0 →
+  1.0/1.0/1.0`; slalom γ=0.1 mode `0.33→1.0`; slalom movie-record coverage `0.38→0.79`, down+weave@`r1`,
+  over-the-top@`r27`). **Honest caveat — validity can drop while coverage rises:** slalom γ=0.1 validity `0.53→0.28`
+  over the 6-round run, i.e. pushing into new modes at the conservative γ yields more diverse but partly-invalid
+  samples; the peak-round-save + mode-balancing mitigate but do not remove this **coverage ↔ validity** trade. **γ
+  modulates diversity:** at γ=0.1 the policy strongly prefers `around_down` (weave/over-the-top ≈ 1–4 / 150 samples), at
+  γ=0.5/1.0 all three modes come readily — so `exploration_modes.mp4` uses temperature-escalated sampling to surface one
+  certified rep of each mode at the stingy γ.
+
+### 18.6 Honest caveats / open
+- **The σ-tilt (AFE-9) is near-uniform here.** A design is a *window at a conditioning*; early vs. late windows across a
+  trajectory are not directly comparable in `φ_s`, so a global GP over windows is weakly informative (`ESS≈N`). We drive
+  exploration with certified **broad proposals + temperature** and keep the kernel/σ as a *diagnostic* (they still give
+  the clean "block structure appears exactly when a new mode is certified" read-out).
+- `Ω*` (the coverage denominator) is itself a broad-proposal estimate — coverage is *relative to that proxy*, not absolute.
+- CFM floor `≈0.66` is the multi-modal-target floor, **not** a training failure.
+- Over-the-top (slalom) needed `T=27` rounds + a dedicated high-arc broad proposal; it is the hardest mode and is
+  discovered *after* the weave (down/weave early → over-the-top late), matching the geometric intuition.
+- Files: `expansion_record.py` (loop+per-round K_t/σ/coverage logging), `movie_2x2.py` (the 2×2 render),
+  `exploration_modes.py` (3 certified modes per γ), `diag_eq910.py` (single-state AFE-9/10 snapshot),
+  `diag_safety_encoder.py` (grid reconstruction + token PCA). W&B project `cfm-mppi-safeflow`, groups `gap`/`slalom`.

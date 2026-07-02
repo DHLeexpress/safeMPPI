@@ -79,13 +79,13 @@ def run(scene, max_rounds, device, cov_goal=0.55, log=print):
         for g in C.GAMMAS:
             _, pg, pl, pu, pm = collect_fm_positives(pol, env, g, 24, temp=1.6, device=device)
             pos["grid"] += pg; pos["low"] += pl; pos["U"] += pu; pos["mode"] += pm
-            bg, bl, bu, bm = collect_broad_positives(env, g, 100, seed=r * 100 + int(g * 10),
+            bg, bl, bu, bm = collect_broad_positives(env, g, 140, seed=r * 100 + int(g * 10),
                                                      H_pred=C.H_PRED, device=device)
             pos["grid"] += bg; pos["low"] += bl; pos["U"] += bu; pos["mode"] += bm
-        finetune(pol, demo, pos, 150, batch=128, lr=2e-4, device=device)
+        finetune(pol, demo, pos, 200, batch=128, lr=2e-4, device=device)
         round_trajs = []
         for g in C.GAMMAS:
-            paths, _ = fm_rollout(pol, env, g, n_traj=20, temp=1.0, device=device, record=False)
+            paths, _ = fm_rollout(pol, env, g, n_traj=24, temp=1.15, device=device, record=False)
             for p in paths:
                 if VAL.is_valid(p, env, g):
                     m = COV.mode_of(p, env)
