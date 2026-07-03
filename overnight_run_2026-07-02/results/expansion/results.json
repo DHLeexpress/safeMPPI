@@ -1,0 +1,32 @@
+{
+  "params": {
+    "ell": 0.2,
+    "beta": 0.02,
+    "alpha": 0.0,
+    "demo_frac": 0.5,
+    "iters": 450
+  },
+  "results": {
+    "0.5": {
+      "coverage": 0.14682539682539683,
+      "validity": 0.4,
+      "avg_steps": 94.3,
+      "covered": 37,
+      "reached_goal": false
+    },
+    "1.0": {
+      "coverage": 0.1865079365079365,
+      "validity": 0.48,
+      "avg_steps": 104.875,
+      "covered": 47,
+      "reached_goal": false
+    },
+    "0.1": {
+      "coverage": 0.09126984126984126,
+      "validity": 0.14,
+      "avg_steps": 153.0,
+      "covered": 23,
+      "reached_goal": false
+    }
+  }
+}
