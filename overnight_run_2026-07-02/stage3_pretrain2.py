@@ -106,6 +106,9 @@ def main():
     ap.add_argument("--no-gru", action="store_true", help="drop GRU history from ctx")
     ap.add_argument("--no-enc-low", action="store_true", help="drop E_l encoder (raw low -> trunk)")
     ap.add_argument("--no-grid", action="store_true", help="drop grid CNN E_g (no encoded safety)")
+    ap.add_argument("--raw-hist", action="store_true", help="append raw last-k executed actions to ctx")
+    ap.add_argument("--raw-hist-k", type=int, default=10)
+    ap.add_argument("--dropout", type=float, default=0.0, help="trunk dropout (regularizer tweak)")
     ap.add_argument("--tag", default=None, help="output filename tag (e.g. 'reduced' -> pretrained2_reduced.pt)")
     ap.add_argument("--epochs", type=int, default=120)
     ap.add_argument("--batch", type=int, default=256)
@@ -133,7 +136,8 @@ def main():
           f"({n - nval} train / {nval} val), cfm-only ===", flush=True)
 
     pol = GP2.build_policy2(width=args.width, use_gru=not args.no_gru, encode_low=not args.no_enc_low,
-                            use_grid=not args.no_grid, device=dev)
+                            use_grid=not args.no_grid, raw_hist=args.raw_hist, raw_hist_k=args.raw_hist_k,
+                            dropout=args.dropout, device=dev)
     rep = GP2.param_report(pol)
     print("params:", rep, flush=True)
     opt = torch.optim.Adam(pol.parameters(), lr=args.lr)

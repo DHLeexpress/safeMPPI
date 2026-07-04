@@ -35,11 +35,12 @@ def draw_grid(ax, obs):
     ax.set_xlim(-.6, 5.6); ax.set_ylim(-.6, 5.6); ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
 
 
-def main():
+def main(policy="pretrained2_w256.pt", out="prelim_pretrained2_vs_safemppi.png",
+         label="v2 W256 pretrained rollouts"):
     env = GS.make_grid()
     obs = env.obstacles.numpy()
     cfg = GS.mode1_config()
-    pol, _ = GP2.load_policy2("pretrained2_w256.pt", device=DEV)
+    pol, _ = GP2.load_policy2(policy, device=DEV)
     fig, axes = plt.subplots(1, 3, figsize=(16.5, 5.6))
     for ax, g in zip(axes, GAMMAS):
         draw_grid(ax, obs)
@@ -62,18 +63,22 @@ def main():
             ok = GM.reaches_goal(pth, env.goal.numpy())
             ax.plot(pth[:, 0], pth[:, 1], "-", color="#ff7f0e", lw=1.0, alpha=.5, zorder=6)
             nm += int(ok)
-        ax.set_title(f"γ={g}   SafeMPPI expert n={ne} · pretrained n={N_MODEL} (reach {nm}/{N_MODEL})", fontsize=10.5)
+        ax.set_title(f"γ={g}   SafeMPPI expert n={ne} · rollouts n={N_MODEL} (reach {nm}/{N_MODEL})", fontsize=10.5)
     handles = [Line2D([0], [0], color="#2ca02c", lw=2, label="SafeMPPI expert (success-only)"),
-               Line2D([0], [0], color="#ff7f0e", lw=2, label="v2 W256 pretrained rollouts")]
+               Line2D([0], [0], color="#ff7f0e", lw=2, label=label)]
     fig.legend(handles=handles, loc="lower center", ncol=2, fontsize=10, frameon=False, bbox_to_anchor=(0.5, -0.02))
-    fig.suptitle("PRELIMINARY — v2 pretrained policy vs SafeMPPI training data, per γ "
-                 "(pre-expansion starting point: model reproduces the expert, concentrated near the diagonal)",
-                 fontsize=12)
+    fig.suptitle(f"PRELIMINARY — {label} vs SafeMPPI training data, per γ", fontsize=12)
     fig.tight_layout(rect=(0, 0.03, 1, 1))
-    out = os.path.join(FIG, "prelim_pretrained2_vs_safemppi.png")
-    fig.savefig(out, dpi=140, bbox_inches="tight"); plt.close(fig)
-    print("saved", out)
+    outp = os.path.join(FIG, out)
+    fig.savefig(outp, dpi=140, bbox_inches="tight"); plt.close(fig)
+    print("saved", outp)
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--policy", default="pretrained2_w256.pt")
+    ap.add_argument("--out", default="prelim_pretrained2_vs_safemppi.png")
+    ap.add_argument("--label", default="v2 W256 pretrained rollouts")
+    a = ap.parse_args()
+    main(a.policy, a.out, a.label)

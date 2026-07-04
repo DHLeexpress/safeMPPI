@@ -25,12 +25,13 @@ import grid_feats as GF
 class GridGRUFlowPolicy2(FlowPolicy):
     def __init__(self, H_pred=GF.H_PRED, grid_shape=(3, GF.N_THETA, GF.N_R), K_hist=GF.K_HIST,
                  gru_dim=16, low_token=48, grid_token=64, width=256, depth=2, u_max=GF.U_MAX,
-                 use_gru=True, encode_low=True, use_grid=True):
+                 use_gru=True, encode_low=True, use_grid=True, raw_hist=False, raw_hist_k=10, dropout=0.0):
         gd = gru_dim if use_gru else 0
         raw_low = 4 + gd + 1                                    # relgoal2 + vel2 + [GRU] + γ
         low_out = low_token if encode_low else raw_low
         grid_out = grid_token if use_grid else 0
-        ctx_dim = low_out + grid_out
+        rawh_out = raw_hist_k * 2 if raw_hist else 0           # RAW last-k executed actions (unencoded) appended to ctx
+        ctx_dim = low_out + grid_out + rawh_out
         super().__init__(T=H_pred, ctx_dim=ctx_dim, width=width, depth=depth, u_max=u_max)
         self.H_pred = H_pred
         self.grid_shape = tuple(grid_shape)
@@ -39,7 +40,16 @@ class GridGRUFlowPolicy2(FlowPolicy):
         self.use_gru = use_gru
         self.encode_low = encode_low
         self.use_grid = use_grid
+        self.raw_hist = raw_hist
+        self.raw_hist_k = raw_hist_k
+        self.dropout = dropout
         self.raw_low = raw_low
+        if dropout > 0:                                        # rebuild trunk WITH dropout (regularizer tweak);
+            in_dim = self.d + ctx_dim + self.t_dim            # SiLU kept (subsumes ReLU, better for flow trunks)
+            layers = [nn.Linear(in_dim, width), nn.SiLU(), nn.Dropout(dropout)]
+            for _ in range(depth - 1):
+                layers += [nn.Linear(width, width), nn.SiLU(), nn.Dropout(dropout)]
+            self.trunk = nn.Sequential(*layers)
         if use_gru:
             self.gru = nn.GRU(input_size=2, hidden_size=gru_dim, num_layers=1, batch_first=True)
         if encode_low:
@@ -69,6 +79,9 @@ class GridGRUFlowPolicy2(FlowPolicy):
         low_raw = self._low_raw(low5, hist)
         low_part = self.enc_low(low_raw) if self.encode_low else low_raw
         parts = [low_part]
+        if self.raw_hist:                                     # raw last-k executed actions (unencoded)
+            h = hist.unsqueeze(0) if hist.dim() == 2 else hist
+            parts.append(h[:, -self.raw_hist_k:, :].reshape(h.shape[0], -1).float())
         if self.use_grid:
             if grid.dim() == 3:
                 grid = grid.unsqueeze(0)
@@ -128,13 +141,16 @@ class GridGRUFlowPolicy2(FlowPolicy):
         return dict(arch="v2", H_pred=self.H_pred, grid_shape=self.grid_shape, K_hist=self.K_hist,
                     gru_dim=self.gru_dim, width=self.width,
                     depth=len([m for m in self.trunk if isinstance(m, nn.Linear)]), u_max=self.u_max,
-                    use_gru=self.use_gru, encode_low=self.encode_low, use_grid=self.use_grid)
+                    use_gru=self.use_gru, encode_low=self.encode_low, use_grid=self.use_grid,
+                    raw_hist=self.raw_hist, raw_hist_k=self.raw_hist_k, dropout=self.dropout)
 
 
 def build_policy2(width=256, depth=2, gru_dim=16, K_hist=GF.K_HIST, u_max=GF.U_MAX,
-                  use_gru=True, encode_low=True, use_grid=True, device="cpu"):
+                  use_gru=True, encode_low=True, use_grid=True, raw_hist=False, raw_hist_k=10, dropout=0.0,
+                  device="cpu"):
     return GridGRUFlowPolicy2(width=width, depth=depth, gru_dim=gru_dim, K_hist=K_hist, u_max=u_max,
-                              use_gru=use_gru, encode_low=encode_low, use_grid=use_grid).to(device)
+                              use_gru=use_gru, encode_low=encode_low, use_grid=use_grid,
+                              raw_hist=raw_hist, raw_hist_k=raw_hist_k, dropout=dropout).to(device)
 
 
 def save_policy2(policy, path, extra=None):
@@ -150,7 +166,8 @@ def load_policy2(path, device="cpu"):
     pol = GridGRUFlowPolicy2(H_pred=c["H_pred"], grid_shape=tuple(c["grid_shape"]), K_hist=c["K_hist"],
                              gru_dim=c["gru_dim"], width=c["width"], depth=c["depth"], u_max=c["u_max"],
                              use_gru=c.get("use_gru", True), encode_low=c.get("encode_low", True),
-                             use_grid=c.get("use_grid", True))
+                             use_grid=c.get("use_grid", True), raw_hist=c.get("raw_hist", False),
+                             raw_hist_k=c.get("raw_hist_k", 10), dropout=c.get("dropout", 0.0))
     pol.load_state_dict(ck["state_dict"]); pol.to(device).eval()
     return pol, ck
 

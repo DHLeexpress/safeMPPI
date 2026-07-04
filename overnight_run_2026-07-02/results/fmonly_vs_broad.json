@@ -1,0 +1,16 @@
+{
+  "FM-only (N=96, no broad, no filter)": {
+    "iters": 825,
+    "wall": 1203.6511840820312,
+    "cov": 0.09126984126984126,
+    "val": 0.675,
+    "covered": 23
+  },
+  "FM+broad (40+40, safety filter)": {
+    "iters": 625,
+    "wall": 1200.6272864341736,
+    "cov": 0.17857142857142858,
+    "val": 0.5,
+    "covered": 46
+  }
+}
