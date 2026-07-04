@@ -37,8 +37,10 @@ PY = sys.executable
 WIDTHS = [256, 192, 128]
 GAMMAS = [0.5, 1.0, 0.1]
 N_MEASURE = 25
-STAGE_DEADLINE_S = 9 * 3600
-BASE = dict(lr=2e-4, alpha=0.0, beta=0.1, s=0.9, freeze=False, margin=0.0, unc="gp", schedule="online")
+STAGE_DEADLINE_S = 12 * 3600
+# Positive-only (no U_demo). MAIN path = GP-RBF + online. enc_mult = encoder/field lr ratio (the "nice
+# optimizer" lever for the entangled representation; 0.0 == frozen encoder). NN + round are PARALLEL BACKUPS.
+BASE = dict(lr=2e-4, enc_mult=1.0, alpha=0.0, beta=0.1, s=0.9, margin=0.0, unc="gp", schedule="online")
 
 
 def ts():
@@ -56,8 +58,8 @@ def goal_append(text):
 
 def run_id(c):
     rid = f"lr{c['lr']:g}_a{c['alpha']:g}_b{c['beta']:g}_s{c['s']:g}"
-    if c["freeze"]:
-        rid += "_frz"
+    if c.get("enc_mult", 1.0) != 1.0:
+        rid += f"_e{c['enc_mult']:g}"
     if c["margin"] > 0:
         rid += f"_m{c['margin']:g}"
     if c.get("unc", "gp") != "gp":
@@ -65,6 +67,17 @@ def run_id(c):
     if c.get("schedule", "online") != "online":
         rid += f"_{c['schedule']}"
     return rid
+
+
+def build_cmd(c, rid, outdir, width):
+    cmd = [PY, "grid_expand2.py", "--policy", f"pretrained2_w{width}.pt", "--outdir", outdir,
+           "--run-id", rid, "--iters", "2000", "--lr", f"{c['lr']:g}", "--alpha", f"{c['alpha']:g}",
+           "--beta", f"{c['beta']:g}", "--s", f"{c['s']:g}", "--enc-lr-mult", f"{c.get('enc_mult', 1.0):g}",
+           "--n-measure", str(N_MEASURE), "--unc", c.get("unc", "gp"),
+           "--schedule", c.get("schedule", "online"), "--wandb-mode", "online"]
+    if c["margin"] > 0:
+        cmd += ["--pos-margin", f"{c['margin']:g}"]
+    return cmd
 
 
 def spawn(cmd, logfile):
@@ -199,16 +212,7 @@ def launch_stage(name, cfgs, width):
             log(f"{name}: {rid} cached")
             continue
         os.makedirs(outdir, exist_ok=True)
-        cmd = [PY, "grid_expand2.py", "--policy", f"pretrained2_w{width}.pt", "--outdir", outdir,
-               "--run-id", rid, "--iters", "2000", "--lr", f"{c['lr']:g}", "--alpha", f"{c['alpha']:g}",
-               "--beta", f"{c['beta']:g}", "--s", f"{c['s']:g}", "--n-measure", str(N_MEASURE),
-               "--unc", c.get("unc", "gp"), "--schedule", c.get("schedule", "online"),
-               "--wandb-mode", "online"]
-        if c["freeze"]:
-            cmd.append("--freeze-enc")
-        if c["margin"] > 0:
-            cmd += ["--pos-margin", f"{c['margin']:g}"]
-        procs.append((rid, *spawn(cmd, os.path.join(outdir, "run.log"))))
+        procs.append((rid, *spawn(build_cmd(c, rid, outdir, width), os.path.join(outdir, "run.log"))))
         log(f"{name} launched {rid}")
     if procs:
         wait_all(procs, STAGE_DEADLINE_S, name)
@@ -220,14 +224,12 @@ def run_sweep(width):
     inc = dict(BASE)
     stages = [
         ("S1-lr", "lr", [2e-4, 1e-4, 1e-5]),
-        ("S2-enc", "freeze", [False, True]),
+        ("S2-optim", "enc_mult", [1.0, 0.3, 0.1, 0.0]),   # per-group encoder lr; 0.0 == frozen encoder (causal)
         ("S3-alpha", "alpha", [0.0, 0.005, 0.01]),
         ("S4-beta", "beta", [0.1, 0.2, 0.05]),
         ("S5-s", "s", [0.9, 0.8, 0.3]),
         ("S6-margin", "margin", [0.0, 0.03]),
-        ("S7-unc", "unc", ["gp", "nn"]),          # GP novelty vs paper's NN validity-classifier ensemble
-        ("S8-sched", "schedule", ["online", "round"]),   # per-trajectory vs paper's round-based block fine-tune
-    ]
+    ]   # NN estimator + round-based schedule are PARALLEL BACKUPS (launched in main, not in the main chain)
     for name, key, values in stages:
         cfgs = []
         for v in values:
@@ -249,16 +251,6 @@ def run_sweep(width):
                     f"alternatives: " + ", ".join(f"`{r}` {t['score']:.3f}" for r, t in
                                                   sorted(tbl.items(), key=lambda x: -x[1]["score"])) + ".")
         log(f"=== {name} winner: {win} ===")
-
-    # Guarantee the paper-flagship data point (NN estimator + round-based fine-tune) even if the greedy
-    # chain didn't land on it — everything else at the sweep incumbent.
-    flag = dict(inc); flag["unc"] = "nn"; flag["schedule"] = "round"
-    if run_id(flag) != run_id(inc):
-        log(f"=== flagship-ref: {run_id(flag)} (nn+round at incumbent) ===")
-        launch_stage("flagship-ref", [flag], width)
-        _, ftbl = stage_pick([run_id(flag), run_id(inc)], run_id(inc))
-        summary["flagship-ref"] = dict(table=ftbl)
-        json.dump(summary, open(summary_f, "w"), indent=2)
     return inc, summary
 
 
@@ -309,9 +301,9 @@ def overlay_figures(winner_rid):
 
 
 def entanglement_figure(winner_rid):
-    frz = [d for d in os.listdir(ROOT) if d.endswith("_frz") and load_hist(d)]
-    pairs = [(winner_rid, "#d62728", "winner")] + [(frz[0], "#1f77b4", "freeze_enc") if frz else None]
-    pairs = [p for p in pairs if p]
+    # compare the winner against the frozen-encoder run (enc_mult=0 == the causal freeze arm)
+    frz = [d for d in os.listdir(ROOT) if d.endswith("_e0") and load_hist(d)]
+    pairs = [(winner_rid, "#d62728", "winner")] + ([(frz[0], "#1f77b4", "frozen-encoder (enc_mult=0)")] if frz else [])
     fig, ax = plt.subplots(1, 3, figsize=(16.5, 4.4))
     for rid, col, lab in pairs:
         h = load_hist(rid)
@@ -327,21 +319,62 @@ def entanglement_figure(winner_rid):
         ax[2].plot(it2, [r["probes"]["demo_val_cfm"] for r in h], color=col, label=lab)
     ax[0].set_yscale("log"); ax[0].set_title("per-module grad RMS: context vs field")
     ax[1].set_title("context drift ‖ctx_t−ctx_0‖/‖ctx_0‖ (frozen probes)")
-    ax[2].set_title("demo forgetting probe (val-CFM, fixed noise)")
+    ax[2].set_title("demo-CFM: distance explored from dataset (↑ expected; not a loss)")
     for a in ax:
         a.grid(alpha=.25); a.legend(fontsize=8); a.set_xlabel("iteration")
     fig.suptitle("Entangled-input-space diagnosis: is the context map chasing the field?", fontsize=12)
     fig.tight_layout(); fig.savefig(os.path.join(FIG, "sweep0703_entanglement.png"), dpi=130); plt.close(fig)
 
 
+def launch_backups(width):
+    """PARALLEL BACKUP plans (positive-only, at BASE config): NN estimator, round-based fine-tune. Launched
+    concurrently with the main chain; each is a clean A/B vs the base GP-online run (same everything else)."""
+    procs = []
+    for extra in ({"unc": "nn"}, {"schedule": "round"}):
+        c = dict(BASE); c.update(extra); rid = run_id(c)
+        outdir = os.path.join(ROOT, rid)
+        if os.path.exists(os.path.join(outdir, "history.json")):
+            log(f"backup {rid} cached")
+            continue
+        os.makedirs(outdir, exist_ok=True)
+        procs.append((rid, *spawn(build_cmd(c, rid, outdir, width), os.path.join(outdir, "run.log"))))
+        log(f"BACKUP launched {rid} (parallel to main chain)")
+    return procs
+
+
+def report_backups(summary):
+    base_rid = run_id(BASE)
+    nn_rid = run_id({**BASE, "unc": "nn"})
+    rd_rid = run_id({**BASE, "schedule": "round"})
+    _, tbl = stage_pick([base_rid, nn_rid, rd_rid], base_rid)
+    summary["backups"] = dict(table=tbl)
+    json.dump(summary, open(os.path.join(ROOT, "summary.json"), "w"), indent=2)
+    if base_rid in tbl:
+        b = tbl[base_rid]
+        useful = []
+        for rid, lab in ((nn_rid, "NN-estimator"), (rd_rid, "round-based")):
+            if rid in tbl and tbl[rid]["score"] > b["score"] + 0.01:
+                useful.append(f"{lab} `{rid}` BEATS base (score {tbl[rid]['score']:.3f} vs {b['score']:.3f}, "
+                              f"val2 {tbl[rid]['val_mean']*100:.0f}% vs {b['val_mean']*100:.0f}%)")
+        verdict = ("USEFUL: " + "; ".join(useful)) if useful else "neither backup beat the GP-online base"
+        goal_append(f"- **[BACKUPS {time.strftime('%m-%d %H:%M')}]** (parallel, positive-only at base) — {verdict}. "
+                    + "; ".join(f"`{r}` {t['score']:.3f} (val2 {t['val_mean']*100:.0f}%, cov {t['cov_cum']*100:.1f}%)"
+                                for r, t in sorted(tbl.items(), key=lambda x: -x[1]["score"])) + ".")
+        log(f"backup verdict: {verdict}")
+
+
 # --------------------------------------------------------------------- main
 def main():
     os.makedirs(ROOT, exist_ok=True); os.makedirs(FIG, exist_ok=True)
-    log("===== run_sweep_0703 master start =====")
+    log("===== run_sweep_0703 master start (POSITIVE-ONLY; GP-online main + NN/round backups) =====")
     width = phase_pretrain()
+    backups = launch_backups(width)                     # kick off parallel backups BEFORE the main chain
     inc, summary = run_sweep(width)
     winner = run_id(inc)
-    log(f"===== sweep complete, winner {winner} =====")
+    log(f"===== main sweep complete, winner {winner}; waiting on {len(backups)} backups =====")
+    if backups:
+        wait_all(backups, STAGE_DEADLINE_S, "backups")
+    report_backups(summary)
 
     wdir = os.path.join(ROOT, winner)
     fe_dir = os.path.join(wdir, "final_eval")

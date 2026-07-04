@@ -59,22 +59,29 @@ class SFG2Config:
     lam: float = 1e-2
     gp_buf: int = 384
     s: float = 0.9               # φ_s noise level (SWEEP: 0.9 / 0.8 / 0.3)
-    # NN estimator (warm-start + early-stop refit; scaled from the paper's 5×MLP-2×100-ReLU-0.1drop-Adam1e-3)
+    # NN estimator (BACKUP plan, shrunk per user: 5×MLP-2×nn_hidden-ReLU-0.1drop; warm-start + early-stop)
     nn_refit_every: int = 16     # refit ensemble every k iters (warm-started, cheap)
     nn_max_steps: int = 1000
+    nn_hidden: int = 64          # shrunk from the paper's 100 (smaller problem)
     lbuf_cap: int = 8000         # labeled buffer (both classes) for the NN fit
-    # fine-tuning schedule (S8 arm): "online" = update every trajectory (inner_steps) OR
+    # fine-tuning schedule (BACKUP plan): "online" = update every trajectory (inner_steps) OR
     #   "round" = paper-style: collect round_traj trajectories -> refit estimator -> finetune_steps block update
     schedule: str = "online"
     round_traj: int = 16
     finetune_steps: int = 200
     warmup_valid: int = 300      # defer the first block update until this many valid windows accumulated
-    # v2 union update
+    # v2 update — POSITIVE-ONLY (user 2026-07-03: U_demo REMOVED from the loss; demo pulled exploration back).
+    #   demo is still LOADED for the forgetting/drift PROBES (diagnostic only), never for the gradient.
+    demo_anchor: bool = False    # keep False: loss = L_CFM(U_pos) − α·L_CFM(U_neg); no demo term
     alpha: float = 0.0           # negative-sample loss weight (SWEEP: 0 / 0.005 / 0.01)
     inner_steps: int = 12
     batch: int = 128
-    lr: float = 2e-4             # SWEEP: 2e-4 / 1e-4 / 1e-5
-    freeze_enc: bool = False     # causal arm: freeze E_g/E_l/GRU (context map fixed, only field learns)
+    lr: float = 2e-4             # base (field) lr — SWEEP: 2e-4 / 1e-4 / 1e-5
+    # "nice optimizer" for the ENTANGLED encoder+field: per-group lr (context encoders learn at lr·enc_lr_mult,
+    #   the velocity field at lr) + cosine schedule. enc_lr_mult=0 == frozen encoder (the causal freeze arm).
+    enc_lr_mult: float = 1.0     # SWEEP: 1.0 / 0.3 / 0.1 / 0.0
+    sched: str = "cosine"        # "cosine" | "none"
+    freeze_enc: bool = False     # legacy alias: if True -> enc_lr_mult forced to 0
     pos_margin: float = 0.0      # data-hygiene gate: window min clearance ≥ margin to enter D_pos
     cap_pos: int = 60000
     cap_neg: int = 4000
@@ -166,18 +173,23 @@ def fit_nn(policy, unc, lbuf, cfg, device, seed=0):
 
 
 def update_flow2(policy, opt, demo, pos, neg, cfg, device, n_steps=None):
-    """Union-pool signed update: batch ~ inv-freq classes over demo(one class) ∪ pos(class per staircase);
-    loss = cfm(pool) − α·cfm(neg, c_neg). Returns dict(loss, per-module grad RMS). None until pos exists.
-    n_steps overrides inner_steps (used for the round-based block fine-tune)."""
+    """POSITIVE-ONLY update (demo removed from the loss, user 2026-07-03): batch ~ inverse-frequency by
+    staircase class over D_pos; loss = cfm(pos) − α·cfm(neg, c_neg). If cfg.demo_anchor is set (off by
+    default), demo is added back as one extra class. Returns dict(loss, per-module grad RMS). None until pos.
+    n_steps overrides inner_steps (round-based block fine-tune)."""
     npos = 0 if pos is None else pos["U"].shape[0]
     if npos == 0:
         return None
-    nd = demo["U"].shape[0]
     freq = Counter(pos["tag"])
-    ncls = len(freq) + 1
-    w = torch.empty(nd + npos, dtype=torch.double)
-    w[:nd] = 1.0 / (ncls * nd)
-    w[nd:] = torch.tensor([1.0 / (ncls * freq[t]) for t in pos["tag"]], dtype=torch.double)
+    use_demo = cfg.demo_anchor and demo is not None
+    nd = demo["U"].shape[0] if use_demo else 0
+    if use_demo:
+        ncls = len(freq) + 1
+        w = torch.empty(nd + npos, dtype=torch.double)
+        w[:nd] = 1.0 / (ncls * nd)
+        w[nd:] = torch.tensor([1.0 / (ncls * freq[t]) for t in pos["tag"]], dtype=torch.double)
+    else:
+        w = torch.tensor([1.0 / freq[t] for t in pos["tag"]], dtype=torch.double)   # inv-freq over pos classes
     nneg = 0 if neg is None else neg["U"].shape[0]
     policy.train()
     last = 0.0
@@ -186,7 +198,7 @@ def update_flow2(policy, opt, demo, pos, neg, cfg, device, n_steps=None):
     for _ in range(steps):
         idx = torch.multinomial(w, cfg.batch, replacement=True)
         di = idx[idx < nd]
-        pi = idx[idx >= nd] - nd
+        pi = idx[idx >= nd] - nd if use_demo else idx
         Gs, Ls, Hs, Us = [], [], [], []
         if di.numel():
             Gs += [demo["grid"][di]]; Ls += [demo["low5"][di]]; Hs += [demo["hist"][di]]; Us += [demo["U"][di]]
@@ -217,20 +229,28 @@ def state_from_low5(low5_np):
 
 def run_expand2(policy, env, cfg: SFG2Config, device="cpu", run=None, outdir=None, log=print):
     gammas = list(cfg.gammas)
-    demo = load_demo_all()
-    if cfg.freeze_enc:
-        for m in (policy.enc_grid, policy.enc_low, policy.gru):
-            for p in m.parameters():
-                p.requires_grad_(False)
-        log("[freeze_enc] E_g/E_l/GRU frozen — context map fixed, only trunk+head learn", flush=True)
-    opt = torch.optim.Adam([p for p in policy.parameters() if p.requires_grad], lr=cfg.lr)
+    demo = load_demo_all()               # loaded for PROBES only (positive-only loss; no demo gradient)
+    enc_mult = 0.0 if cfg.freeze_enc else cfg.enc_lr_mult
+    # "nice optimizer": separate param groups so the entangled context encoders and the velocity field can
+    # learn at different rates (enc_mult<1 slows the context map -> less drift/forgetting; =0 freezes it).
+    # The REDUCED model has NO learned encoder -> only the field group (enc_mult is then a no-op).
+    field_params = list(policy.trunk.parameters()) + list(policy.head.parameters())
+    enc_params = policy.encoder_modules()
+    groups = [{"params": field_params, "lr": cfg.lr}]
+    if enc_params:
+        groups.append({"params": enc_params, "lr": cfg.lr * enc_mult})
+    opt = torch.optim.Adam(groups)
+    sched = (torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.iters)
+             if cfg.sched == "cosine" else None)
     is_nn = cfg.unc == "nn"
     is_round = cfg.schedule == "round"
     if is_nn:
-        unc = NNUncertainty(warm_start=True, max_steps=cfg.nn_max_steps, normalize=True, device=device)
+        unc = NNUncertainty(warm_start=True, hidden=cfg.nn_hidden, max_steps=cfg.nn_max_steps,
+                            normalize=True, device=device)
     else:
         unc = GPUncertainty(kernel=cfg.kernel, lengthscale=cfg.ell, lam=cfg.lam, normalize=True)
-    log(f"[expand2] estimator={cfg.unc}  schedule={cfg.schedule}"
+    log(f"[expand2] POSITIVE-ONLY (demo_anchor={cfg.demo_anchor})  estimator={cfg.unc}  schedule={cfg.schedule}"
+        f"  enc_lr_mult={enc_mult}  sched={cfg.sched}"
         + (f" (round_traj={cfg.round_traj}, finetune_steps={cfg.finetune_steps}, warmup_valid={cfg.warmup_valid})"
            if is_round else ""), flush=True)
     probes = Probes(policy, demo, device)
@@ -278,15 +298,22 @@ def run_expand2(policy, env, cfg: SFG2Config, device="cpu", run=None, outdir=Non
         mv = np.mean([rec[f"g{g}"]["validity"] for g in gammas])
         mc = np.mean([rec[f"g{g}"]["coverage_cum"] for g in gammas])
         mf = np.mean([rec[f"g{g}"]["coverage_final"] for g in gammas])
+        vio = {k: float(np.mean([rec[f"g{g}"]["violations"][k] for g in gammas]))   # γ-mean violation fractions
+               for k in ("taskspace", "approach", "socp")}
         log(f"it{it:05d}: val2 {mv*100:.0f}% (γ:" +
             "/".join(f"{rec[f'g{g}']['validity']*100:.0f}" for g in gammas) +
             f") cov_cum {mc*100:.1f}% cov_fin {mf*100:.1f}% varσ {rec['var_sigma']:.4f} "
+            f"viol[task {vio['taskspace']*100:.0f} appr {vio['approach']*100:.0f} socp {vio['socp']*100:.0f}] "
             f"drift {rec['probes']['ctx_drift']:.3f} demoCFM {rec['probes']['demo_val_cfm']:.3f} "
             f"npos {rec['n_pos']}", flush=True)
         wl = {}
         for g in gammas:
             for k in ("validity", "coverage_cum", "coverage_final", "reach_rate"):
                 wl[f"expand2/{k}_g{g}"] = rec[f"g{g}"][k]
+            for k in ("taskspace", "approach", "socp"):
+                wl[f"viol/{k}_g{g}"] = rec[f"g{g}"]["violations"][k]
+        for k, v in vio.items():
+            wl[f"viol/{k}_mean"] = v
         wl.update({"expand2/var_sigma": rec["var_sigma"], "expand2/sigma_mean": rec["sigma_mean"],
                    "expand2/out_var": rec["out_var"], "expand2/n_pos": rec["n_pos"],
                    "probe/ctx_drift": rec["probes"]["ctx_drift"], "probe/ctx_cos": rec["probes"]["ctx_cos"],
@@ -360,6 +387,8 @@ def run_expand2(policy, env, cfg: SFG2Config, device="cpu", run=None, outdir=Non
                                   path=np.asarray(out["path"], np.float32),
                                   covered={str(gg): len(covered[gg]) for gg in gammas},
                                   covered_sets={str(gg): sorted(covered[gg]) for gg in gammas}))
+        if sched is not None:
+            sched.step()
         if outdir and t % cfg.ckpt_every == 0:
             GP2.save_policy2(policy, os.path.join(outdir, f"ckpt_{t}.pt"),
                              extra={"iter": t, "covered": {str(gg): sorted(covered[gg]) for gg in gammas}})
@@ -383,10 +412,14 @@ def main():
     ap.add_argument("--temp", type=float, default=1.3)
     ap.add_argument("--ell", type=float, default=0.2)
     ap.add_argument("--unc", choices=["gp", "nn"], default="gp")
+    ap.add_argument("--nn-hidden", type=int, default=64)
     ap.add_argument("--schedule", choices=["online", "round"], default="online")
     ap.add_argument("--round-traj", type=int, default=16)
     ap.add_argument("--finetune-steps", type=int, default=200)
     ap.add_argument("--warmup-valid", type=int, default=300)
+    ap.add_argument("--enc-lr-mult", type=float, default=1.0)
+    ap.add_argument("--sched", choices=["cosine", "none"], default="cosine")
+    ap.add_argument("--demo-anchor", action="store_true", help="(off by default) add U_demo back into the loss")
     ap.add_argument("--freeze-enc", action="store_true")
     ap.add_argument("--pos-margin", type=float, default=0.0)
     ap.add_argument("--measure-every", type=int, default=200)
@@ -401,14 +434,15 @@ def main():
     env = GS.make_grid()
     pol, _ = GP2.load_policy2(args.policy, device=dev)
     cfg = SFG2Config(iters=args.iters, lr=args.lr, alpha=args.alpha, beta=args.beta, s=args.s,
-                     temp=args.temp, ell=args.ell, unc=args.unc, schedule=args.schedule,
+                     temp=args.temp, ell=args.ell, unc=args.unc, nn_hidden=args.nn_hidden, schedule=args.schedule,
                      round_traj=args.round_traj, finetune_steps=args.finetune_steps, warmup_valid=args.warmup_valid,
+                     enc_lr_mult=args.enc_lr_mult, sched=args.sched, demo_anchor=args.demo_anchor,
                      freeze_enc=args.freeze_enc, pos_margin=args.pos_margin,
                      measure_every=args.measure_every, n_measure=args.n_measure,
                      snapshot_every=args.snapshot_every, ckpt_every=args.ckpt_every)
     rid = args.run_id or os.path.basename(os.path.normpath(args.outdir))
     run = W.init_run(args, name=f"sweep0703-{rid}", config={**vars(args), **asdict(cfg)}, group="sweep-0703")
-    print(f"===== expand2 [{rid}]: {json.dumps({k: v for k, v in asdict(cfg).items() if k in ('iters','lr','alpha','beta','s','temp','unc','schedule','freeze_enc','pos_margin')})} =====", flush=True)
+    print(f"===== expand2 [{rid}]: {json.dumps({k: v for k, v in asdict(cfg).items() if k in ('iters','lr','alpha','beta','s','temp','unc','schedule','enc_lr_mult','demo_anchor','pos_margin')})} =====", flush=True)
     r = run_expand2(pol, env, cfg, device=dev, run=run, outdir=args.outdir)
     GP2.save_policy2(pol, os.path.join(args.outdir, "final.pt"), extra={"covered": r["covered"]})
     with open(os.path.join(args.outdir, "history.json"), "w") as f:
