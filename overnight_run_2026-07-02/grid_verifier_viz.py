@@ -48,8 +48,15 @@ def draw_verifier_window(ax, seg, obs, r_robot, gamma, trail=None, xlim=(-0.7, 5
     ok, faces, raw, R_eff = VP.certify_window(seg, obs, r_robot, gamma, R=2.5, n_theta=180)
     gx = np.linspace(c[0] - R_eff, c[0] + R_eff, 130); gy = np.linspace(c[1] - R_eff, c[1] + R_eff, 130)
     GX, GY = np.meshgrid(gx, gy); H = _hp_field(faces, c, GX, GY)
-    ax.contourf(GX, GY, H, levels=[0, .2, .4, .6, .8, 1.0], cmap="Greens", alpha=.55, zorder=1)
-    ax.contour(GX, GY, H, levels=[0.0], colors="#006d2c", linewidths=1.6, zorder=3)
+    # GAMMA-DEPENDENT level sets: the DTCBF requires H_P(x_t) >= (1-gamma)^t, so shade the shrinking allowed
+    # region by those thresholds. Conservative gamma -> levels bunched near the center (tight tube);
+    # aggressive gamma=1 -> single band = the whole polytope (H_P>=0).
+    Hn = len(seg)
+    lv = sorted(set([0.0, 1.0] + [round(float((1.0 - gamma) ** t), 4) for t in range(Hn)]))
+    ax.contourf(GX, GY, H, levels=lv, cmap="Greens", alpha=.55, zorder=1)
+    ax.contour(GX, GY, H, levels=[0.0], colors="#006d2c", linewidths=1.6, zorder=3)              # polytope boundary
+    tube = float((1.0 - gamma) ** (Hn - 1))                                                       # loosest (final-step) CBF level
+    ax.contour(GX, GY, H, levels=[tube], colors="#08519c", linewidths=1.3, linestyles="--", zorder=3.2)  # reachable tube
     for k in range(6):
         ax.axvline(k, color="#eee", lw=.5, zorder=0); ax.axhline(k, color="#eee", lw=.5, zorder=0)
     ax.add_patch(Rectangle((0, 0), 5, 5, fill=False, edgecolor="#999", lw=1.0, zorder=0.5))
@@ -127,7 +134,9 @@ def verifier_movie(policy, env, gammas, out, deploy_fn, H=10, fps=10):
             ax = axes[0][ci]; ax.clear()
             p = rolls[g]; t = min(f, len(p) - H - 1); t = max(t, 0)
             draw_verifier_window(ax, p[t:t + H + 1], obs, rr, g, trail=p[:t + 1])
-        fig.suptitle("Verifier polytope + DTCBF level sets moving with the FM rollout", fontsize=12)
+        fig.suptitle("Verifier polytope + DTCBF level sets moving with the FM rollout  "
+                     "(green bands = H_P≥(1−γ)^t allowed region, tighter for smaller γ; dashed = reachable tube)",
+                     fontsize=11)
         return []
 
     anim = FuncAnimation(fig, frame, frames=range(0, nF - H, 2), interval=120)
@@ -142,13 +151,14 @@ def verifier_movie(policy, env, gammas, out, deploy_fn, H=10, fps=10):
 if __name__ == "__main__":
     import grid_scene as GS, grid_policy as GP, grid_rollout as GR
     dev = "cuda"
-    env = GS.make_grid(); pol, _ = GP.load_policy("pretrained.pt", device=dev)
+    POLICY = os.environ.get("POLICY", "pretrained.pt"); SUF = os.environ.get("SUFFIX", "")
+    env = GS.make_grid(); pol, _ = GP.load_policy(POLICY, device=dev)
     FIG = os.path.join(os.path.dirname(__file__), "figures")
 
     def deploy(policy, env, g):
         return GR.fm_deploy(policy, env, g, T=250, nfe=10, device=dev)["path"]
 
-    snapshot_failures(pol, env, [0.1, 0.5, 1.0], os.path.join(FIG, "verifier_failure.png"), deploy)
-    print("saved verifier_failure.png")
-    verifier_movie(pol, env, [0.1, 0.5, 1.0], os.path.join(FIG, "verifier_rollout.gif"), deploy)
-    print("saved verifier_rollout.{gif,mp4}")
+    snapshot_failures(pol, env, [0.1, 0.5, 1.0], os.path.join(FIG, f"verifier_failure{SUF}.png"), deploy)
+    print(f"saved verifier_failure{SUF}.png")
+    verifier_movie(pol, env, [0.1, 0.5, 1.0], os.path.join(FIG, f"verifier_rollout{SUF}.gif"), deploy)
+    print(f"saved verifier_rollout{SUF}.{{gif,mp4}}")

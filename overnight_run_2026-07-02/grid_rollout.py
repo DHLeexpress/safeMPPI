@@ -141,8 +141,11 @@ def fm_deploy(policy, env, gamma, T=250, temp=1.0, nfe=8, tilt=None, target=None
                 if m.any():
                     keep = np.where(m)[0]
                     Ucand = Ucand[torch.as_tensor(keep, device=Ucand.device)]; Uc_np = Uc_np[keep]
-            phi = policy.phi_s_at(Ucand, gT, lT, hT, s=tilt["s"])   # Eq-10 features
-            sig = tilt["unc"].sigma(phi)                            # GP σ over φ_s
+            if tilt.get("feature", "phi_s") == "rawU":              # context-invariant control-content feature
+                feat = Ucand.reshape(Ucand.shape[0], -1) / policy.u_max
+            else:
+                feat = policy.phi_s_at(Ucand, gT, lT, hT, s=tilt["s"])   # Eq-10 entangled features
+            sig = tilt["unc"].sigma(feat)                           # GP σ (window-to-window novelty)
             w = torch.exp(((sig - sig.max()) / max(tilt["beta"], 1e-6)).clamp(-30, 30))   # Eq-9 tilt
             if pdir is not None:                                    # bias toward the target's prescribed direction
                 net = di_rollout_batch(st, Uc_np, env.dt)[:, -1, :] - st[:2]

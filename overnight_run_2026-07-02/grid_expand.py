@@ -53,6 +53,7 @@ class SFGridConfig:
     ell: float = 0.2          # lengthscale (SWEEP priority; lower => σ more sensitive)
     lam: float = 1e-2
     gp_buf: int = 384
+    feature: str = "phi_s"    # σ feature: "phi_s" (original/default) or "rawU" (experimental, context-invariant)
     # signed UpdateFlow (+demo replay)
     alpha: float = 0.0        # negative-unlearning weight (default 0 per user)
     inner_steps: int = 12
@@ -68,10 +69,28 @@ class SFGridConfig:
     measure_every: int = 50
     n_measure: int = 50
     baseline_deploys: int = 500
+    track_variance: bool = False   # also record the FM output variance at probe states (de-collapse diagnostic)
     nfe_measure: int = 8
     T: int = 250
     goal_cov: float = 0.90
     goal_val: float = 0.90
+
+
+def output_variance(policy, env, gamma, device, n=96, probes=(0.15, 0.4, 0.65)):
+    """FM output spread at diagonal probe states: total variance of window net-displacement, sampled at temp=1
+    (the policy's OWN distribution). ~0 for a collapsed/deterministic policy; grows if it de-collapses off-diagonal."""
+    import grid_feats as GF
+    obs = env.obstacles.detach().cpu().numpy(); rr = float(env.r_robot); goal = env.goal.detach().cpu().numpy()
+    vs = []
+    for pf in probes:
+        st = np.array([pf * GM.GRID_M, pf * GM.GRID_M, 0.0, 0.0], np.float32)
+        g = GF.axis_grid(st[:2], obs, rr); l = GF.low5(st, goal, gamma); h = GF.hist_pad(np.zeros((0, 2)), 16)
+        with torch.no_grad():
+            U = policy.sample_window(torch.tensor(g, device=device), torch.tensor(l, device=device),
+                                     torch.tensor(h, device=device), n=n, temp=1.0, nfe=8).detach().cpu().numpy()
+        nets = GR.di_rollout_batch(st, U, env.dt)[:, -1, :] - st[:2]
+        vs.append(float(np.var(nets, axis=0).sum()))
+    return float(np.mean(vs))
 
 
 def load_demo(gamma, device="cpu"):
@@ -105,11 +124,13 @@ def _cat(buf, G, L, H, U, tags=None, cap=None):
     return buf
 
 
-def _buffer_phi(policy, qbuf, s, cap, device):
+def _buffer_feat(policy, qbuf, feature, s, cap, device):
     if qbuf is None or qbuf["U"].shape[0] == 0:
         return None
     n = qbuf["U"].shape[0]
     idx = torch.randperm(n)[:cap]
+    if feature == "rawU":                                            # context-invariant control-content
+        return qbuf["U"][idx].reshape(idx.shape[0], -1).to(device) / policy.u_max
     ctx = policy.ctx_from(qbuf["grid"][idx].to(device), qbuf["low5"][idx].to(device), qbuf["hist"][idx].to(device))
     return policy.phi_s(qbuf["U"][idx].to(device), ctx, s=s)
 
@@ -126,10 +147,12 @@ def update_flow(policy, opt, demo, pos, neg, cfg, device):
         wp = wp / wp.sum()
     policy.train()
     last = 0.0
-    nd_b = max(1, int(cfg.batch * cfg.demo_frac)) if use_pos else cfg.batch
+    nd_b = int(cfg.batch * cfg.demo_frac) if use_pos else cfg.batch   # demo_frac=0 => positive-only after warmup
     for _ in range(cfg.inner_steps):
-        bd = torch.randint(0, nd, (nd_b,))
-        Gs, Ls, Hs, Us = [demo["grid"][bd]], [demo["low5"][bd]], [demo["hist"][bd]], [demo["U"][bd]]
+        Gs, Ls, Hs, Us = [], [], [], []
+        if nd_b > 0:
+            bd = torch.randint(0, nd, (nd_b,))
+            Gs += [demo["grid"][bd]]; Ls += [demo["low5"][bd]]; Hs += [demo["hist"][bd]]; Us += [demo["U"][bd]]
         if use_pos:
             bp = torch.multinomial(wp, cfg.batch - nd_b, replacement=True)
             Gs.append(pos["grid"][bp]); Ls.append(pos["low5"][bp]); Hs.append(pos["hist"][bp]); Us.append(pos["U"][bp])
@@ -162,7 +185,10 @@ def run_expand(policy, env, gamma, cfg: SFGridConfig, demo=None, device="cpu", l
     base_paths = GR.deploy_many(policy, env, gamma, cfg.baseline_deploys if cfg.iters >= 50 else cfg.n_measure,
                                 T=cfg.T, nfe=cfg.nfe_measure, device=device)
     val, cov, steps, _ = GM.measure(base_paths, env, gamma, covered)
-    history.append(dict(iter=iter_offset, coverage=cov, validity=val, avg_steps=steps, n_pos=0))
+    base_rec = dict(iter=iter_offset, coverage=cov, validity=val, avg_steps=steps, n_pos=0)
+    if cfg.track_variance:
+        base_rec["out_var"] = output_variance(policy, env, gamma, device)
+    history.append(base_rec)
     log(f"[γ{gamma}] it{iter_offset:03d} baseline: cov={cov*100:.1f}% val={val*100:.1f}% steps={steps:.0f} covered={len(covered)}/252", flush=True)
     W.log(run, {f"expand/coverage_g{gamma}": cov, f"expand/validity_g{gamma}": val,
                 f"expand/avg_steps_g{gamma}": steps}, step=step0)
@@ -171,7 +197,7 @@ def run_expand(policy, env, gamma, cfg: SFGridConfig, demo=None, device="cpu", l
         if time_budget is not None and _time.time() - _t0 > time_budget:
             log(f"[γ{gamma}] wall-clock budget {time_budget:.0f}s reached at iter {t}", flush=True)
             break
-        unc.set_buffer(_buffer_phi(policy, qbuf, cfg.s, cfg.gp_buf, device))
+        unc.set_buffer(_buffer_feat(policy, qbuf, cfg.feature, cfg.s, cfg.gp_buf, device))
         target = style_rho = None
         if cfg.use_style:                                            # coherent per-trajectory right/up ratio
             style_rho = random.uniform(0.05, 0.95)
@@ -183,7 +209,7 @@ def run_expand(policy, env, gamma, cfg: SFGridConfig, demo=None, device="cpu", l
             target = random.choice(list(frontier)) if frontier else (
                 random.choice(list(GM.STAIRCASES - covered)) if len(covered) < GM.N_STAIR else None)
         out = GR.fm_deploy(policy, env, gamma, T=cfg.T, target=target, style_rho=style_rho,
-                           tilt=dict(unc=unc, beta=cfg.beta, N=cfg.N, s=cfg.s, broad=cfg.broad,
+                           tilt=dict(unc=unc, beta=cfg.beta, N=cfg.N, s=cfg.s, broad=cfg.broad, feature=cfg.feature,
                                      temp=cfg.temp_explore, churn=cfg.churn, safe_filter=cfg.safe_filter,
                                      n_target=cfg.n_target, align_temp=cfg.align_temp),
                            nfe=cfg.nfe_explore, record=True, device=device)
@@ -204,7 +230,11 @@ def run_expand(policy, env, gamma, cfg: SFGridConfig, demo=None, device="cpu", l
             paths = GR.deploy_many(policy, env, gamma, cfg.n_measure, T=cfg.T, nfe=cfg.nfe_measure, device=device)
             val, cov, steps, _ = GM.measure(paths, env, gamma, covered)
             np_ = 0 if pos is None else pos["U"].shape[0]
-            history.append(dict(iter=iter_offset + t, coverage=cov, validity=val, avg_steps=steps, n_pos=np_, upd=upd))
+            rec = dict(iter=iter_offset + t, coverage=cov, validity=val, avg_steps=steps, n_pos=np_, upd=upd)
+            if cfg.track_variance:
+                rec["out_var"] = output_variance(policy, env, gamma, device)
+                W.log(run, {f"expand/out_var_g{gamma}": rec["out_var"]}, step=step0 + t)
+            history.append(rec)
             snapshots.append(dict(iter=iter_offset + t, covered=sorted(covered),
                                   paths=[np.asarray(p, np.float32) for p in paths[:8]]))
             log(f"[γ{gamma}] it{iter_offset + t:03d}: cov={cov*100:.1f}% val={val*100:.1f}% steps={steps:.0f} "
