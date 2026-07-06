@@ -73,6 +73,8 @@ class SFG2Config:
     # v2 update — POSITIVE-ONLY (user 2026-07-03: U_demo REMOVED from the loss; demo pulled exploration back).
     #   demo is still LOADED for the forgetting/drift PROBES (diagnostic only), never for the gradient.
     demo_anchor: bool = False    # keep False: loss = L_CFM(U_pos) − α·L_CFM(U_neg); no demo term
+    demo_frac: float = 0.0       # 2.1 (user 2026-07-05, MACE-multihead-inspired): δ of every batch = demo windows
+    lwf_eta: float = 0.0         # 2.2 LwF frozen-teacher: + η·E_{ctx~demo}‖v_θ−v_θ₀‖² (anti-forgetting regularizer)
     alpha: float = 0.0           # negative-sample loss weight (SWEEP: 0 / 0.005 / 0.01)
     inner_steps: int = 12
     batch: int = 128
@@ -91,6 +93,7 @@ class SFG2Config:
     measure_every: int = 200
     n_measure: int = 25
     nfe_measure: int = 8
+    temp_measure: float = 1.0     # no-tilt deploy temp for MEASUREMENT (reduced models reach only near ~0.5)
     T: int = 250
     snapshot_every: int = 100
     ckpt_every: int = 500
@@ -195,12 +198,21 @@ def update_flow2(policy, opt, demo, pos, neg, cfg, device, n_steps=None):
     last = 0.0
     steps = n_steps or cfg.inner_steps
     gsum = {k: 0.0 for k in policy.module_groups()}
+    ndf = int(round(cfg.demo_frac * cfg.batch)) if (cfg.demo_frac > 0 and demo is not None) else 0
     for _ in range(steps):
-        idx = torch.multinomial(w, cfg.batch, replacement=True)
-        di = idx[idx < nd]
-        pi = idx[idx >= nd] - nd if use_demo else idx
+        if ndf > 0:                                   # 2.1: δ·batch demo windows + (1−δ)·batch positives
+            di = torch.randint(0, demo["U"].shape[0], (ndf,))
+            pi = torch.multinomial(w, cfg.batch - ndf, replacement=True)
+            if use_demo:
+                pi = pi[pi >= nd] - nd                # (demo_anchor off in this mode; keep indices in pos space)
+            use_d = True
+        else:
+            idx = torch.multinomial(w, cfg.batch, replacement=True)
+            di = idx[idx < nd]
+            pi = idx[idx >= nd] - nd if use_demo else idx
+            use_d = use_demo
         Gs, Ls, Hs, Us = [], [], [], []
-        if di.numel():
+        if (use_d or ndf > 0) and di.numel():
             Gs += [demo["grid"][di]]; Ls += [demo["low5"][di]]; Hs += [demo["hist"][di]]; Us += [demo["U"][di]]
         if pi.numel():
             Gs += [pos["grid"][pi]]; Ls += [pos["low5"][pi]]; Hs += [pos["hist"][pi]]; Us += [pos["U"][pi]]
@@ -211,6 +223,20 @@ def update_flow2(policy, opt, demo, pos, neg, cfg, device, n_steps=None):
             ni = torch.randint(0, nneg, (min(cfg.batch, nneg),))
             nctx = policy.ctx_from(neg["grid"][ni].to(device), neg["low5"][ni].to(device), neg["hist"][ni].to(device))
             loss = loss - cfg.alpha * policy.cfm_loss(neg["U"][ni].to(device), nctx)
+        teacher = getattr(cfg, "_teacher", None)
+        if cfg.lwf_eta > 0 and teacher is not None and demo is not None:   # 2.2 LwF on demo contexts
+            li = torch.randint(0, demo["U"].shape[0], (cfg.batch,))
+            Gd, Ld, Hd = demo["grid"][li].to(device), demo["low5"][li].to(device), demo["hist"][li].to(device)
+            Ud = demo["U"][li].to(device)
+            B_ = Ud.shape[0]
+            x1 = (Ud / policy.u_max).reshape(B_, policy.d)
+            x0 = torch.randn_like(x1)
+            tau = torch.rand(B_, device=x1.device).clamp(1e-4, 1.0)
+            x_tau = (1 - tau)[:, None] * x0 + tau[:, None] * x1
+            v_s = policy.forward(x_tau, tau, policy._expand_ctx(policy.ctx_from(Gd, Ld, Hd), B_))
+            with torch.no_grad():
+                v_t = teacher.forward(x_tau, tau, teacher._expand_ctx(teacher.ctx_from(Gd, Ld, Hd), B_))
+            loss = loss + cfg.lwf_eta * ((v_s - v_t) ** 2).mean()
         opt.zero_grad(); loss.backward()
         for k, v in grad_rms(policy).items():
             gsum[k] += v
@@ -253,6 +279,11 @@ def run_expand2(policy, env, cfg: SFG2Config, device="cpu", run=None, outdir=Non
         f"  enc_lr_mult={enc_mult}  sched={cfg.sched}"
         + (f" (round_traj={cfg.round_traj}, finetune_steps={cfg.finetune_steps}, warmup_valid={cfg.warmup_valid})"
            if is_round else ""), flush=True)
+    if cfg.lwf_eta > 0:                              # frozen teacher v_θ₀ for the LwF field-distillation term
+        import copy as _copy
+        cfg._teacher = _copy.deepcopy(policy).eval()
+        for p_ in cfg._teacher.parameters():
+            p_.requires_grad_(False)
     probes = Probes(policy, demo, device)
     pos = neg = qbuf = lbuf = None
     covered = {g: set() for g in gammas}
@@ -267,7 +298,8 @@ def run_expand2(policy, env, cfg: SFG2Config, device="cpu", run=None, outdir=Non
         rec = dict(iter=it, n_pos=0 if pos is None else int(pos["U"].shape[0]),
                    n_neg=0 if neg is None else int(neg["U"].shape[0]), n_upd=n_upd)
         for g in gammas:
-            paths = GR.deploy_many(policy, env, g, cfg.n_measure, T=cfg.T, nfe=cfg.nfe_measure, device=device)
+            paths = GR.deploy_many(policy, env, g, cfg.n_measure, T=cfg.T, temp=cfg.temp_measure,
+                                   nfe=cfg.nfe_measure, device=device)
             m = GM2.measure2(paths, env, g, covered[g])
             rec[f"g{g}"] = m
             snapshots.append(dict(kind="measure", iter=it, gamma=g,
@@ -424,6 +456,7 @@ def main():
     ap.add_argument("--pos-margin", type=float, default=0.0)
     ap.add_argument("--measure-every", type=int, default=200)
     ap.add_argument("--n-measure", type=int, default=25)
+    ap.add_argument("--temp-measure", type=float, default=1.0)
     ap.add_argument("--snapshot-every", type=int, default=100)
     ap.add_argument("--ckpt-every", type=int, default=500)
     W.add_wandb_args(ap)
@@ -438,7 +471,7 @@ def main():
                      round_traj=args.round_traj, finetune_steps=args.finetune_steps, warmup_valid=args.warmup_valid,
                      enc_lr_mult=args.enc_lr_mult, sched=args.sched, demo_anchor=args.demo_anchor,
                      freeze_enc=args.freeze_enc, pos_margin=args.pos_margin,
-                     measure_every=args.measure_every, n_measure=args.n_measure,
+                     measure_every=args.measure_every, n_measure=args.n_measure, temp_measure=args.temp_measure,
                      snapshot_every=args.snapshot_every, ckpt_every=args.ckpt_every)
     rid = args.run_id or os.path.basename(os.path.normpath(args.outdir))
     run = W.init_run(args, name=f"sweep0703-{rid}", config={**vars(args), **asdict(cfg)}, group="sweep-0703")

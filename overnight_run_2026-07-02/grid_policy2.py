@@ -25,12 +25,16 @@ import grid_feats as GF
 class GridGRUFlowPolicy2(FlowPolicy):
     def __init__(self, H_pred=GF.H_PRED, grid_shape=(3, GF.N_THETA, GF.N_R), K_hist=GF.K_HIST,
                  gru_dim=16, low_token=48, grid_token=64, width=256, depth=2, u_max=GF.U_MAX,
-                 use_gru=True, encode_low=True, use_grid=True, raw_hist=False, raw_hist_k=10, dropout=0.0):
+                 use_gru=True, encode_low=True, use_grid=True, raw_hist=False, raw_hist_k=10, dropout=0.0,
+                 enc_hist=False):
         gd = gru_dim if use_gru else 0
         raw_low = 4 + gd + 1                                    # relgoal2 + vel2 + [GRU] + γ
+        rawh = raw_hist_k * 2 if raw_hist else 0
+        enc_hist_eff = bool(enc_hist and raw_hist and encode_low)   # route the raw history THROUGH E_l
+        enc_in = raw_low + (rawh if enc_hist_eff else 0)      # E_l input dim (25 for the 2nd reduced model)
         low_out = low_token if encode_low else raw_low
+        rawh_out = rawh if (raw_hist and not enc_hist_eff) else 0    # appended raw ONLY when not encoded
         grid_out = grid_token if use_grid else 0
-        rawh_out = raw_hist_k * 2 if raw_hist else 0           # RAW last-k executed actions (unencoded) appended to ctx
         ctx_dim = low_out + grid_out + rawh_out
         super().__init__(T=H_pred, ctx_dim=ctx_dim, width=width, depth=depth, u_max=u_max)
         self.H_pred = H_pred
@@ -43,6 +47,8 @@ class GridGRUFlowPolicy2(FlowPolicy):
         self.raw_hist = raw_hist
         self.raw_hist_k = raw_hist_k
         self.dropout = dropout
+        self.enc_hist = enc_hist_eff
+        self.enc_in = enc_in
         self.raw_low = raw_low
         if dropout > 0:                                        # rebuild trunk WITH dropout (regularizer tweak);
             in_dim = self.d + ctx_dim + self.t_dim            # SiLU kept (subsumes ReLU, better for flow trunks)
@@ -53,7 +59,7 @@ class GridGRUFlowPolicy2(FlowPolicy):
         if use_gru:
             self.gru = nn.GRU(input_size=2, hidden_size=gru_dim, num_layers=1, batch_first=True)
         if encode_low:
-            self.enc_low = nn.Sequential(nn.Linear(raw_low, 64), nn.SiLU(), nn.Linear(64, low_token), nn.SiLU())
+            self.enc_low = nn.Sequential(nn.Linear(enc_in, 64), nn.SiLU(), nn.Linear(64, low_token), nn.SiLU())
         if use_grid:
             self.enc_grid = nn.Sequential(
                 nn.Conv2d(grid_shape[0], 8, 3, padding=1), nn.SiLU(),
@@ -74,14 +80,22 @@ class GridGRUFlowPolicy2(FlowPolicy):
             return torch.cat([low5[:, :4], h_n[-1], low5[:, 4:5]], dim=1)
         return torch.cat([low5[:, :4], low5[:, 4:5]], dim=1)
 
+    def _raw_hist(self, hist):
+        h = hist.unsqueeze(0) if hist.dim() == 2 else hist
+        return h[:, -self.raw_hist_k:, :].reshape(h.shape[0], -1).float()
+
     def ctx_from(self, grid, low5, hist):
         """grid [B,3,16,12], low5 [B,5], hist [B,K,2] -> ctx [B,ctx_dim]."""
         low_raw = self._low_raw(low5, hist)
-        low_part = self.enc_low(low_raw) if self.encode_low else low_raw
+        rh = self._raw_hist(hist) if self.raw_hist else None
+        if self.encode_low:
+            enc_input = torch.cat([low_raw, rh], dim=1) if self.enc_hist else low_raw
+            low_part = self.enc_low(enc_input)               # 2nd reduced model: E_l(25)->48
+        else:
+            low_part = low_raw
         parts = [low_part]
-        if self.raw_hist:                                     # raw last-k executed actions (unencoded)
-            h = hist.unsqueeze(0) if hist.dim() == 2 else hist
-            parts.append(h[:, -self.raw_hist_k:, :].reshape(h.shape[0], -1).float())
+        if self.raw_hist and not self.enc_hist:              # raw last-k actions appended UNENCODED
+            parts.append(rh)
         if self.use_grid:
             if grid.dim() == 3:
                 grid = grid.unsqueeze(0)
@@ -95,7 +109,8 @@ class GridGRUFlowPolicy2(FlowPolicy):
         if self.use_gru:
             out["gru"] = lr[:, 4:4 + self.gru_dim]
         if self.encode_low:
-            out["e_l"] = self.enc_low(lr)
+            enc_input = torch.cat([lr, self._raw_hist(hist)], dim=1) if self.enc_hist else lr
+            out["e_l"] = self.enc_low(enc_input)
         if self.use_grid:
             g = grid.unsqueeze(0) if grid.dim() == 3 else grid
             out["e_g"] = self.enc_grid(g.float())
@@ -142,15 +157,16 @@ class GridGRUFlowPolicy2(FlowPolicy):
                     gru_dim=self.gru_dim, width=self.width,
                     depth=len([m for m in self.trunk if isinstance(m, nn.Linear)]), u_max=self.u_max,
                     use_gru=self.use_gru, encode_low=self.encode_low, use_grid=self.use_grid,
-                    raw_hist=self.raw_hist, raw_hist_k=self.raw_hist_k, dropout=self.dropout)
+                    raw_hist=self.raw_hist, raw_hist_k=self.raw_hist_k, dropout=self.dropout,
+                    enc_hist=self.enc_hist)
 
 
 def build_policy2(width=256, depth=2, gru_dim=16, K_hist=GF.K_HIST, u_max=GF.U_MAX,
                   use_gru=True, encode_low=True, use_grid=True, raw_hist=False, raw_hist_k=10, dropout=0.0,
-                  device="cpu"):
+                  enc_hist=False, device="cpu"):
     return GridGRUFlowPolicy2(width=width, depth=depth, gru_dim=gru_dim, K_hist=K_hist, u_max=u_max,
                               use_gru=use_gru, encode_low=encode_low, use_grid=use_grid,
-                              raw_hist=raw_hist, raw_hist_k=raw_hist_k, dropout=dropout).to(device)
+                              raw_hist=raw_hist, raw_hist_k=raw_hist_k, dropout=dropout, enc_hist=enc_hist).to(device)
 
 
 def save_policy2(policy, path, extra=None):
@@ -167,7 +183,8 @@ def load_policy2(path, device="cpu"):
                              gru_dim=c["gru_dim"], width=c["width"], depth=c["depth"], u_max=c["u_max"],
                              use_gru=c.get("use_gru", True), encode_low=c.get("encode_low", True),
                              use_grid=c.get("use_grid", True), raw_hist=c.get("raw_hist", False),
-                             raw_hist_k=c.get("raw_hist_k", 10), dropout=c.get("dropout", 0.0))
+                             raw_hist_k=c.get("raw_hist_k", 10), dropout=c.get("dropout", 0.0),
+                             enc_hist=c.get("enc_hist", False))
     pol.load_state_dict(ck["state_dict"]); pol.to(device).eval()
     return pol, ck
 
