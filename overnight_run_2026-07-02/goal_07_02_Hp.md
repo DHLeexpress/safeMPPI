@@ -187,6 +187,31 @@ Reading: δ.75 too conservative even at temp 1.5; δ.5 holds AND discovers; temp
 ### CONFIRM STAGE (launched ~01:05): helios 2k× {r2_combo, r2_delta05 configs} · nyx R3 500-screens
 {r3_temp14 = δ.5 η.1 EF temp1.4 (the interpolation bet) · r3_delta04 = δ.4 η.1 EF temp1.5 (more explore at
 cov-passing temp)}. Judge confirms vs wave-1 dfrac0.25 (67%/27.4 with dip): want ≥70 held, no dip, cov ≥ 27.
+R3 RESULT: temp14 68→72 (+4) cov 8.6 · delta04 78→68 (dip 57) cov 9.1 — δ0.4 BREAKS the hold; floor = δ0.5.
+Confirms KILLED at it400 per user (combo 75%/cov 10.2 · delta05 71%/7.0 at kill — inconclusive by design).
+
+## PHASE-S WRAP-UP — LESSONS (user stop 2026-07-06 ~02:30: "enough to see temp is not working")
+1. **The hold mechanism is SOLVED and composite**: frozen encoder + old-input gradients (replay δ OR anchor η).
+   Each alone fails (enc0 79→35; unfrozen safeNOEF −12; wave-1 dips); together: NO dip for 500 iters (4 configs).
+2. **Replay floor at wide temp**: δ0.5 holds at temp1.5 (−2), δ0.4 breaks (−10, dip 57). δ0.75 over-conserves
+   (cov 5.4-6.6). η is interchangeable with δ for holding, NOT additive (safeMAX ≈ safeDELTA ≈ safeETA @500).
+3. **Temp is a pure trade, not a lever**: +0.2 temp ≈ −3 val / +2.5 cov pts. Coverage bought by widening
+   sampling is paid in validity. Max observed under ANY safe config: cov ~11 @500 — a CEILING.
+4. **Diagnosis of the ceiling**: with the encoder frozen at its (0,0)-start training distribution, off-diagonal
+   H_P patterns are OOD → garbage ctx → SOCP rejects → no positives there, regardless of update rule. The
+   bottleneck moved from "forgetting" (solved) to "the encoder has never seen where we want to go."
+5. Measurement: n=50/γ anchors still spread 68-80 run-to-run → judge each run vs its OWN anchor only.
+
+## PHASE-DR (user directive 2026-07-06): side-quest — domain-randomized ENCODER adaptation
+**Frontier models locked: safeETA (δ.25 η1.0 EF) and safeDELTA (δ.75 η.1 EF), temp 1.3.**
+Plan: (1) DR data: `gen_dr_data.py` — random starts (uniform interior, obstacle/goal clearance), FIXED goal,
+per-γ SafeMPPI mode-1 expert, successes → `dataset/dr_windows_g*.pt` (400 seeds/γ, RUNNING). (2) Encoder
+side-quest: `hp_dr_encoder.py` — train ONLY enc_grid (7.4k params) on DR windows with trunk/head FROZEN (the
+mirror image of expansion); per-epoch val-cfm on DR AND on original data (compatibility gauge); best → 
+`results/hp_arch/enc_hp_dr.pt`. (3) SPLICE: replace encoder in res2w256_ft → `results/hp_arch/res2w256_dr.pt`.
+**Original frozen encoder archived: `results/hp_arch/enc_hp_original.pt`** (6 tensors, 7.4k). (4) Overlay
+rollout viz of spliced vs original per γ. (5) Deploy safeETA + safeDELTA expansion from the spliced model
+(encoder frozen again), in parallel (helios GPU3 / nyx).
 
 ## TWO-MACHINE DISTRIBUTED PHASE (2026-07-05, clean restart — tasks #51-54)
 **Split (user): LOCAL = main part / aggressive search · REMOTE = fine-tuning brackets.**
