@@ -103,3 +103,44 @@ Center-tree sanity (`figures/hp_test/tree_sanity_center_t2.png`): temp 2.0 → 7
 **ARM SET (one override each vs the new base):** 1) encm0.1 (enc_lr_mult 0.5→0.1) · 2) lr1e-5 · 3) inner4 ·
 4) **alpha0.1** (α 0→0.1, raised from 0.005) · 5) beta0.2. Judging unchanged (hold ≥76 γ-mean, jiggle↓, cov
 slope, SOCP, γ0.1 tie-break, tree metrics ft→1k→2k).
+
+## SWEEP ROUND 3 (hp6, 2026-07-05) — separated effects at the FINAL LOCKED BASE
+Base (LOCKED, final): temp **1.5** explore / 1.0 measure · ell 0.5 · enc_lr_mult 0.5 · β 0.1 · s 0.9 · N 64 ·
+lr 2e-4 Adam+cosine · α 0 · inner 12×128 · measure/100 · n=25/γ. (β0.2 quota experiments showed temp 2.0 too
+extreme → 1.5; γ log-column order still (0.5, 1.0, 0.1).)
+
+**Results (1000 iters, one knob each; `results/hp_sweep6/`):**
+| arm | val2 γ-mean it0→1000 | per-γ at 1000 | cov_cum | drift | demoCFM | verdict |
+|---|---|---|---|---|---|---|
+| beta0.01 (greedy tilt) | 68 → **36%** | 56/32/20 | 7.4% | 0.280 | 0.79→1.20 | collapse, discovery also slow |
+| enc0 (freeze E_hp) | 79 → **35%** | 48/44/12 | 12.8% | **0.000 ≡** | 0.79→1.20 | collapse WITH frozen encoder |
+| lr1e-5 | (died at launch 18:08; rerun 07-05 19:45) | | | | | pending |
+
+**The separated-effects verdict — where forgetting lives and what each knob can/cannot do:**
+- **enc0 is the theorem**: drift ≡ 0.000 for 1000 iters (encoder bit-frozen) yet validity collapsed 79→35 on the
+  SAME trajectory as every other arm ⇒ **forgetting lives in the trunk/head FIELD, not the encoder**. enc_lr_mult
+  protects ctx geometry (σ/kernel sanity), it is NOT a retention lever. Optimize: keep 0.5; remote tests 0.1;
+  EMA-encoder only if ctx drift ever bites.
+- **β is a selection knob, not a retention knob**: β0.01 (greedy-σ) collapsed identically AND discovered less
+  (7.4% vs 12.8): extreme tilt picks weirder candidates that fail the gate → fewer, more-biased positives.
+  Optimize: β 0.1 stays; brackets 0.05/0.3 on remote judge discovery-rate-vs-validity-slope only after a hold
+  mechanism exists.
+- **lr is a speed knob**: prior evidence (quota-C at lr1e-5 still collapsed) says small steps walk the SAME biased
+  direction, just slower. The rerun completes the table; expectation: slower slope, same sign.
+- **⇒ The collapse is a DATA-COMPOSITION bias**: positive-only batches are drawn ever further from the pretraining
+  distribution; no per-parameter step-size/locus knob can fix a gradient that points away from the demo manifold.
+  **The real levers change the gradient DIRECTION: 2.1 demo_frac (mix old-input batches) and 2.2 LwF (anchor the
+  field on old inputs)** — exactly the two-machine phase below.
+
+## TWO-MACHINE DISTRIBUTED PHASE (2026-07-05, clean restart — tasks #51-54)
+**Split (user): LOCAL = main part / aggressive search · REMOTE = fine-tuning brackets.**
+- **LOCAL (GPU 0/3, running since 19:45)**: dfrac0.25 (2.1 default, 2k it) · lwf0.1 (2.2 default, 2k it) ·
+  lr1e-5 rerun (1k, completes Round 3). NEXT: dfrac0.25+lwf0.1 combined → winner long-run (5-10k, target
+  cov ≥ 40% with val2 HELD ≥~76) → quota-D discovery harvest (frozen-core Hamming + 5%-floor ban) on the winner.
+- **REMOTE (via `HP_RUNBOOK.md`, the one file)**: the 8 bracket rows — dfrac{0.1,0.5}, lwf{0.01,1.0},
+  beta{0.05,0.3}, enc0.1, lr5e-5. Deliverables per run: 3-row tree + 4-panel trend + last 3 log lines.
+- **Judging (both machines, §5 of runbook)**: hold val2 γ-mean ≥~76 while cov_cum climbs ≥ ~13%/1k-it; jiggle↓;
+  γ0.1 tie-break; tree branches/died/reached at it2000.
+- **ROADMAP after the winner**: transfer the hold-while-explore recipe to SFM (`grid_expand_sfm.py` gains
+  demo_frac/lwf_eta) → re-run expansion → `stage_e_benchmark` ours-side ONLY (Kazuki numbers cached) → close
+  the 9.7% vs 4.0% collision gap = "beat Kazuki as the bonus of full exploration".
