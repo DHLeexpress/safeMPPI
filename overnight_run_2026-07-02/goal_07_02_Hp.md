@@ -156,6 +156,26 @@ parallel pairs per round (helios GPU3 ×2 + nyx GPU0/GPU1), report → narrow �
   temp 1.5); all fail → tighten (δ.9 / η10 / temp1.0 / inner4). After any PASS: 2k confirm top-2 → raise 60k
   pos-buffer cap → long run; tree + 4-panel at each stage.
 
+### ROUND 1 RESULT (23:50) — **VALIDITY HOLD ACHIEVED; the frozen encoder is CAUSALLY NECESSARY**
+| run | anchor→it500 | traj (it100..500) | cov@500 | drift | verdict |
+|---|---|---|---|---|---|
+| safeDELTA δ.75 η.1 EF | 71 → **74 (+3)** | 71·71·70·78·74 | 6.6% | ≡0 | **best holder — RISES, no dip** |
+| safeMAX δ.75 η1 EF | 75 → 73 (−2) | 71·77·73·75·73 | 5.4% | ≡0 | holds (never below 71) |
+| safeETA δ.25 η1 EF | 73 → 73 (0) | 69·85·73·76·73 | 6.0% | ≡0 | holds |
+| safeNOEF δ.75 η1 enc.5 | 73 → **61 (−12)** | 69·80·69·72·61 | 4.8% | 0.134 | **FAILS — only unfrozen arm** |
+- Key composition: freeze alone collapses (R3 enc0 79→35), replay/anchor alone dips (wave-1); **freeze +
+  replay/anchor holds**. safeNOEF vs safeMAX is the controlled proof the freeze is required.
+- η1.0 adds nothing over η0.1 when δ=.75 (safeMAX ≤ safeDELTA) → replay is the main holder at heavy δ.
+- **Coverage gate FAILED everywhere (4.8-6.6 < 10)** — the safety cost discovery (temp 1.3 + heavy replay).
+### ROUND 2 (launched 23:55, pre-registered relax branch — restore discovery, keep the hold; EF everywhere)
+| run | δ | η | temp | machine |
+|---|---|---|---|---|
+| r2_temp15 | .75 | .1 | **1.5** | helios G3 |
+| r2_delta05 | **.5** | .1 | 1.3 | helios G3 |
+| r2_combo | **.5** | .1 | **1.5** | nyx G1 |
+| r2_etaT15 | .25 | 1.0 | **1.5** | nyx G0 |
+Gate unchanged (val2@500 ≥ anchor ∧ cov ≥ 10).
+
 ## TWO-MACHINE DISTRIBUTED PHASE (2026-07-05, clean restart — tasks #51-54)
 **Split (user): LOCAL = main part / aggressive search · REMOTE = fine-tuning brackets.**
 - **LOCAL (GPU 0/3)**: **WAVE-1 FINALS (2k it, done 20:44)** — the mechanisms WORK where every plain knob failed:
