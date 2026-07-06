@@ -176,6 +176,18 @@ parallel pairs per round (helios GPU3 ×2 + nyx GPU0/GPU1), report → narrow �
 | r2_etaT15 | .25 | 1.0 | **1.5** | nyx G0 |
 Gate unchanged (val2@500 ≥ anchor ∧ cov ≥ 10).
 
+### ROUND 2 RESULT (~01:00 07-06) — **THE FRONTIER IS δ0.5 + η0.1 + EF**
+| run | δ/η/temp | anchor→500 | cov@500 | verdict |
+|---|---|---|---|---|
+| **r2_delta05** | .5/.1/1.3 | 74→**79 (+5)**, ends at max, γ0.1=66 (best ever) | 8.6 | val-PASS · cov just short |
+| **r2_combo** | .5/.1/1.5 | 75→73 (−2, in noise), γ0.5=92 | **11.1 ✓** (climbing 1.2/100it) | **cov-PASS · val-WATCH** |
+| r2_temp15 | .75/.1/1.5 | 78→71 (−7) | 6.6 | reject — heavy replay chokes discovery |
+| r2_etaT15 | .25/1.0/1.5 | 80→70 (−10) | 8.9 | reject — anchor corner degrades at wide temp |
+Reading: δ.75 too conservative even at temp 1.5; δ.5 holds AND discovers; temp trades ~2-3 val pts for ~2.5 cov.
+### CONFIRM STAGE (launched ~01:05): helios 2k× {r2_combo, r2_delta05 configs} · nyx R3 500-screens
+{r3_temp14 = δ.5 η.1 EF temp1.4 (the interpolation bet) · r3_delta04 = δ.4 η.1 EF temp1.5 (more explore at
+cov-passing temp)}. Judge confirms vs wave-1 dfrac0.25 (67%/27.4 with dip): want ≥70 held, no dip, cov ≥ 27.
+
 ## TWO-MACHINE DISTRIBUTED PHASE (2026-07-05, clean restart — tasks #51-54)
 **Split (user): LOCAL = main part / aggressive search · REMOTE = fine-tuning brackets.**
 - **LOCAL (GPU 0/3)**: **WAVE-1 FINALS (2k it, done 20:44)** — the mechanisms WORK where every plain knob failed:
