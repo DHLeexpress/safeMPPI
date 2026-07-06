@@ -3,7 +3,8 @@
 # safe-flow expansion with Claude's recipe, grid+GRU encoder FROZEN (enc_lr_mult 0), on helios GPU2.
 set -u
 cd /home/dohyun/projects/cfm_mppi/overnight_run_2026-07-02 || exit 1
-export LD_LIBRARY_PATH=/home/dohyun/miniforge3/lib:${LD_LIBRARY_PATH:-}
+# NB: conda lib ONLY for python (matplotlib CXXABI); exporting it globally breaks ssh/scp OpenSSL.
+PYLIB=/home/dohyun/miniforge3/lib
 NYX=dohyunlee@dhcp-101-145.caltech.edu
 NYXD='~/projects/cfm_mppi/overnight_run_2026-07-02'
 
@@ -21,11 +22,11 @@ ssh -o BatchMode=yes $NYX "grep -E 'RESULT|DONE' $NYXD/results/hp_arch/gru_ft.lo
 scp -o BatchMode=yes $NYX:$NYXD/results/hp_arch/res2w256_gru_ft.pt results/hp_arch/ || { echo "SCP FAILED"; exit 1; }
 
 # 3) origin overlay (iteration 0 = fine-tuned base)
-python hp_origin_overlay.py --ckpt results/hp_arch/res2w256_gru_ft.pt --n 16 --tag gru_ft 2>&1 | tail -1
+LD_LIBRARY_PATH=$PYLIB python hp_origin_overlay.py --ckpt results/hp_arch/res2w256_gru_ft.pt --n 16 --tag gru_ft 2>&1 | tail -1
 
 # 4) safe-flow expansion — Claude recipe, grid+GRU FROZEN, from the GRU base (5k, ckpt 1k, measure 500)
 mkdir -p results/hp_gru_expand
-CUDA_VISIBLE_DEVICES=2 setsid nohup python grid_hp_expt.py \
+CUDA_VISIBLE_DEVICES=2 LD_LIBRARY_PATH=$PYLIB setsid nohup python grid_hp_expt.py \
   --iters 5000 --measure-every 500 --n-measure 50 --ckpt-every 1000 \
   --temp 1.5 --ell 0.5 --enc-lr-mult 0 --lr 1e-4 --grad-clip 10 \
   --demo-frac 0.4 --lwf-eta 0.05 --beta 0.1 --alpha 0.02 --s 0.9 \

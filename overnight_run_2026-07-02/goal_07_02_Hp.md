@@ -329,6 +329,23 @@ rounds vs GRU's single from-scratch run, but val-cfm is converged and the γ0.1 
 undertraining. **DECISION: GRU stays OFF; res2w256_ft_v2 remains the base.** (GRU may matter on MOVING/SFM scenes
 where history is non-Markovian — revisit there, not here.)
 
+### GRU FINE-TUNE → OVERLAY → FROZEN-ENCODER EXPANSION (user 2026-07-06, chain `gru_expand_pipeline.sh`)
+Despite the negative pretraining result, user asked to fine-tune the GRU model, viz from origin, freeze BOTH
+encoders, and run Claude's recipe. All done:
+- **Fine-tune** `res2w256_gru` → `res2w256_gru_ft.pt` (60 ep lr1e-4, nyx): val-cfm ~0.815 (flat, converged);
+  eval n=25 γ0.1 48 / γ0.5 72 / γ1.0 84; mm-splits [13,0,0] (still no split at obstacle-encounter — the GRU
+  weakness persists).
+- **Origin overlay** (`figures/dr_test_overnight/origin_overlay_gru_ft.png`): from (0,0), reach 16/16 all γ,
+  validity2 12/14/**8** (γ0.5/1.0/0.1) — γ0.1 the reddest, multimodal staircase paths visible.
+- **Freeze BOTH encoders — verified**: `encoder_modules()` = enc_grid(7424) + **gru(960)** = 8384 params, all
+  `requires_grad=False` at enc_lr_mult 0. Expansion it0 **drift ≡ 0.000** confirms the freeze live.
+- **Expansion** (helios GPU2, `results/hp_gru_expand/gru_mine`, my recipe δ.4 η.05 β.1 α.02 s.9 lr1e-4 temp1.5,
+  grad-clip 10, 5k, ckpt1k): it0 n=50 val2 **68%** (66/74/64) — more balanced than the n=25 eval. Tests whether
+  hold-while-explore progresses from the weaker GRU base. Compare to no-GRU ov_mine (v2 base, 70%/cov31.5@5k).
+- **Bug fixed**: `gru_expand_pipeline.sh` initially aborted — `export LD_LIBRARY_PATH=conda` (matplotlib) breaks
+  ssh/scp OpenSSL, so the nyx poll misfired "ft died". Fixed: conda lib prefixed per-python-call only (the
+  dr_milestone.sh lesson). Fine-tune had actually completed; finished the chain manually.
+
 ## 20k LONG RUNS (user 2026-07-06, GPU0+GPU3, `results/hp_20k/`, ckpt every 1k)
 Two recipes to 20k iters, from v2 base (encoder frozen), measure/500 n=50, grad-clip 10 (α explosion guard).
 - **yours** (Claude, GPU0): δ.4 η.05 β.1 **α.02** s.9 lr1e-4 — **warm-started from ov_mine/ckpt_5000** (real
