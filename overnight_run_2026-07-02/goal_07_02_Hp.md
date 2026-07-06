@@ -267,7 +267,7 @@ data into PRETRAINING, then run safe expansion from the stronger base. Everythin
   |---|---|---|---|---|---|---|---|---|
   | **ov_conj** (PRIORITY) | .25 | .1 | **.05** | **.05** | .9 | 2e-4 | helios G3 | user conjecture |
   | ov_s08 | .25 | .1 | .05 | .05 | **.8** | 2e-4 | helios G3 | conjecture + s-probe (never tested) |
-  | ov_aggr | .25 | **0** | **2.0** | **.1** | .9 | 2e-4 | helios G0 | no-reg aggressive; update verified = grad(cfm(δ-replay+pos)) − α·grad(cfm(neg)); β=2 ⇒ p∝exp(σ/2) ≈ near-uniform candidate pick |
+  | ov_aggr (CORRECTED 02:0x: **temp 2.0**, lr **1e-4**) | .25 | **0** | **2.0** | **.1** | .9 | **1e-4** | helios G0 | no-reg aggressive at WIDE sampling (temp 2.0); update verified = grad(cfm(δ-replay+pos)) − α·grad(cfm(neg)); β=2 ⇒ p∝exp(σ/2) ≈ near-uniform candidate pick; watcher `ov_aggr_fix.sh` swaps the arm at Phase-D launch (pipeline script can't be edited mid-execution); its Phase-E tree re-rendered at temp 2.0 in the morning |
   | ov_mine | **.4** | **.05** | .1 | **.02** | .9 | **1e-4** | helios G0 | Claude's pick: δ at the hold floor + a little of every stabilizer — replay-heavy hold (δ.4>floor .5 at t1.5 was old-enc; v2 should lower the floor), light anchor insurance, GENTLE α to actively push off rejected modes, half-lr to halve per-step bias while cosine-over-5k keeps total plasticity |
 - **E. Report**: every arm logs val2/cov every 500 (n=50) + **train loss per block (new `loss` field)**;
   at end 6-row trees (v2, 1k..5k) per arm on nyx + 4-panel trends. Loss-movement analysis + ad-hoc-solutions
