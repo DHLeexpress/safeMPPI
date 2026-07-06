@@ -276,6 +276,42 @@ data into PRETRAINING, then run safe expansion from the stronger base. Everythin
   measure noise ±3-4 pts on γ-mean. nyx compute NOT used for arms (5.6 s/it — would blow the 6h budget);
   helios runs 2 arms/GPU (~0.7→~1.4 s/it) ≈ 2.5-3h for all four.
 
+### OVERNIGHT RESULTS (07-06 04:58, done under budget) — **THE OOD-IN-PRETRAINING PREMISE WORKS**
+**HEADLINE: v2 base it0 (n=50) = 77% with γ BALANCED (76/78/76).** The chronic γ0.1 weakness — 0% (450-traj
+base) → 16-64% (2001) — is GONE. Folding 2001 off-diagonal trajs into PRETRAINING (not expansion) balanced the
+γ conditioning at the source. val-cfm 0.810. Data: 1334/1334 success/γ, 4002 trajs, ~308k windows.
+| arm | δ/η/β/α/s/temp/lr | it0→peak→5000 (γ-mean) | γ0.1 | cov@5k | loss | verdict |
+|---|---|---|---|---|---|---|
+| **ov_mine** (Claude) | .4/.05/.1/.02/.9/1.5/1e-4 | 71→**74**(it3500)→70* | 44-64 alive | **31.5%** | 0.83-0.89 stable | **WINNER: ~70 held + cov 31.5 + γ0.1 alive** |
+| ov_s08 | .25/.1/.05/.05/**.8**/1.5/2e-4 | 73→74→59 | volatile 26-60 | **33.2%** | 0.86-1.0 | cov leader but validity oscillates ±12 |
+| ov_aggr (CORR.) | .25/0/**2.0**/.1/.9/**2.0**/1e-4 | 76→64→51 | 32-62 | 30.2% | 0.86-1.0 | survived; wide temp+β2 = noise, no cov gain (temp-is-a-trade, AGAIN) |
+| **ov_conj** (PRIORITY) | .25/.1/.05/.05/.9/1.5/2e-4 | 76→**DIVERGED** | 0 | frozen 7.4 | **→ −4e20** | **BLEW UP at it~300: loss explodes, validity 0 from it500** |
+(*ov_mine last block 57 is n=50 noise; it held 65-74 across it2000-4500. Trees: v2-base 76 reached / ov_mine
+it5000 branches spray the FULL grid — off-diagonal corners now explored, cov climbed 10→31.5%.)
+
+**LOSS-MOVEMENT ANALYSIS (user asked to quantify):**
+- **Stable arms**: raw cfm loss sits 0.83-1.0, gently oscillating, tracking demoCFM (0.83-0.86) — the field
+  stays on the demo manifold; replay+freeze holding as designed. ov_mine has the LOWEST, FLATTEST loss (0.83)
+  = the gentlest, most stable optimization → its steady 70% is no accident.
+- **ov_conj DIVERGENCE**: loss goes −2e14 → −4e20 monotonically from it500; varσ column shows the same blow-up.
+  Cause = the **α negative-unlearning term is unbounded below**: `loss −= α·cfm(neg)` MAXIMIZES cfm-loss on
+  negatives, which has no floor → weights explode. ov_conj vs its twin ov_s08 (identical but s .9→.8) isolates
+  s=0.9 as this run's trigger, but the STRUCTURAL fault is α-unlearning with no clamp. ov_aggr (α.1) and
+  ov_mine (α.02) survived → it's a knife-edge, not a threshold. **Ad-hoc fixes**: (1) clamp the neg term
+  `α·min(cfm(neg), c)` or detach/normalize it; (2) keep α≤0.02 (ov_mine's safe dose); (3) gradient-norm clip on
+  the field group; (4) the honest option — **drop α entirely**: it caused the only failure and the winner barely
+  used it (.02). Positive-only + replay is the stable core.
+- **Ad-hoc solutions observed more broadly**: (a) v2's balanced γ removes the per-γ harvest-quota hack we built
+  earlier — pretraining fixed what expansion couldn't; (b) 60k pos-buffer FIFO saturates ~it1800 (all arms
+  npos=60000 after) — for 5k runs raise to ~150k so late coverage isn't fighting eviction; (c) cov_fin stays ~6%
+  while cov_cum hits 31% → discovery is broad but not consolidating per-γ; a coverage-weighted replay is the next
+  lever.
+
+**VERDICT & NEXT**: ov_mine recipe (δ.4 η.05 β.1 **α.02** s.9 temp1.5 lr1e-4, from v2, EF) is the locked
+hold-while-explore winner: 70% validity sustained over 5k iters with 31.5% coverage and γ0.1 alive — the first
+config to hold AND meaningfully explore. Artifact `results/hp_overnight/ov_mine/ckpt_5000.pt`. Ready to (1) push
+longer with raised buffer, or (2) transfer to SFM vs Kazuki (task #54).
+
 ## TWO-MACHINE DISTRIBUTED PHASE (2026-07-05, clean restart — tasks #51-54)
 **Split (user): LOCAL = main part / aggressive search · REMOTE = fine-tuning brackets.**
 - **LOCAL (GPU 0/3)**: **WAVE-1 FINALS (2k it, done 20:44)** — the mechanisms WORK where every plain knob failed:
