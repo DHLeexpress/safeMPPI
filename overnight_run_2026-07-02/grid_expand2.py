@@ -264,7 +264,11 @@ def run_expand2(policy, env, cfg: SFG2Config, device="cpu", run=None, outdir=Non
     enc_params = policy.encoder_modules()
     groups = [{"params": field_params, "lr": cfg.lr}]
     if enc_params:
-        groups.append({"params": enc_params, "lr": cfg.lr * enc_mult})
+        if enc_mult <= 0:
+            for p in enc_params:                     # hard freeze (2026-07-05): requires_grad=False,
+                p.requires_grad_(False)              # not Adam lr*0 — no grads flow into the encoder at all
+        else:
+            groups.append({"params": enc_params, "lr": cfg.lr * enc_mult})
     opt = torch.optim.Adam(groups)
     sched = (torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.iters)
              if cfg.sched == "cosine" else None)

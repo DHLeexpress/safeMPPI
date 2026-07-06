@@ -133,6 +133,29 @@ ft baseline 77/963 branches):**
   **The real levers change the gradient DIRECTION: 2.1 demo_frac (mix old-input batches) and 2.2 LwF (anchor the
   field on old inputs)** — exactly the two-machine phase below.
 
+## PHASE-S — 500-ITER "HOPE" SCREENING (2026-07-05 ~22:30, USER WIND-BACK; supersedes the wave-2/nyx-chain plan)
+User verdict after wave-1: both mechanism arms DIP in the first 500 (dfrac0.25 71→59, lwf0.1 79→63) before
+recovering — not good enough. **Today's goal: find ONE config where validity holds/rises AND coverage climbs
+within the FIRST 500 iters.** No long runs until such "a hope" exists. Round-based divide & conquer, 3-4
+parallel pairs per round (helios GPU3 ×2 + nyx GPU0/GPU1), report → narrow → repeat.
+- **Thesis (user)**: high δ + high η + FROZEN grid encoder ≈ mimics the pretrained policy by construction while
+  the (1−δ) positives nudge off-diagonal. Explore temp ↓ **1.3**; **n-measure ↑ 50/γ** (high-belief it500 verdict).
+- **Code (committed with this section)**: (a) `grid_expand2.py` enc_lr_mult≤0 now sets `requires_grad_(False)`
+  on ALL encoder params (hard freeze, not Adam-lr-0); (b) `grid_hp_expt.py --n-measure` exposed. Smoke-verified
+  (drift≡0 with δ0.75+η1.0 updates flowing).
+- **ROUND 1 slate** (500 it · temp 1.3 · n=50 · measure/100 · rest = locked base; `results/hp_screen/`):
+  | run | δ | η | enc | machine | answers |
+  |---|---|---|---|---|---|
+  | safeMAX | .75 | 1.0 | frozen | helios G3 | the thesis corner |
+  | safeDELTA | .75 | 0.1 | frozen | helios G3 | heavy replay, weak anchor enough? |
+  | safeETA | .25 | 1.0 | frozen | nyx G1 | strong anchor, light replay enough? |
+  | safeNOEF | .75 | 1.0 | 0.5 | nyx G0 | is the freeze needed? |
+- **GATE @ it500 (n=50)**: PASS = val2 γ-mean ≥ it0 anchor AND cov_cum ≥ 10% · WATCH = within 4 pts + cov ≥ 10%
+  · else rejected. References: wave-1 dfrac0.25 59/16.1 · lwf0.1 63/13.1 · plain arms 35-48/5-8 (all FAIL).
+- **Round 2 branches (pre-registered)**: safeMAX passes → relax one knob per run (δ.5 / η.1 / unfreeze .5 /
+  temp 1.5); all fail → tighten (δ.9 / η10 / temp1.0 / inner4). After any PASS: 2k confirm top-2 → raise 60k
+  pos-buffer cap → long run; tree + 4-panel at each stage.
+
 ## TWO-MACHINE DISTRIBUTED PHASE (2026-07-05, clean restart — tasks #51-54)
 **Split (user): LOCAL = main part / aggressive search · REMOTE = fine-tuning brackets.**
 - **LOCAL (GPU 0/3)**: **WAVE-1 FINALS (2k it, done 20:44)** — the mechanisms WORK where every plain knob failed:
