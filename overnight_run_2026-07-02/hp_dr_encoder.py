@@ -43,13 +43,19 @@ def main():
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--mix-orig", type=float, default=0.0,
                     help="fraction of each batch drawn from the ORIGINAL windows (fallback lever)")
+    ap.add_argument("--mode", choices=("enc", "full"), default="enc",
+                    help="enc = THE METHOD (encoder only, trunk/head frozen). full = ORACLE baseline: train "
+                         "everything on DR data — saved for reference lines ONLY, never the deployed method "
+                         "(trunk trained on expert demos of new modes = unfaithful to safe expansion).")
     args = ap.parse_args()
 
     pol, meta = ARCH.load_arch(args.base, device=DEV)
+    enc_only = args.mode == "enc"
     for n, p in pol.named_parameters():
-        p.requires_grad_(n.startswith("enc_grid"))
+        p.requires_grad_(True if not enc_only else n.startswith("enc_grid"))
     enc_pars = [p for n, p in pol.named_parameters() if n.startswith("enc_grid")]
-    print(f"[dr-enc] trainable (enc_grid) {sum(p.numel() for p in enc_pars)/1e3:.1f}k / "
+    train_pars = enc_pars if enc_only else list(pol.parameters())
+    print(f"[dr-{args.mode}] trainable {sum(p.numel() for p in train_pars)/1e3:.1f}k / "
           f"total {sum(p.numel() for p in pol.parameters())/1e3:.1f}k params", flush=True)
 
     G, L, Hh, U = load_pool("dr_")
@@ -66,7 +72,7 @@ def main():
     ova = (oG[oidx].to(DEV), oL[oidx].to(DEV), oH[oidx].to(DEV), oU[oidx].to(DEV))
     print(f"[dr-enc] DR windows {n} ({n-nval} train) · orig-val 4096 · mix_orig {args.mix_orig}", flush=True)
 
-    opt = torch.optim.AdamW(enc_pars, lr=args.lr, weight_decay=1e-4)
+    opt = torch.optim.AdamW(train_pars, lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda ep: (ep + 1) / args.warmup if ep < args.warmup else
         0.5 * (1 + math.cos(math.pi * (ep - args.warmup) / max(1, args.epochs - args.warmup))))
@@ -90,20 +96,33 @@ def main():
             vdr = float(pol.cfm_loss(va[3], pol.ctx_from(va[0], va[1], va[2])))
             vor = float(pol.cfm_loss(ova[3], pol.ctx_from(ova[0], ova[1], ova[2])))
         if vdr < best[0]:
-            best = (vdr, {k: v.detach().cpu().clone() for k, v in pol.state_dict().items() if k.startswith("enc_grid")}, ep)
+            keep = (lambda k: k.startswith("enc_grid")) if enc_only else (lambda k: True)
+            best = (vdr, {k: v.detach().cpu().clone() for k, v in pol.state_dict().items() if keep(k)}, ep)
         print(f"ep {ep:03d}  train {tot/nb:.4f}  val-DR {vdr:.4f}  val-ORIG {vor:.4f}"
               + ("  *best" if best[2] == ep else ""), flush=True)
 
-    enc_out = os.path.join(OUTD, "enc_hp_dr.pt")
-    torch.save(dict(enc_state=best[1], best_val_dr=best[0], best_ep=best[2],
-                    base=os.path.basename(args.base), mix_orig=args.mix_orig), enc_out)
     base = torch.load(args.base, map_location="cpu", weights_only=False)
-    sd = dict(base["state_dict"]); sd.update(best[1])
-    spliced = dict(base); spliced["state_dict"] = sd
-    spliced["dr_adapted"] = True; spliced["dr_val"] = best[0]; spliced["enc_source"] = "enc_hp_dr.pt"
-    spl_out = os.path.join(OUTD, "res2w256_dr.pt")
-    torch.save(spliced, spl_out)
-    print(f"[dr-enc] saved encoder -> {enc_out}\n[dr-enc] saved SPLICED model -> {spl_out}", flush=True)
+    if enc_only:
+        enc_out = os.path.join(OUTD, "enc_hp_dr.pt")
+        torch.save(dict(enc_state=best[1], best_val_dr=best[0], best_ep=best[2],
+                        base=os.path.basename(args.base), mix_orig=args.mix_orig), enc_out)
+        sd = dict(base["state_dict"]); sd.update(best[1])
+        spliced = dict(base); spliced["state_dict"] = sd
+        spliced["dr_adapted"] = True; spliced["dr_val"] = best[0]; spliced["enc_source"] = "enc_hp_dr.pt"
+        spl_out = os.path.join(OUTD, "res2w256_dr.pt")
+        torch.save(spliced, spl_out)
+        print(f"[dr-enc] saved encoder -> {enc_out}\n[dr-enc] saved SPLICED model -> {spl_out}", flush=True)
+    else:
+        trunk = {k: v for k, v in best[1].items() if k.startswith(("trunk", "head"))}
+        tr_out = os.path.join(OUTD, "trunk_hp_dr.pt")
+        torch.save(dict(trunk_head_state=trunk, best_val_dr=best[0], best_ep=best[2],
+                        note="ORACLE trunk (trained on DR expert demos) — reference only, NOT the method"), tr_out)
+        oracle = dict(base); oracle["state_dict"] = dict(best[1])
+        oracle["oracle_dr_full"] = True; oracle["dr_val"] = best[0]
+        or_out = os.path.join(OUTD, "res2w256_drfull.pt")
+        torch.save(oracle, or_out)
+        print(f"[dr-full] saved ORACLE trunk -> {tr_out}\n[dr-full] saved ORACLE model -> {or_out}\n"
+              f"[dr-full] use for reference lines only (its it0 coverage = the ceiling)", flush=True)
 
 
 if __name__ == "__main__":
