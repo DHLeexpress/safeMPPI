@@ -249,6 +249,33 @@ rollout viz of spliced vs original per γ. (5) Deploy safeETA + safeDELTA expans
 - Natural next (PROPOSAL, not launched): from dr_safeDELTA ckpt_2000 (repaired + DR eyes), re-open discovery
   with the r2_combo recipe (δ.5 or temp 1.5) — repair-then-explore staging; or bank and go to SFM (task #54).
 
+## OVERNIGHT AUTONOMOUS SWEEP (user 2026-07-06 ~01:00, "trust me", ~6h, NO permission stops)
+**Premise ("hopeless version" — honest concession): OOD data is sometimes needed.** Fold off-diagonal expert
+data into PRETRAINING, then run safe expansion from the stronger base. Everything in `overnight_pipeline.sh`
+(one background orchestrator, helios GPU0+GPU3 compute, nyx = tree/report factory). Figures →
+`figures/dr_test_overnight/`.
+- **A. Data**: +2001 DR trajs (667/γ), goal fixed, start uniform free space with **|y−x| ≥ 0.5** (off-diagonal
+  band excluded → no diagonal replays; `gen_dr_data.py --offdiag 0.5 --out-prefix "" --append`). Originals
+  backed up → `dataset/backup_2001traj/`. Data viz: `od_data_viz.png`.
+- **B. Pretrain v2**: fine-tune res2w256_ft on the merged **4002 trajs** (1334/γ) → `res2w256_ft_v2.pt`
+  (`hp_finetune_v2.py`, 60 ep, lr 1e-4).
+- **C. Baseline**: v2 it0 validity/coverage (n=50, start (0,0)) + 1-row tree (nyx) — encoder will be FROZEN
+  (not replaced) for all arms.
+- **D. Four 5k-iter expansion arms** (parallel; from v2; EF; temp 1.5; measure/500 n=50; ell .5; defaults else;
+  demo replay + LwF now draw from the MERGED pool automatically):
+  | arm | δ | η | β | α | s | lr | GPU | rationale |
+  |---|---|---|---|---|---|---|---|---|
+  | **ov_conj** (PRIORITY) | .25 | .1 | **.05** | **.05** | .9 | 2e-4 | helios G3 | user conjecture |
+  | ov_s08 | .25 | .1 | .05 | .05 | **.8** | 2e-4 | helios G3 | conjecture + s-probe (never tested) |
+  | ov_aggr | .25 | **0** | **2.0** | **.1** | .9 | 2e-4 | helios G0 | no-reg aggressive; update verified = grad(cfm(δ-replay+pos)) − α·grad(cfm(neg)); β=2 ⇒ p∝exp(σ/2) ≈ near-uniform candidate pick |
+  | ov_mine | **.4** | **.05** | .1 | **.02** | .9 | **1e-4** | helios G0 | Claude's pick: δ at the hold floor + a little of every stabilizer — replay-heavy hold (δ.4>floor .5 at t1.5 was old-enc; v2 should lower the floor), light anchor insurance, GENTLE α to actively push off rejected modes, half-lr to halve per-step bias while cosine-over-5k keeps total plasticity |
+- **E. Report**: every arm logs val2/cov every 500 (n=50) + **train loss per block (new `loss` field)**;
+  at end 6-row trees (v2, 1k..5k) per arm on nyx + 4-panel trends. Loss-movement analysis + ad-hoc-solutions
+  section in the morning report.
+- Notes: pos-buffer FIFO cap 60k will saturate ~it1800 (documented, unchanged for comparability). n=50
+  measure noise ±3-4 pts on γ-mean. nyx compute NOT used for arms (5.6 s/it — would blow the 6h budget);
+  helios runs 2 arms/GPU (~0.7→~1.4 s/it) ≈ 2.5-3h for all four.
+
 ## TWO-MACHINE DISTRIBUTED PHASE (2026-07-05, clean restart — tasks #51-54)
 **Split (user): LOCAL = main part / aggressive search · REMOTE = fine-tuning brackets.**
 - **LOCAL (GPU 0/3)**: **WAVE-1 FINALS (2k it, done 20:44)** — the mechanisms WORK where every plain knob failed:

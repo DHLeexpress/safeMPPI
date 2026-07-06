@@ -24,13 +24,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "dataset"); os.makedirs(DATA, exist_ok=True)
 
 
-def sample_start(env, rng, goal_clear=1.5, obs_margin=0.15, lo=0.25, hi=4.75, tries=200):
+def sample_start(env, rng, goal_clear=1.5, obs_margin=0.15, lo=0.25, hi=4.75, tries=400, offdiag=0.0):
+    """offdiag>0 (user 2026-07-06): require |y-x| >= offdiag — starts OFF the diagonal band, so expert
+    trajectories cannot just replay the diagonal behavior."""
     obs = env.obstacles.detach().cpu().numpy()
     oc = obs[:, :2] if len(obs) else obs
     orad = obs[:, 2] if len(obs) and obs.shape[1] > 2 else np.full(len(obs), GS.OBS_R)
     goal = env.goal.detach().cpu().numpy()
     for _ in range(tries):
         p = rng.uniform(lo, hi, size=2)
+        if offdiag > 0 and abs(p[1] - p[0]) < offdiag:
+            continue
         if np.linalg.norm(p - goal) < goal_clear:
             continue
         if len(obs) and (np.linalg.norm(oc - p[None], axis=1) - orad).min() < float(env.r_robot) + obs_margin:
@@ -39,11 +43,11 @@ def sample_start(env, rng, goal_clear=1.5, obs_margin=0.15, lo=0.25, hi=4.75, tr
     return env.x0.detach().cpu().numpy().astype(np.float32)   # fallback: canonical start
 
 
-def rollout_dr(env, gamma, cfg, seed, reach=0.4):
+def rollout_dr(env, gamma, cfg, seed, reach=0.4, offdiag=0.0):
     """stage2.rollout_full with a randomized start (rng independent of the planner seeds)."""
     ad = SafeMPPIAdapter(**cfg)
     rng = np.random.default_rng(10_000_000 + seed)
-    st = sample_start(env, rng)
+    st = sample_start(env, rng, offdiag=offdiag)
     start = st.copy()
     goal_t = env.goal.detach().cpu().float()
     obs_plan = GS.planner_obstacles(env)
@@ -59,11 +63,11 @@ def rollout_dr(env, gamma, cfg, seed, reach=0.4):
     return np.array(states, np.float32), np.array(controls, np.float32), start
 
 
-def generate(gamma, seeds, env, cfg, s0=0, log=print):
+def generate(gamma, seeds, env, cfg, s0=0, offdiag=0.0, log=print):
     G, L, Hh, U, starts = [], [], [], [], []
     n_ok = 0; t0 = time.time()
     for s in range(s0, s0 + seeds):
-        states, controls, start = rollout_dr(env, gamma, cfg, s)
+        states, controls, start = rollout_dr(env, gamma, cfg, s, offdiag=offdiag)
         ok, _ = GS.is_success(states[:, :2], env)
         if not ok or len(controls) < 2:
             continue
@@ -85,17 +89,23 @@ def main():
     ap.add_argument("--s0", type=int, default=0, help="seed offset (append runs)")
     ap.add_argument("--gammas", type=float, nargs="+", default=[0.1, 0.5, 1.0])
     ap.add_argument("--append", action="store_true")
+    ap.add_argument("--offdiag", type=float, default=0.0, help="require |y-x| >= this at the start")
+    ap.add_argument("--out-prefix", default="dr_", help='shard prefix ("" appends to the MAIN windows_g*.pt)')
     args = ap.parse_args()
     env = GS.make_grid(); cfg = GS.mode1_config()
     print(f"=== PHASE-DR data: random starts (goal fixed), {len(env.obstacles)} obstacles, "
-          f"seeds {args.s0}..{args.s0+args.seeds} ===", flush=True)
+          f"seeds {args.s0}..{args.s0+args.seeds}, offdiag {args.offdiag}, prefix '{args.out_prefix}' ===",
+          flush=True)
     for g in args.gammas:
-        d = generate(g, args.seeds, env, cfg, s0=args.s0)
-        out = os.path.join(DATA, f"dr_windows_g{g}.pt")
+        d = generate(g, args.seeds, env, cfg, s0=args.s0, offdiag=args.offdiag)
+        out = os.path.join(DATA, f"{args.out_prefix}windows_g{g}.pt")
         if args.append and os.path.exists(out):
             old = torch.load(out)
             for k in ("grid", "low5", "hist", "U", "starts"):
-                d[k] = torch.cat([old[k], d[k]], 0)
+                if k in old:
+                    d[k] = torch.cat([old[k], d[k]], 0)
+                elif k == "starts":
+                    d.pop(k, None)        # main shards have no starts key — keep schema unchanged
             d["n_traj"] += old.get("n_traj", 0); d["n_seeds"] += old.get("n_seeds", 0)
         torch.save(d, out)
         print(f"γ{g}: saved {d['grid'].shape[0]} DR windows from {d['n_traj']} successes "

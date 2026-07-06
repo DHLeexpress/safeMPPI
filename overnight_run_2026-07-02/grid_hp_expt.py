@@ -132,6 +132,7 @@ def main():
     ap.add_argument("--temp", type=float, default=None)
     ap.add_argument("--measure-every", type=int, default=None)
     ap.add_argument("--n-measure", type=int, default=None)
+    ap.add_argument("--s", type=float, default=None)
     ap.add_argument("--demo-frac", type=float, default=None)
     ap.add_argument("--lwf-eta", type=float, default=None)
     ap.add_argument("--arch-ckpt", default=None, help="start from an hp_arch checkpoint (ResTrunk-aware)")
@@ -150,7 +151,7 @@ def main():
         pol = pretrain(dev)
     env = GS.make_grid()
     cfg = GX2.SFG2Config(iters=args.iters)                        # 0702 defaults; sweep overrides only if given
-    for k in ("lr", "alpha", "beta", "enc_lr_mult", "inner_steps", "ell", "temp", "measure_every", "n_measure", "demo_frac", "lwf_eta"):
+    for k in ("lr", "alpha", "beta", "enc_lr_mult", "inner_steps", "ell", "temp", "measure_every", "n_measure", "demo_frac", "lwf_eta", "s"):
         v = getattr(args, k)
         if v is not None:
             setattr(cfg, k, v)

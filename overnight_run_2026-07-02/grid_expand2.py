@@ -243,6 +243,7 @@ def update_flow2(policy, opt, demo, pos, neg, cfg, device, n_steps=None):
         opt.step()
         last = float(loss)
     policy.eval()
+    cfg._last_loss = last            # exposed for the block log line (loss-movement tracking, 2026-07-06)
     return dict(loss=last, **{f"grad_{k}": v / steps for k, v in gsum.items()})
 
 
@@ -341,7 +342,7 @@ def run_expand2(policy, env, cfg: SFG2Config, device="cpu", run=None, outdir=Non
             f") cov_cum {mc*100:.1f}% cov_fin {mf*100:.1f}% varσ {rec['var_sigma']:.4f} "
             f"viol[task {vio['taskspace']*100:.0f} appr {vio['approach']*100:.0f} socp {vio['socp']*100:.0f}] "
             f"drift {rec['probes']['ctx_drift']:.3f} demoCFM {rec['probes']['demo_val_cfm']:.3f} "
-            f"npos {rec['n_pos']}", flush=True)
+            f"npos {rec['n_pos']} loss {getattr(cfg, '_last_loss', float('nan')):.3f}", flush=True)
         wl = {}
         for g in gammas:
             for k in ("validity", "coverage_cum", "coverage_final", "reach_rate"):
