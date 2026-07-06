@@ -8,22 +8,37 @@ scripts) and they work at H=5 after **one knob + two default-unifications**. H i
 "5, potentially changing" is a one-line edit later.
 
 ---
-## 0. THE DESIGN — H becomes a SINGLE knob (`grid_feats.H_PRED`)
-Today H lives in THREE decoupled places (all hardcoded `10`); the model/data/sampling already follow
-`GF.H_PRED`, only the two verifier/metric windows don't. Point them at `GF.H_PRED` → one knob drives everything.
+## 0. WORK IN A COPY, then ONE knob (`grid_feats.H_PRED`) drives FOUR things
+**Isolation (Q2 = copy):** the H=10 runs stay live, so H=5 goes in a fresh sibling folder:
+```bash
+cp -r overnight_run_2026-07-02 overnight_run_H5 && cd overnight_run_H5
+rm -rf results dataset wandb figures                 # start clean; keep the .py + .md
+```
+`_paths.py` recomputes relative to the new folder, so the SHARED deps still resolve
+(`overnight_run_2026-07-01/verifier_polytope.py` + `di_grid_viz`, `overnight_run_today/src/*`) — the H5 folder
+must remain a sibling of `overnight_run_2026-07-01/` under the repo root. **Local files** (copied, editable):
+`grid_feats.py`, `grid_scene.py`, `grid_metrics.py`, `grid_metrics2.py`, all `hp_*`/`grid_*`. **Shared, DO NOT
+EDIT:** `overnight_run_2026-07-01/verifier_polytope.py` — it's used by H=10 too; we drive it via an explicit
+`H_win` argument instead (Edit C).
+
+**Q1 = expert also plans H=5** (user: same sensing range ⇒ 5-level-set sampling differs, a slice of a 10-plan is
+NOT the same controls). So `GF.H_PRED` drives FOUR things: MPPI expert horizon, FM window, validity2 window,
+verifier window. Today only model/data/sampling follow it; the other three are hardcoded `10`. The edits:
 
 **Edit A — the knob** · `grid_feats.py:25` → `H_PRED = 5`
-**Edit B — validity2 window** · `grid_metrics2.py`: change the DEFAULTS `traj_valid2(..., H=10, ...)` and
-`traj_breakdown(..., H=10, ...)` → `H=GF.H_PRED` (module already `import grid_feats as GF`). Every caller
-(`grid_expand2.py:396`, `hp_rollout_viz.py:42`, `hp_origin_overlay.py:48`, `hp_quota_expand.py`) uses the
-default, so this one change propagates.
-**Edit C — SOCP verifier window (the "level sets")** · `grid_metrics.py:89` `socp_ok(..., H_win=10)` →
-`H_win=GF.H_PRED` (add `import grid_feats as GF`), and `verifier_polytope.certify_trajectory(..., H_win=10, ...)`
-default → `GF.H_PRED` (add the import in `overnight_run_2026-07-01/verifier_polytope.py`). This makes the DTCBF
-polytope `alpha = (1-γ)**arange(H+1)` shrink over the 5-step arc.
-**Edit D — tree-viz schedule** · `hp_tree_viz.py`: the recursive branch schedule is H-tied. At H=5 a node is
-one 5-step window (0.5 s at dt 0.1); use `k = [6,6,5,5,4,4,3,3,2,2,1,1,1,…]` and extend the k-list to cover
-~T/H = 50 nodes (pad with 1s). Node metrics/timing then match H=5.
+**Edit E — MPPI expert horizon** · `grid_scene.py` `mode1_config()`: after `cfg = dict(load_best_config())`
+add `cfg["horizon"] = GF.H_PRED` and `cfg["guidance_horizon"] = GF.H_PRED` (add `import grid_feats as GF` if
+absent). This makes the SafeMPPI expert genuinely plan 5 steps (was `horizon:10` in best_area_mode4.json;
+guidance_horizon 12 would exceed 5). ⇒ different, shorter-sighted demos — intended.
+**Edit B — validity2 window** · `grid_metrics2.py`: DEFAULTS `traj_valid2(..., H=10, ...)` and
+`traj_breakdown(..., H=10, ...)` → `H=GF.H_PRED` (module already imports GF). All callers use the default.
+**Edit C — SOCP verifier window** · `grid_metrics.py:89` `socp_ok(..., H_win=10)` → `H_win=GF.H_PRED` (add
+`import grid_feats as GF`). `socp_ok` ALREADY forwards `H_win` explicitly to `certify_trajectory` (line 92-93),
+and `certify_window`'s `alpha=(1-γ)**arange(seg_len)` follows the passed seg — so the SHARED
+`verifier_polytope.py` needs **NO edit** and H=10 stays intact. (Q3: H=5 window = 5 controls, 6 states; robot's
+first state has H_P≡1 by construction ⇒ **5 shrinking level sets** α^1…α^5 — matches "5 level sets".)
+**Edit D — tree-viz schedule** · `hp_tree_viz.py`: branch schedule is H-tied. At H=5 a node is one 5-step
+window (0.5 s at dt 0.1); use `k = [6,6,5,5,4,4,3,3,2,2,1,1,1,…]` extended to ~T/H = 50 nodes (pad 1s).
 
 **What cascades AUTOMATICALLY (verify, do NOT edit):**
 - **Model dim** — `GridHPFlowPolicy(H_pred=GF.H_PRED)` default ⇒ d = 2H = **10**, trunk in **79** (U10+ctx37+t32),
@@ -117,11 +132,19 @@ tree branches/died/reached (v2→it5000) · verdict.
 | `hp_trend_viz.py` | 4-panel trend |
 | `hp_ell_calib.py` · `hp_s_calib.py` | σ-kernel ell/s recalibration in 10-dim φ_s |
 
-## 7. OPEN QUESTIONS (answer before running — see the chat)
-- **Q1 MPPI expert horizon**: does the SafeMPPI expert that GENERATES data also drop its planning horizon 10→5
-  (config `horizon` in `best_area_mode4.json`; shorter-sighted expert = different data), or keep planning at 10
-  and only slice/certify at 5?
-- **Q2 Isolation**: edit `H_PRED` in place in 0702 (existing files, but H=10 artifacts become unloadable), or
-  copy to `overnight_run_H5/` (H=10 stays intact)?
-- **Q3 Level-set convention**: H=5 window = 5 controls = 6 states ⇒ DTCBF has 6 shrinking sets (α^0…α^5).
-  "5 level sets" = this H=5 window, or literally 5 (H=4)?
+## 7. DECISIONS LOCKED (user 2026-07-06)
+- **Q1 → expert plans H=5 too** (Edit E). Same sensing range ⇒ the 5-level-set sample differs from a slice of a
+  10-step plan, so the demos must come from a genuine 5-step planner. Data distribution changes vs H=10 — intended.
+- **Q2 → copy to `overnight_run_H5/`** (§0). H=10 runs/artifacts untouched; H=5 runs on the spare GPU headroom now.
+- **Q3 → H=5 window** (5 controls, 6 states). Robot's first state is H_P≡1 by construction, so it's not counted:
+  **5 shrinking level sets** α^1…α^5. Verifier `certify_window` handles this via the passed seg length.
+
+## 8. ONE-SHOT SANITY (before the full regen — proves the knob works end to end)
+After Edits A-E, from `overnight_run_H5/`:
+```bash
+python -c "import _paths, grid_feats as GF, grid_scene as GS, hp_arch_sweep as A; \
+print('H_PRED', GF.H_PRED, '| expert horizon', GS.mode1_config()['horizon']); \
+p=A.build('res2w256'); print('model d', p.d, '(=2H, expect 10) | trunk_in', p.d+p.ctx_dim+p.t_dim, '(expect 79)')"
+python stage2_grid_data.py --seeds 4 --gammas 0.5   # expect U shape [.,5,2]; check windows_g0.5.pt grid/U dims
+```
+All three must read 5 / 5 / 10 / 79 and the smoke shard must have U of width-5 windows — then run §1-§4.
