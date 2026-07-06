@@ -34,25 +34,25 @@ python grid_hp_expt.py --iters 2000 --temp 1.5 --ell 0.5 --enc-lr-mult 0.5 --mea
 ```
 
 ## 3. EXPERIMENT MATRIX (one run per row; 2000 iters each, ~80 min/GPU)
-**MACHINE SPLIT (2026-07-05): the REMOTE machine runs the 8 rows marked REMOTE (fine-tuning brackets).**
-The LOCAL/main machine does the aggressive search: the mechanism defaults (dfrac0.25, lwf0.1), the combined
-run, the winner long-run, and the quota-D discovery harvest — already running locally, do NOT duplicate.
+**USER VERDICT 2026-07-05: plain-knob arms are CUT** (β/enc/lr separated-effects closed: beta0.01 68→36 ·
+enc0 79→35 drift≡0 · lr1e-5 81→21 with γ0.1→0; trees 77→{0,5,15} reached — no plain knob prevents collapse).
+**Only the mechanism arms continue: dfrac (2.1) and LwF (2.2).**
+**MACHINE SPLIT: REMOTE (ssh, Caltech box) = mechanism brackets · LOCAL (main) = aggressive search**
+(defaults dfrac0.25 + lwf0.1, the combined run, winner long-run, quota-D harvest — running locally, do NOT duplicate).
 | run name | override flags | tests | machine |
 |---|---|---|---|
-| beta0.05 | `--beta 0.05` | tilt greediness (β0.01 & β0.2 done locally) | **REMOTE** |
-| beta0.3 | `--beta 0.3` | softer tilt | **REMOTE** |
-| enc0.1 | `--enc-lr-mult 0.1` | partial encoder slowing (0.0 done locally) | **REMOTE** |
-| lr5e-5 | `--lr 5e-5` | mid step-size (1e-5 done locally) | **REMOTE** |
-| dfrac0.1 | `--demo-frac 0.1` | 2.1 distillation: 10% of every batch = demo windows | **REMOTE** |
+| dfrac0.1 | `--demo-frac 0.1` | 2.1 replay, light: 10% of every batch = demo windows | **REMOTE** |
 | dfrac0.25 | `--demo-frac 0.25` | 2.1 default (32 demo + 96 positives per 128-batch) | local (running) |
 | dfrac0.5 | `--demo-frac 0.5` | 2.1 heavy replay (the old v1 anchor regime) | **REMOTE** |
-| lwf0.01 | `--lwf-eta 0.01` | 2.2 LwF: light field-distillation on demo ctx | **REMOTE** |
+| lwf0.01 | `--lwf-eta 0.01` | 2.2 LwF, light field-distillation on demo ctx | **REMOTE** |
 | lwf0.1 | `--lwf-eta 0.1` | 2.2 default | local (running) |
 | lwf1.0 | `--lwf-eta 1.0` | 2.2 strong hold | **REMOTE** |
-| dfrac0.25+lwf0.1 | `--demo-frac 0.25 --lwf-eta 0.1` | the combined hold (run after singles) | local |
+| dfrac0.25+lwf1.0 | `--demo-frac 0.25 --lwf-eta 1.0` | tier 2: replay + strong anchor | **REMOTE** (after singles) |
+| dfrac0.5+lwf0.1 | `--demo-frac 0.5 --lwf-eta 0.1` | tier 2: heavy replay + light anchor | **REMOTE** (after singles) |
+| dfrac0.25+lwf0.1 | `--demo-frac 0.25 --lwf-eta 0.1` | the combined default | local |
 
-Suggested remote order (most informative first): dfrac0.1 → dfrac0.5 → lwf0.01 → lwf1.0 → beta0.05 →
-beta0.3 → enc0.1 → lr5e-5. With 2 GPUs run two chains (dfrac/lwf chain + beta/enc/lr chain), ~5.5 h total.
+Remote order: dfrac0.1 → lwf1.0 (chain A) · dfrac0.5 → lwf0.01 (chain B); tier-2 combos after the singles
+land. 2 GPUs → ~3 h for the singles.
 
 **What 2.1/2.2 are** (implemented in `grid_expand2.py`, inert unless flagged):
 - `--demo-frac δ` — every 128-window update batch = δ·128 uniformly-sampled DEMO windows + (1−δ)·128 positives
@@ -74,13 +74,15 @@ python hp_trend_viz.py --log <path to the run's log> --out arm_<RUN>_trend.png
 ## 5. Judging (fill one row per run)
 | run | val2 γ-mean it0→2000 (hold ≥~76?) | jiggle (std of blocks) | cov_cum | SOCP-viol trend | drift | demoCFM | tree: branches/died/reached at it2000 |
 
-Reference results from the local machine (base, 1000-iter arms, FINAL): plain expansion DEGRADES validity at
-every single-knob setting tried — beta0.01: 68→36% (cov 7.4) · enc0: 79→35% (cov 12.8, **drift≡0.000 all run**
-→ forgetting is in the FIELD/trunk+head, not the encoder) · lr1e-5: rerunning locally. **That is why 2.1/2.2
-exist**: β/enc/lr change the SIZE or LOCUS of the update but not its DIRECTION — the collapse is a
-data-composition bias (positives crowd out the pretraining distribution). demo_frac and LwF are the only knobs
-here that mix old-input gradients back in. Expected winner: dfrac or lwf arms holding val2 γ-mean ≥~76 while
-cov_cum climbs ≥ the ~13%/1k-iter discovery rate.
+Reference results from the local machine (base, 1000-iter arms, FINAL — this is why the plain rows were cut):
+plain expansion DEGRADES validity at every single-knob setting — beta0.01: 68→36% (cov 7.4) · enc0: 79→35%
+(cov 12.8, **drift≡0.000 all run** → forgetting is in the FIELD/trunk+head, not the encoder) · lr1e-5: 81→**21%**
+(cov 13.5, **γ0.1→0** — the WORST arm: tiny steps still walk the same biased direction, 12×128×1000 ≈ 12k
+gradient applications). β/enc/lr change the SIZE or LOCUS of the update but not its DIRECTION — the collapse is
+a data-composition bias (positives crowd out the pretraining distribution). demo_frac and LwF are the only
+knobs that mix old-input gradients back in, and the local mid-run reads confirm it (dfrac0.25 ~57-61% & lwf0.1
+~55% at it1200-1500 with cov ~23-24% and demoCFM 0.85-0.90 vs plain arms' 31-39%/1.20 at matched iters).
+Winner = holds val2 γ-mean ≥~76 while cov_cum climbs ≥ the ~13%/1k-iter discovery rate.
 
 ## 6. Context (1 paragraph)
 Model = `GridHPFlowPolicy` res2w256_ft: ctx = raw low5(5) ⊕ E_hp(H_P 1-ch [1,16,12]→CNN+AAP→32); trunk

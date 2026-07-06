@@ -109,12 +109,13 @@ Base (LOCKED, final): temp **1.5** explore / 1.0 measure · ell 0.5 · enc_lr_mu
 lr 2e-4 Adam+cosine · α 0 · inner 12×128 · measure/100 · n=25/γ. (β0.2 quota experiments showed temp 2.0 too
 extreme → 1.5; γ log-column order still (0.5, 1.0, 0.1).)
 
-**Results (1000 iters, one knob each; `results/hp_sweep6/`):**
-| arm | val2 γ-mean it0→1000 | per-γ at 1000 | cov_cum | drift | demoCFM | verdict |
-|---|---|---|---|---|---|---|
-| beta0.01 (greedy tilt) | 68 → **36%** | 56/32/20 | 7.4% | 0.280 | 0.79→1.20 | collapse, discovery also slow |
-| enc0 (freeze E_hp) | 79 → **35%** | 48/44/12 | 12.8% | **0.000 ≡** | 0.79→1.20 | collapse WITH frozen encoder |
-| lr1e-5 | (died at launch 18:08; rerun 07-05 19:45) | | | | | pending |
+**Results (1000 iters, one knob each; `results/hp_sweep6/`; tree = reached-goal leaves at γ0.5/temp1.5,
+ft baseline 77/963 branches):**
+| arm | val2 γ-mean it0→1000 | per-γ at 1000 | cov_cum | drift | demoCFM | tree reached ft→500→1000 | verdict |
+|---|---|---|---|---|---|---|---|
+| beta0.01 (greedy tilt) | 68 → **36%** | 56/32/20 | 7.4% | 0.280 | 0.79→1.20 | 77 → 1 → **0** | collapse, discovery also slow |
+| enc0 (freeze E_hp) | 79 → **35%** | 48/44/12 | 12.8% | **0.000 ≡** | 0.79→1.20 | 77 → 11 → **5** | collapse WITH frozen encoder |
+| lr1e-5 (rerun) | 81 → **21%** | 28/36/**0** | 13.5% | 0.140 | 0.79→1.01 | (tree rendering) | WORST arm — tiny steps, same bias; γ0.1 dead |
 
 **The separated-effects verdict — where forgetting lives and what each knob can/cannot do:**
 - **enc0 is the theorem**: drift ≡ 0.000 for 1000 iters (encoder bit-frozen) yet validity collapsed 79→35 on the
@@ -137,8 +138,11 @@ extreme → 1.5; γ log-column order still (0.5, 1.0, 0.1).)
 - **LOCAL (GPU 0/3, running since 19:45)**: dfrac0.25 (2.1 default, 2k it) · lwf0.1 (2.2 default, 2k it) ·
   lr1e-5 rerun (1k, completes Round 3). NEXT: dfrac0.25+lwf0.1 combined → winner long-run (5-10k, target
   cov ≥ 40% with val2 HELD ≥~76) → quota-D discovery harvest (frozen-core Hamming + 5%-floor ban) on the winner.
-- **REMOTE (via `HP_RUNBOOK.md`, the one file)**: the 8 bracket rows — dfrac{0.1,0.5}, lwf{0.01,1.0},
-  beta{0.05,0.3}, enc0.1, lr5e-5. Deliverables per run: 3-row tree + 4-panel trend + last 3 log lines.
+- **REMOTE (ssh dohyunlee@dhcp-101-145.caltech.edu, driven by Claude; via `HP_RUNBOOK.md`)**: **plain-knob
+  brackets CUT (user 2026-07-05: "the only hope is the dfrac and lwf")** → remote runs mechanism brackets only:
+  dfrac{0.1,0.5}, lwf{0.01,1.0} singles, then tier-2 combos dfrac0.25+lwf1.0 & dfrac0.5+lwf0.1.
+  Deliverables per run: 3-row tree + 4-panel trend + last 3 log lines. (LwF = Learning without Forgetting,
+  Li & Hoiem 2017 — frozen-teacher distillation of the pretrained field on demo contexts.)
 - **Judging (both machines, §5 of runbook)**: hold val2 γ-mean ≥~76 while cov_cum climbs ≥ ~13%/1k-it; jiggle↓;
   γ0.1 tie-break; tree branches/died/reached at it2000.
 - **ROADMAP after the winner**: transfer the hold-while-explore recipe to SFM (`grid_expand_sfm.py` gains
