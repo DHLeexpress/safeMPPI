@@ -29,6 +29,7 @@ VARIANTS = {
     "res2w256": dict(depth=2, width=256, res=2),
     "res3w256": dict(depth=2, width=256, res=3),
     "d2w384": dict(depth=2, width=384, res=0),
+    "res2w256_gru": dict(depth=2, width=256, res=2, use_gru=True),   # GRU over past controls (2026-07-06)
 }
 
 
@@ -50,7 +51,7 @@ class ResTrunk(nn.Module):
 
 def build(name):
     v = VARIANTS[name]
-    pol = HP.GridHPFlowPolicy(width=v["width"], depth=v["depth"])
+    pol = HP.GridHPFlowPolicy(width=v["width"], depth=v["depth"], use_gru=v.get("use_gru", False))
     if v["res"] > 0:
         pol.trunk = ResTrunk(pol.d + pol.ctx_dim + pol.t_dim, v["width"], v["res"])
     return pol

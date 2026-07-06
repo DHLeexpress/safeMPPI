@@ -34,17 +34,18 @@ os.makedirs(OUT, exist_ok=True)
 
 class GridHPFlowPolicy(GP2.GridGRUFlowPolicy2):
     """ctx = raw low5(5) ⊕ E_g(H_P[1,16,12]→32). Slices channel 2 (clipped H_P) from the standard 3-ch grid."""
-    def __init__(self, width=256, depth=2, u_max=1.0, **kw):
+    def __init__(self, width=256, depth=2, u_max=1.0, use_gru=False, **kw):
         super().__init__(grid_shape=(1, 16, 12), width=width, depth=depth, u_max=u_max,
-                         use_gru=False, encode_low=False, use_grid=True, **kw)
+                         use_gru=use_gru, encode_low=False, use_grid=True, **kw)
         # shallow 1-ch CNN + AdaptiveAvgPool → 32 (parent pattern, half the params, H_P only)
         self.enc_grid = nn.Sequential(
             nn.Conv2d(1, 8, 3, padding=1), nn.SiLU(),
             nn.Conv2d(8, 16, 3, padding=1), nn.SiLU(),
             nn.AdaptiveAvgPool2d((4, 3)), nn.Flatten(),
             nn.Linear(16 * 4 * 3, 32), nn.SiLU())
-        self.ctx_dim = 5 + 32                                     # raw low5 + H_P token
-        in_dim = self.d + self.ctx_dim + self.t_dim               # 20 + 37 + 32 = 89
+        gd = self.gru_dim if use_gru else 0                      # GRU(16) over past controls → curvature (2026-07-06)
+        self.ctx_dim = 5 + gd + 32                               # raw low5 (+ GRU token if on) + H_P token
+        in_dim = self.d + self.ctx_dim + self.t_dim              # 20 + 37 + 32 = 89 (105 with GRU)
         layers = [nn.Linear(in_dim, width), nn.SiLU()]
         for _ in range(depth - 1):
             layers += [nn.Linear(width, width), nn.SiLU()]
