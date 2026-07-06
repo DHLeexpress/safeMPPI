@@ -213,6 +213,24 @@ mirror image of expansion); per-epoch val-cfm on DR AND on original data (compat
 rollout viz of spliced vs original per γ. (5) Deploy safeETA + safeDELTA expansion from the spliced model
 (encoder frozen again), in parallel (helios GPU3 / nyx).
 
+### PHASE-DR RESULTS (07-06 ~04:00)
+- **Data**: 1200/1200 successes (random starts are easier than the corner), 72,198 DR windows. Scene/expert
+  IDENTICAL to stage-2 (env built once; only start varies — user-confirmed spec).
+- **Encoder-only training (THE METHOD)**: val-DR 0.861 · **val-ORIG 0.831** (base was 0.799 → +0.03
+  compatibility cost), still improving at ep59. → `enc_hp_dr.pt`, spliced `res2w256_dr.pt`.
+- **Oracle full training**: OVERFITS immediately (train 0.88→0.73 while val-DR 0.851→0.895; best=ep0) —
+  300k params vs 65k windows; the 7.4k-param encoder didn't overfit = design vindication. Oracle saved
+  (`trunk_hp_dr.pt`, `res2w256_drfull.pt`, ≈254 full-model steps) — REFERENCE ONLY.
+- **(0,0) overlay prediction: CONFIRMED** (`figures/hp_test/dr_overlay.png`): spliced model from (0,0) still
+  runs the diagonal bundle — reach 8/9/5 per γ vs original 10/8/5 (equivalent), slightly more dispersion.
+- **it0 n=50 measures**: spliced 59% (γ:76/86/**16**) · oracle 58% (70/84/20). The compatibility cost is
+  ENTIRELY in γ0.1 — and it is a CERTIFICATE effect (socp viol 35 vs ~20), not behavioral (γ0.1 reach equal).
+- **DEPLOYMENTS (launched 04:05, `results/hp_dr/`)**: dr_safeETA (δ.25 η1.0 EF, GPU3) · dr_safeDELTA
+  (δ.75 η.1 EF, GPU0) — 2k iters, temp 1.3, n=50, from res2w256_dr.pt. Hypotheses: (a) demo replay through
+  the NEW encoder repairs γ0.1 (the field adapts to the new eyes on old inputs); (b) coverage ceiling lifts
+  above the ~11%@500 / 27%@2k of the original-encoder runs because off-diagonal ctx is now in-distribution.
+  NB the LwF teacher for dr_safeETA = deepcopy of the SPLICED model (anchors to post-splice field on demos).
+
 ## TWO-MACHINE DISTRIBUTED PHASE (2026-07-05, clean restart — tasks #51-54)
 **Split (user): LOCAL = main part / aggressive search · REMOTE = fine-tuning brackets.**
 - **LOCAL (GPU 0/3)**: **WAVE-1 FINALS (2k it, done 20:44)** — the mechanisms WORK where every plain knob failed:
