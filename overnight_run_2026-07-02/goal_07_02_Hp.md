@@ -135,9 +135,15 @@ ft baseline 77/963 branches):**
 
 ## TWO-MACHINE DISTRIBUTED PHASE (2026-07-05, clean restart — tasks #51-54)
 **Split (user): LOCAL = main part / aggressive search · REMOTE = fine-tuning brackets.**
-- **LOCAL (GPU 0/3, running since 19:45)**: dfrac0.25 (2.1 default, 2k it) · lwf0.1 (2.2 default, 2k it) ·
-  lr1e-5 rerun (1k, completes Round 3). NEXT: dfrac0.25+lwf0.1 combined → winner long-run (5-10k, target
-  cov ≥ 40% with val2 HELD ≥~76) → quota-D discovery harvest (frozen-core Hamming + 5%-floor ban) on the winner.
+- **LOCAL (GPU 0/3)**: **WAVE-1 FINALS (2k it, done 20:44)** — the mechanisms WORK where every plain knob failed:
+  | arm | val2 γ-mean it0→2000 | per-γ @2k | cov_cum | drift | demoCFM | shape |
+  |---|---|---|---|---|---|---|
+  | **dfrac0.25** | 71 → **67%** | 68/**88**/44 | **27.4%** | 0.264 | **0.835** | dip ~55 mid → RECOVERS to 60-69 |
+  | lwf0.1 | 79 → **52%** | 68/56/32 | 27.0% | 0.294 | 0.895 | holds mid-50s, slow decay |
+  (plain arms 21-36% & cov 7-13% at half the iterations; both mechanism arms saturate the 60k FIFO pos-buffer —
+  raise cap for long runs. dfrac0.25 = single-arm winner: better hold, better demoCFM, γ0.1 alive at 44.)
+  **WAVE 2 (running since 21:00)**: dfrac0.25+lwf0.1 combined (2k, GPU0) · dfrac0.25 LONG 5k (GPU3, winner
+  long-run). NEXT: quota-D discovery harvest (frozen-core Hamming + 5%-floor ban) on the winner.
 - **REMOTE (ssh dohyunlee@dhcp-101-145.caltech.edu, driven by Claude; via `HP_RUNBOOK.md`)**: **plain-knob
   brackets CUT (user 2026-07-05: "the only hope is the dfrac and lwf")** → remote runs mechanism brackets only:
   dfrac{0.1,0.5}, lwf{0.01,1.0} singles, then tier-2 combos dfrac0.25+lwf1.0 & dfrac0.5+lwf0.1.
