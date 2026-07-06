@@ -180,7 +180,11 @@ def main():
     ap.add_argument("--ell", type=float, default=0.5)   # calibrated ell* (hp_ell_calib: 0.2 gives sigma≡1)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tag", default="tree")
+    ap.add_argument("--outdir", default=None, help="override output dir (default figures/hp_test)")
     a = ap.parse_args()
+    if a.outdir:
+        globals()["FIG"] = a.outdir
+        os.makedirs(a.outdir, exist_ok=True)
     env = GS.make_grid()
     rows = []
     for ri, (cp, lb) in enumerate(zip(a.ckpts, a.labels)):

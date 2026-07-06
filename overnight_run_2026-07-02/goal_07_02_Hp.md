@@ -231,6 +231,24 @@ rollout viz of spliced vs original per γ. (5) Deploy safeETA + safeDELTA expans
   above the ~11%@500 / 27%@2k of the original-encoder runs because off-diagonal ctx is now in-distribution.
   NB the LwF teacher for dr_safeETA = deepcopy of the SPLICED model (anchors to post-splice field on demos).
 
+### DR-DEPLOYMENT FINALS (07-06 00:30, 2k iters each; figures/dr_test/)
+| arm | val2 it0→peak→2000 | γ0.1 path | cov@2000 | demoCFM | verdict |
+|---|---|---|---|---|---|
+| **dr_safeDELTA** (δ.75 η.1) | 59 → **78 (it1000)** → 72 | 16→**60**→54 | 11.0 | **0.789** | **first arm ever to RISE above anchor; γ0.1 REPAIRED** |
+| dr_safeETA (δ.25 η1.0) | 57 → flat → 61 | 16→14-22 dead | **14.0** | 0.818 | anchor does NOT repair |
+- **Hypothesis (a) CONFIRMED, mechanism isolated**: demo REPLAY through the new encoder repairs the γ0.1
+  certificate damage (field re-learns to act on new representations *from the demos*). LwF does NOT — it
+  anchors the field to the spliced model's own (already-damaged) γ0.1 behavior. Replay says "stay correct on
+  the data"; LwF says "stay as you are" — after a splice, only the former heals.
+- **Hypothesis (b) NOT confirmed at this config**: cov 11-14@2k vs wave-1 dfrac0.25's 27.4@2k (but that ran
+  temp 1.5 · δ.25 = far more positive flow). At matched config/iter (R1 safeDELTA old-enc: 6.6@500 vs
+  dr_safeDELTA 6.6@500) the DR eyes alone do NOT accelerate discovery — exploration is throttled by the
+  engine (temp/δ), not perception. Discovery still needs the aggressive knobs.
+- **Artifact**: `results/hp_dr/dr_safeDELTA/ckpt_2000.pt` = the best hold-while-explore model to date
+  (72% ≥ every anchor measured for this base, γ0.1 alive at 54, demoCFM at pretrained level).
+- Natural next (PROPOSAL, not launched): from dr_safeDELTA ckpt_2000 (repaired + DR eyes), re-open discovery
+  with the r2_combo recipe (δ.5 or temp 1.5) — repair-then-explore staging; or bank and go to SFM (task #54).
+
 ## TWO-MACHINE DISTRIBUTED PHASE (2026-07-05, clean restart — tasks #51-54)
 **Split (user): LOCAL = main part / aggressive search · REMOTE = fine-tuning brackets.**
 - **LOCAL (GPU 0/3)**: **WAVE-1 FINALS (2k it, done 20:44)** — the mechanisms WORK where every plain knob failed:
