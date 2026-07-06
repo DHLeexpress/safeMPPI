@@ -345,6 +345,18 @@ encoders, and run Claude's recipe. All done:
 - **Bug fixed**: `gru_expand_pipeline.sh` initially aborted — `export LD_LIBRARY_PATH=conda` (matplotlib) breaks
   ssh/scp OpenSSL, so the nyx poll misfired "ft died". Fixed: conda lib prefixed per-python-call only (the
   dr_milestone.sh lesson). Fine-tune had actually completed; finished the chain manually.
+- **GRU 5k VERDICT (`figures/dr_test_overnight/gru_vs_nogru_5k.png`, tree_gru_mine_grid, gru_mine_trend)** —
+  same ov_mine recipe, GRU vs no-GRU, both 5k, last-3-block means (kills n=50 noise):
+  | | val2 γ-mean | cov@5k | γ0.1 | tree reached (base→5k) | speed |
+  |---|---|---|---|---|---|
+  | no-GRU ov_mine | 65.7 | 31.5% | 46 | 76→22 | ~1.3 s/it |
+  | **GRU gru_mine** | **69.0** | 31.5% | **50** | 65→17 | **~3.3 s/it** |
+  **TIED-to-marginally-GRU-favorable**: IDENTICAL coverage, GRU +3 val / +4 γ0.1 (both ~1σ, so a slight edge not
+  a clear win) — but **2.5× slower** (recurrent per-step rollouts) and its tree reaches fewer goals (17 vs 22).
+  The expansion recipe CLOSED the pretraining gap (GRU base 65 → parity) — perception backbone barely matters on
+  this STATIC task; history didn't unlock the multimodal γ0.1 rescue we hoped. **DECISION unchanged: no-GRU v2 is
+  the base** (equal quality, 2.5× faster). GRU only worth revisiting on MOVING/SFM where history is non-Markovian
+  (per h5/SFM notes). load_any patched to load GRU ckpts (gru.* → res2w256_gru).
 
 ## 20k LONG RUNS (user 2026-07-06, GPU0+GPU3, `results/hp_20k/`, ckpt every 1k)
 Two recipes to 20k iters, from v2 base (encoder frozen), measure/500 n=50, grad-clip 10 (α explosion guard).
