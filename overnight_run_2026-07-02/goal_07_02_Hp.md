@@ -312,6 +312,27 @@ hold-while-explore winner: 70% validity sustained over 5k iters with 31.5% cover
 config to hold AND meaningfully explore. Artifact `results/hp_overnight/ov_mine/ckpt_5000.pt`. Ready to (1) push
 longer with raised buffer, or (2) transfer to SFM vs Kazuki (task #54).
 
+## 20k LONG RUNS (user 2026-07-06, GPU0+GPU3, `results/hp_20k/`, ckpt every 1k)
+Two recipes to 20k iters, from v2 base (encoder frozen), measure/500 n=50, grad-clip 10 (α explosion guard).
+- **yours** (Claude, GPU0): δ.4 η.05 β.1 **α.02** s.9 lr1e-4 — **warm-started from ov_mine/ckpt_5000** (real
+  total = 25k). it0 (warm) 56% cov6.1.
+- **mine** (user, GPU3): δ.25 η.05 β.1 **α.05** s**.99** lr1e-4 — from res2w256_ft_v2. it0 69% cov1.7.
+
+**Q&A (user 2026-07-06):**
+1. **GRU? NO.** `GridHPFlowPolicy(use_gru=False, encode_low=False, use_grid=True)` — ctx = H_P CNN+AAP encoder ⊕
+   raw low5 only. hist is passed but ignored (no GRU, no E_l). 299k params (ResTrunk trunk).
+2. **Does raising s spread the σ distribution? YES — confirmed by calibration** (`hp_s_calib.py`,
+   `figures/dr_test_overnight/s_calibration.png`). s is the flow-interpolation level where φ_s probes the field:
+   x_s=(1−s)·x0 + s·x1, τ=s. s→1 ⇒ x_s = the actual DIVERSE candidate controls ⇒ features spread ⇒ GP-σ
+   discriminates; s→0 ⇒ x_s = shared noise templates ⇒ features collapse ⇒ σ≈uniform. σ-std climbs MONOTONICALLY
+   0.022 (s.5) → 0.038 (s.8) → 0.045 (s.9) → 0.046 (s.95) → 0.050 (s.99) → **0.052 (s1.0 = S\*)**. Chose **s=0.99**
+   for the user recipe: ~96% of max spread, +10% over the proposed .95, but strictly inside the flow (avoids the
+   degenerate τ=1.0 endpoint). Exact analogue of the ell calibration (ell too big / s too small ⇒ σ≡uniform).
+3. **α=0.05 is the ov_conj divergence knob** (unbounded-below unlearning). Guarded with `--grad-clip 10`
+   (new `SFG2Config.grad_clip`; off by default, no effect on healthy grads) so the 20k mine-run can't detonate.
+Watch: whether s.99's wider σ gives mine better exploration than yours' s.9; whether warm-start (yours) or
+fresh-from-v2 (mine) reaches higher cov by 20k; loss stability under the grad-clip.
+
 ## TWO-MACHINE DISTRIBUTED PHASE (2026-07-05, clean restart — tasks #51-54)
 **Split (user): LOCAL = main part / aggressive search · REMOTE = fine-tuning brackets.**
 - **LOCAL (GPU 0/3)**: **WAVE-1 FINALS (2k it, done 20:44)** — the mechanisms WORK where every plain knob failed:

@@ -75,6 +75,7 @@ class SFG2Config:
     demo_anchor: bool = False    # keep False: loss = L_CFM(U_pos) − α·L_CFM(U_neg); no demo term
     demo_frac: float = 0.0       # 2.1 (user 2026-07-05, MACE-multihead-inspired): δ of every batch = demo windows
     lwf_eta: float = 0.0         # 2.2 LwF frozen-teacher: + η·E_{ctx~demo}‖v_θ−v_θ₀‖² (anti-forgetting regularizer)
+    grad_clip: float = 0.0       # max grad-norm on trainable params (0=off); explosion guard for α>0 (2026-07-06)
     alpha: float = 0.0           # negative-sample loss weight (SWEEP: 0 / 0.005 / 0.01)
     inner_steps: int = 12
     batch: int = 128
@@ -240,6 +241,9 @@ def update_flow2(policy, opt, demo, pos, neg, cfg, device, n_steps=None):
         opt.zero_grad(); loss.backward()
         for k, v in grad_rms(policy).items():
             gsum[k] += v
+        if getattr(cfg, "grad_clip", 0.0) > 0:          # explosion guard (α-unlearning is unbounded below,
+            torch.nn.utils.clip_grad_norm_(              # 2026-07-06); off by default, no effect on healthy grads
+                [p for p in policy.parameters() if p.requires_grad], cfg.grad_clip)
         opt.step()
         last = float(loss)
     policy.eval()
