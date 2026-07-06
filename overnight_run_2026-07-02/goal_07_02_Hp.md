@@ -312,6 +312,23 @@ hold-while-explore winner: 70% validity sustained over 5k iters with 31.5% cover
 config to hold AND meaningfully explore. Artifact `results/hp_overnight/ov_mine/ckpt_5000.pt`. Ready to (1) push
 longer with raised buffer, or (2) transfer to SFM vs Kazuki (task #54).
 
+## GRU-ENABLED VARIANT TEST (user 2026-07-06, nyx GPU1) — **NEGATIVE: keep GRU OFF**
+Built `res2w256_gru` (VARIANTS + build wired; `GridHPFlowPolicy(use_gru=True)` → parent's `_low_raw` inserts a
+GRU(16) over past executed controls into the low vector → ctx 37→**53**, 305k params). Trained from scratch 120 ep
+on the 4002-traj set (353k windows) on nyx. `results/hp_arch/res2w256_gru.pt`.
+| model | val-cfm | validity2@it0 n=50 | per-γ | mm-splits (start/enc/mid) |
+|---|---|---|---|---|
+| **res2w256_ft_v2** (no GRU) | 0.810 | **77%** | **76/78/76 balanced** | — |
+| res2w256_gru (GRU on) | 0.819 | **65%** | 80/76/**38** | [10, 2, 0] |
+**Read**: the GRU fits the data about as well (val-cfm 0.819 vs 0.810, converged flat ep100-119) but **hurts the
+metric we care about**: validity2 −12 pts, and it **breaks the γ balance v2 achieved — γ0.1 collapses 76→38**. On
+this STATIC chessboard the H_P grid snapshot is Markovian-sufficient (it already encodes the obstacle geometry);
+the GRU's history channel is a distractor whose extra capacity lets the field overfit the easy γ1.0 (88%) at the
+hard γ0.1's expense. Multimodal splitting at obstacle-encounter is also poor (2). Caveat: v2 had extra fine-tune
+rounds vs GRU's single from-scratch run, but val-cfm is converged and the γ0.1 gap is a conditioning failure, not
+undertraining. **DECISION: GRU stays OFF; res2w256_ft_v2 remains the base.** (GRU may matter on MOVING/SFM scenes
+where history is non-Markovian — revisit there, not here.)
+
 ## 20k LONG RUNS (user 2026-07-06, GPU0+GPU3, `results/hp_20k/`, ckpt every 1k)
 Two recipes to 20k iters, from v2 base (encoder frozen), measure/500 n=50, grad-clip 10 (α explosion guard).
 - **yours** (Claude, GPU0): δ.4 η.05 β.1 **α.02** s.9 lr1e-4 — **warm-started from ov_mine/ckpt_5000** (real
