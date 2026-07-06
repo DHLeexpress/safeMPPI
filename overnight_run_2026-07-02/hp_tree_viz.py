@@ -181,6 +181,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tag", default="tree")
     ap.add_argument("--outdir", default=None, help="override output dir (default figures/hp_test)")
+    ap.add_argument("--ncols", type=int, default=0, help="grid columns (0=single row; 3 -> 2x3 for 6 trees)")
     a = ap.parse_args()
     if a.outdir:
         globals()["FIG"] = a.outdir
@@ -198,13 +199,17 @@ def main():
               f"alive-at-end {tree['alive_end']}", flush=True)
     sigs = [b[1] for _, t in rows for b in t["segs"]]
     smin, smax = min(sigs), max(sigs)
-    fig, axes = plt.subplots(1, len(rows), figsize=(6.4 * len(rows), 6.4))
-    axes = np.atleast_1d(axes)
+    nc = a.ncols if a.ncols and a.ncols > 0 else len(rows)     # --ncols grid (e.g. 3 -> 2x3 for 6 trees, legible)
+    nr = int(np.ceil(len(rows) / nc))
+    fig, axes = plt.subplots(nr, nc, figsize=(7.2 * nc, 7.2 * nr))
+    axes = np.atleast_1d(axes).ravel()
     for ax, (lb, tree) in zip(axes, rows):
         nrm = draw_tree(ax, tree, env, smin, smax)
         nf = sum(1 for b in tree["segs"] if not b[2])
         ax.set_title(f"{lb} — {len(tree['segs'])} branches · {nf} died · {tree['n_reached']} reached goal",
-                     fontsize=11, color="#2ca02c" if tree["n_reached"] else "#d62728")
+                     fontsize=12, color="#2ca02c" if tree["n_reached"] else "#d62728")
+    for ax in axes[len(rows):]:
+        ax.axis("off")
     fig.colorbar(ScalarMappable(norm=Normalize(smin, smax), cmap="viridis"), ax=axes.tolist(), fraction=.02, label="σ")
     fig.suptitle(f"SAFE-EXPANSION TREE (recursive) — γ{a.gamma}, temp {a.temp}, β {a.beta}, ell {a.ell} · every branch rolls out "
                  "separately, k=[5,4,4,3,3,2,2,1,…]/branch (throttled, never orphaned) · deaths color-coded G/T/S · dots=branch events",
