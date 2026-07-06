@@ -38,7 +38,8 @@ def load_any(path):
     if "variant" in ck:
         return ARCH.load_arch(path, device=DEV)[0]
     if any(k.startswith("trunk.blocks") for k in ck["state_dict"]):   # expansion ckpt of a ResTrunk variant
-        pol = ARCH.build("res2w256")
+        gru = any(k.startswith("gru.") for k in ck["state_dict"])     # GRU expansion ckpt (2026-07-06)
+        pol = ARCH.build("res2w256_gru" if gru else "res2w256")
         pol.load_state_dict(ck["state_dict"])
         return pol.to(DEV).eval()
     return HP.load_hp(path, device=DEV)[0]
