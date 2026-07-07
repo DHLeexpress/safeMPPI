@@ -379,6 +379,17 @@ Two recipes to 20k iters, from v2 base (encoder frozen), measure/500 n=50, grad-
 Watch: whether s.99's wider σ gives mine better exploration than yours' s.9; whether warm-start (yours) or
 fresh-from-v2 (mine) reaches higher cov by 20k; loss stability under the grad-clip.
 
+### 20k FINALS (07-06 16:37; figures/dr_test_overnight/{yours,mine}_20k_{trend,grid}.png)
+| run | s | val2@20k (γ0.5/1.0/0.1) | cov@20k | verdict |
+|---|---|---|---|---|
+| **mine** (v2 fresh) | **0.99** | 64% (78/78/**36**) | **52.0%** | **coverage CHAMPION** — widest σ discovers most, γ0.1 pays |
+| **yours** (ov_mine warm→25k eff) | 0.9 | 67% (76/74/**50**) | 43.0% | holds validity + γ0.1 better, less coverage |
+**The s knob cleanly separates explore-vs-retain**: s.99 (+σ spread, from the calibration) → cov 52 but γ0.1 36;
+s.9 → cov 43 but γ0.1 50 / val 67. Both stable to 20k (grad-clip held, no divergence, loss ~0.86-0.87 flat, α
+guarded). Coverage kept climbing past the old 20k H=10 baseline's 39.8% (both beat it: 43/52%). **No collapse in
+20k under either recipe** — the frozen-encoder + replay/anchor + grad-clip stack is robust at length. Best
+all-round hold-while-explore = yours (s.9); best raw coverage = mine (s.99). Pick by whether γ0.1 or coverage matters.
+
 ## TWO-MACHINE DISTRIBUTED PHASE (2026-07-05, clean restart — tasks #51-54)
 **Split (user): LOCAL = main part / aggressive search · REMOTE = fine-tuning brackets.**
 - **LOCAL (GPU 0/3)**: **WAVE-1 FINALS (2k it, done 20:44)** — the mechanisms WORK where every plain knob failed:
