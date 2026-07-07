@@ -3,6 +3,31 @@
 The 0704 plan (beat Kazuki) is TERMINATED (9 tasks: 7 done; Stage-E head-to-head closed at "compute 15× + succ
 +6 n.s., collision 9.7 vs 4.0 open"; sanity-3 folded into validity2 work). Focus = HP on the 0702 chessboard.
 Figures for testing → `figures/hp_test/`.
+
+## ★ FINAL JUDGMENT — ALL ARMS → LOCKED WINNER (task #54, 2026-07-06)
+**The arc, judged:** plain-knob arms (β/enc/lr) ALL collapse → forgetting lives in the trunk/head FIELD, not the
+encoder (enc0 drift≡0 yet 79→35). Mechanism arms (demo_frac replay, LwF anchor) HOLD. Phase-S proved the hold is
+COMPOSITE and causal: **frozen encoder + old-input gradients (replay δ OR anchor η)** — each alone fails, together
+no dip. δ0.5 is the replay floor. Temp is a pure explore↔retain trade (not a lever). The ceiling was ENCODER-OOD:
+solved by **folding off-diagonal data into PRETRAINING** — `res2w256_ft_v2` reads **77% balanced (76/78/76)**,
+retiring the γ0.1 problem at the source. GRU tested → tied with no-GRU but 2.5× slower ⇒ **no GRU**. DR
+encoder-splice → replay repairs γ0.1 through new eyes. 20k confirmed no collapse; s cleanly separates
+explore(s.99→cov52)↔retain(s.9→γ0.1 50).
+
+**★ LOCKED WINNER RECIPE (hold-while-explore):**
+- **Base**: `results/hp_arch/res2w256_ft_v2.pt` — OD-augmented (4002 trajs, origin+off-diagonal), balanced γ, NO GRU.
+- **Recipe (ov_mine / "yours")**: **frozen encoder (enc_lr_mult 0) · demo_frac 0.4 · lwf_eta 0.05 · β 0.1 ·
+  α 0.02 · s 0.9 · lr 1e-4 · temp 1.5 · grad-clip 10** · ell 0.5. → holds val2 ~67-70% with cov ↑ to 43% @20k,
+  γ0.1 alive at 50, no collapse.
+- **Max-coverage alt**: same but **s 0.99** → cov 52%@20k (γ0.1 pays, drops to 36). Pick by objective.
+- Artifacts: `results/hp_20k/{yours,mine}/ckpt_20000.pt`.
+
+**→ TRANSFER: `GOAL_SFM_TRANSFER.md`** (launch-ready runbook — port the 3 knobs into grid_expand_sfm, run
+expansion from pretrained_sfm, re-benchmark vs Kazuki). Honest framing: 0704 already CLOSED the collision gap via
+certified DEPLOYMENT (3%/97% @6ms vs Kazuki 10%/95ms); expansion-only was 9.7%. So the transfer's value = does the
+better hold-while-explore base let certified deployment go further (lower pad/yield, higher success). A refinement
+on an already-winning deployment, not a must-win.
+
 Current 20k iter basline -> 
 
 ## CURRENT STATUS — necessary & sufficient config snapshot
