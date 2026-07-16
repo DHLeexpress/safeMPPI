@@ -45,17 +45,17 @@ positives ever enter D⁺ there (visible hole in the trained-samples map), so th
 finish — the certified fallback bridges the last ~10 steps of essentially every episode, forever.
 **The shield removes exactly the failure pressure that would force expansion at hard contexts.**
 
-**5. Mode sharpening returns — but it is NOT the old prior collapse, and the EXECUTION RULE is the
-diversity lever.** Under argmax-progress execution, per-γ coverage falls from 2–4 modes (round 0) to
-**1 dominant mode for every γ≥0.3 by round 20** at M=8 (γ0.1 keeps 4–7), and stays low even at M=40
-(covΣ 26–30 vs pretrained 34 — a diversity LOSS). Yet the raw first-window up-fraction at the start
-context is UNCHANGED (0.137–0.153 vs pretrained 0.145) — unlike the measured un-anchored curriculum
-collapse (0.14→0.73): the sharpening lives in the visited-context + replay amplification loop, not
-the prior. **exec-rule=pi (execute a verified-safe plan sampled ∝π instead of argmax-progress)
-fixes the realized diversity: covΣ 52 at M=40 — equal to the curriculum+anchor recipe (51), near
-expert (56) — with SR 0.92/CR 0.08.** At M=8 its per-γ draw still shows the dominant mode (1/γ),
-i.e. π-execution preserves a fat tail of secondary routes rather than equalizing them. No anchor,
-no curriculum — the diversity was recoverable inside the method's own vocabulary.
+**5. Mode sharpening returns — NOT the old prior collapse; the execution rule is the (partial)
+diversity lever.** [CORRECTED 2026-07-16b: an earlier draft mis-attributed the pretrained's pooled
+line to the π arm.] The pretrained base is highly diverse: **covΣ 52** at M=40. Every pure arm
+loses diversity: argmax-progress execution collapses per-γ coverage to 1 dominant mode (γ≥0.3, by
+round 20 at M=8; covΣ 26–30 at M=40), while **exec-rule=pi retains covΣ 34 with the best shielded
+closed-loop numbers (SR 0.954 / CR 0.046)** — better than argmax, but well below the
+curriculum+anchor recipe, which preserved the base's diversity (51). The raw first-window
+up-fraction at the start stays at the pretrained 0.10–0.15 in all arms (the old prior collapse
+0.14→0.73 does NOT reappear): the sharpening lives in the visited-context + replay amplification
+loop. Verdict: π-execution mitigates, does not solve; full diversity preservation was what the
+anchor bought.
 
 **6. σ saturates regardless of λ; acquisition ≈ uniform after ~round 10.** Drawn-candidate σ:
 0.19→0.02 by round 20 at λ=10 (λ=0.01: ≈0 after round 1). The λ-study's surviving high-σ
@@ -72,29 +72,39 @@ constraint on expansion.
 | pure_s911 (λ10) | 0.94 | 0.06 | 0.248 | 10.49 | 30 | 11/28 |
 | pure_s912 (λ10) | 0.90 | 0.10 | 0.245 | 10.31 | 26 | 6/28 |
 | pure_lam001_s910 | 0.94 | 0.06 | 0.249 | 10.46 | 29 | 11/28 |
-| **pure_pi_s910 (λ10, exec∝π)** | **0.92** | **0.08** | **0.257** | **10.82** | **52** | **9/28** |
-| pretrained baseline | 0.95 | 0.05 | 0.253 | 11.26 | 34 | 7/28 |
-| C: faithful_div (curriculum+anchor) | 0.94 | 0.06 | 0.255 | 11.08 | 51 | 8/28 |
-| expert (SafeMPPI) | 1.00 | 0.00 | — | — | 56 | — |
+| **pure_pi_s910 (λ10, exec∝π)** | **0.954** | **0.046** | 0.253 | 11.26 | **34** | 7/28 |
+| −Verifier brother | 0.954 | 0.046 | 0.249 | 10.73 | 34 | 8/28 |
+| −Fallback brother | 0.946 | 0.054 | 0.251 | 11.09 | 33 | 6/28 |
+| −Prox brother | 1.000 | 0.000 | 0.262 | 10.91 | 18 | 24/28 |
+| pretrained baseline | 0.918 | 0.082 | 0.257 | 10.82 | **52** | 9/28 |
+| C: faithful_div (curriculum+anchor) | 0.943 | 0.057 | 0.255 | 11.08 | 51 | 8/28 |
+| expert (SafeMPPI) | 1.000 | 0.000 | 0.259 | 10.80 | 56 | — |
 
-Read against the strong T=350 pretrained baseline (SR 0.95, covΣ 34): every arm stays near baseline
-SR/CR; argmax arms LOSE coverage (26–30); **exec∝π matches the curriculum+anchor recipe's coverage
-(52 vs 51) with zero stabilizers** and the best clearance of the pure arms. The differentiators of
-the method are the gathering-time guarantees (0 collisions, every trained window certified) and the
-π-execution diversity — not raw SR on this task, where the baseline is already near-saturated.
+[CORRECTED 2026-07-16b — all numbers now pooled from row_g*.json, one consistent source.]
+Read against the T=350 pretrained baseline (SR 0.918, covΣ 52): Ours improves reliability
+(CR 0.082→0.046, SR +3.6 pts) with zero gather-time collisions and a fully certified training set,
+at the cost of diversity (52→34; argmax exec loses more, 26–30). The gate ablations locate each
+piece's value at GATHER time or in the audit, not eval CR: −Verifier kills 8.5% of gathering
+episodes and admits uncertified training plans; −Fallback kills 4.9%; −Prox posts the best
+closed-loop line (SR 1.0, a-d 24/28) while collapsing routes (covΣ 18) and ERODING audit validity
+(V̂_adv 0.438→0.393, the only arm to move it down) — the prox term is a validity/diversity
+preserver, not an SR maximizer. See paper_results/table_v6.md.
 
 ## The honest scoped claim this supports
 The deterministic full-window verifier + certified fallback carry runtime safety completely
-(0 deaths / 0 collisions while gathering, at every γ, from round 0). Uncertainty-tilted querying
-expands the verified-plan set **only along the executed distribution's own support**: mid-route
-holes close (fallback −75% there), but contexts the shielded process never visits (adverse
-velocities, the OOD goal corner) never expand. Realized route diversity is governed by the
-execution rule among verified-safe plans: argmax-progress sharpens to one mode per γ; sampling ∝π
-retains curriculum-recipe-level coverage with no stabilizers. The curriculum-era mechanisms
-(frontier replay, recovery starts, demo/LwF anchor) were ad-hoc compensations for holes the minimal
-method now makes *measurable*; one of the three (diversity) closes inside the method itself, the
-other two (adverse-context validity, the goal-corner hole) are properties of the fixed context
-process ρ(c), not of the learner.
+(0 deaths / 0 collisions while gathering, at every γ, from round 0 — vs 8.5%/4.9% dead episodes
+without the verifier/fallback). Uncertainty-tilted querying expands the verified-plan set **only
+along the executed distribution's own support**: mid-route holes close (fallback −75% there), but
+contexts the shielded process never visits (adverse velocities, the OOD goal corner) never expand.
+Realized route diversity is governed by the execution rule among verified-safe plans:
+argmax-progress sharpens to one mode per γ (covΣ 26–30); sampling ∝π mitigates (34) but nothing in
+the pure method preserves the base's 52 — that preservation is what the curriculum-era anchor
+bought (51). The prox term's measured role is validity/diversity preservation: removing it
+maximizes closed-loop SR while eroding the untilted audit and collapsing routes. The curriculum-era
+mechanisms (frontier replay, recovery starts, demo/LwF anchor) were ad-hoc compensations for holes
+the minimal method now makes *measurable*; the remaining two structural holes (adverse-context
+validity, the goal-corner hole) are properties of the fixed context process ρ(c), not of the
+learner.
 
 Within the method's own vocabulary the remaining lever is ρ(c): the audit already samples the hard
 contexts, so an *episode-start distribution matching ρ_eval* (start some episodes at adverse/corner

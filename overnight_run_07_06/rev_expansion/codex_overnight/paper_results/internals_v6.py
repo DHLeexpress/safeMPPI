@@ -61,8 +61,9 @@ def main():
     if covs:
         a2 = a.twinx(); a2.plot(*zip(*covs), "--s", c="#4477aa", lw=1.4, ms=3)
         a2.set_ylabel(r"$\Sigma$ coverage @M=8 (dominant-mode draw)", color="#4477aa")
-        a2.annotate("M=8 undercounts the kept tail:\nfinal M=40 covΣ = 52 (≈ curriculum recipe 51)",
-                    xy=(covs[-1][0], covs[-1][1]), xytext=(0.30, 0.42), textcoords="axes fraction",
+        a2.annotate("M=8 undercounts the kept tail: final M=40 covΣ = 34\n"
+                    "(pretrained base 52, argmax-exec arms 26–30, curriculum+anchor 51)",
+                    xy=(covs[-1][0], covs[-1][1]), xytext=(0.22, 0.42), textcoords="axes fraction",
                     fontsize=8.5, color="#4477aa",
                     arrowprops=dict(arrowstyle="->", color="#4477aa", lw=1.0))
     a.set_ylim(-0.02, 1.02); a.set_title("(A) closed-loop SR / CR / coverage (no shield)")

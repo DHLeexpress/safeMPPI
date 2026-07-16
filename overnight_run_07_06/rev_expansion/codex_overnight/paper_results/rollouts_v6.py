@@ -46,9 +46,12 @@ OURS_DIR = "results/p2/eval_afe_pure_pi_s910"     # pure AFE, exec ~ pi among ve
 PRE_DIR = "results/p2/eval_pretrained_g47"
 EXP_DIR = "results/expert_g47"
 KAZ_DIR = "results/kazuki_g47_trap"               # safety-CALIBRATED CFM-MPPI (w_safe .72): traps
-ABL = [("results/p2/eval_afe_bro_noverif", "NO pre-execution verifier"),
-       ("results/p2/eval_afe_bro_nofallback", "NO certified fallback"),
-       ("results/p2/eval_afe_bro_noprox", "NO proximal bound")]
+ABL = [("results/p2/eval_afe_bro_noverif", "NO pre-execution verifier",
+        "8.5% of gather episodes DIE\nuncertified plans train the flow"),
+       ("results/p2/eval_afe_bro_nofallback", "NO certified fallback",
+        "4.9% of gather episodes DIE\nat contexts the flow can't certify"),
+       ("results/p2/eval_afe_bro_noprox", "NO proximal bound",
+        "routes collapse: covΣ 18 (Ours 34)\naudit validity erodes (−4.5 pts)")]
 START_XY = (0.3, 0.3)
 DEMO_TPL = os.path.join(P2, "..", "..", "dataset", "w8d_windows_g{}.pt")
 
@@ -178,8 +181,9 @@ def main():
         cx, cy = tail[:, 0].mean(), tail[:, 1].mean()
         add_zoom(ax, (cx - 0.8, cx + 0.8, cy - 0.8, cy + 0.8), kfail[:2], loc="upper left")
 
-    # (5-7) the method's OWN gate ablations (matched pi-rule recipe, one piece removed each)
-    for ax, (d, t) in zip(axes[1, :3], ABL):
+    # (5-7) the method's OWN gate ablations (matched pi-rule recipe, one piece removed each);
+    # the annotation states each removed gate's MEASURED cost (gather-time deaths / collapse)
+    for ax, (d, t, note) in zip(axes[1, :3], ABL):
         scene(ax, t)
         got = False
         for g in GSEL:
@@ -188,6 +192,9 @@ def main():
                 draw(ax, p, g); got = True
         if not got:
             ax.text(2.5, 2.6, "ablation arm\ntraining", ha="center", fontsize=12, color="#888888")
+        else:
+            ax.text(0.03, 0.97, note, transform=ax.transAxes, va="top", ha="left", fontsize=10,
+                    color="#aa2211", bbox=dict(fc="white", ec="#cc3311", alpha=0.85, lw=1.0))
 
     # (8) OURS — pure AFE with pi-execution: balanced route words (U-first and R-first together)
     ax = axes[1, 3]; scene(ax, "Ours", bold=True)
