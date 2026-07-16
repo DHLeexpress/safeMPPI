@@ -20,9 +20,12 @@ Replaces the curriculum trainer (grid_expand_hardtail.py) with the endorsed mini
     gamma -- its decay IS the expansion curve), dithering share of D+ (prog < 0.05), closed-loop
     SR/CR/coverage, and per-round viz DBs recording exactly which samples trained the model.
 
-  NO curriculum: no easy/frontier split, no quantile, no mix ratio, no gamma/mode balancing, no
-  demo backfill (demo replay exists ONLY as the explicit ablation arm B via --demo-frac), sigma is
-  used exactly once (acquisition).  gamma is a conditioning variable on a fixed episode rotation.
+  NO curriculum and NO ad-hoc stabilizers (user 2026-07-16): no easy/frontier split, no quantile,
+  no mix ratio, no gamma/mode balancing, no demo replay, no LwF, no anchoring, no encoder freezing.
+  ALL parameters train; the ONLY regularizer is the proximal term.  sigma is used exactly once
+  (acquisition).  gamma is a conditioning variable on a fixed episode rotation.  If the measured
+  un-anchored failure modes (U-collapse, dithering) reappear, the audit and the up-frac probe are
+  the instruments that must show them.
 """
 from __future__ import annotations
 
@@ -84,10 +87,6 @@ class AFEConfig:
     max_inner: int = 40
     fstep_stop: float = 0.03       # stop the solver at this relative field displacement vs round start
     grad_clip: float = 1.0
-    # ablation arm B
-    demo_frac: float = 0.0
-    demo_prefix: str = "dr05_"
-    demo_cap: int = 1200
     # tracking
     audit_every: int = 5
     audit_pos: int = 12
@@ -205,21 +204,21 @@ def gather_round(policy, phi0, blr, store, env, cfg, fb, round_i, device):
 
 
 # ------------------------------------------------------------------ update
-def prox_update(policy, opt, store, demo, cfg, device, rng):
+def prox_update(policy, opt, store, cfg, device, rng):
     """One proximal update: argmin_theta mean l_CFM over uniform D+ replay + (1/(2 eta))||theta-theta_n||^2.
 
-    Adam-step count is a SOLVER setting: stop when the relative field displacement on a fixed probe
-    batch (vs the round start) reaches fstep_stop, or at max_inner.  Reports the drawn D+ ids
-    (exactly which samples trained the model this round), the loss decomposition, and the stop cause.
+    theta = ALL parameters (encoder included; no freezing) and the prox term is the ONLY
+    regularizer.  Adam-step count is a SOLVER setting: stop when the relative field displacement on
+    a fixed probe batch (vs the round start) reaches fstep_stop, or at max_inner.  Reports the drawn
+    D+ ids (exactly which samples trained the model this round), the loss decomposition, and the
+    stop cause.
     """
     if store.n_pos() == 0:
         return None
     policy.train()
     trainable = [p for p in policy.parameters() if p.requires_grad]
     refs = [p.detach().clone() for p in trainable]
-    nb_demo = int(round(cfg.demo_frac * cfg.batch)) if (cfg.demo_frac > 0 and demo is not None) else 0
-    nb_pos = cfg.batch - nb_demo
-    nd = demo["U"].shape[0] if demo is not None else 0
+    nb_pos = cfg.batch
     probe = None
     v_before = None
     drawn_ids = {}
@@ -232,12 +231,6 @@ def prox_update(policy, opt, store, demo, cfg, device, rng):
         for q in ids:
             drawn_ids[q] = drawn_ids.get(q, 0) + 1
         G, L, H, U = G.to(device), L.to(device), H.to(device), U.to(device)
-        if nb_demo > 0:
-            di = torch.as_tensor(rng.integers(0, nd, nb_demo))
-            G = torch.cat([G, demo["grid"][di].to(device)])
-            L = torch.cat([L, demo["low5"][di].to(device)])
-            H = torch.cat([H, demo["hist"][di].to(device)])
-            U = torch.cat([U, demo["U"][di].to(device)])
         if probe is None:                                   # fixed functional probe = first batch
             na = min(U.shape[0], 128)
             xa = 0.5 * (U[:na] / policy.u_max).reshape(na, policy.d)
@@ -270,7 +263,7 @@ def prox_update(policy, opt, store, demo, cfg, device, rng):
                 fstep_final=fstep_hist[-1] if fstep_hist else 0.0,
                 prox_over_cfm=(float(np.mean(prox_hist)) / max(float(np.mean(cfm_hist)), 1e-9)),
                 drawn_ids=drawn_ids, n_distinct=len(drawn_ids),
-                batch=(nb_pos, nb_demo))
+                batch=(nb_pos, 0))
 
 
 # ------------------------------------------------------------------ closed-loop measurement
@@ -339,17 +332,9 @@ def run_afe(policy, phi0, env, cfg, device, outdir, log=print):
     fb = AC.SafeMPPIFallback(env)
     rng = np.random.default_rng(cfg.seed)
     goal_np = env.goal.detach().cpu().numpy()
-    demo = None
-    if cfg.demo_frac > 0:
-        import pretrain_repr as PR
-        G, L, H, U = PR.load_data(cfg.demo_prefix, [str(g) for g in cfg.gammas], cfg.demo_cap)
-        demo = dict(grid=G, low5=L, hist=H, U=U)
-        log(f"[afe] arm-B demo replay: {U.shape[0]} windows ({cfg.demo_prefix}) frac {cfg.demo_frac}")
-    # frozen-encoder training (every winning recipe; phi0 is a separate frozen copy for sigma)
-    for p in policy.encoder_modules():
-        p.requires_grad_(False)
-    trainable = [p for p in policy.parameters() if p.requires_grad]
-    opt = torch.optim.Adam(trainable, lr=cfg.lr)
+    # ALL parameters train (encoder included): no freezing, no demo replay, no LwF, no anchor.
+    # The prox term is the only regularizer; phi0 stays a separate frozen copy for sigma.
+    opt = torch.optim.Adam(policy.parameters(), lr=cfg.lr)
     audit_ctxs = AC.build_audit_contexts(env, cfg.gammas, n_pos=cfg.audit_pos)
     recipe = dict(algorithm="afe_minimal_2026_07_16",
                   object_identity="planned_window==queried==verified==trained",
@@ -361,10 +346,11 @@ def run_afe(policy, phi0, env, cfg, device, outdir, log=print):
                   update="uniform cumulative D+ replay, prox eta=%g, lr=%g, batch=%d, "
                          "stop=fstep>=%g or %d steps" % (cfg.eta, cfg.lr, cfg.batch,
                                                          cfg.fstep_stop, cfg.max_inner),
-                  no_curriculum=True, demo_frac=cfg.demo_frac, gammas=list(cfg.gammas),
+                  no_curriculum=True, no_stabilizers="no demo/LwF/anchor/encoder-freeze",
+                  gammas=list(cfg.gammas),
                   episodes_per_round=cfg.episodes_per_round, T=cfg.T, reach=cfg.reach,
                   wall_plugs=cfg.wall_plugs, start_eps=cfg.start_eps, goal_xy=list(cfg.goal_xy),
-                  seed=cfg.seed, frozen_encoder=True,
+                  seed=cfg.seed, all_params_trainable=True,
                   audit=dict(every=cfg.audit_every, n_pos=cfg.audit_pos, plans=cfg.audit_plans,
                              held_out=True, never_buffered=True))
     with open(os.path.join(outdir, "recipe.json"), "w") as f:
@@ -397,7 +383,7 @@ def run_afe(policy, phi0, env, cfg, device, outdir, log=print):
         gstats = gather_round(policy, phi0, blr, store, env, cfg, fb, n, device)
         t_gather = time.time() - t0
         t0 = time.time()
-        upd = prox_update(policy, opt, store, demo, cfg, device, rng)
+        upd = prox_update(policy, opt, store, cfg, device, rng)
         t_upd = time.time() - t0
         # ---- tracking ----
         a_hat = gstats["n_acc"] / max(gstats["n_q"], 1)
@@ -584,8 +570,6 @@ def main():
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--max-inner", type=int, default=40)
     ap.add_argument("--fstep-stop", type=float, default=0.03)
-    ap.add_argument("--demo-frac", type=float, default=0.0)
-    ap.add_argument("--demo-prefix", default="dr05_")
     ap.add_argument("--audit-every", type=int, default=5)
     ap.add_argument("--audit-pos", type=int, default=12)
     ap.add_argument("--audit-plans", type=int, default=4)
@@ -620,15 +604,14 @@ def main():
                     lam=args.lam, n_theta=args.n_theta, exec_rule=args.exec_rule,
                     gammas=tuple(args.gammas), lr=args.lr, eta=args.eta, batch=args.batch,
                     max_inner=args.max_inner, fstep_stop=args.fstep_stop,
-                    demo_frac=args.demo_frac, demo_prefix=args.demo_prefix,
                     audit_every=args.audit_every, audit_pos=args.audit_pos,
                     audit_plans=args.audit_plans, measure_every=args.measure_every,
                     M_measure=args.M_measure, ckpt_every=args.ckpt_every, viz_every=args.viz_every,
                     wall_plugs=args.wall_plugs, start_eps=args.start_eps,
                     goal_xy=tuple(args.goal_xy), seed=args.seed, max_hours=args.max_hours)
     print(f"[afe] ckpt {os.path.basename(args.ckpt)} repr {ck['config'].get('repr_dim')} dev {dev} "
-          f"K{cfg.K} B{cfg.B} beta {cfg.beta} eta {cfg.eta} exec {cfg.exec_rule} "
-          f"demo {cfg.demo_frac}", flush=True)
+          f"K{cfg.K} B{cfg.B} beta {cfg.beta} lam {cfg.lam} eta {cfg.eta} exec {cfg.exec_rule} "
+          f"PURE (no demo/LwF/anchor/freeze)", flush=True)
     if args.probe:
         component_probe(policy, phi0, env, cfg, dev)
         return
