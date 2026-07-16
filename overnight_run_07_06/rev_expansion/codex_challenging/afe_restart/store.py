@@ -8,7 +8,7 @@ from typing import Any, Mapping
 import numpy as np
 from numpy.typing import NDArray
 
-from .schemas import ReplayItem, VerificationRecord
+from .schemas import QuerySource, ReplayItem, VerificationRecord
 from .uncertainty import CumulativeLinearUncertainty
 
 
@@ -64,7 +64,9 @@ class VerificationStore:
     side effects.
     """
 
-    STATE_VERSION = 1
+    # Version 2 requires query-schema-v2 contexts carrying the exact float64
+    # verifier state and immutable scene/goal/dynamics/verifier fingerprint.
+    STATE_VERSION = 2
 
     def __init__(
         self,
@@ -214,9 +216,26 @@ class VerificationStore:
         ):
             raise RuntimeError("audit isolation was violated")
 
-    def uniform_positive_view(self) -> UniformPositiveView:
+    def uniform_positive_view(
+        self,
+        *,
+        source: QuerySource | str | None = None,
+    ) -> UniformPositiveView:
+        """Return uniform verified-positive replay, optionally source-scoped.
+
+        Stage 05 passes QuerySource.FLOW: certified backup plans remain real
+        verifier observations in cumulative A, but runtime fallback must never
+        silently become expert distillation.
+        """
+
+        source_value = QuerySource(source) if source is not None else None
         return UniformPositiveView(
-            [ReplayItem.from_record(record) for record in self._records if record.safe]
+            [
+                ReplayItem.from_record(record)
+                for record in self._records
+                if record.safe
+                and (source_value is None or record.source is source_value)
+            ]
         )
 
     def assert_exact_accounting(self) -> None:
@@ -269,7 +288,10 @@ class VerificationStore:
     @classmethod
     def from_state_dict(cls, state: Mapping[str, Any]) -> "VerificationStore":
         if int(state.get("version", -1)) != cls.STATE_VERSION:
-            raise ValueError("unsupported verification-store state version")
+            raise ValueError(
+                "unsupported verification-store state version; legacy stores "
+                "without exact verifier query identity must not be resumed"
+            )
         expected_uncertainty = CumulativeLinearUncertainty.from_state_dict(
             state["uncertainty"]
         )

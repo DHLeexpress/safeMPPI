@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Stage 1B: smooth SafeMPPI expert on the provisional radius-1.2 OOD scene.
+"""Stage 1B: smooth SafeMPPI expert on a declared-radius OOD scene.
 
 The task is deliberately fixed to start=(0.5,0.5), goal=(4.5,4.5), and one
-radius-1.2 obstacle replacing the four central obstacles.  ``tune`` compares
+giant obstacle replacing the four central obstacles.  ``tune`` compares
 smoothness weights with matched planner noise.  ``final`` evaluates M=2 for
 every gamma with a long closed-loop horizon and saves a--e plus validity audits.
 """
@@ -615,6 +615,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smooth-grid", type=float, nargs="+", default=list(DEFAULT_SMOOTH_GRID))
     parser.add_argument("--smooth-weight", type=float)
     parser.add_argument("--M", type=int, default=2)
+    parser.add_argument(
+        "--radius",
+        type=float,
+        default=RADIUS,
+        help="giant-obstacle radius; all other scene geometry remains fixed",
+    )
     parser.add_argument("--max-steps", type=int, default=800)
     parser.add_argument("--reach", type=float, default=0.15)
     parser.add_argument("--seed0", type=int, default=65100)
@@ -624,7 +630,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    global RADIUS
     args = parse_args()
+    if not 0.0 < args.radius < 2.0:
+        raise ValueError("--radius must lie in (0, 2)")
+    # The existing implementation intentionally routes every geometry use
+    # through this module constant.  Set it once, before constructing an env,
+    # so a radius sweep changes geometry only and remains reproducible.
+    RADIUS = float(args.radius)
     if args.M != 2 and args.phase == "final":
         raise ValueError("Stage 1B approval figure is locked to M=2 per gamma")
     if args.max_steps < 250:

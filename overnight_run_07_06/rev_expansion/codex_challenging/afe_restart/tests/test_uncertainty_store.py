@@ -23,6 +23,8 @@ def _context(offset: float = 0.0) -> QueryContext:
         grid=np.arange(16, dtype=np.float32).reshape(4, 4) + offset,
         low5=np.linspace(0.0, 1.0, 5, dtype=np.float32) + offset,
         hist=np.arange(12, dtype=np.float32).reshape(6, 2) + offset,
+        verifier_state=np.asarray([offset, 0.0, 0.0, 0.0], dtype=np.float64),
+        verifier_spec_fingerprint="c" * 64,
     )
 
 
@@ -41,6 +43,7 @@ def _record(
     plan_offset: float = 0.0,
     audit: bool = False,
     feature_z: np.ndarray | None = None,
+    source: QuerySource = QuerySource.FLOW,
 ) -> VerificationRecord:
     z = _feature(index) if feature_z is None else np.asarray(feature_z)
     plan = (
@@ -50,7 +53,7 @@ def _record(
         context=_context(10.0 if audit else 0.0),
         gamma=gamma,
         plan=plan,
-        source=QuerySource.FLOW,
+        source=source,
         feature_z=z,
         acquisition_sigma=store.uncertainty.sigma(z),
         safety=SafetyResult(
@@ -200,6 +203,15 @@ def test_exact_query_identity_and_replay_hashes_are_tamper_evident() -> None:
     assert baseline == query_content_hash(context, 0.5, plan[:, ::-1][:, ::-1])
     assert baseline != query_content_hash(context, 1.0, plan)
     assert baseline != query_content_hash(_context(0.1), 0.5, plan)
+    changed_state = replace(
+        context,
+        verifier_state=np.nextafter(
+            context.verifier_state, np.ones(4, dtype=np.float64)
+        ),
+    )
+    assert baseline != query_content_hash(changed_state, 0.5, plan)
+    changed_spec = replace(context, verifier_spec_fingerprint="f" * 64)
+    assert baseline != query_content_hash(changed_spec, 0.5, plan)
     changed_plan = plan.copy()
     changed_plan[0, 0] = np.nextafter(changed_plan[0, 0], np.float32(1.0))
     assert baseline != query_content_hash(context, 0.5, changed_plan)
@@ -217,3 +229,20 @@ def test_exact_query_identity_and_replay_hashes_are_tamper_evident() -> None:
         record.plan[0, 0] = 999.0
     with pytest.raises(ValueError, match="read-only"):
         replay.plan[0, 0] = 999.0
+
+
+def test_safe_backup_updates_cumulative_A_but_is_excluded_from_flow_replay() -> None:
+    store = VerificationStore()
+    backup = _record(
+        store,
+        index=7,
+        safe=True,
+        source=QuerySource.SAFEMPPI_BACKUP,
+    )
+    before = store.uncertainty.A
+    store.append(backup)
+
+    assert store.query_count == store.uncertainty.count == 1
+    assert not np.array_equal(before, store.uncertainty.A)
+    assert len(store.uniform_positive_view()) == 1
+    assert len(store.uniform_positive_view(source=QuerySource.FLOW)) == 0

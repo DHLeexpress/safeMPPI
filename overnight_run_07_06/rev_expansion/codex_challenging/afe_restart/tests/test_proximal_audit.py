@@ -83,20 +83,16 @@ def test_proximal_uses_uniform_epochs_and_configured_not_fixed_steps() -> None:
     # metadata has no effect.  Seven requested steps also proves that four is
     # not embedded in the implementation.
     for step in result_a.trace:
-        assert sorted(step.original_record_indices) == list(range(6))
         assert step.microbatch_count == 3
-        flattened = tuple(
-            index
-            for batch in step.microbatch_original_indices
-            for index in batch
-        )
-        assert flattened == step.original_record_indices
+        assert step.microbatch_sizes == (2, 2, 2)
+        assert step.unique_record_count == 6
+        assert len(step.record_order_sha256) == 64
         assert step.positive_coverage == 1.0
     assert result_a.optimizer_steps == 7
     assert result_a.stopping_reason == "max_steps"
     assert result_a.sampling == "uniform_full_positive_pass_seeded_reshuffle"
-    assert [s.original_record_indices for s in result_a.trace] == [
-        s.original_record_indices for s in result_b.trace
+    assert [s.record_order_sha256 for s in result_a.trace] == [
+        s.record_order_sha256 for s in result_b.trace
     ]
     assert torch.equal(model_a.weight.detach(), model_b.weight.detach())
 
@@ -127,11 +123,47 @@ def test_proximal_penalty_and_hard_update_norm_bound() -> None:
     assert abs(float(model.weight.detach())) == pytest.approx(0.05, abs=1.0e-6)
 
 
+def test_relative_tolerance_stops_at_the_evaluated_model() -> None:
+    """Convergence telemetry and saved parameters must name one point."""
+
+    model = ScalarModel(0.0)
+    result = solve_proximal_update(
+        model,
+        [{"y": True, "target": 1.0}],
+        mse_loss,
+        ProximalConfig(
+            eta=100.0,
+            learning_rate=0.1,
+            batch_size=1,
+            max_steps=5,
+            min_steps=1,
+            update_norm_limit=10.0,
+            relative_loss_tolerance=1.0,
+            gradient_tolerance=None,
+            tolerance_patience=1,
+        ),
+        optimizer_factory=lambda params, lr: torch.optim.SGD(params, lr=lr),
+    )
+
+    # One step moves w=0 to w=.2.  The next full objective evaluation meets
+    # the deliberately loose tolerance and must stop *before* another step.
+    assert result.stopping_reason == "relative_loss_tolerance"
+    assert result.optimizer_steps == 1
+    assert result.objective_evaluations == 2
+    assert float(model.weight.detach()) == pytest.approx(0.2, abs=1.0e-7)
+    expected_objective = (0.2 - 1.0) ** 2 + 0.2**2 / (2.0 * 100.0)
+    assert result.trace[-1].objective == pytest.approx(expected_objective)
+    assert result.trace[-1].optimizer_step == result.optimizer_steps
+    assert result.trace[-1].update_norm == pytest.approx(result.final_update_norm)
+
+
 def test_proximal_accepts_identity_checked_positive_replay_items() -> None:
     context = QueryContext(
         grid=np.zeros((2, 2), dtype=np.float32),
         low5=np.zeros(5, dtype=np.float32),
         hist=np.zeros((2, 2), dtype=np.float32),
+        verifier_state=np.zeros(4, dtype=np.float64),
+        verifier_spec_fingerprint="d" * 64,
     )
     plan = np.zeros((10, 2), dtype=np.float32)
     content_hash = query_content_hash(context, 0.5, plan)

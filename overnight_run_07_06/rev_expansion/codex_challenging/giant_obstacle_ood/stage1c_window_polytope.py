@@ -44,12 +44,11 @@ import grid_scene as GS  # noqa: E402
 import verifier_polytope as VP  # noqa: E402
 from cfm_mppi.safegpc_adapter.polytope_v2 import build_polytope_v2  # noqa: E402
 
-from giant_obstacle_ood.stage1_geometry_sweep import draw_scene  # noqa: E402
+from giant_obstacle_ood.stage1_geometry_sweep import draw_scene, make_scene  # noqa: E402
 from giant_obstacle_ood.stage1b_smooth_expert import (  # noqa: E402
     GOAL,
     RADIUS,
     START,
-    make_fixed_scene,
 )
 from viz_style import GAMMAS, GAMMA_COLORS  # noqa: E402
 
@@ -60,6 +59,14 @@ H = 10
 BLUE = "#0072B2"
 GREEN = "#009E73"
 RED = "#CC3311"
+
+
+def make_diagnostic_scene(max_steps: int):
+    """Build the exact declared-radius scene used by the source trajectories."""
+
+    env = make_scene(float(RADIUS), START, GOAL)
+    env.T = int(max_steps)
+    return env
 
 
 def halfspace_polygon(A: np.ndarray, b: np.ndarray, tol: float = 1e-7) -> np.ndarray | None:
@@ -210,7 +217,7 @@ def rates(group: list[dict]) -> dict:
 
 
 def run_metrics(args: argparse.Namespace) -> None:
-    env = make_fixed_scene(800)
+    env = make_diagnostic_scene(800)
     rollouts = load_rollouts(args.source)
     records = []
     started = time.perf_counter()
@@ -431,8 +438,10 @@ def frame_panel(axis, record: dict, env, step: int, reach: float) -> dict:
     axis.plot(state[0], state[1], "o", color="black", ms=4.5, zorder=8)
 
     nominal_exists, nominal_outer, nominal_level, poly = nominal_polygons(state, env, gamma)
-    add_polygon(axis, nominal_outer, BLUE, 0.08, "-", 1.3, 3)
-    add_polygon(axis, nominal_level, BLUE, 0.0, "--", 1.1, 3)
+    # Keep the requested nominal geometry visibly on top when the fitted
+    # verifier happens to share nearly the same faces.
+    add_polygon(axis, nominal_outer, BLUE, 0.05, "-", 2.0, 6)
+    add_polygon(axis, nominal_level, BLUE, 0.0, "--", 1.5, 6)
 
     arrived = current >= len(controls)
     if arrived:
@@ -463,7 +472,7 @@ def frame_panel(axis, record: dict, env, step: int, reach: float) -> dict:
 
 
 def run_gif(args: argparse.Namespace) -> None:
-    env = make_fixed_scene(800)
+    env = make_diagnostic_scene(800)
     all_rollouts = load_rollouts(args.source)
     seed = min(record["seed"] for record in all_rollouts) if args.seed is None else args.seed
     rollouts = [record for record in all_rollouts if record["seed"] == seed]
@@ -576,11 +585,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--duration-ms", type=int, default=250)
     parser.add_argument("--poster-step", type=int, default=100)
     parser.add_argument("--reach", type=float, default=0.15)
+    parser.add_argument(
+        "--radius",
+        type=float,
+        default=RADIUS,
+        help="giant-obstacle radius used to generate --source",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
+    global RADIUS
     args = parse_args()
+    if not 0.0 < args.radius < 2.0:
+        raise ValueError("--radius must lie in (0, 2)")
+    RADIUS = float(args.radius)
     if args.frame_stride < 1:
         raise ValueError("frame stride must be positive")
     if not args.source.exists():

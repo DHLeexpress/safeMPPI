@@ -1,0 +1,4 @@
+# Large generated artifacts are reproducible from the stage manifests.
+/afe_restart/stage_results/
+/giant_obstacle_ood/stage_results/
+/stage_results/

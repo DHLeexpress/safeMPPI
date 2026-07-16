@@ -17,6 +17,7 @@ method.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import hashlib
 import inspect
 import math
 from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequence
@@ -99,8 +100,9 @@ class ProximalStepTelemetry:
     evaluation: int
     optimizer_step: int
     microbatch_count: int
-    microbatch_original_indices: tuple[tuple[int, ...], ...]
-    original_record_indices: tuple[int, ...]
+    microbatch_sizes: tuple[int, ...]
+    record_order_sha256: str
+    unique_record_count: int
     positive_coverage: float
     cfm_loss: float
     proximal_penalty: float
@@ -131,6 +133,7 @@ class ProximalUpdateResult:
     update_norm_limit: float
     final_update_norm: float
     sampling: str
+    objective_randomness: str
     trace: tuple[ProximalStepTelemetry, ...]
 
     def to_dict(self) -> dict[str, Any]:
@@ -196,6 +199,19 @@ def _materialize_records(records: Iterable[Any] | Any) -> list[Any]:
     return list(records)
 
 
+def _record_order_sha256(indices: Sequence[int]) -> str:
+    """Compact, exact evidence for one uniformly shuffled full-ledger pass."""
+
+    digest = hashlib.sha256(b"afe-uniform-positive-order-v1\x00")
+    digest.update(len(indices).to_bytes(8, byteorder="little", signed=False))
+    for index in indices:
+        value = int(index)
+        if value < 0:
+            raise ValueError("record order cannot contain a negative index")
+        digest.update(value.to_bytes(8, byteorder="little", signed=False))
+    return digest.hexdigest()
+
+
 def _loss_accepts_generator(loss_fn: Callable[..., Any]) -> bool:
     try:
         signature = inspect.signature(loss_fn)
@@ -230,9 +246,12 @@ def _make_loss_generator(parameters: Sequence[nn.Parameter], seed: int) -> torch
 
 
 def _squared_update(
-    parameters: Sequence[nn.Parameter], anchors: Sequence[torch.Tensor]
+    parameters: Sequence[nn.Parameter], reference_values: Sequence[torch.Tensor]
 ) -> torch.Tensor:
-    terms = [torch.sum((parameter - anchor) ** 2) for parameter, anchor in zip(parameters, anchors)]
+    terms = [
+        torch.sum((parameter - reference) ** 2)
+        for parameter, reference in zip(parameters, reference_values)
+    ]
     # ``parameters`` is nonempty at every call site.
     return torch.stack(terms).sum()
 
@@ -245,9 +264,16 @@ def _gradient_norm(parameters: Sequence[nn.Parameter]) -> float:
     return float(torch.sqrt(squared).cpu())
 
 
-def _update_norm(parameters: Sequence[nn.Parameter], anchors: Sequence[torch.Tensor]) -> float:
+def _update_norm(
+    parameters: Sequence[nn.Parameter],
+    reference_values: Sequence[torch.Tensor],
+) -> float:
     with torch.no_grad():
-        return float(torch.sqrt(_squared_update(parameters, anchors).double()).cpu())
+        return float(
+            torch.sqrt(
+                _squared_update(parameters, reference_values).double()
+            ).cpu()
+        )
 
 
 def _restore(parameters: Sequence[nn.Parameter], values: Sequence[torch.Tensor]) -> None:
@@ -258,19 +284,19 @@ def _restore(parameters: Sequence[nn.Parameter], values: Sequence[torch.Tensor])
 
 def _project_update(
     parameters: Sequence[nn.Parameter],
-    anchors: Sequence[torch.Tensor],
+    reference_values: Sequence[torch.Tensor],
     limit: float,
 ) -> float:
-    norm = _update_norm(parameters, anchors)
+    norm = _update_norm(parameters, reference_values)
     if norm <= limit:
         return norm
     scale = limit / norm
     with torch.no_grad():
-        for parameter, anchor in zip(parameters, anchors):
-            parameter.copy_(anchor + scale * (parameter - anchor))
+        for parameter, reference in zip(parameters, reference_values):
+            parameter.copy_(reference + scale * (parameter - reference))
     # Return the measured value rather than assuming floating-point projection
     # lands exactly on ``limit``.
-    return _update_norm(parameters, anchors)
+    return _update_norm(parameters, reference_values)
 
 
 class _UniformFullPass:
@@ -297,8 +323,8 @@ def solve_proximal_update(
 ) -> ProximalUpdateResult:
     """Optimize one bounded proximal CFM update over uniform positive replay.
 
-    The anchor is captured at function entry and remains fixed for the whole
-    solve.  Every positive row contributes with equal weight before *each*
+    The proximal reference theta_n is captured at function entry and remains
+    fixed for the whole solve. Every positive row contributes with equal weight before *each*
     optimizer step; shuffling and microbatching only bound memory.  No record
     metadata other than the deterministic verifier label is inspected.  A
     zero-positive call is an exact parameter and optimizer no-op.
@@ -325,6 +351,13 @@ def solve_proximal_update(
         min_steps=config.min_steps,
         update_norm_limit=config.update_norm_limit,
         sampling="uniform_full_positive_pass_seeded_reshuffle",
+        objective_randomness=str(
+            getattr(
+                cfm_loss_fn,
+                "objective_randomness",
+                "caller_managed_unspecified",
+            )
+        ),
     )
     if not indexed_positives:
         return ProximalUpdateResult(
@@ -347,7 +380,7 @@ def solve_proximal_update(
             trace=(),
         )
 
-    anchors = [parameter.detach().clone() for parameter in parameters]
+    round_start = [parameter.detach().clone() for parameter in parameters]
     cpu_generator = torch.Generator().manual_seed(config.seed)
     loss_generator = _make_loss_generator(parameters, config.seed)
     batches = _UniformFullPass(
@@ -372,7 +405,7 @@ def solve_proximal_update(
         for evaluation in range(1, config.max_steps + 1):
             optimizer.zero_grad(set_to_none=True)
             original_indices_list: list[int] = []
-            microbatch_original_indices: list[tuple[int, ...]] = []
+            microbatch_sizes: list[int] = []
             microbatch_count = 0
             cfm_value = 0.0
             finite_cfm = True
@@ -381,7 +414,7 @@ def solve_proximal_update(
                 original_microbatch = tuple(
                     indexed_positives[index][0] for index in positive_indices
                 )
-                microbatch_original_indices.append(original_microbatch)
+                microbatch_sizes.append(len(original_microbatch))
                 original_indices_list.extend(original_microbatch)
                 batch = tuple(indexed_positives[index][1] for index in positive_indices)
                 if accepts_generator:
@@ -404,7 +437,9 @@ def solve_proximal_update(
                 weighted_loss.backward()
 
             original_indices = tuple(original_indices_list)
-            squared_update = _squared_update(parameters, anchors)
+            unique_record_count = len(set(original_indices))
+            record_order_sha256 = _record_order_sha256(original_indices)
+            squared_update = _squared_update(parameters, round_start)
             proximal_penalty = squared_update / (2.0 * config.eta)
             proximal_value = float(proximal_penalty.detach().cpu())
             objective_value = cfm_value + proximal_value
@@ -420,24 +455,25 @@ def solve_proximal_update(
                         evaluation=evaluation,
                         optimizer_step=optimizer_steps,
                         microbatch_count=microbatch_count,
-                        microbatch_original_indices=tuple(microbatch_original_indices),
-                        original_record_indices=original_indices,
+                        microbatch_sizes=tuple(microbatch_sizes),
+                        record_order_sha256=record_order_sha256,
+                        unique_record_count=unique_record_count,
                         positive_coverage=(
-                            len(set(original_indices)) / len(indexed_positives)
+                            unique_record_count / len(indexed_positives)
                         ),
                         cfm_loss=cfm_value,
                         proximal_penalty=proximal_value,
                         objective=objective_value,
                         relative_objective_change=relative_change,
                         gradient_norm=math.nan,
-                        update_norm=_update_norm(parameters, anchors),
+                        update_norm=_update_norm(parameters, round_start),
                         projected_to_update_bound=False,
                     )
                 )
                 break
 
             # CFM gradients were accumulated microbatch-by-microbatch above;
-            # the round-anchor term is differentiated exactly once.
+            # The proximal-reference term is differentiated exactly once.
             proximal_penalty.backward()
             gradient_norm = _gradient_norm(parameters)
             if not math.isfinite(gradient_norm):
@@ -447,47 +483,73 @@ def solve_proximal_update(
                         evaluation=evaluation,
                         optimizer_step=optimizer_steps,
                         microbatch_count=microbatch_count,
-                        microbatch_original_indices=tuple(microbatch_original_indices),
-                        original_record_indices=original_indices,
+                        microbatch_sizes=tuple(microbatch_sizes),
+                        record_order_sha256=record_order_sha256,
+                        unique_record_count=unique_record_count,
                         positive_coverage=1.0,
                         cfm_loss=cfm_value,
                         proximal_penalty=proximal_value,
                         objective=objective_value,
                         relative_objective_change=relative_change,
                         gradient_norm=gradient_norm,
-                        update_norm=_update_norm(parameters, anchors),
+                        update_norm=_update_norm(parameters, round_start),
                         projected_to_update_bound=False,
                     )
                 )
                 break
 
-            # A stationary initial point can converge without a gratuitous Adam
-            # step when the caller explicitly permits zero solver steps.
-            if (
+            gradient_converged = (
                 config.gradient_tolerance is not None
                 and optimizer_steps >= config.min_steps
                 and gradient_norm <= config.gradient_tolerance
+            )
+            if (
+                config.relative_loss_tolerance is not None
+                and relative_change is not None
+                and optimizer_steps >= config.min_steps
+                and relative_change <= config.relative_loss_tolerance
             ):
-                stopping_reason = "gradient_tolerance"
+                stable_evaluations += 1
+            else:
+                stable_evaluations = 0
+            objective_converged = (
+                stable_evaluations >= config.tolerance_patience
+            )
+
+            # The objective and gradient above describe the *current* model.
+            # Stop at that evaluated point.  Taking one more Adam step here
+            # would make the saved parameters differ from the parameters whose
+            # convergence was actually measured.
+            if gradient_converged or objective_converged:
+                stopping_reason = (
+                    "gradient_tolerance"
+                    if gradient_converged
+                    else "relative_loss_tolerance"
+                )
                 converged = True
                 trace.append(
                     ProximalStepTelemetry(
                         evaluation=evaluation,
                         optimizer_step=optimizer_steps,
                         microbatch_count=microbatch_count,
-                        microbatch_original_indices=tuple(microbatch_original_indices),
-                        original_record_indices=original_indices,
+                        microbatch_sizes=tuple(microbatch_sizes),
+                        record_order_sha256=record_order_sha256,
+                        unique_record_count=unique_record_count,
                         positive_coverage=1.0,
                         cfm_loss=cfm_value,
                         proximal_penalty=proximal_value,
                         objective=objective_value,
                         relative_objective_change=relative_change,
                         gradient_norm=gradient_norm,
-                        update_norm=_update_norm(parameters, anchors),
+                        update_norm=_update_norm(parameters, round_start),
                         projected_to_update_bound=False,
                     )
                 )
                 break
+
+            # This objective becomes the reference for the next evaluated
+            # point.  It must be recorded before taking the numerical step.
+            previous_objective = objective_value
 
             before_step = [parameter.detach().clone() for parameter in parameters]
             optimizer.step()
@@ -501,32 +563,36 @@ def solve_proximal_update(
                         evaluation=evaluation,
                         optimizer_step=optimizer_steps,
                         microbatch_count=microbatch_count,
-                        microbatch_original_indices=tuple(microbatch_original_indices),
-                        original_record_indices=original_indices,
+                        microbatch_sizes=tuple(microbatch_sizes),
+                        record_order_sha256=record_order_sha256,
+                        unique_record_count=unique_record_count,
                         positive_coverage=1.0,
                         cfm_loss=cfm_value,
                         proximal_penalty=proximal_value,
                         objective=objective_value,
                         relative_objective_change=relative_change,
                         gradient_norm=gradient_norm,
-                        update_norm=_update_norm(parameters, anchors),
+                        update_norm=_update_norm(parameters, round_start),
                         projected_to_update_bound=False,
                     )
                 )
                 break
 
-            update_norm_before_projection = _update_norm(parameters, anchors)
+            update_norm_before_projection = _update_norm(
+                parameters, round_start
+            )
             projected = update_norm_before_projection >= config.update_norm_limit
             update_norm = _project_update(
-                parameters, anchors, config.update_norm_limit
+                parameters, round_start, config.update_norm_limit
             ) if projected else update_norm_before_projection
             trace.append(
                 ProximalStepTelemetry(
                     evaluation=evaluation,
                     optimizer_step=optimizer_steps,
                     microbatch_count=microbatch_count,
-                    microbatch_original_indices=tuple(microbatch_original_indices),
-                    original_record_indices=original_indices,
+                    microbatch_sizes=tuple(microbatch_sizes),
+                    record_order_sha256=record_order_sha256,
+                    unique_record_count=unique_record_count,
                     positive_coverage=1.0,
                     cfm_loss=cfm_value,
                     proximal_penalty=proximal_value,
@@ -541,21 +607,6 @@ def solve_proximal_update(
             if projected:
                 stopping_reason = "update_norm_bound"
                 break
-
-            if (
-                config.relative_loss_tolerance is not None
-                and relative_change is not None
-                and optimizer_steps >= config.min_steps
-                and relative_change <= config.relative_loss_tolerance
-            ):
-                stable_evaluations += 1
-            else:
-                stable_evaluations = 0
-            if stable_evaluations >= config.tolerance_patience:
-                stopping_reason = "relative_loss_tolerance"
-                converged = True
-                break
-            previous_objective = objective_value
     finally:
         model.train(original_training_mode)
 
@@ -565,7 +616,7 @@ def solve_proximal_update(
         objective_evaluations=len(trace),
         stopping_reason=stopping_reason,
         converged=converged,
-        final_update_norm=_update_norm(parameters, anchors),
+        final_update_norm=_update_norm(parameters, round_start),
         trace=tuple(trace),
     )
 

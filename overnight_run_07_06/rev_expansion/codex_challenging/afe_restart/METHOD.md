@@ -25,11 +25,14 @@ Two qualifications are essential:
 
 ## Objects
 
-For context `c=(grid, low5, hist)` and planned controls `U` with shape `[10,2]`,
-one immutable query record stores:
+For model context `c=(grid, low5, hist)` and planned controls `U` with shape
+`[10,2]`, one immutable query record stores:
 
-- exact context arrays, gamma, and exact `U`;
-- a content hash over `(c,gamma,U)`;
+- exact model-context arrays, the literal float64 verifier state, gamma, and
+  exact `U`;
+- a SHA-256 fingerprint of the scene, goal, dynamics, and verifier
+  configuration;
+- a content hash over all of those verifier inputs;
 - source (`flow` or `safemppi_backup`);
 - frozen normalized 32-D feature `z` and acquisition sigma;
 - strict-bounds result and full SOCP result;
@@ -52,10 +55,10 @@ sigma^2 = z^T A_n^-1 z
 ```
 
 Every *new* full-verifier call, positive or negative and including backup
-queries, updates `A`. An exact `(context,gamma,U)` duplicate is served from a
-deterministic-result cache, logged as a cache hit, and neither consumes fresh
-verifier budget nor updates `A` a second time. Audit-only samples never update
-it.
+queries, updates `A`. An exact duplicate under the full verifier-input identity
+is served from a deterministic-result cache, logged as a cache hit, and neither
+consumes fresh verifier budget nor updates `A` a second time. Audit-only samples
+never update it.
 
 ## Acquisition and execution
 
@@ -73,29 +76,51 @@ At each receding-horizon step:
 
 ## Update
 
-Uniformly replay all safe ledger plans under:
+Uniformly replay all safe **flow-acquired** ledger plans under:
 
 ```text
 mean(CFM loss) + ||theta-theta_round_start||^2 / (2 eta)
 ```
 
+SafeMPPI backup plans remain in the full-verifier ledger and cumulative `A`, but
+are excluded from CFM replay: the backup is a runtime safety mechanism, not an
+implicit expert-distillation channel. Query acceptance is likewise computed
+only over the uncertainty-acquired flow queries; backup calls and acceptance
+are reported separately.
+
 The numerical solver uses a declared maximum, relative-loss/gradient tolerance,
 and a hard parameter-update norm. It reports the stopping reason and actual
-number of steps. There is no demo fraction, success quota, frontier weight, or
-negative unlearning in Full.
+number of steps. Within a round, every replay row receives fixed CFM bridge
+noise and flow time keyed by the round seed and exact query hash, so shuffled
+microbatches evaluate the same Monte Carlo objective and tolerance labels do
+not compare newly redrawn losses. There is no demo fraction, LwF, teacher/data anchoring,
+success quota, frontier weight, negative unlearning, or fixed optimizer-step
+count in Full. The displayed parameter reference is only the explicitly stated
+proximal objective above.
 
-## Independent audit
+## Isolated monitoring and sealed final audit
 
 At each round, sample ordinary (not sigma-tilted) plans at temperature 1.0 from
-a fixed held-out context bank. Full-verifier audit rows are isolated: they enter
-neither the query ledger, `A`, nor replay. Report per gamma:
+a fixed **round-monitoring** context bank. Full-verifier audit rows are isolated:
+they enter neither the query ledger, `A`, nor replay. Their Wilson intervals are
+conditional plan-sampling intervals for that fixed bank and one trained model;
+they are never described as confidence intervals across training seeds. Report
+per gamma:
 
 - query acceptance;
 - model validity mass estimate;
 - safety-and-progress validity;
 - safe-plan mode coverage;
 - certified-fallback and fail-closed frequency;
-- confidence intervals across independent seeds.
+- conditional plan-sampling intervals, with their scope stated explicitly.
+
+A separate sealed final-test bank includes the deployment start and interior
+contexts drawn from distinct, disjoint expert seeds. It is never evaluated for
+round selection or hyperparameter tuning. Final independent-training-seed
+intervals require at least two independently trained expansion runs evaluated
+once on this same sealed bank; they are aggregated across the per-seed validity
+estimates rather than pooling plan samples and pretending they are training
+seeds.
 
 Temperature 0.5 is permitted only for the separate rollout visualization.
 
@@ -113,6 +138,9 @@ Temperature 0.5 is permitted only for the separate rollout visualization.
    model-validity audit at temperature 1.0 and rollout diagnostic at 0.5.
 5. **AFE expansion.** Fixed gamma distribution, planned-query verifier,
    certified fallback, uniform positive replay, proximal solver.
+   The small nonzero-SR gate is only a checkpoint-selection heuristic. Final
+   evidence requires the untouched sealed bank and at least two independently
+   trained models.
 6. **Ablations and reports.** Replace undefined `-Curriculum` with matched-budget
    `-AFE` (uniform querying). Runtime-unsafe `-SOCP` is offline-only and never
    presented as a safe controller. Produce rollout, acquisition/A internals,

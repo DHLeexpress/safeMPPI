@@ -7,6 +7,7 @@ import torch
 
 from afe_restart.dynamics import step_state
 from afe_restart.fallback import BackupProposal
+from afe_restart.scene import verifier_spec_fingerprint
 from afe_restart.schemas import QueryContext, query_content_hash
 from afe_restart.stage2_planned_demos import DemoRunConfig, run_expert_rollout
 
@@ -33,6 +34,16 @@ class FixedBackup:
         ], {"proposal_count": len(self.plans)}
 
 
+class KindBackup:
+    def __init__(self, proposals: list[tuple[np.ndarray, str]]) -> None:
+        self.proposals = proposals
+
+    def propose(self, state, goal, env, gamma, *, seed, device):
+        return [
+            BackupProposal(plan, kind, True) for plan, kind in self.proposals
+        ], {"proposal_count": len(self.proposals)}
+
+
 def tiny_context(state, goal, gamma, controls, env) -> QueryContext:
     history = np.zeros((3, 2), dtype=np.float32)
     controls = np.asarray(controls, dtype=np.float32).reshape(-1, 2)
@@ -42,6 +53,8 @@ def tiny_context(state, goal, gamma, controls, env) -> QueryContext:
         grid=np.asarray([[state[0], state[1]]], dtype=np.float32),
         low5=np.asarray([*state, gamma], dtype=np.float32),
         hist=history,
+        verifier_state=np.asarray(state, dtype=np.float64),
+        verifier_spec_fingerprint=verifier_spec_fingerprint(env, goal),
     )
 
 
@@ -137,3 +150,58 @@ def test_no_safe_plan_fails_closed_without_action_or_target() -> None:
     assert episode["states"].shape == (1, 4)
     assert np.array_equal(episode["states"][0], env.x0.numpy())
 
+
+def test_raw_debug_rollout_cannot_bypass_safe_expert_smoothness_selection() -> None:
+    expert = np.full((10, 2), [0.2, 0.0], dtype=np.float32)
+    debug = np.empty((10, 2), dtype=np.float32)
+    debug[::2] = [1.0, -1.0]
+    debug[1::2] = [-1.0, 1.0]
+    expected_next = step_state(np.asarray([0.5, 0.5, 0.0, 0.0]), expert[0])
+    env = TinyEnvironment(tuple(expected_next[:2]))
+    backup = KindBackup(
+        [(expert, "weighted_mean"), (debug, "debug_candidate")]
+    )
+    verify, seen = verifier_with_progress(
+        {(0.2, 0.0): 0.1, (1.0, -1.0): 0.9}
+    )
+
+    episode = run_expert_rollout(
+        env=env,
+        gamma=0.4,
+        seed=18,
+        device=torch.device("cpu"),
+        config=DemoRunConfig(max_steps=1, reach_m=1.0e-6, max_proposals_per_step=2),
+        backup=backup,
+        verify_fn=verify,
+        context_fn=tiny_context,
+    )
+
+    assert episode["success"]
+    assert len(seen) == 2  # diagnostic proposal remains a real verifier query
+    assert np.array_equal(episode["training_plans"][0], expert)
+    selected = int(episode["selected_query_indices"][0])
+    assert episode["query_kinds"][selected] == "weighted_mean"
+
+
+def test_safe_debug_only_step_fails_closed_without_execution_or_target() -> None:
+    debug = np.full((10, 2), [0.4, 0.0], dtype=np.float32)
+    env = TinyEnvironment((4.5, 4.5))
+    backup = KindBackup([(debug, "debug_candidate")])
+    verify, seen = verifier_with_progress({(0.4, 0.0): 0.8}, safe=True)
+
+    episode = run_expert_rollout(
+        env=env,
+        gamma=0.4,
+        seed=19,
+        device=torch.device("cpu"),
+        config=DemoRunConfig(max_steps=1, reach_m=0.1, max_proposals_per_step=1),
+        backup=backup,
+        verify_fn=verify,
+        context_fn=tiny_context,
+    )
+
+    assert len(seen) == 1  # it remains a fully observed audit query
+    assert episode["dead_reason"] == "no_certified_cost_selected_plan"
+    assert episode["steps"] == 0
+    assert episode["training_plans"].shape == (0, 10, 2)
+    assert episode["executed_actions"].shape == (0, 2)

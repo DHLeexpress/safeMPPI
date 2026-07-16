@@ -71,7 +71,7 @@ class BinomialInterval:
     low: float
     high: float
     confidence: float
-    method: str = "wilson"
+    method: str = "wilson_conditional_plan_sampling"
 
 
 @dataclass(frozen=True)
@@ -99,8 +99,12 @@ class AuditResult:
     temperature: float
     progress_threshold: float
     context_bank_fingerprint: str
+    context_bank_role: str
     sampling_distribution: str
     uncertainty_tilting: bool
+    confidence_interval_scope: str
+    independent_training_seed_count: int
+    independent_training_seed_ci: bool
     per_gamma: tuple[GammaAuditMetrics, ...]
 
     def by_gamma(self) -> dict[float, GammaAuditMetrics]:
@@ -169,15 +173,22 @@ def _fingerprint(contexts: Sequence[Any]) -> str:
 class ImmutableContextBank(Sequence[Any]):
     """Deep-snapshotted held-out contexts returned only through fresh copies."""
 
-    def __init__(self, contexts: Iterable[Any]) -> None:
+    def __init__(self, contexts: Iterable[Any], *, role: str = "unspecified") -> None:
         self._contexts = tuple(copy.deepcopy(context) for context in contexts)
         if not self._contexts:
             raise ValueError("the independent audit context bank cannot be empty")
+        if role not in {"unspecified", "round_monitoring", "sealed_final_test"}:
+            raise ValueError(f"unsupported audit context-bank role: {role!r}")
+        self._role = role
         self._fingerprint = _fingerprint(self._contexts)
 
     @property
     def fingerprint(self) -> str:
         return self._fingerprint
+
+    @property
+    def role(self) -> str:
+        return self._role
 
     def assert_integrity(self) -> None:
         if _fingerprint(self._contexts) != self._fingerprint:
@@ -419,8 +430,14 @@ def run_independent_audit(
         temperature=1.0,
         progress_threshold=config.progress_threshold,
         context_bank_fingerprint=bank.fingerprint,
+        context_bank_role=bank.role,
         sampling_distribution="ordinary_conditional_flow_iid",
         uncertainty_tilting=False,
+        confidence_interval_scope=(
+            "conditional_plan_sampling_wilson_on_fixed_context_bank_single_model"
+        ),
+        independent_training_seed_count=1,
+        independent_training_seed_ci=False,
         per_gamma=tuple(metrics),
     )
 

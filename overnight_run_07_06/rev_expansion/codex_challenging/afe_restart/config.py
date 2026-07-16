@@ -14,6 +14,20 @@ from typing import Final
 GAMMAS: Final[tuple[float, ...]] = (0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0)
 
 
+def clean_method_absence_manifest() -> dict[str, object]:
+    """Explicitly serialize mechanisms removed from the clean restart."""
+
+    return {
+        "demo_frac": "absent",
+        "lwf_or_functional_data_anchor": "absent",
+        "legacy_anchor_or_recovery_replay": "absent",
+        "easy_frontier_split_or_weighting": "absent",
+        "negative_sample_alpha_objective": "absent",
+        "uncertainty_weighted_replay": "absent",
+        "fixed_optimizer_step_count_as_scientific_rule": False,
+    }
+
+
 @dataclass(frozen=True)
 class DynamicsConfig:
     """Double-integrator and task-space constants."""

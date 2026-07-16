@@ -2,7 +2,8 @@
 
 The hash in this module is deliberately about the *query*, not its verifier
 result.  Consequently the same generated plan, verifier input, and replay
-target must all have the same hash over ``(context, gamma, plan)``.
+target must all have the same hash over the model context, exact verifier
+state/specification, ``gamma``, and plan.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from numpy.typing import ArrayLike, NDArray
 PLAN_HORIZON = 10
 ACTION_DIM = 2
 FEATURE_DIM = 32
-HASH_VERSION = b"afe-restart-query-v1\x00"
+HASH_VERSION = b"afe-restart-query-v2-exact-verifier-input\x00"
 
 
 class QuerySource(str, Enum):
@@ -95,27 +96,72 @@ def _validate_hash(value: str, *, name: str) -> str:
 
 @dataclass(frozen=True, eq=False)
 class QueryContext:
-    """Exact conditional-flow context at one receding-horizon step."""
+    """Model context plus the exact non-plan verifier inputs.
+
+    ``grid/low5/hist`` are the tensors supplied to the conditional flow.
+    They are intentionally float32 and therefore cannot serve as a lossless
+    proxy for the float64 state supplied to the full verifier.  The latter and
+    a fingerprint of scene, goal, dynamics and verifier configuration are
+    carried separately so a cached label is valid only for the identical
+    deterministic verifier query.
+    """
 
     grid: NDArray[Any]
     low5: NDArray[Any]
     hist: NDArray[Any]
+    verifier_state: NDArray[np.float64]
+    verifier_spec_fingerprint: str
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "grid", _immutable_array(self.grid, name="grid"))
         object.__setattr__(self, "low5", _immutable_array(self.low5, name="low5"))
         object.__setattr__(self, "hist", _immutable_array(self.hist, name="hist"))
+        object.__setattr__(
+            self,
+            "verifier_state",
+            _immutable_array(
+                self.verifier_state,
+                name="verifier_state",
+                shape=(4,),
+                dtype=np.float64,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "verifier_spec_fingerprint",
+            _validate_hash(
+                self.verifier_spec_fingerprint,
+                name="verifier_spec_fingerprint",
+            ),
+        )
 
     def to_state_dict(self) -> dict[str, NDArray[Any]]:
         return {
             "grid": np.array(self.grid, copy=True),
             "low5": np.array(self.low5, copy=True),
             "hist": np.array(self.hist, copy=True),
+            "verifier_state": np.array(self.verifier_state, copy=True),
+            "verifier_spec_fingerprint": self.verifier_spec_fingerprint,
         }
 
     @classmethod
     def from_state_dict(cls, state: Mapping[str, Any]) -> "QueryContext":
-        return cls(grid=state["grid"], low5=state["low5"], hist=state["hist"])
+        missing = {
+            "verifier_state",
+            "verifier_spec_fingerprint",
+        } - set(state)
+        if missing:
+            raise ValueError(
+                "legacy query context lacks exact verifier identity fields: "
+                f"{sorted(missing)}; regenerate the artifact under query schema v2"
+            )
+        return cls(
+            grid=state["grid"],
+            low5=state["low5"],
+            hist=state["hist"],
+            verifier_state=state["verifier_state"],
+            verifier_spec_fingerprint=state["verifier_spec_fingerprint"],
+        )
 
 
 def query_content_hash(
@@ -134,6 +180,9 @@ def query_content_hash(
     _hash_array(hasher, b"grid", context.grid)
     _hash_array(hasher, b"low5", context.low5)
     _hash_array(hasher, b"hist", context.hist)
+    _hash_array(hasher, b"verifier_state", context.verifier_state)
+    hasher.update(b"verifier_spec_fingerprint\x00")
+    hasher.update(bytes.fromhex(context.verifier_spec_fingerprint))
     # Gamma is a semantic float scalar, canonicalized as IEEE-754 binary64.
     hasher.update(b"gamma\x00")
     hasher.update(struct.pack("!d", gamma_value))
@@ -282,7 +331,8 @@ class VerificationRecord:
         if supplied_query != expected or generated != expected or verifier != expected:
             raise ValueError(
                 "identity mismatch: generated plan, verifier input, and exact "
-                "(context, gamma, plan) content must have the same hash"
+                "(model context, exact verifier state/spec, gamma, plan) "
+                "content must have the same hash"
             )
 
         object.__setattr__(self, "gamma", gamma)
@@ -410,4 +460,3 @@ class ReplayItem:
         expected = query_content_hash(self.context, self.gamma, self.plan)
         if expected != self.source_query_hash or expected != self.training_target_hash:
             raise ValueError("replay identity hash mismatch")
-

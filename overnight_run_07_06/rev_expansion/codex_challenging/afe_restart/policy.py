@@ -8,7 +8,7 @@ from __future__ import annotations
 import copy
 import hashlib
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 import torch
@@ -32,6 +32,76 @@ def model_state_hash(model: torch.nn.Module) -> str:
         digest.update(str(contiguous.dtype).encode("ascii"))
         digest.update(contiguous.numpy().tobytes())
     return digest.hexdigest()
+
+
+def _is_sha256(value: object) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        bytes.fromhex(value)
+    except ValueError:
+        return False
+    return value == value.lower()
+
+
+def require_promoted_fresh_pretrain(
+    model: torch.nn.Module,
+    checkpoint: Mapping[str, object],
+) -> str:
+    """Reject diagnostic/failed-gate or legacy checkpoints before expansion.
+
+    Stage 03 writes the production checkpoint names only after its ordinary
+    temperature-one evaluation observes successful R- and U-first behavior at
+    every gamma.  Consumers recheck the embedded promotion evidence instead of
+    inferring success from a filename or a prior process exit code.
+    """
+
+    state_hash = model_state_hash(model)
+    config = checkpoint.get("config")
+    if not isinstance(config, Mapping):
+        raise RuntimeError("pretrained checkpoint is missing its model config")
+    source_manifest = checkpoint.get("source_manifest")
+    required = (
+        checkpoint.get("stage_schema") == "afe_fresh_pretrain_v1"
+        and checkpoint.get("fresh_from_scratch") is True
+        and checkpoint.get("endpoint_free") is True
+        and checkpoint.get("expansion_promotion") is True
+        and checkpoint.get("id_mode_diversity_gate_passed") is True
+        and float(checkpoint.get("id_evaluation_temperature", float("nan"))) == 1.0
+        and checkpoint.get("id_evaluation_uncertainty_tilting") is False
+        and checkpoint.get("model_state_sha256") == state_hash
+        and _is_sha256(checkpoint.get("source_query_hash_digest"))
+        and isinstance(source_manifest, str)
+        and bool(source_manifest.strip())
+        and _is_sha256(checkpoint.get("id_metrics_sha256"))
+        and checkpoint.get("frozen_feature_snapshot") is not True
+        and config.get("arch") == "hp-repr"
+        and config.get("schema_version") == "w8sg-hp-v2-low5-only"
+        and config.get("raw_start_goal") is False
+        and int(config.get("H_pred", -1)) == 10
+        and tuple(config.get("grid_shape", ())) == (1, 32, 32)
+        and int(config.get("K_hist", -1)) == 16
+        and float(config.get("u_max", float("nan"))) == 1.0
+        and config.get("use_gru") is False
+        and config.get("boundary_adapter") is False
+        and int(config.get("repr_dim", -1)) == 32
+        and int(config.get("ctx_dim", -1)) == 37
+        and int(getattr(model, "repr_dim", -1)) == 32
+        and int(getattr(model, "ctx_dim", -1)) == 37
+        and int(getattr(model, "H_pred", -1)) == 10
+        and int(getattr(model, "T", -1)) == 10
+        and tuple(getattr(model, "grid_shape", ())) == (1, 32, 32)
+        and int(getattr(model, "K_hist", -1)) == 16
+        and float(getattr(model, "u_max", float("nan"))) == 1.0
+        and getattr(model, "use_gru", None) is False
+        and getattr(model, "boundary_adapter", None) is False
+    )
+    if not required:
+        raise RuntimeError(
+            "consumer requires a fresh endpoint-free Stage-03 checkpoint "
+            "promoted only after the ordinary T=1 all-gamma R/U gate"
+        )
+    return state_hash
 
 
 def context_tensors(context: QueryContext, device: torch.device) -> tuple[torch.Tensor, ...]:
@@ -152,6 +222,75 @@ def batch_context_arrays(records: Sequence[object], device: torch.device) -> tup
     return grids, low5, hist, plans
 
 
+def _ledger_identity(record: object) -> str:
+    """Return the immutable query identity used to key CFM common randomness."""
+
+    validate = getattr(record, "validate_identity", None)
+    if callable(validate):
+        validate()
+    if isinstance(record, dict):
+        candidates = (
+            record.get("query_hash"),
+            record.get("source_query_hash"),
+            record.get("training_target_hash"),
+        )
+    else:
+        candidates = (
+            getattr(record, "query_hash", None),
+            getattr(record, "source_query_hash", None),
+            getattr(record, "training_target_hash", None),
+        )
+    identity = next((str(value).lower() for value in candidates if value), "")
+    if len(identity) != 64:
+        raise ValueError(
+            "ledger CFM replay requires a SHA-256 query identity per record"
+        )
+    try:
+        bytes.fromhex(identity)
+    except ValueError as exc:
+        raise ValueError(
+            "ledger CFM replay contains a non-hex query identity"
+        ) from exc
+    return identity
+
+
+def ledger_common_random_arrays(
+    records: Sequence[object],
+    *,
+    round_seed: int,
+    dimension: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return per-query fixed x0 and tau for one proximal round.
+
+    Each row is keyed by (round_seed, exact_query_hash). Consequently the same
+    record receives bit-identical bridge noise and flow time on every objective
+    evaluation, regardless of shuffled order or microbatch size. This turns
+    tolerance checks into checks on one fixed Monte Carlo CFM objective instead
+    of comparisons between newly redrawn objectives.
+    """
+
+    if dimension <= 0:
+        raise ValueError("CFM common-random dimension must be positive")
+    seed_bytes = (int(round_seed) & ((1 << 64) - 1)).to_bytes(8, "big")
+    x0_rows: list[np.ndarray] = []
+    tau_rows: list[np.float32] = []
+    for record in records:
+        identity = _ledger_identity(record)
+        digest = hashlib.sha256(
+            b"afe-ledger-cfm-crn-v1\x00" + seed_bytes + bytes.fromhex(identity)
+        ).digest()
+        record_seed = int.from_bytes(digest[:16], "big")
+        rng = np.random.Generator(np.random.PCG64(record_seed))
+        x0_rows.append(rng.standard_normal(dimension, dtype=np.float32))
+        tau_rows.append(
+            np.float32(max(float(rng.random(dtype=np.float32)), 1.0e-4))
+        )
+    return (
+        np.stack(x0_rows, axis=0).astype(np.float32, copy=False),
+        np.asarray(tau_rows, dtype=np.float32),
+    )
+
+
 def ledger_cfm_loss(
     model: torch.nn.Module,
     records: Sequence[object],
@@ -164,9 +303,22 @@ def ledger_cfm_loss(
     context = model.ctx_from(grid, low5, hist)
     batch = plans.shape[0]
     x1 = (plans / float(model.u_max)).reshape(batch, int(model.d))
-    x0 = torch.randn(x1.shape, generator=generator, device=device, dtype=x1.dtype)
-    tau = torch.rand(batch, generator=generator, device=device, dtype=x1.dtype).clamp(1e-4, 1.0)
+    x0_array, tau_array = ledger_common_random_arrays(
+        records,
+        round_seed=generator.initial_seed(),
+        dimension=int(model.d),
+    )
+    x0 = torch.as_tensor(x0_array, device=device, dtype=x1.dtype)
+    tau = torch.as_tensor(tau_array, device=device, dtype=x1.dtype)
     x_tau = (1.0 - tau)[:, None] * x0 + tau[:, None] * x1
     target = x1 - x0
     prediction = model(x_tau, tau, model._expand_ctx(context, batch))
     return ((prediction - target) ** 2).mean()
+
+
+# The proximal solver records this declaration in its telemetry. It is safe
+# because ledger_common_random_arrays ignores mutable generator state and keys
+# every auxiliary draw by the immutable ledger identity and round seed.
+ledger_cfm_loss.objective_randomness = (
+    "fixed_per_query_sha256_pcg64_common_random_numbers_v1"
+)
