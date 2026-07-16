@@ -105,7 +105,7 @@ def main():
                 if vga and g in vga:
                     xs.append(r["round"]); ys.append(vga[g])
             if xs:
-                ax.plot(xs, ys, ls_by_arm[ai], color=gamma_color(g), lw=1.6,
+                ax.plot(xs, ys, ls_by_arm[ai % len(ls_by_arm)], color=gamma_color(g), lw=1.6,
                         label=(f"γ{g}" if ai == 0 else None))
     ax.set_title("model validity V̂ per γ — ADVERSE audit slice (untilted, held-out ρ_eval)")
     ax.set_xlabel("round"); ax.set_ylabel("V̂ (certified fraction)"); ax.set_ylim(-0.02, 1.02)
@@ -117,19 +117,19 @@ def main():
         for key, c in (("V_adverse", "tab:red"), ("V_rest", "tab:green"), ("Vprog", "tab:blue")):
             xs, ys = series(recs, key)
             if len(xs):
-                ax.plot(xs, ys, ls_by_arm[ai], color=c, lw=1.8,
+                ax.plot(xs, ys, ls_by_arm[ai % len(ls_by_arm)], color=c, lw=1.8,
                         label=(f"{key}" if ai == 0 else None))
     ax.set_title("pooled validity (rest ≈ ceiling = no-collapse guard)")
     ax.set_xlabel("round"); ax.set_ylim(-0.02, 1.02)
     ax.legend(fontsize=9); ax.grid(alpha=0.3)
-    ax.text(0.02, 0.02, " / ".join(f"{ls_by_arm[ai]} = {lab}" for ai, (lab, _, _) in enumerate(arms)),
+    ax.text(0.02, 0.02, " / ".join(f"{ls_by_arm[ai % len(ls_by_arm)]} = {lab}" for ai, (lab, _, _) in enumerate(arms)),
             transform=ax.transAxes, fontsize=9, color="dimgray")
 
     # (3) acceptance vs fallback (per gamma fallback)
     ax = axes[0, 2]
     for ai, (lab, recs, _) in enumerate(arms):
         xs, ys = series(recs, "a_hat")
-        ax.plot(xs, ys, ls_by_arm[ai], color="black", lw=1.8, label=("â (tilted acceptance)" if ai == 0 else None))
+        ax.plot(xs, ys, ls_by_arm[ai % len(ls_by_arm)], color="black", lw=1.8, label=("â (tilted acceptance)" if ai == 0 else None))
         for g in GAMMAS:
             xs, ys = [], []
             for r in recs:
@@ -137,7 +137,7 @@ def main():
                 if fg and g in fg and fg[g][1] > 0:
                     xs.append(r["round"]); ys.append(fg[g][0] / fg[g][1])
             if xs and g in ("0.1", "0.2", "0.5", "1.0"):
-                ax.plot(xs, ys, ls_by_arm[ai], color=gamma_color(g), lw=1.2, alpha=0.85,
+                ax.plot(xs, ys, ls_by_arm[ai % len(ls_by_arm)], color=gamma_color(g), lw=1.2, alpha=0.85,
                         label=(f"fallback γ{g}" if ai == 0 else None))
     ax.set_title("query efficiency â vs certified-fallback rate (decay = expansion)")
     ax.set_xlabel("round"); ax.set_ylim(-0.02, 1.02); ax.legend(fontsize=8); ax.grid(alpha=0.3)
@@ -148,13 +148,13 @@ def main():
         for key, c in (("SR", "tab:green"), ("CR", "tab:red")):
             xs, ys = series(recs, key)
             if len(xs):
-                ax.plot(xs, ys, ls_by_arm[ai], color=c, marker="o", ms=3, lw=1.6,
+                ax.plot(xs, ys, ls_by_arm[ai % len(ls_by_arm)], color=c, marker="o", ms=3, lw=1.6,
                         label=(key if ai == 0 else None))
         covs = [(r["round"], sum(r["cov"].values())) for r in recs if r.get("cov")]
         if covs:
             xs, ys = zip(*covs)
             ax2 = ax.twinx() if ai == 0 else ax2
-            ax2.plot(xs, ys, ls_by_arm[ai], color="tab:purple", lw=1.2, alpha=0.7)
+            ax2.plot(xs, ys, ls_by_arm[ai % len(ls_by_arm)], color="tab:purple", lw=1.2, alpha=0.7)
             ax2.set_ylabel("Σ coverage (distinct staircases)", color="tab:purple")
     ax.set_title("closed-loop SR / CR (bare policy, no shield) + coverage")
     ax.set_xlabel("round"); ax.set_ylim(-0.02, 1.02); ax.legend(fontsize=9); ax.grid(alpha=0.3)
@@ -163,11 +163,11 @@ def main():
     ax = axes[1, 1]
     for ai, (lab, recs, _) in enumerate(arms):
         xs, ys = series(recs, "sigma_drawn_mean")
-        ax.plot(xs, ys, ls_by_arm[ai], color="tab:olive", lw=1.5, label=("σ of drawn queries" if ai == 0 else None))
+        ax.plot(xs, ys, ls_by_arm[ai % len(ls_by_arm)], color="tab:olive", lw=1.5, label=("σ of drawn queries" if ai == 0 else None))
         xs, ys = series(recs, "fstep")
-        ax.plot(xs, ys, ls_by_arm[ai], color="tab:brown", lw=1.5, label=("functional step / round" if ai == 0 else None))
+        ax.plot(xs, ys, ls_by_arm[ai % len(ls_by_arm)], color="tab:brown", lw=1.5, label=("functional step / round" if ai == 0 else None))
         xs, ys = series(recs, "dither_new")
-        ax.plot(xs, ys, ls_by_arm[ai], color="tab:pink", lw=1.5, label=("dither share (new D⁺, r<0.05)" if ai == 0 else None))
+        ax.plot(xs, ys, ls_by_arm[ai % len(ls_by_arm)], color="tab:pink", lw=1.5, label=("dither share (new D⁺, r<0.05)" if ai == 0 else None))
     ax.set_title("acquisition signal, solver step, dithering-watch")
     ax.set_xlabel("round"); ax.legend(fontsize=9); ax.grid(alpha=0.3)
 
