@@ -63,6 +63,13 @@ class SafeMPPIConfig:
     smooth_weight: float = 0.12
     soft_clearance_weight: float = 25.0
     progress_weight: float = 2.0
+    # Optional anti-retreat shaping for expert-data generation.  A positive
+    # value softly penalizes each predicted increase in goal distance as
+    # weight * expm1(delta_distance / scale).  It is deliberately disabled by
+    # default so existing planner configurations and results are unchanged.
+    goal_retreat_exp_weight: float = 0.0
+    goal_retreat_exp_scale: float = 0.05
+    goal_retreat_exp_cap: float = 6.0
     heading_weight: float = 0.4
     check_first_control_only: bool = False
     dynamics_type: str = "doubleintegrator"
@@ -754,6 +761,7 @@ class SafeMPPIAdapter:
         infeasible = torch.zeros(sample_count, device=device, dtype=torch.bool)
         min_h = torch.full((sample_count,), float("inf"), device=device, dtype=dtype)
         initial_goal_distance = torch.linalg.norm(x[:, :2] - goal[:2].to(device=device, dtype=dtype), dim=1)
+        previous_goal_distance = initial_goal_distance
         prev_action = torch.zeros_like(controls[:, 0])
         for t in range(self.config.horizon):
             if obstacle_velocities is not None and safe_obstacles.numel():
@@ -803,6 +811,19 @@ class SafeMPPIAdapter:
             effort = self.config.control_weight * torch.sum(controls[:, t] ** 2, dim=1)
             smooth = self.config.smooth_weight * torch.sum((controls[:, t] - prev_action) ** 2, dim=1)
             progress = -self.config.progress_weight * (initial_goal_distance - goal_distance)
+            if self.config.goal_retreat_exp_weight > 0.0:
+                scale = max(float(self.config.goal_retreat_exp_scale), torch.finfo(dtype).eps)
+                retreat = torch.relu(goal_distance - previous_goal_distance)
+                normalized_retreat = torch.clamp(
+                    retreat / scale,
+                    max=max(float(self.config.goal_retreat_exp_cap), 0.0),
+                )
+                retreat_cost = self.config.goal_retreat_exp_weight * torch.expm1(normalized_retreat)
+            else:
+                # Keep the default path algebraically identical to the
+                # pre-feature planner, including its floating-point operation
+                # order.  This makes the option safe for legacy checkpoints.
+                retreat_cost = 0.0
             clearance = barrier_clearance(x_next[:, :2], obstacles_batch_next)
             soft_clearance = self.config.soft_clearance_weight * torch.relu(-clearance) ** 2
             if self.config.dynamics_type == "unicycle":
@@ -812,8 +833,9 @@ class SafeMPPIAdapter:
                 heading_cost = self.config.heading_weight * heading_error**2
             else:
                 heading_cost = 0.0
-            costs += goal_cost + effort + smooth + soft_clearance + progress + heading_cost
+            costs += goal_cost + effort + smooth + soft_clearance + progress + heading_cost + retreat_cost
             x = x_next
+            previous_goal_distance = goal_distance
             prev_action = controls[:, t]
             state_seq.append(x.clone())
         terminal_goal = torch.linalg.norm(x[:, :2] - goal[:2].to(device=device, dtype=dtype), dim=1)
@@ -869,6 +891,14 @@ class SafeMPPIAdapter:
             "mixture_p": float(mix_p),                                      # Mode-B (opening) mixture fraction
             "sample_mode": (sample_mode.detach().cpu().numpy() if sample_mode is not None else None),  # [N] 0=A/1=B/2=C
             "sigma": sigma.detach().cpu().reshape(-1).numpy(),            # [2] sampling std (control units)
+            # Exact full-plan observability for external deterministic
+            # verification.  These fields do not alter MPPI selection or the
+            # returned action.  A caller making a runtime certificate claim
+            # must verify the same sequence whose first action it executes.
+            "mean_sequence": u_avg_seq.detach().cpu().numpy(),
+            "best_sequence": controls[best].detach().cpu().numpy(),
+            "best_feasible_internal": bool((~infeasible[best]).detach().cpu()),
+            "all_samples_infeasible_internal": bool(infeasible.all().detach().cpu()),
             # polytope diagnostics: faces (A,b,c,margins) + free-space centroid DIR + size + EXACT centroid POSITION
             "polytope": None if poly is None else tuple(t.detach().cpu().numpy() for t in poly[:4]),
             "centroid_dir": None if poly is None else poly[4].detach().cpu().numpy(),
@@ -901,6 +931,7 @@ class SafeMPPIAdapter:
                 draw_idx = torch.nonzero(sample_mask, as_tuple=False).flatten()
             info["debug_rollouts"] = {
                 "states": state_seq_t[draw_idx].numpy(),
+                "controls": controls.detach().cpu()[draw_idx].numpy(),
                 "feasible": feasible[draw_idx].numpy(),
                 "best_state": state_seq_t[best].numpy(),
             }
