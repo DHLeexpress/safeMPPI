@@ -141,6 +141,14 @@ def render_round(db, probe, out_png, max_segs=2200):
     axC.set_xlabel("round")
     axC.set_title("validity of the expansion (untilted audit ≠ query acceptance)")
 
+    fig.text(0.005, 0.008,
+             r"$c_t$=(H$_P$ grid, low5, hist)  $U_t\in\mathbb{R}^{10\times2}$ planned window | "
+             r"$\sigma_n^2=z^\top A_n^{-1}z$, $z=\phi_s^0(U,c)/\|\cdot\|$ FROZEN, "
+             r"$A_n=I+\lambda^{-1}\Sigma zz^\top$ over ALL verified queries | "
+             r"draw B=8 w/o repl. $\propto\pi=e^{(\sigma-\sigma_{max})/\beta}$, FULL SOCP BEFORE exec | "
+             r"exec $\propto\pi$ among verified-safe, else certified SafeMPPI | "
+             r"update: $\min_\theta\,\ell_{CFM}(D_n^+)+\|\theta-\theta_n\|^2/2\eta$ (uniform replay, "
+             r"no curriculum)", fontsize=8.2, color="#333333")
     fig.savefig(out_png, dpi=110)
     plt.close(fig)
 

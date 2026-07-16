@@ -104,6 +104,9 @@ class AFEConfig:
     goal_xy: tuple = (4.7, 4.7)
     seed: int = 910
     max_hours: float = 20.0
+    # ablation brothers (paper): each removes ONE load-bearing piece of the method
+    ablate_verifier: bool = False   # no pre-execution verification: every drawn plan y=1 -> D+
+    ablate_fallback: bool = False   # no certified backup: execute the chosen plan unshielded
 
 
 # ------------------------------------------------------------------ gather
@@ -142,36 +145,51 @@ def gather_round(policy, phi0, blr, store, env, cfg, fb, round_i, device):
             drawn = torch.multinomial(w / w.sum(), min(cfg.B, cfg.K), replacement=False)
             sid = store.add_step_ctx(st, grid_np, l5_np, h_np, (round_i, e, t))
             best = None                                     # (prog, qid, U_np)
-            safe = []                                       # (weight, qid, U_np)
+            safe = []                                       # (weight, prog, qid, U_np) among y=1
+            drawn_all = []                                  # every drawn plan (for the -fallback brother)
             for j in drawn.tolist():
                 U_np = Ucand[j].detach().cpu().numpy()
                 seg = GR.window_positions(st, U_np, env.dt)
-                v = AC.verify_plan(st, U_np, env, g, goal_np, n_theta=cfg.n_theta)
+                if getattr(cfg, "ablate_verifier", False):  # BROTHER: no pre-execution verification —
+                    d = np.linalg.norm(np.vstack([st[:2][None], seg]) - goal_np[None], axis=1)
+                    v = dict(y=1, margin=float("nan"), resid=float("nan"),   # every plan enters D+
+                             prog=float(d[0] - d[-1]), d0=float(d[0]), reason="unverified")
+                else:
+                    v = AC.verify_plan(st, U_np, env, g, goal_np, n_theta=cfg.n_theta)
                 qid = store.add_query(sid, U_np, v, float(sig[j]), g, round_i, seg)
                 blr.update(Z[j:j + 1])
                 n_q += 1
                 acc_g[g][1] += 1
                 sig_drawn.append(float(sig[j]))
                 n_socp_err += int(v["reason"] == "socp_error")
+                drawn_all.append((float(w[j]), v["prog"], qid, U_np))
                 if v["y"]:
                     n_acc += 1
                     acc_g[g][0] += 1
                     new_pos_prog.append(v["prog"])
-                    safe.append((float(w[j]), qid, U_np))
+                    safe.append((float(w[j]), v["prog"], qid, U_np))
                     if best is None or v["prog"] > best[0]:
                         best = (v["prog"], qid, U_np)
+
+            def _pick(cands):                               # execution rule among the given plans
+                if cfg.exec_rule == "pi" and len(cands) > 1:
+                    ws = np.array([c[0] for c in cands], np.float64)
+                    return cands[int(np.random.choice(len(cands), p=ws / ws.sum()))]
+                return max(cands, key=lambda c: c[1])
             fb_g[g][1] += 1
             if safe:
-                if cfg.exec_rule == "pi" and len(safe) > 1:
-                    ws = np.array([sfe[0] for sfe in safe], np.float64)
-                    pick = int(np.random.choice(len(safe), p=ws / ws.sum()))
-                    _, qid, U_np = safe[pick]
-                else:
-                    _, qid, U_np = best
+                _, _, qid, U_np = _pick(safe)
                 a = U_np[0]
                 store.mark_executed(qid)
                 n_exec += 1
                 fb_mask.append(False)
+            elif getattr(cfg, "ablate_fallback", False):    # BROTHER: UNSHIELDED — execute the chosen
+                _, _, qid, U_np = _pick(drawn_all)          # plan even though none verified safe
+                a = U_np[0]
+                store.mark_executed(qid)
+                n_fb += 1                                   # fb counters = not-verified-safe steps
+                fb_g[g][0] += 1
+                fb_mask.append(True)
             else:                                           # certified backup carries the step
                 try:
                     a = fb.plan(st, g, seed=cfg.seed * 1000003 + round_i * 9973 + e * 1009 + t)
@@ -347,6 +365,8 @@ def run_afe(policy, phi0, env, cfg, device, outdir, log=print):
                          "stop=fstep>=%g or %d steps" % (cfg.eta, cfg.lr, cfg.batch,
                                                          cfg.fstep_stop, cfg.max_inner),
                   no_curriculum=True, no_stabilizers="no demo/LwF/anchor/encoder-freeze",
+                  ablations=dict(verifier=bool(getattr(cfg, "ablate_verifier", False)),
+                                 fallback=bool(getattr(cfg, "ablate_fallback", False))),
                   gammas=list(cfg.gammas),
                   episodes_per_round=cfg.episodes_per_round, T=cfg.T, reach=cfg.reach,
                   wall_plugs=cfg.wall_plugs, start_eps=cfg.start_eps, goal_xy=list(cfg.goal_xy),
@@ -582,6 +602,10 @@ def main():
     ap.add_argument("--goal-xy", type=float, nargs=2, default=[4.7, 4.7])
     ap.add_argument("--seed", type=int, default=910)
     ap.add_argument("--max-hours", type=float, default=20.0)
+    ap.add_argument("--ablate-verifier", action="store_true",
+                    help="brother: NO pre-execution verification (every drawn plan enters D+)")
+    ap.add_argument("--ablate-fallback", action="store_true",
+                    help="brother: NO certified backup (execute the chosen plan unshielded)")
     ap.add_argument("--probe", action="store_true", help="component checks only, no training run")
     args = ap.parse_args()
     np.random.seed(args.seed)
@@ -608,7 +632,8 @@ def main():
                     audit_plans=args.audit_plans, measure_every=args.measure_every,
                     M_measure=args.M_measure, ckpt_every=args.ckpt_every, viz_every=args.viz_every,
                     wall_plugs=args.wall_plugs, start_eps=args.start_eps,
-                    goal_xy=tuple(args.goal_xy), seed=args.seed, max_hours=args.max_hours)
+                    goal_xy=tuple(args.goal_xy), seed=args.seed, max_hours=args.max_hours,
+                    ablate_verifier=args.ablate_verifier, ablate_fallback=args.ablate_fallback)
     print(f"[afe] ckpt {os.path.basename(args.ckpt)} repr {ck['config'].get('repr_dim')} dev {dev} "
           f"K{cfg.K} B{cfg.B} beta {cfg.beta} lam {cfg.lam} eta {cfg.eta} exec {cfg.exec_rule} "
           f"PURE (no demo/LwF/anchor/freeze)", flush=True)
