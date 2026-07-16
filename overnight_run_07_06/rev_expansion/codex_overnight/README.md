@@ -12,6 +12,11 @@ the 9-fault critique ("Faults in Claude's implementation"). The whole design red
 
 Rollback: git tag `pre-afe-2026-07-16` restores all pre-refactor code.
 
+Two studies live here: **Study 1** (§1–§8): the pure AFE-minimal method, 100 rounds, certified
+SafeMPPI fallback, 5 arms + 3 gate-brothers. **Study 2 — AFE2** (§9): the corrected two-arm
+10-round study (evolving representation, rebuilt A, EXPERT-FREE verify-or-terminate). §10 is the
+complete manifest of every file added/modified in this work.
+
 ---
 
 ## 1. Notation (what you see in the figures/video)
@@ -177,3 +182,101 @@ bash analysis/afe_assemble.sh                            # evals + validity repo
 Artifacts per run: `probe.jsonl` (per-round â, per-γ acceptance/fallback, V̂, σ, solver, dither),
 `viz_db/round*.pt`, `dstore.pt` (~600k verified queries), `ckpt_*.pt`/`final.pt` (report_at-
 compatible), `history.json`.
+
+---
+
+## 9. Study 2 — AFE2: corrected two-arm, 10-round, expert-free study (spec 2026-07-16b)
+
+`grid_expand_afe2.py` implements the user's corrected spec; it changes Study 1 in exactly these ways:
+
+- **Evolving representation.** σ features come from the CURRENT policy φ_s⁽ⁿ⁾ (initialized at the
+  pretrained φ_s⁽⁰⁾); encoder + trunk + head all train. The raw query archive D_n stays cumulative;
+  at the START of every round all stored queries are re-embedded under φ_s⁽ⁿ⁾ and
+  A = I + λ⁻¹Σzzᵀ is REBUILT from scratch (never carried across a representation update). θ and φ
+  are held fixed during the round's gathering while A updates sequentially per successful verifier
+  query. `socp_error` updates nothing (not stored in D, no A update).
+- **Expert-free.** No SafeMPPI, no fallback action, anywhere (expansion AND evaluation). If none of
+  the B queried plans is SOCP-positive the rollout TERMINATES with status `NO_VERIFIED_POSITIVE`.
+  Execution among positives = argmax progress (fixed nominal J_exec for this study).
+- **Complete γ sweep**: one episode per γ, all seven γ, fixed order, every round; 10 rounds.
+- **β fixed by ESS calibration** (`--calibrate`): dry round-0 pass over all 7 γ; choose
+  β ∈ {0.01, 0.02, 0.05} whose median acquisition ESS/K ∈ [0.25, 0.5] (never from σ's absolute
+  magnitude). Measured: 0.01→0.036, 0.02→0.125, 0.05→0.626 — NONE in band; rule-based fallback
+  (nearest band midpoint) picked **β=0.02** over 0.05 by 0.250 vs 0.251 (`results/afe2/calib/
+  beta_calibration.json`). Both arms share it.
+- **Two arms**, identical acquisition/representation/execution/seeds/budget:
+  `--arm prox` (control: batch 128, lr 2e-5, η 0.01, stop fstep ≥ 0.03 or 40 steps) vs
+  `--arm afe` (uniform cumulative D⁺ replay, batch 128, lr 1e-4, 250 steps, NO prox).
+  No curriculum, expert replay, anchors, easy/frontier, or automatic collapse rollback.
+- **Diagnostics per round** (probe.jsonl): all-K and selected-B σ quantiles, ESS, normalized
+  acquisition entropy, selected-vs-pool σ uplift, eigen-spectrum + effective rank of A, total CFM
+  loss, encoder/trunk/head gradient norms, relative per-module parameter change, fixed-probe
+  representation cosine drift, per-γ query/positive/distinct-trained counts, untilted raw validity
+  (audit), dither share.
+- **Evaluation** (round 0 = pretrained, then every round): (i) untilted generator audit;
+  (ii) expert-free verified controller with fixed-index equal-count rollouts (M=8/γ, the SAME
+  rollout seeds at every round → paired across rounds), reporting SR / CR / NVP rate / true min
+  clearance / time-to-goal; Wilson CIs in the report.
+- **Video** (`video_afe2.py`): every round, all seven γ panels; gray = K=64 generated plans,
+  orange = socp_error queries, green = SOCP-positive, red = rejected, blue/thick = cost-selected
+  plan + executed path, X = NO_VERIFIED_POSITIVE; text = positive count, min SOCP margin, raw
+  untilted validity, termination timestep.
+
+**Hard baseline fact**: the round-0 expert-free verified controller of the pretrained scores
+SR 0.00 / NVP 1.00 at EVERY γ (CR 0.00) — in Study 1 the certified fallback was completing every
+episode. Any SR > 0 after training is unambiguous expert-free expansion of the verified set.
+
+Runs: `results/afe2/{prox_s910,afe_s910}` (+ `calib/`). Report: `analysis/afe2_report.py` →
+`paper_results/afe2_report_v1.png`; videos → `paper_results/afe2_{prox,afe}.mp4`.
+
+---
+
+## 10. File manifest — everything added/modified in this work
+
+**New — Study 1 (pure AFE-minimal):**
+
+| file | what it is |
+|---|---|
+| `afe_core.py` | BLRSigma (cumulative 32×32 A_n, Sherman-Morrison), DStore (append-only verified-query archive, per-step contexts, hp-channel f16 storage — reconstruction verified exact), `verify_plan` (pre-execution full verifier: in-bounds + SOCP + separate m, r), SafeMPPIFallback, `build_audit_contexts`/`run_audit` (fixed ρ_eval, rest + adverse velocity slices). |
+| `grid_expand_afe.py` | Study-1 trainer: σ-tilted B-budget acquisition, verified-before-execution, certified fallback, uniform cumulative D⁺ replay + prox objective, untilted audit, per-round viz_db/probe.jsonl; `--probe` component checks; brothers via `--ablate-verifier` / `--ablate-fallback` (+ noprox via `--eta 1e18 --fstep-stop 999`). History: demo-replay arm and encoder freezing existed briefly and were **removed entirely** (user: no ad-hoc stabilizers). |
+| `video_afe.py` | Study-1 per-round expansion video (verified plan fans, σ dots, executed paths + fallback steps, trained-on D⁺ rows by round-of-origin, validity curves; notation footer). |
+| `analysis/afe_driver.sh` | launches the pure arms (λ10 × seeds 910/911/912 + λ0.01 reference). |
+| `analysis/afe_assemble.sh` | end-of-run evals (report_at vs expert), validity report, videos. |
+| `analysis/afe_lam_study.py` | measured λ choice: σ-spread under candidate λ from a saved A_n. |
+| `analysis/afe_report.py` | multi-arm validity tracking figure + raw-up-frac collapse audit. |
+| `paper_results/rollouts_v6.py` | paper rollout gallery for the new paradigm: Ours vs the 3 method-gate brothers (panels annotated with measured costs: −verifier 8.5% gather deaths, −fallback 4.9%, −prox covΣ 18 + audit erosion) + safety-calibrated Kazuki + expert + pretrained. |
+| `paper_results/scatter_v6.py` | SR-CR and clearance-time phase planes, all methods (plasma_trunc = γ; viridis reserved for σ). |
+| `paper_results/internals_v6.py` | training-internals figure: per-γ fallback + LOCATION split (shield moral hazard), D/D⁺ growth, prox solver, untilted-audit-vs-acceptance, σ decay + dither. |
+| `paper_results/table_v6.md` | all methods, one row-file-consistent source, incl. gather-time deaths and V̂_adverse. |
+| `paper_results/AFE_FINDINGS.md` | the full findings write-up (includes the 2026-07-16b coverage-number correction). |
+
+**New — Study 2 (AFE2):**
+
+| file | what it is |
+|---|---|
+| `grid_expand_afe2.py` | the corrected two-arm trainer (§9): evolving φ_s⁽ⁿ⁾, per-round A rebuild, expert-free verify-or-terminate, argmax-progress J_exec, full 7-γ sweep, `--calibrate` ESS β-selection, both update arms, all §9 diagnostics, fixed-index controller eval. |
+| `video_afe2.py` | the 7-γ-panel spec-color video (gray/orange/green/red/blue/X + per-panel text). |
+| `analysis/afe2_report.py` | two-arm diagnostics figure (controller SR/NVP/CR, per-γ SR, per-γ raw validity, CFM + per-module grads, rep cosine drift + Δθ/θ, ESS/entropy/uplift with the calibration band, σ all-K vs selected + A effective rank, final per-γ Wilson-CI table). |
+| `README.md` | this document. |
+
+**Modified (existing files touched by this work):**
+
+| file | change |
+|---|---|
+| `grid_expand_afe.py`, `afe_core.py` | (listed above as new; noted here because they were edited across the session: sys.path precedence fix — local copies must win or `grid_metrics2` resolves to the older rev_expansion copy; adverse-velocity audit slice added after the rest-only audit measured at a 99% ceiling; demo/freeze purge; ablation flags.) |
+| `paper_results/internals_v6.py` | coverage annotation corrected (M=40 covΣ = 34 vs base 52; an earlier draft mis-attributed the pretrained's pooled line to the π arm). |
+| `analysis/afe_report.py` | line-style cycling fix for ≥5 arms. |
+| `video_afe.py` | ffmpeg even-dimension scale filter; notation footer. |
+
+**NOT modified** (imported as-is; other agents must not edit local same-named copies without
+checking `module.__file__`): `grid_scene.py`, `grid_feats.py`, `grid_rollout.py`,
+`grid_metrics.py`, `grid_metrics2.py` (codex_overnight copy), `grid_hp_expt.py`,
+`grid_policy2.py`, `pretrain_repr.py`, `gen_uniform_data.py`, `verifier_polytope.py`
+(resolves from `overnight_run_2026-07-01/`), `sr_cr_eval.py`, `eval_ae.py`,
+`analysis/report_at.py`, `grid_expand_hardtail.py` (the superseded curriculum trainer — kept
+untouched as the museum piece; `_apply_wall_plugs`/`_save_hp_atomic` are reused from it).
+
+**Git waypoints**: `pre-afe-2026-07-16` (tag, pre-refactor code) → `6a5312b` (Study-1 trainer) →
+`83c6033` (pure purge) → `5dc25b7` (findings) → `2333b71` (v6 viz) → `4a1e665` (brother evals +
+coverage correction) → `14afca5` (README) → `13dad74` (AFE2). Branch `codex/safe-mppi-publish`,
+mirrored to `master`, pushed to origin.
