@@ -129,6 +129,7 @@ CHECKPOINT_SHA=$(sha256sum "$CHECKPOINT" | awk '{print $1}')
   --expected-checkpoint-sha256 "$CHECKPOINT_SHA" \
   --outdir "$EVALUATION" \
   --M 20 \
+  --nfe 12 \
   --device cuda:0 \
   --verifier-workers 16 \
   >"$RUN_ROOT/logs/pretrained_eval_m20.log" 2>&1

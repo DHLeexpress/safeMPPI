@@ -86,7 +86,7 @@ CHECKPOINT_STAGE_SCHEMA = "afe_fresh_pretrain_v2_low7_uniform_pairs"
 MODEL_SCHEMA = "w8sg-hp-v3-low7-closest-boundary"
 T = 300
 REACH = 0.15
-NFE = 8
+NFE = 12
 TEMP = 1.0
 N_THETA = 180
 WORKSPACE_LOW = 0.0
@@ -890,6 +890,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise FileExistsError(f"evaluation output root must be absent: {outdir}")
     if args.m <= 0 or args.verifier_workers <= 0 or args.verifier_chunk_size <= 0:
         raise ValueError("M, verifier workers, and verifier chunk size must be positive")
+    if args.nfe <= 0:
+        raise ValueError("NFE must be positive")
     device = torch.device(args.device)
     device_provenance = _device_provenance(device)
     policy, checkpoint = load_low7_candidate(
@@ -912,6 +914,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             scenes[scene_name],
             scene_name,
             m=args.m,
+            nfe=args.nfe,
             device=device,
         )
         for episode in scene_episodes:
@@ -989,7 +992,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "gammas": GAMMAS,
             "T": T,
             "reach": REACH,
-            "nfe": NFE,
+            "nfe": args.nfe,
             "temperature": TEMP,
             "verifier_n_theta": N_THETA,
             "verifier_config": asdict(VerifierConfig(angle_samples=N_THETA)),
@@ -1049,6 +1052,12 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-checkpoint-sha256", required=True)
     parser.add_argument("--outdir", type=Path, required=True)
     parser.add_argument("--M", dest="m", type=int, default=DEFAULT_M)
+    parser.add_argument(
+        "--nfe",
+        type=int,
+        default=NFE,
+        help="flow ODE function evaluations; 12 matches the canonical pretraining audit",
+    )
     parser.add_argument(
         "--device", default="cuda:0" if torch.cuda.is_available() else "cpu"
     )
