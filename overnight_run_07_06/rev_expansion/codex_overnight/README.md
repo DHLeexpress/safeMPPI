@@ -185,17 +185,20 @@ compatible), `history.json`.
 
 ---
 
-## 9. Study 2 — AFE2: corrected two-arm, 10-round, expert-free study (spec 2026-07-16b)
+## 9. Historical Claude AFE2: fixed-H two-arm study (spec 2026-07-16b)
 
-`grid_expand_afe2.py` implements the user's corrected spec; it changes Study 1 in exactly these ways:
+This section records the result produced at `e97eead`. The current trainer preserves its acquisition
+and update values but applies the explicit absorbing-goal correction in §11.
 
 - **Evolving representation.** σ features come from the CURRENT policy φ_s⁽ⁿ⁾ (initialized at the
   pretrained φ_s⁽⁰⁾); encoder + trunk + head all train. The raw query archive D_n stays cumulative;
   at the START of every round all stored queries are re-embedded under φ_s⁽ⁿ⁾ and
   A = I + λ⁻¹Σzzᵀ is REBUILT from scratch (never carried across a representation update). θ and φ
-  are held fixed during the round's gathering while A updates sequentially per successful verifier
-  query. `socp_error` updates nothing (not stored in D, no A update).
-- **Expert-free.** No SafeMPPI, no fallback action, anywhere (expansion AND evaluation). If none of
+  are held fixed during the round's gathering while A updates per completed verifier query.
+  The implementation that produced the reported result computes one pre-step `sigma/pi` vector and
+  draws all B indices without replacement before those updates; it does not sequentially re-score
+  the remaining candidates. `socp_error` is not stored in D and does not update A.
+- **Historical fixed-H execution.** No SafeMPPI or fallback action. If none of
   the B queried plans is SOCP-positive the rollout TERMINATES with status `NO_VERIFIED_POSITIVE`.
   Execution among positives = argmax progress (fixed nominal J_exec for this study).
 - **Complete γ sweep**: one episode per γ, all seven γ, fixed order, every round; 10 rounds.
@@ -204,7 +207,9 @@ compatible), `history.json`.
   magnitude). Measured: 0.01→0.036, 0.02→0.125, 0.05→0.626 — NONE in band; rule-based fallback
   (nearest band midpoint) picked **β=0.02** over 0.05 by 0.250 vs 0.251 (`results/afe2/calib/
   beta_calibration.json`). Both arms share it.
-- **Two arms**, identical acquisition/representation/execution/seeds/budget:
+- **Two matched arms**, sharing code/configuration, initial checkpoint, execution rule, budget, and
+  common-random-number streams; their learned representations, plans, contexts, archives, and A
+  matrices diverge after their different updates:
   `--arm prox` (control: batch 128, lr 2e-5, η 0.01, stop fstep ≥ 0.03 or 40 steps) vs
   `--arm afe` (uniform cumulative D⁺ replay, batch 128, lr 1e-4, 250 steps, NO prox).
   No curriculum, expert replay, anchors, easy/frontier, or automatic collapse rollback.
@@ -217,8 +222,9 @@ compatible), `history.json`.
   (ii) expert-free verified controller with fixed-index equal-count rollouts (M=8/γ, the SAME
   rollout seeds at every round → paired across rounds), reporting SR / CR / NVP rate / true min
   clearance / time-to-goal; Wilson CIs in the report.
-- **Video** (`video_afe2.py`): every round, all seven γ panels; gray = K=64 generated plans,
-  orange = socp_error queries, green = SOCP-positive, red = rejected, blue/thick = cost-selected
+- **Video** (`video_afe2.py`): every round, all seven γ panels; gray = every K=64 generated plan
+  at every executed step, orange = B full-verifier query objects, green = full-H SOCP-positive,
+  red = full-H rejected, blue/thick = cost-selected
   plan + executed path, X = NO_VERIFIED_POSITIVE; text = positive count, min SOCP margin, raw
   untilted validity, termination timestep.
 
@@ -237,7 +243,7 @@ Runs: `results/afe2/{prox_s910,afe_s910}` (+ `calib/`). Report: `analysis/afe2_r
 
 | file | what it is |
 |---|---|
-| `afe_core.py` | BLRSigma (cumulative 32×32 A_n, Sherman-Morrison), DStore (append-only verified-query archive, per-step contexts, hp-channel f16 storage — reconstruction verified exact), `verify_plan` (pre-execution full verifier: in-bounds + SOCP + separate m, r), SafeMPPIFallback, `build_audit_contexts`/`run_audit` (fixed ρ_eval, rest + adverse velocity slices). |
+| `afe_core.py` | BLRSigma (cumulative 32×32 A_n, Sherman-Morrison), DStore (append-only verified-query archive with float32 embedding inputs), `verify_plan` (legacy-tolerance task box + SOCP + separate m, r), isolated diagnostic RNG, SafeMPPIFallback, and fixed ρ_eval audit helpers. |
 | `grid_expand_afe.py` | Study-1 trainer: σ-tilted B-budget acquisition, verified-before-execution, certified fallback, uniform cumulative D⁺ replay + prox objective, untilted audit, per-round viz_db/probe.jsonl; `--probe` component checks; brothers via `--ablate-verifier` / `--ablate-fallback` (+ noprox via `--eta 1e18 --fstep-stop 999`). History: demo-replay arm and encoder freezing existed briefly and were **removed entirely** (user: no ad-hoc stabilizers). |
 | `video_afe.py` | Study-1 per-round expansion video (verified plan fans, σ dots, executed paths + fallback steps, trained-on D⁺ rows by round-of-origin, validity curves; notation footer). |
 | `analysis/afe_driver.sh` | launches the pure arms (λ10 × seeds 910/911/912 + λ0.01 reference). |
@@ -254,10 +260,14 @@ Runs: `results/afe2/{prox_s910,afe_s910}` (+ `calib/`). Report: `analysis/afe2_r
 
 | file | what it is |
 |---|---|
-| `grid_expand_afe2.py` | the corrected two-arm trainer (§9): evolving φ_s⁽ⁿ⁾, per-round A rebuild, expert-free verify-or-terminate, argmax-progress J_exec, full 7-γ sweep, `--calibrate` ESS β-selection, both update arms, all §9 diagnostics, fixed-index controller eval. |
+| `grid_expand_afe2.py` | shared two-arm trainer: e97 acquisition/update values plus the §11 absorbing-goal correction, evolving φ_s⁽ⁿ⁾, per-round A rebuild, expert-free verify-or-terminate, full 7-γ sweep, diagnostics, and fixed-index controller evaluation. |
 | `video_afe2.py` | the 7-γ-panel spec-color video (gray/orange/green/red/blue/X + per-panel text). |
 | `analysis/afe2_report.py` | two-arm diagnostics figure (controller SR/NVP/CR, per-γ SR, per-γ raw validity, CFM + per-module grads, rep cosine drift + Δθ/θ, ESS/entropy/uplift with the calibration band, σ all-K vs selected + A effective rank, final per-γ Wilson-CI table). |
 | `AFE2_HANDOFF.md` | the RESULT story with final numbers (prox frozen SR 0; afe SR 0→0.34→0.16 oscillation + audit erosion −7.5 pts adverse; both walls located; σ blind effR≈1.1), exact file:line pinpoints of every mechanism/knob, and the prioritized recipe matrix for the next arms — the document to give a continuing agent. |
+| `afe2_scene_profiles.py` | explicit `claude_grid_v1` and `codex_radius1_v1` task adapters plus immutable scene snapshots/fingerprints. |
+| `afe2_calibration.py` | shared fail-closed radius-1 beta-calibration contract used both before arm 1 and at pair promotion. |
+| `run_afe2_radius1_pair.sh` | sequential calibration→prox→afe launcher that locks the declared non-beta Claude recipe, absorbing-goal contract, scene profile, and supplied checkpoint hash. |
+| `analysis/validate_afe2_pair.py` | completion, seven-gamma/K/B semantic, report-decode, and ten-frame-video gate; emits a hash manifest only for a matched rounds-0--10 pair. |
 | `README.md` | this document. |
 
 **Modified (existing files touched by this work):**
@@ -281,3 +291,42 @@ untouched as the museum piece; `_apply_wall_plugs`/`_save_hp_atomic` are reused 
 `83c6033` (pure purge) → `5dc25b7` (findings) → `2333b71` (v6 viz) → `4a1e665` (brother evals +
 coverage correction) → `14afca5` (README) → `13dad74` (AFE2). Branch `codex/safe-mppi-publish`,
 mirrored to `master`, pushed to origin.
+
+---
+
+## 11. Codex radius 1 with an absorbing goal set
+
+The Claude and Codex tasks now call the same `grid_expand_afe2.py`; there is no copied trainer to
+drift. The Codex run preserves Claude's K/B, lambda, acquisition, and two update recipes, with
+one declared shared correction: the unchanged radius-0.15 goal set is absorbing. A full-H rejected
+plan can be executed only when its prefix through the first goal hit is certified; that plan keeps
+its full-H negative label and never enters D+. Thus the safety claim is through the goal hitting
+time, not after termination. Execution progress is truncated at that same first hit, while the
+full-H progress remains separately logged for data analysis. Here B is the candidate-query budget; terminal rechecks make the
+SOCP-solve count variable, so solver count/time are logged separately. `--scene-profile codex_radius1_v1` replaces exactly the four center disks by one
+disk at `(2.5,2.5)` with physical radius `1.0`, retains the remaining obstacles/walls/plugs, and
+sets `(0.5,0.5) -> (4.5,4.5)`. The pretrained checkpoint is supplied explicitly and hash-recorded.
+Before either arm, the launcher performs one beta-neutral radius-1 round-0 ESS calibration over
+`{0.01,0.02,0.05}` and hash-binds its selected beta to both arms; it does not assume Claude's beta
+transfers across scenes. Archive embedding inputs remain float32, and named RNG streams isolate
+gathering from update/audit/evaluation randomness. The inherited task-box check is also explicit:
+it preserves Claude's legacy `[-0.12,5.12]` tolerance rather than silently claiming exact `[0,5]`
+containment. Evaluation uses M=8 fixed-index rollouts per gamma and is labeled as a pilot;
+the Wilson/bootstrap intervals are conditional on fixed contexts/episode indices and expose that
+limited power rather than claiming across-seed uncertainty or a safety guarantee.
+
+Run the two original arms sequentially, with no knob changes:
+
+```bash
+./run_afe2_radius1_pair.sh \
+  /absolute/path/to/codex_pretrained_32d.pt \
+  EXPECTED_CHECKPOINT_FILE_SHA256 \
+  /absolute/path/to/output/afe2_radius1
+```
+
+The launcher uses `--lock-reference-recipe`, so changing K/B, lambda, update rates/steps,
+horizon, evaluation count, or either arm's update rule is an error. It refuses existing arm
+directories, requires the shared beta-calibration artifact, validates the pair before rendering,
+and writes `DELIVERY_COMPLETE.json` only after hashing the calibration, report, and both videos.
+The complete continuation
+contract and completion gates are in `../codex_challenging/afe_restart/AFE2_RADIUS1_HANDOFF.md`.

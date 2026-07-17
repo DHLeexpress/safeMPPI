@@ -1,5 +1,11 @@
 # AFE2 handoff — what happened, where it lives in code, and which recipes to try next
 
+> **Historical result only.** Do not execute the recipe matrix below for the
+> radius-1 replication. The locked, non-sweep continuation contract is
+> `../codex_challenging/afe_restart/AFE2_RADIUS1_HANDOFF.md`; it first corrects
+> absorbing-goal termination and experimental provenance while leaving both
+> update arms unchanged.
+
 Audience: another agent (codex) continuing this line, possibly on a different task. Read
 `README.md` §9-§10 first for the full spec; this document is the RESULT story + the exact code
 pinpoints + a prioritized recipe matrix. Repo: `DHLeexpress/safeMPPI`, branch
@@ -8,8 +14,9 @@ pinpoints + a prioritized recipe matrix. Repo: `DHLeexpress/safeMPPI`, branch
 
 ## 1. The study in one paragraph
 
-Two arms, identical in every respect (evolving representation φ_s⁽ⁿ⁾, per-round rebuilt
-uncertainty matrix A, σ-tilted B=8-of-K=64 verified acquisition, argmax-progress execution among
+Two matched arms use the same protocol, initial checkpoint, and indexed random streams (their
+learned representations, candidates, archives, and A matrices then diverge): evolving
+representation φ_s⁽ⁿ⁾, per-round rebuilt uncertainty matrix A, σ-tilted B=8-of-K=64 verified acquisition, argmax-progress execution among
 SOCP-positive plans, EXPERT-FREE: an episode terminates `NO_VERIFIED_POSITIVE` when nothing
 certifies — no SafeMPPI, no fallback, ever) except the update: **prox** (batch 128, lr 2e-5,
 η=0.01, ≤40 steps, fstep-bound 0.03) vs **afe** (batch 128, lr 1e-4, exactly 250 steps, no prox).
