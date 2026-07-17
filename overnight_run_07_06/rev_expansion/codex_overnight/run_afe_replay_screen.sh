@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# One five-round adaptive-estimator run at replay W=1, W=5, or cumulative.
+# One five-round adaptive-estimator run at finite replay W=1, 3, 5, or 10.
 set -euo pipefail
 
 if [[ $# -ne 9 ]]; then
-  echo "usage: $0 rbf|ensemble 1|5|all SCENE CHECKPOINT SHA256 OUTPUT_ROOT REPLICAS M_EVAL WORKERS" >&2
+  echo "usage: $0 rbf|ensemble 1|3|5|10 SCENE CHECKPOINT SHA256 OUTPUT_ROOT REPLICAS M_EVAL WORKERS" >&2
   exit 2
 fi
 
@@ -21,7 +21,7 @@ PYTHON_BIN=${PYTHON:-python}
 ROUNDS=5
 
 case "$ESTIMATOR" in rbf|ensemble) ;; *) echo "estimator must be rbf or ensemble" >&2; exit 2 ;; esac
-case "$WINDOW" in 1|5) REPLAY=(--replay-window "$WINDOW") ;; all) REPLAY=() ;; *) echo "W must be 1, 5, or all" >&2; exit 2 ;; esac
+case "$WINDOW" in 1|3|5|10) REPLAY=(--replay-window "$WINDOW") ;; *) echo "W must be 1, 3, 5, or 10" >&2; exit 2 ;; esac
 if [[ -d "$OUT" && -n "$(find "$OUT" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
   echo "output root must be new or empty: $OUT" >&2
   exit 2

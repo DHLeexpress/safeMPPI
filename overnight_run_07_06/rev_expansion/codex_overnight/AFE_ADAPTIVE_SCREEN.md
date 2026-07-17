@@ -21,13 +21,18 @@ The optional RBF counterfactual diagnostic evaluates length-scale multipliers
 `{0.5,1,2}` and buffer caps `{128,512}` on the same unlabeled feature pools. It
 does not select, verify, execute, or train on a plan.
 
-The replay screen accepts `W=1`, `W=5`, or `W=all`. The append-only D+ archive
+The replay screen accepts finite `W` in `{1, 3, 5, 10}`. The append-only D+ archive
 is identical in semantics for every option. Only the positive IDs eligible for
 each CFM minibatch change:
 
 - `W=1`: current round;
+- `W=3`: current and previous two rounds;
 - `W=5`: current and previous four rounds;
-- `W=all`: full cumulative D+.
+- `W=10`: current and previous nine rounds.
+
+The cumulative-replay control is not repeated: the completed 100-round runs
+already exhibit its fresh-sample dilution. Run `W={1,3,5}` first; use `W=10`
+only if the five-round learning/forgetting comparison is inconclusive.
 
 Both screens are fixed to five rounds and preserve `K=64`, `B=8`, batch 128,
 250 CFM steps, learning rate `1e-4`, the deterministic verifier, expert-free
