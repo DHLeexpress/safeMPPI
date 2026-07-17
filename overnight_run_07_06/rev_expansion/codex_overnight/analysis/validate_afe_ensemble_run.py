@@ -33,6 +33,7 @@ def main():
     parser.add_argument("--run", required=True)
     parser.add_argument("--report", required=True)
     parser.add_argument("--report-pdf", default=None)
+    parser.add_argument("--gpu-provenance", default=None)
     parser.add_argument("--video", required=True)
     parser.add_argument("--expected-video-frames", type=int, default=None)
     parser.add_argument("--out", required=True)
@@ -189,6 +190,8 @@ def main():
     }
     if args.report_pdf is not None:
         delivery["report_pdf"] = artifact(args.report_pdf)
+    if args.gpu_provenance is not None:
+        delivery["gpu_provenance"] = artifact(args.gpu_provenance)
     with open(args.out, "w") as stream:
         json.dump(delivery, stream, indent=2, sort_keys=True)
         stream.write("\n")

@@ -63,6 +63,7 @@ nvidia-smi --id="$CUDA_VISIBLE_DEVICES" \
   --dense-until 10 --every-after 10
 "$PYTHON_BIN" analysis/validate_afe_ensemble_run.py \
   --run "$RUN" --report "$OUT/report.png" --report-pdf "$OUT/report.pdf" \
+  --gpu-provenance "$OUT/gpu_provenance.csv" \
   --video "$OUT/video.mp4" --expected-video-frames "$VIDEO_FRAMES" \
   --out "$OUT/DELIVERY_COMPLETE.json"
 
