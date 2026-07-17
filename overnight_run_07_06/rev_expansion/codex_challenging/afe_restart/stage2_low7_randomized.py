@@ -1844,6 +1844,7 @@ def _contour_face_level(
     color: str,
     linestyle: str,
     linewidth: float,
+    zorder: float,
 ) -> None:
     coordinates = np.linspace(WORKSPACE_LOW, WORKSPACE_HIGH, 181)
     grid_x, grid_y = np.meshgrid(coordinates, coordinates)
@@ -1857,7 +1858,7 @@ def _contour_face_level(
             colors=[color],
             linestyles=[linestyle],
             linewidths=[linewidth],
-            zorder=7,
+            zorder=zorder,
         )
 
 
@@ -1893,21 +1894,26 @@ def _render_polytope_panel(
         alpha=0.85,
         zorder=9,
     )
-    _contour_face_level(
-        axis,
-        replay["nominal_faces"],
-        center,
-        color=NOMINAL_BLUE,
-        linestyle="--",
-        linewidth=1.8,
-    )
+    # Draw fitted first, then the dashed nominal boundary above it.  Otherwise
+    # coincident faces make the green solid line hide the requested blue
+    # nominal evidence.
     _contour_face_level(
         axis,
         replay["fitted_faces"],
         center,
         color=VERIFIER_GREEN,
         linestyle="-",
+        linewidth=2.4,
+        zorder=7,
+    )
+    _contour_face_level(
+        axis,
+        replay["nominal_faces"],
+        center,
+        color=NOMINAL_BLUE,
+        linestyle="--",
         linewidth=2.0,
+        zorder=8,
     )
     start = np.asarray(episode["states"])[0, :2]
     goal = np.asarray(episode["goal"])
@@ -2105,6 +2111,7 @@ def render_polytope_video(args: argparse.Namespace) -> dict[str, Any]:
         "diagnostic_only": True,
         "dataset_selection_changed": False,
         "visualization_evidence": "deterministic verifier replay",
+        "video_renderer_sha256": sha256_file(Path(__file__)),
         "face_evidence": "recomputed from authenticated stored query; not originally persisted faces",
         "source_manifest": str(manifest_path),
         "source_manifest_sha256": sha256_file(manifest_path),
