@@ -18,6 +18,7 @@ from afe_restart.stage2_low7_randomized import (
     _validate_dataset_payload,
     collect_gamma_shard,
     generate_endpoint_payload,
+    generate_fixed_goal_grid_payload,
     grid_features,
     load_endpoint_bank,
     make_parser,
@@ -56,6 +57,29 @@ def test_endpoint_bank_is_deterministic_iid_free_space_without_pair_filter(
     assert bool((displacement[:, 0] > 0).any())
     assert bool((displacement[:, 1] < 0).any())
     assert bool((displacement[:, 1] > 0).any())
+
+
+def test_fixed_goal_grid_adds_diagonal_starts_without_weakening_clearance(
+    tmp_path: Path,
+) -> None:
+    first = generate_fixed_goal_grid_payload(seed=0)
+    second = generate_fixed_goal_grid_payload(seed=0)
+    assert first["pairs"] == second["pairs"]
+    sampling = first["sampling"]
+    assert first["pair_count"] == 881
+    assert sampling["legacy_off_diagonal_count"] == 566
+    assert sampling["new_diagonal_region_count"] == 315
+    assert sampling["strict_free_clearance_m"] == 0.05
+    assert sampling["minimum_obstacle_clearance_m"] > 0.05
+    assert sampling["diagonal_constraint"] is False
+    assert sampling["fixed_goal"] == [4.7, 4.7]
+
+    path = tmp_path / "fixed_grid_endpoints.json"
+    _atomic_json(path, first)
+    bank = load_endpoint_bank(path)
+    assert bank.starts.shape == bank.goals.shape == (881, 2)
+    assert np.all(bank.goals == np.asarray((4.7, 4.7), dtype=np.float32))
+    assert bool((np.abs(bank.starts[:, 1] - bank.starts[:, 0]) < 1.0).any())
 
 
 def test_planner_retry_seed_is_paired_across_gamma() -> None:
@@ -100,6 +124,15 @@ def test_cli_parser_registers_each_additive_command_once(tmp_path: Path) -> None
     assert parser.parse_args(
         ["render", "--manifest", str(tmp_path / "manifest.json")]
     ).command == "render"
+    assert parser.parse_args(
+        [
+            "starts",
+            "--endpoint-manifest",
+            str(tmp_path / "endpoints.json"),
+            "--output",
+            str(tmp_path / "starts.png"),
+        ]
+    ).command == "starts"
     video = parser.parse_args(
         ["video", "--manifest", str(tmp_path / "manifest.json")]
     )

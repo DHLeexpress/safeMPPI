@@ -69,11 +69,18 @@ DEFAULT_ROOT = PACKAGE_ROOT / "stage_results/02_low7_randomized"
 DEFAULT_ENDPOINT_MANIFEST = DEFAULT_ROOT / "endpoints.json"
 DATA_SCHEMA = "afe_planned_demo_v3_low7_uniform_pairs"
 ENDPOINT_SCHEMA = "afe_low7_iid_free_endpoint_manifest_v1"
+FIXED_GRID_ENDPOINT_SCHEMA = "afe_low7_fixed_goal_full_grid_endpoint_manifest_v1"
 SHARD_STATUS = "LOW7_RANDOMIZED_GAMMA_SHARD_COMPLETE"
 COMBINED_STATUS = "LOW7_RANDOMIZED_ALL_GAMMA_COMPLETE"
 WORKSPACE_LOW = 0.0
 WORKSPACE_HIGH = 5.0
 FREE_CLEARANCE_M = 1.0e-4
+GRID_LOW = 0.1
+GRID_HIGH = 4.9
+GRID_SIZE = 32
+GRID_JITTER_M = 0.02
+GRID_FREE_CLEARANCE_M = 0.05
+FIXED_GOAL = np.asarray((4.7, 4.7), dtype=np.float64)
 DEFAULT_PAIR_COUNT = 100
 DEFAULT_ENDPOINT_SEED = 20_260_717
 DEFAULT_PLANNER_SEED0 = 810_000
@@ -234,10 +241,86 @@ def generate_endpoint_payload(*, pair_count: int, seed: int) -> dict[str, Any]:
     }
 
 
+def generate_fixed_goal_grid_payload(*, seed: int) -> dict[str, Any]:
+    """Return the old fixed-jitter grid without its off-diagonal exclusion.
+
+    This changes only the start support relative to the 566-start corpus: the
+    5 cm obstacle-clearance rule, zero initial velocity, and fixed goal remain
+    explicit.  Grid points are identities, so failed expert rollouts are not
+    success-conditioned replacements.
+    """
+
+    env = make_id_scene(goal=FIXED_GOAL)
+    cell = (GRID_HIGH - GRID_LOW) / GRID_SIZE
+    centers = GRID_LOW + cell * (np.arange(GRID_SIZE) + 0.5)
+    x_grid, y_grid = np.meshgrid(centers, centers)
+    points = np.stack((x_grid.ravel(), y_grid.ravel()), axis=1)
+    points += np.random.default_rng(int(seed)).uniform(
+        -GRID_JITTER_M, GRID_JITTER_M, points.shape
+    )
+    clearance = np.asarray(
+        [_clearance(point.astype(np.float64), env) for point in points]
+    )
+    starts = points[clearance > GRID_FREE_CLEARANCE_M].astype(np.float32)
+    start_clearance = clearance[clearance > GRID_FREE_CLEARANCE_M]
+    pairs = [
+        {
+            "pair_id": pair_id,
+            "start": start.tolist(),
+            "goal": FIXED_GOAL.tolist(),
+            "start_clearance_m": float(start_clearance[pair_id]),
+            "initial_velocity": [0.0, 0.0],
+        }
+        for pair_id, start in enumerate(starts)
+    ]
+    diagonal = np.abs(starts[:, 1] - starts[:, 0]) < 1.0
+    wall_clearance = np.minimum.reduce(
+        (starts[:, 0], starts[:, 1], 5.0 - starts[:, 0], 5.0 - starts[:, 1])
+    )
+    return {
+        "schema_version": FIXED_GRID_ENDPOINT_SCHEMA,
+        "status": "IMMUTABLE_FIXED_GOAL_FULL_GRID_BANK_COMPLETE",
+        "created_at_utc": _utc_now(),
+        "seed": int(seed),
+        "pair_count": len(pairs),
+        "scene": {
+            "name": "ordinary_symmetric_4x4_ID_stadium",
+            "geometry_sha256": _scene_geometry_sha256(env),
+            "obstacle_count": int(len(env.obstacles)),
+            "robot_radius_m": float(env.r_robot),
+            "workspace_m": [WORKSPACE_LOW, WORKSPACE_HIGH],
+        },
+        "sampling": {
+            "mode": "fixed_jitter_full_grid_starts_fixed_goal",
+            "start_distribution": "32x32_uniform_grid_centers_with_fixed_uniform_jitter",
+            "goal_distribution": "fixed",
+            "fixed_goal": FIXED_GOAL.tolist(),
+            "initial_velocity": [0.0, 0.0],
+            "grid_low_m": GRID_LOW,
+            "grid_high_m": GRID_HIGH,
+            "grid_size": GRID_SIZE,
+            "jitter_m": GRID_JITTER_M,
+            "strict_free_clearance_m": GRID_FREE_CLEARANCE_M,
+            "endpoint_relation_constraints": ["fixed_goal_only"],
+            "diagonal_constraint": False,
+            "minimum_start_goal_distance_m": None,
+            "success_conditioned_resampling": False,
+            "raw_grid_points": int(GRID_SIZE**2),
+            "retained_starts": len(pairs),
+            "legacy_off_diagonal_count": int((~diagonal).sum()),
+            "new_diagonal_region_count": int(diagonal.sum()),
+            "minimum_obstacle_clearance_m": float(start_clearance.min()),
+            "minimum_workspace_wall_distance_m": float(wall_clearance.min()),
+        },
+        "pairs": pairs,
+    }
+
+
 def load_endpoint_bank(path: str | Path) -> EndpointBank:
     path = Path(path).resolve()
     payload = json.loads(path.read_text())
-    if payload.get("schema_version") != ENDPOINT_SCHEMA:
+    schema = payload.get("schema_version")
+    if schema not in {ENDPOINT_SCHEMA, FIXED_GRID_ENDPOINT_SCHEMA}:
         raise RuntimeError(f"unsupported endpoint manifest schema: {path}")
     count = int(payload.get("pair_count", -1))
     rows = list(payload.get("pairs", ()))
@@ -246,16 +329,36 @@ def load_endpoint_bank(path: str | Path) -> EndpointBank:
     if [int(row.get("pair_id", -1)) for row in rows] != list(range(count)):
         raise RuntimeError("endpoint pair IDs must be contiguous from zero")
     sampling = dict(payload.get("sampling", {}))
-    if (
-        sampling.get("endpoint_relation_constraints") != []
-        or sampling.get("diagonal_constraint") is not False
-        or sampling.get("minimum_start_goal_distance_m") is not None
-        or sampling.get("start_goal_independent") is not True
-        or float(sampling.get("strict_free_clearance_m", math.nan))
-        != FREE_CLEARANCE_M
-    ):
-        raise RuntimeError("endpoint manifest does not declare the IID free-space contract")
-    env = make_id_scene()
+    if schema == ENDPOINT_SCHEMA:
+        if (
+            sampling.get("endpoint_relation_constraints") != []
+            or sampling.get("diagonal_constraint") is not False
+            or sampling.get("minimum_start_goal_distance_m") is not None
+            or sampling.get("start_goal_independent") is not True
+            or float(sampling.get("strict_free_clearance_m", math.nan))
+            != FREE_CLEARANCE_M
+        ):
+            raise RuntimeError("endpoint manifest does not declare the IID free-space contract")
+        env = make_id_scene()
+        required_clearance = FREE_CLEARANCE_M
+    else:
+        if (
+            sampling.get("mode") != "fixed_jitter_full_grid_starts_fixed_goal"
+            or sampling.get("diagonal_constraint") is not False
+            or sampling.get("success_conditioned_resampling") is not False
+            or int(sampling.get("grid_size", -1)) != GRID_SIZE
+            or float(sampling.get("strict_free_clearance_m", math.nan))
+            != GRID_FREE_CLEARANCE_M
+            or not np.allclose(
+                np.asarray(sampling.get("fixed_goal"), dtype=np.float32),
+                FIXED_GOAL,
+                rtol=0.0,
+                atol=5.0e-7,
+            )
+        ):
+            raise RuntimeError("endpoint manifest does not declare the fixed-goal full-grid contract")
+        env = make_id_scene(goal=FIXED_GOAL)
+        required_clearance = GRID_FREE_CLEARANCE_M
     if payload.get("scene", {}).get("geometry_sha256") != _scene_geometry_sha256(env):
         raise RuntimeError("endpoint manifest belongs to different scene geometry")
     starts = np.asarray([row["start"] for row in rows], dtype=np.float32)
@@ -270,8 +373,13 @@ def load_endpoint_bank(path: str | Path) -> EndpointBank:
         clearance = np.asarray(
             [_clearance(point.astype(np.float64), env) for point in array]
         )
-        if bool(np.any(clearance <= FREE_CLEARANCE_M)):
+        if label == "start" and bool(np.any(clearance <= required_clearance)):
             raise RuntimeError(f"{label} endpoint violates strict free-space clearance")
+    if schema == FIXED_GRID_ENDPOINT_SCHEMA:
+        if not bool(np.allclose(goals, FIXED_GOAL[None], rtol=0.0, atol=5.0e-7)):
+            raise RuntimeError("fixed-grid endpoint bank contains a nonfixed goal")
+        if count != int(sampling.get("retained_starts", -1)):
+            raise RuntimeError("fixed-grid retained-start count is inconsistent")
     return EndpointBank(
         path=path,
         sha256=sha256_file(path),
@@ -285,7 +393,11 @@ def generate_endpoints(args: argparse.Namespace) -> dict[str, Any]:
     output = args.output.resolve()
     if output.exists():
         raise FileExistsError(f"refusing to overwrite immutable endpoint bank: {output}")
-    payload = generate_endpoint_payload(pair_count=args.pairs, seed=args.seed)
+    payload = (
+        generate_fixed_goal_grid_payload(seed=args.seed)
+        if args.fixed_goal_grid
+        else generate_endpoint_payload(pair_count=args.pairs, seed=args.seed)
+    )
     _atomic_json(output, payload)
     result = {**payload, "manifest": str(output), "manifest_sha256": sha256_file(output)}
     print(
@@ -308,6 +420,12 @@ def _canonical_gamma(value: float) -> float:
     if len(matches) != 1:
         raise ValueError(f"gamma must be exactly one of {tuple(GAMMAS)}, got {value!r}")
     return matches[0]
+
+
+def _endpoint_scientific_change(bank: EndpointBank) -> str:
+    if bank.payload.get("schema_version") == FIXED_GRID_ENDPOINT_SCHEMA:
+        return "fixed_goal_full_grid_starts_zero_velocity_no_diagonal_exclusion"
+    return "iid_uniform_free_start_goal_pairs"
 
 
 def _planner_seed(seed0: int, pair_id: int, retry: int, retries: int) -> int:
@@ -918,7 +1036,7 @@ def collect_gamma_shard(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "scientific_changes": [
                 "low7_closest_boundary_conditioning",
-                "iid_uniform_free_start_goal_pairs",
+                _endpoint_scientific_change(endpoint_manifest),
             ],
         },
         "generator_sha256": randomized_generator_sha256,
@@ -1189,7 +1307,7 @@ def combine_shards(args: argparse.Namespace) -> dict[str, Any]:
             "all_shards_match_canonical": True,
             "scientific_changes": [
                 "low7_closest_boundary_conditioning",
-                "iid_uniform_free_start_goal_pairs",
+                _endpoint_scientific_change(endpoint_manifest),
             ],
         },
         "generator_sha256": reference_generator,
@@ -1237,6 +1355,63 @@ def _draw_scene(axis: Any, env: Any) -> None:
     axis.set_xticks((0, 1, 2, 3, 4, 5))
     axis.set_yticks((0, 1, 2, 3, 4, 5))
     axis.grid(color="0.9", lw=0.5, zorder=0)
+
+
+def render_endpoint_starts(args: argparse.Namespace) -> dict[str, Any]:
+    """Show the immutable start bank before any expert rollout is collected."""
+
+    bank = load_endpoint_bank(args.endpoint_manifest)
+    output = args.output.resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    goal = bank.goals[0]
+    env = make_id_scene(goal=goal)
+    clearance = np.asarray(
+        [_clearance(point.astype(np.float64), env) for point in bank.starts]
+    )
+    figure, axis = plt.subplots(figsize=(8.2, 7.6))
+    _draw_scene(axis, env)
+    scatter = axis.scatter(
+        bank.starts[:, 0],
+        bank.starts[:, 1],
+        c=clearance,
+        cmap="viridis",
+        vmin=0.05,
+        vmax=float(np.quantile(clearance, 0.95)),
+        s=14,
+        linewidths=0.0,
+        zorder=4,
+    )
+    axis.plot(goal[0], goal[1], "*", color="#ffd60a", mec="black", mew=0.6, ms=14, zorder=6)
+    axis.plot((0.0, 5.0), (0.0, 5.0), ":", color="0.25", lw=0.8, zorder=2)
+    colorbar = figure.colorbar(scatter, ax=axis, fraction=0.047, pad=0.03)
+    colorbar.set_label("initial obstacle-boundary clearance [m]")
+    sampling = bank.payload["sampling"]
+    axis.set_title(
+        f"Fixed-goal full-grid start bank: {bank.count} zero-velocity starts\n"
+        f"no diagonal exclusion; clearance > {float(sampling['strict_free_clearance_m']):.2f} m"
+    )
+    axis.set_xlabel("world x [m]")
+    axis.set_ylabel("world y [m]")
+    figure.tight_layout()
+    figure.savefig(output, dpi=180, bbox_inches="tight", facecolor="white")
+    plt.close(figure)
+    sidecar = {
+        "schema_version": "afe_low7_endpoint_start_map_v1",
+        "status": "COMPLETE",
+        "endpoint_manifest": str(bank.path),
+        "endpoint_manifest_sha256": bank.sha256,
+        "output": str(output),
+        "output_sha256": sha256_file(output),
+        "start_count": bank.count,
+        "goal": goal.tolist(),
+        "initial_velocity": [0.0, 0.0],
+        "minimum_obstacle_clearance_m": float(clearance.min()),
+        "median_obstacle_clearance_m": float(np.median(clearance)),
+        "diagonal_constraint": False,
+    }
+    _atomic_json(output.with_suffix(".json"), sidecar)
+    print(json.dumps(sidecar, indent=2), flush=True)
+    return sidecar
 
 
 def _candidate_path(meta_path: Path, expected_meta_sha256: str) -> np.ndarray:
@@ -1357,6 +1532,9 @@ def render_overlay(args: argparse.Namespace) -> dict[str, Any]:
             alpha=0.25,
             zorder=3,
         )
+    fixed_goal_grid = (
+        endpoint_manifest.payload.get("schema_version") == FIXED_GRID_ENDPOINT_SCHEMA
+    )
     main_axis.scatter(
         endpoint_manifest.starts[:, 0],
         endpoint_manifest.starts[:, 1],
@@ -1367,18 +1545,19 @@ def render_overlay(args: argparse.Namespace) -> dict[str, Any]:
         linewidths=0.35,
         alpha=0.38,
         zorder=5,
-        label="IID starts",
+        label=("full-grid starts" if fixed_goal_grid else "IID starts"),
     )
+    displayed_goals = endpoint_manifest.goals[:1] if fixed_goal_grid else endpoint_manifest.goals
     main_axis.scatter(
-        endpoint_manifest.goals[:, 0],
-        endpoint_manifest.goals[:, 1],
+        displayed_goals[:, 0],
+        displayed_goals[:, 1],
         s=11,
         marker="*",
         color="#d62828",
         linewidths=0.25,
         alpha=0.36,
         zorder=5,
-        label="IID goals",
+        label=("fixed goal" if fixed_goal_grid else "IID goals"),
     )
     total_attempts = sum(len(rows) for rows in rows_by_gamma.values())
     total_success = sum(
@@ -1386,7 +1565,7 @@ def render_overlay(args: argparse.Namespace) -> dict[str, Any]:
     )
     main_axis.set_title(
         "All real SafeMPPI attempts over the full 5×5 workspace\n"
-        f"{endpoint_manifest.count} paired IID endpoints × 7 γ; "
+        f"{endpoint_manifest.count} {'fixed-goal grid starts' if fixed_goal_grid else 'paired IID endpoints'} × 7 γ; "
         f"success={total_success}/{total_attempts}",
         fontsize=13,
     )
@@ -1438,7 +1617,11 @@ def render_overlay(args: argparse.Namespace) -> dict[str, Any]:
         axis.tick_params(labelsize=6)
     mini_axes[-1].axis("off")
     figure.suptitle(
-        "Low7 randomized expert demonstrations — no diagonal restriction, reflection, or padding",
+        (
+            "Low7 fixed-goal full-grid expert demonstrations — zero initial velocity"
+            if fixed_goal_grid
+            else "Low7 randomized expert demonstrations — no diagonal restriction, reflection, or padding"
+        ),
         fontsize=15,
         y=0.995,
     )
@@ -1458,6 +1641,7 @@ def render_overlay(args: argparse.Namespace) -> dict[str, Any]:
         "includes_failed_retries": True,
         "includes_actual_executed_paths": True,
         "diagonal_band": False,
+        "fixed_goal_grid": fixed_goal_grid,
     }
     _atomic_json(output.with_suffix(".json"), sidecar)
     print(json.dumps(sidecar, indent=2), flush=True)
@@ -2210,10 +2394,19 @@ def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
 
-    endpoints = commands.add_parser("endpoints", help="freeze the shared IID endpoint bank")
+    endpoints = commands.add_parser("endpoints", help="freeze one immutable endpoint bank")
     endpoints.add_argument("--output", type=Path, default=DEFAULT_ENDPOINT_MANIFEST)
     endpoints.add_argument("--pairs", type=int, default=DEFAULT_PAIR_COUNT)
     endpoints.add_argument("--seed", type=int, default=DEFAULT_ENDPOINT_SEED)
+    endpoints.add_argument(
+        "--fixed-goal-grid",
+        action="store_true",
+        help="use all free fixed-jitter grid starts and the canonical fixed goal",
+    )
+
+    starts = commands.add_parser("starts", help="render the endpoint start bank before rollout")
+    starts.add_argument("--endpoint-manifest", type=Path, required=True)
+    starts.add_argument("--output", type=Path, required=True)
 
     collect = commands.add_parser("collect", help="collect one gamma shard")
     collect.add_argument("--endpoint-manifest", type=Path, required=True)
@@ -2278,6 +2471,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = make_parser().parse_args(argv)
     if args.command == "endpoints":
         generate_endpoints(args)
+    elif args.command == "starts":
+        render_endpoint_starts(args)
     elif args.command == "collect":
         collect_gamma_shard(args)
     elif args.command == "combine":

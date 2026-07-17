@@ -168,6 +168,12 @@ def load_pool(manifest_path: Path) -> Low7Pool:
     row_ids = {int(row["trajectory_id"]) for row in trajectory_rows}
     if row_ids != {int(value) for value in torch.unique(trajectory_ids).tolist()}:
         raise ValueError("trajectory rows do not match window trajectory ids")
+    endpoint_path = Path(manifest["endpoint_manifest"])
+    if not endpoint_path.is_absolute():
+        endpoint_path = (manifest_path.parent / endpoint_path).resolve()
+    if sha256_file(endpoint_path) != str(manifest["endpoint_manifest_sha256"]):
+        raise RuntimeError("low7 endpoint-manifest checksum mismatch")
+    endpoint_payload = json.loads(endpoint_path.read_text())
     return Low7Pool(
         grid=grid,
         low7=low7,
@@ -180,7 +186,15 @@ def load_pool(manifest_path: Path) -> Low7Pool:
         trajectory_rows=trajectory_rows,
         query_hashes=hashes,
         declared_pair_ids=declared_pair_ids,
-        source={"manifest": str(manifest_path), "dataset": str(dataset_path), "sha256": expected_sha},
+        source={
+            "manifest": str(manifest_path),
+            "dataset": str(dataset_path),
+            "sha256": expected_sha,
+            "endpoint_manifest": str(endpoint_path),
+            "endpoint_manifest_sha256": str(manifest["endpoint_manifest_sha256"]),
+            "endpoint_schema": str(endpoint_payload.get("schema_version")),
+            "endpoint_sampling": dict(endpoint_payload.get("sampling", {})),
+        },
     )
 
 
@@ -429,11 +443,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     model = model.cpu().eval()
     state_sha = model_state_hash(model)
     query_digest = hashlib.sha256("".join(pool.query_hashes).encode()).hexdigest()
+    fixed_goal_grid = (
+        pool.source.get("endpoint_schema")
+        == "afe_low7_fixed_goal_full_grid_endpoint_manifest_v1"
+    )
     extra = {
         "stage_schema": TRAIN_SCHEMA,
         "fresh_from_scratch": True,
         "endpoint_free": True,
-        "domain_randomized_start_goal": True,
+        "domain_randomized_start_goal": not fixed_goal_grid,
+        "domain_randomized_start": True,
+        "fixed_goal": ([4.7, 4.7] if fixed_goal_grid else None),
+        "zero_initial_velocity": True,
+        "diagonal_start_exclusion": False,
         "source_manifest": str(args.manifest.resolve()),
         "source_query_hash_digest": query_digest,
         "model_state_sha256": state_sha,

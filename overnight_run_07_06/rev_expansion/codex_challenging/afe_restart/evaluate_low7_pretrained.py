@@ -209,7 +209,6 @@ def load_low7_candidate(
         "stage_schema": CHECKPOINT_STAGE_SCHEMA,
         "fresh_from_scratch": True,
         "endpoint_free": True,
-        "domain_randomized_start_goal": True,
         "encoder_trainable_during_pretraining": True,
         "expansion_promotion": False,
     }
@@ -218,6 +217,18 @@ def load_low7_candidate(
             raise CheckpointContractError(
                 f"checkpoint payload {field}={payload.get(field)!r}, expected {expected_value!r}"
             )
+    fixed_goal_grid = payload.get("fixed_goal") is not None
+    if fixed_goal_grid:
+        if (
+            payload.get("domain_randomized_start_goal") is not False
+            or payload.get("domain_randomized_start") is not True
+            or payload.get("zero_initial_velocity") is not True
+            or payload.get("diagonal_start_exclusion") is not False
+            or payload.get("fixed_goal") != [4.7, 4.7]
+        ):
+            raise CheckpointContractError("fixed-goal grid checkpoint provenance is inconsistent")
+    elif payload.get("domain_randomized_start_goal") is not True:
+        raise CheckpointContractError("random-pair checkpoint lost its endpoint provenance")
     if payload.get("frozen_feature_snapshot", False):
         raise CheckpointContractError("evaluation requires the policy candidate, not phi0 snapshot")
     if not _is_sha256(payload.get("source_query_hash_digest")):
@@ -247,6 +258,7 @@ def load_low7_candidate(
         "best_epoch": int(payload["best_epoch"]),
         "best_validation_cfm": float(payload["best_validation_cfm"]),
         "expansion_promotion": False,
+        "fixed_goal_grid": fixed_goal_grid,
         "parameter_count": parameter_count,
     }
     return policy.to(device).eval(), contract

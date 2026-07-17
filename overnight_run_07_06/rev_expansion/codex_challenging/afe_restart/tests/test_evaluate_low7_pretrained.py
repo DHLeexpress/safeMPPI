@@ -11,7 +11,7 @@ from afe_restart import evaluate_low7_pretrained as evaluation
 from afe_restart.policy import model_state_hash
 
 
-def _candidate_checkpoint(path: Path) -> str:
+def _candidate_checkpoint(path: Path, *, fixed_goal_grid: bool = False) -> str:
     policy = evaluation.HP.GridHPFlowPolicy(
         repr_dim=32,
         grid_hw=(32, 32),
@@ -27,7 +27,11 @@ def _candidate_checkpoint(path: Path) -> str:
             "stage_schema": evaluation.CHECKPOINT_STAGE_SCHEMA,
             "fresh_from_scratch": True,
             "endpoint_free": True,
-            "domain_randomized_start_goal": True,
+            "domain_randomized_start_goal": not fixed_goal_grid,
+            "domain_randomized_start": True,
+            "fixed_goal": ([4.7, 4.7] if fixed_goal_grid else None),
+            "zero_initial_velocity": fixed_goal_grid,
+            "diagonal_start_exclusion": False,
             "encoder_trainable_during_pretraining": True,
             "expansion_promotion": False,
             "source_manifest": "/sealed/low7/manifest.json",
@@ -56,6 +60,17 @@ def test_strict_candidate_loader_accepts_only_low7_unpromoted_checkpoint(
 
     with pytest.raises(evaluation.CheckpointContractError, match="caller-declared"):
         evaluation.load_low7_candidate(checkpoint, "0" * 64, "cpu")
+
+
+def test_candidate_loader_accepts_fixed_goal_full_grid_provenance(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "fixed_grid_candidate.pt"
+    checksum = _candidate_checkpoint(checkpoint, fixed_goal_grid=True)
+
+    _policy, contract = evaluation.load_low7_candidate(checkpoint, checksum, "cpu")
+
+    assert contract["fixed_goal_grid"] is True
 
 
 @pytest.mark.parametrize(
