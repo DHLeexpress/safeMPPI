@@ -282,7 +282,6 @@ def test_legacy_claude_checkpoint_contract_is_explicit_and_profile_bound(
     assert contract["name"] == "legacy_a32uni_forensic_v2"
     assert contract["checkpoint_model_state_sha256"] == model_hash
     assert AFE2._canonical_json_sha256(contract) == digest
-
     wrong_trunk = dict(checkpoint)
     wrong_trunk["config"] = dict(checkpoint["config"], trunk_hidden=[128, 64])
     with pytest.raises(RuntimeError, match="legacy uncapped druni_"):
@@ -343,6 +342,11 @@ def test_codex_checkpoint_contract_requires_both_allowlist_and_promotion_witness
     assert contract["name"] == "fresh_stage3_promoted_v1"
     assert contract["checkpoint_model_state_sha256"] == model_hash
     assert AFE2._canonical_json_sha256(contract) == digest
+    radius04_hash, radius04_contract, _ = AFE2.validate_checkpoint_contract(
+        "codex_radius04_v1", policy, checkpoint, documented_hash
+    )
+    assert radius04_hash == model_hash
+    assert radius04_contract["name"] == "fresh_stage3_promoted_v1"
 
     unpromoted = dict(checkpoint, expansion_promotion=False)
     with pytest.raises(RuntimeError, match="promoted only"):

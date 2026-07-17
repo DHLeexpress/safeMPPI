@@ -82,6 +82,50 @@ def _make_completed_pair(root: Path, profile: str = "claude_grid_v1", rounds: in
     return afe
 
 
+def _make_completed_single(root: Path, rounds: int = 2) -> Path:
+    (root / "viz_db").mkdir(parents=True)
+    recipe = {
+        "algorithm": "afe_rbf_previous_round_parallel_v1",
+        "arm": "afe",
+        "single_arm": True,
+        "scene": {"profile": {"name": "codex_radius04_v1"}, "sha256": "s" * 64},
+        "source_checkpoint_sha256": "c" * 64,
+        "source_checkpoint_model_sha256": "d" * 64,
+        "source_checkpoint_contract_sha256": "e" * 64,
+        "source_git_commit": "f" * 40,
+    }
+    (root / "recipe.json").write_text(json.dumps(recipe))
+    (root / "rbf_calibration.json").write_text("{}")
+    (root / "probe.jsonl").write_text("{}\n")
+    (root / "final.pt").write_bytes(b"final")
+    (root / "dstore.pt").write_bytes(b"store")
+    for round_i in range(rounds + 1):
+        (root / f"ckpt_{round_i}.pt").write_bytes(f"ckpt-{round_i}".encode())
+        if round_i:
+            (root / "viz_db" / f"round{round_i}.pt").write_bytes(
+                f"viz-{round_i}".encode()
+            )
+    required = {
+        "recipe.json", "rbf_calibration.json", "probe.jsonl", "final.pt", "dstore.pt",
+        *{f"ckpt_{round_i}.pt" for round_i in range(rounds + 1)},
+        *{f"viz_db/round{round_i}.pt" for round_i in range(1, rounds + 1)},
+    }
+    complete = {
+        "status": "COMPLETE",
+        "completed_round": rounds,
+        "scene_sha256": "s" * 64,
+        "checkpoint_sha256": "c" * 64,
+        "checkpoint_model_sha256": "d" * 64,
+        "checkpoint_contract_sha256": "e" * 64,
+        "source_git_commit": "f" * 40,
+        "artifact_sha256": {
+            relative: _sha(root / relative) for relative in sorted(required)
+        },
+    }
+    (root / "COMPLETE.json").write_text(json.dumps(complete))
+    return root
+
+
 def test_named_seed_deterministic_and_key_sensitive() -> None:
     a = TER.named_seed("v", "scene", "policy", 0.5, 7)
     assert a == TER.named_seed("v", "scene", "policy", 0.5, 7)
@@ -202,6 +246,16 @@ def test_validate_pair_binds_completed_afe_checkpoints(tmp_path: Path) -> None:
     (afe / "ckpt_1.pt").write_bytes(b"tampered")
     with pytest.raises(RuntimeError, match="completion artifact hash mismatch"):
         TER.validate_afe_pair(tmp_path, "claude_grid_v1", 2)
+
+
+def test_validate_single_run_binds_completed_rbf_checkpoints(tmp_path: Path) -> None:
+    run = _make_completed_single(tmp_path, rounds=2)
+    checkpoints, contract = TER.validate_afe_run(run, "codex_radius04_v1", 2)
+    assert sorted(checkpoints) == [0, 1, 2]
+    assert contract["kind"] == "single_afe_rbf_run"
+    (run / "rbf_calibration.json").write_text("tampered")
+    with pytest.raises(RuntimeError, match="artifact hash mismatch"):
+        TER.validate_afe_run(run, "codex_radius04_v1", 2)
 
 
 def test_load_cell_rejects_tampered_raw_paths(tmp_path: Path) -> None:

@@ -37,6 +37,7 @@ class AFE2SceneProfile:
     wall_plugs: int
     center_replacement_radius: float | None
     description: str
+    interior_disk_radius: float | None = None
 
 
 CLAUDE_GRID_V1 = AFE2SceneProfile(
@@ -64,9 +65,23 @@ CODEX_RADIUS1_V1 = AFE2SceneProfile(
     ),
 )
 
+CODEX_RADIUS04_V1 = AFE2SceneProfile(
+    name="codex_radius04_v1",
+    start=(0.5, 0.5),
+    goal=(4.5, 4.5),
+    wall_plugs=8,
+    center_replacement_radius=None,
+    interior_disk_radius=0.4,
+    description=(
+        "Codex obstacle-size OOD task: retain the 4x4 interior grid but double "
+        "exactly those sixteen physical disk radii from 0.2 to 0.4; retain the "
+        "radius-0.2 boundary walls and eight plugs."
+    ),
+)
+
 SCENE_PROFILES = {
     profile.name: profile
-    for profile in (CLAUDE_GRID_V1, CODEX_RADIUS1_V1)
+    for profile in (CLAUDE_GRID_V1, CODEX_RADIUS1_V1, CODEX_RADIUS04_V1)
 }
 
 
@@ -116,6 +131,41 @@ def replace_four_central_disks(
     return replaced
 
 
+def replace_interior_disk_radii(
+    obstacles: np.ndarray,
+    *,
+    radius: float,
+) -> np.ndarray:
+    """Change exactly the canonical 4x4 interior disks, leaving walls/plugs intact."""
+
+    values = np.asarray(obstacles, dtype=np.float32)
+    if values.ndim != 2 or values.shape[1] != 3:
+        raise ValueError("obstacles must have shape [N,3]")
+    if not np.isfinite(radius) or radius <= 0.0:
+        raise ValueError("interior disk radius must be finite and positive")
+    centers = np.asarray(
+        [(x, y) for x in (1.0, 2.0, 3.0, 4.0) for y in (1.0, 2.0, 3.0, 4.0)],
+        dtype=np.float32,
+    )
+    interior = np.zeros(len(values), dtype=bool)
+    for center in centers:
+        matches = np.all(
+            np.isclose(values[:, :2], center[None], rtol=0.0, atol=1.0e-7),
+            axis=1,
+        )
+        if int(matches.sum()) != 1:
+            raise RuntimeError(
+                "codex_radius04_v1 requires one canonical interior disk at "
+                f"{tuple(float(v) for v in center)}; found {int(matches.sum())}"
+            )
+        interior |= matches
+    if int(interior.sum()) != 16:
+        raise RuntimeError(f"expected 16 interior disks; found {int(interior.sum())}")
+    replaced = values.copy()
+    replaced[interior, 2] = float(radius)
+    return replaced
+
+
 def build_scene(profile: AFE2SceneProfile):
     """Build one profile using the same base scene implementation as AFE2."""
 
@@ -126,6 +176,22 @@ def build_scene(profile: AFE2SceneProfile):
     import grid_expand_hardtail as HT
 
     env = HT._apply_wall_plugs(GS.make_grid(), profile.wall_plugs)
+    if profile.interior_disk_radius is not None:
+        replaced = replace_interior_disk_radii(
+            env.obstacles.detach().cpu().numpy(),
+            radius=profile.interior_disk_radius,
+        )
+        env.obstacles = torch.as_tensor(
+            replaced,
+            dtype=env.obstacles.dtype,
+            device=env.obstacles.device,
+        )
+        env.obs_vel = torch.zeros(
+            len(replaced),
+            2,
+            dtype=env.obstacles.dtype,
+            device=env.obstacles.device,
+        )
     if profile.center_replacement_radius is not None:
         replaced = replace_four_central_disks(
             env.obstacles.detach().cpu().numpy(),
@@ -161,8 +227,13 @@ def scene_snapshot(env, profile: AFE2SceneProfile) -> dict[str, Any]:
     obstacles = env.obstacles.detach().cpu().numpy().astype(np.float64)
     start = env.x0.detach().cpu().numpy().astype(np.float64)
     goal = env.goal.detach().cpu().numpy().astype(np.float64)
+    profile_payload = asdict(profile)
+    # Preserve the hashes of the two already-published profiles.  This field did
+    # not exist when their artifacts were frozen and is meaningful only when set.
+    if profile_payload["interior_disk_radius"] is None:
+        profile_payload.pop("interior_disk_radius")
     payload: dict[str, Any] = {
-        "profile": asdict(profile),
+        "profile": profile_payload,
         "obstacles": obstacles.tolist(),
         "start_state": start.tolist(),
         "goal": goal.tolist(),

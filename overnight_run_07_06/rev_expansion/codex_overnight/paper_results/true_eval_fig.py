@@ -41,11 +41,11 @@ import matplotlib.pyplot as plt
 
 import _paths  # noqa: F401
 
-METRIC_VERSION = "true_eval_v3_pairbound"
+METRIC_VERSION = "true_eval_v4_sourcebound"
 EVAL_GAMMAS = (0.1, 0.3, 0.5, 1.0)
 PLA = plt.get_cmap("plasma")
 GCOL = {0.1: PLA(0.08), 0.3: PLA(0.38), 0.5: PLA(0.58), 1.0: PLA(0.85)}
-SUBSET_LABEL = "pre-specified outcome-stratified, ratio-matched random subset (10 of 100)"
+SUBSET_LABEL = "pre-specified outcome-stratified, ratio-matched random subset (10 trajectories)"
 Z95 = 1.959963984540054
 _VERIFIED_RAW_RUNS = {}
 
@@ -277,6 +277,8 @@ def main():
     ap.add_argument("--gammas", type=float, nargs="+", default=list(EVAL_GAMMAS))
     ap.add_argument("--reach", type=float, default=0.15)
     ap.add_argument("--out-prefix", required=True)
+    ap.add_argument("--pilot", action="store_true",
+                    help="render a labeled M>=10 preflight instead of requiring canonical M=100")
     args = ap.parse_args()
     scene = SceneCtx(args.eval_dir, args.scene_profile)
     dt = float(scene.env.dt)
@@ -286,8 +288,11 @@ def main():
     figure_source_commit = require_clean_source(raw_complete.get("source_git_commit"))
     if raw_complete.get("metric_version") != METRIC_VERSION:
         raise RuntimeError("runner and figure metric versions disagree")
-    if int(raw_complete.get("M", -1)) != 100:
-        raise RuntimeError("paper true evaluation requires validated M=100 per cell")
+    evaluated_M = int(raw_complete.get("M", -1))
+    if (not args.pilot and evaluated_M != 100) or (args.pilot and evaluated_M < 10):
+        raise RuntimeError("canonical figures require M=100; --pilot requires validated M>=10")
+    if bool(raw_complete.get("pilot", False)) != bool(args.pilot):
+        raise RuntimeError("figure --pilot mode disagrees with the raw evaluation")
     if [float(g) for g in raw_complete.get("gammas", [])] != [float(g) for g in args.gammas]:
         raise RuntimeError("figure gamma list disagrees with the completed raw evaluation")
     if (list(raw_complete.get("rounds", [])) != list(range(args.rounds + 1))
@@ -309,7 +314,7 @@ def main():
     rows = [
         ("SafeMPPI oracle", lambda g: (f"expert_rNA_g{g}", g)),
         ("Pretrained (bare, ckpt_0)", lambda g: (f"policy_r0_g{g}", g)),
-        (f"AFE2 round {args.rounds} (bare)", lambda g: (f"policy_r{args.rounds}_g{g}", g)),
+        (f"Expanded round {args.rounds} (bare)", lambda g: (f"policy_r{args.rounds}_g{g}", g)),
         ("CFM-MPPI (gamma-blind, same pretrained)", lambda g: ("kazuki_rNA_gblind", g)),
     ]
     fig, axes = plt.subplots(4, len(args.gammas), figsize=(4.1 * len(args.gammas), 16.8))
@@ -321,7 +326,8 @@ def main():
             draw_panel(ax, scene, ed, name, g, met,
                        title=(f"γ = {g}" if ri == 0 else None),
                        row_label=(rlab if ci == 0 else None))
-    fig.suptitle(f"TRUE evaluation — {scene.profile.name}; M=100 random rollouts per cell; "
+    mode_label = "PILOT" if args.pilot else "TRUE evaluation"
+    fig.suptitle(f"{mode_label} — {scene.profile.name}; M={evaluated_M} random rollouts per cell; "
                  f"panels: {SUBSET_LABEL}", fontsize=13)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     for ext in ("png", "pdf"):
@@ -356,7 +362,8 @@ def main():
         if k in ("SR", "CR_obs", "CR_oob", "V_safe"):
             ax.set_ylim(-0.02, 1.02)
         ax.legend(fontsize=8)
-    fig.suptitle(f"Bare-policy metrics per AFE2 round — {scene.profile.name}; M=100/cell; "
+    fig.suptitle(f"Bare-policy metrics per expansion round — {scene.profile.name}; "
+                 f"M={evaluated_M}/cell; "
                  "common random numbers keyed by (γ, rollout index); Wilson/bootstrap 95% CIs "
                  "(finite-M, single training seed)", fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 0.92])
@@ -398,7 +405,8 @@ def main():
             "path": raw_complete_path,
             "sha256": sha256_file(raw_complete_path),
         },
-        "expansion_pair": raw_complete["expansion_pair"],
+        "expansion_source": raw_complete["expansion_source"],
+        "pilot": bool(args.pilot),
         "artifacts": {
             label: {"path": path, "sha256": sha256_file(path), "bytes": os.path.getsize(path)}
             for label, path in output_paths.items()

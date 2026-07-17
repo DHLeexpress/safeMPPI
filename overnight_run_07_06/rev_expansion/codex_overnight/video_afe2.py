@@ -90,11 +90,13 @@ def render_round(db, out_png, arm, allow_legacy_claude=False):
     by_g = {g: [] for g in GAMMAS}
     for v in db["viz"]:
         by_g[round(float(v["gamma"]), 2)].append(v)
-    ep_by_g = {round(float(e["gamma"]), 2): e for e in db["eps"]}
+    ep_by_g = {g: [] for g in GAMMAS}
+    for episode in db["eps"]:
+        ep_by_g[round(float(episode["gamma"]), 2)].append(episode)
     for ax, g in zip(axes.flat[:7], GAMMAS):
         draw_scene(ax, scene, goal, x0)
         steps = by_g[g]
-        ep = ep_by_g.get(g)
+        gamma_episodes = ep_by_g.get(g, [])
         nquery_tot = npos_tot = nexec_tot = nrescue_tot = nsolve_tot = 0
         min_marg = np.inf
         for v in steps:
@@ -137,17 +139,24 @@ def render_round(db, out_png, arm, allow_legacy_claude=False):
             nsolve_tot += int(v.get("n_socp_solve", 0))
             if np.isfinite(v.get("min_margin", np.nan)):
                 min_marg = min(min_marg, float(v["min_margin"]))
-        if ep is not None:                             # blue/thick: the executed path
+        for ep in gamma_episodes:                       # blue/thick: every executed replica
             p = np.asarray(ep["path"], float)
-            ax.plot(p[:, 0], p[:, 1], "-", color="#0b3d91", lw=2.4, zorder=5)
+            ax.plot(p[:, 0], p[:, 1], "-", color="#0b3d91", lw=2.4,
+                    alpha=0.85, zorder=5)
             if ep["status"] == "nvp":
                 ax.plot([p[-1, 0]], [p[-1, 1]], "x", color="k", ms=13, mew=3.2, zorder=7)
             elif ep["status"] == "reached":
                 ax.plot([p[-1, 0]], [p[-1, 1]], "*", color="#0b3d91", mec="k", ms=12, zorder=7)
             elif ep["status"] in ("collision", "oob"):
                 ax.plot([p[-1, 0]], [p[-1, 1]], "x", color="#cc3311", ms=13, mew=3.2, zorder=7)
-        stat = ep["status"] if ep is not None else "-"
-        tt = ep.get("term_t") if ep is not None else None
+        status_counts = {
+            name: sum(ep["status"] == name for ep in gamma_episodes)
+            for name in ("reached", "nvp", "timeout", "collision", "oob")
+        }
+        stat = "/".join(
+            f"{name}:{count}" for name, count in status_counts.items() if count
+        ) or "-"
+        nvp_times = [ep.get("term_t") for ep in gamma_episodes if ep["status"] == "nvp"]
         ax.set_title(f"γ={g}", fontsize=13)
         margin_text = f"{min_marg:.3f}" if np.isfinite(min_marg) else "—"
         ax.text(0.02, 0.98,
@@ -155,7 +164,7 @@ def render_round(db, out_png, arm, allow_legacy_claude=False):
                 f"full+ {npos_tot} / exec+ {nexec_tot} / rescue {nrescue_tot}\n"
                 f"min execution-certificate m {margin_text}\n"
                 f"V̂_H full {float(vg.get(str(g), np.nan)):.2f}\n{stat}"
-                + (f" t={tt}" if tt is not None else ""),
+                + (f" NVP t={nvp_times}" if nvp_times else ""),
                 transform=ax.transAxes, va="top", fontsize=9,
                 bbox=dict(fc="white", ec="0.6", alpha=0.85))
     axL = axes.flat[7]
@@ -173,10 +182,11 @@ def render_round(db, out_png, arm, allow_legacy_claude=False):
                label="NO_VERIFIED_POSITIVE (terminate; no expert, no fallback)"),
     ], loc="center", fontsize=10.5, frameon=False)
     scene_name = scene.get("profile", {}).get("name", "unknown_scene")
-    axL.text(0.5, 0.05, f"arm: {arm} — round {int(db['round'])} — {scene_name}\n"
+    algorithm = "AFE-RBF" if "gp_diagnostics" in db else "AFE2"
+    axL.text(0.5, 0.05, f"{algorithm}: {arm} — round {int(db['round'])} — {scene_name}\n"
              f"absorbing goal; terminal-prefix rescue is execution-only, never D+",
              ha="center", fontsize=10, color="#333333", transform=axL.transAxes)
-    fig.suptitle(f"AFE2 expert-free verified expansion — {arm}, round {int(db['round'])}",
+    fig.suptitle(f"{algorithm} expert-free verified expansion — {arm}, round {int(db['round'])}",
                  fontsize=15)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     fig.savefig(out_png, dpi=105)

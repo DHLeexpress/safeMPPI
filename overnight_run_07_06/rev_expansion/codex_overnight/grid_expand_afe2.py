@@ -240,10 +240,10 @@ def validate_checkpoint_contract(profile_name, policy, checkpoint, checkpoint_sh
     if not common_architecture:
         raise RuntimeError("checkpoint violates the shared AFE2 32-D H=10 architecture")
 
-    if profile_name == "codex_radius1_v1":
+    if profile_name in {"codex_radius1_v1", "codex_radius04_v1"}:
         if checkpoint_sha256 not in CODEX_PROMOTED_CHECKPOINTS:
             raise RuntimeError(
-                "codex_radius1_v1 requires one of the two documented promoted Stage-3 "
+                f"{profile_name} requires one of the two documented promoted Stage-3 "
                 "checkpoint file hashes"
             )
         promoted_hash = require_promoted_fresh_pretrain(policy, checkpoint)

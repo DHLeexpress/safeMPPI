@@ -41,7 +41,7 @@ import torch
 
 import _paths  # noqa: F401
 
-METRIC_VERSION = "true_eval_v3_pairbound"
+METRIC_VERSION = "true_eval_v4_sourcebound"
 STOPPING_RULE = "first goal hit (reach) OR actual collision/OOB OR T cap; no verifier/NVP/fallback"
 EVAL_GAMMAS = (0.1, 0.3, 0.5, 1.0)
 KAZUKI_DEFINITION = dict(gamma_ctx=0.5, w_safe=0.3, coll_w=5.0, goal_w=5.0, goal_coef=1.0,
@@ -243,6 +243,65 @@ def validate_afe_pair(pair_root, scene_profile, rounds):
     return ckpts, contract
 
 
+def validate_afe_run(run_root, scene_profile, rounds):
+    """Bind evaluation directly to one completed single-arm AFE-RBF run."""
+
+    root = os.path.abspath(run_root)
+    recipe_path = os.path.join(root, "recipe.json")
+    complete_path = os.path.join(root, "COMPLETE.json")
+    for path in (recipe_path, complete_path, os.path.join(root, "probe.jsonl")):
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"completed AFE-RBF artifact is missing: {path}")
+    recipe = load_json(recipe_path)
+    complete = load_json(complete_path)
+    if recipe.get("algorithm") != "afe_rbf_previous_round_parallel_v1":
+        raise RuntimeError("--run-root accepts only the declared single-arm AFE-RBF algorithm")
+    if recipe.get("arm") != "afe" or recipe.get("single_arm") is not True:
+        raise RuntimeError("--run-root is not a single AFE arm")
+    if recipe.get("scene", {}).get("profile", {}).get("name") != scene_profile:
+        raise RuntimeError("AFE-RBF recipe scene profile does not match --scene-profile")
+    if complete.get("status") != "COMPLETE" or complete.get("completed_round") != rounds:
+        raise RuntimeError(f"AFE-RBF run is not a completed {rounds}-round run")
+    if complete.get("scene_sha256") != recipe.get("scene", {}).get("sha256"):
+        raise RuntimeError("AFE-RBF completion scene hash disagrees with its recipe")
+    checks = {
+        "checkpoint_sha256": "source_checkpoint_sha256",
+        "checkpoint_model_sha256": "source_checkpoint_model_sha256",
+        "checkpoint_contract_sha256": "source_checkpoint_contract_sha256",
+        "source_git_commit": "source_git_commit",
+    }
+    for complete_key, recipe_key in checks.items():
+        if complete.get(complete_key) != recipe.get(recipe_key):
+            raise RuntimeError(f"AFE-RBF completion disagrees with recipe: {complete_key}")
+    expected_rounds = list(range(rounds + 1))
+    required = {
+        "recipe.json", "rbf_calibration.json", "probe.jsonl", "final.pt", "dstore.pt",
+        *{f"ckpt_{round_i}.pt" for round_i in expected_rounds},
+        *{f"viz_db/round{round_i}.pt" for round_i in expected_rounds[1:]},
+    }
+    inventory = complete.get("artifact_sha256", {})
+    if set(inventory) != required:
+        raise RuntimeError("AFE-RBF completion inventory is incomplete")
+    for relative, expected in inventory.items():
+        path = os.path.join(root, relative)
+        if not os.path.isfile(path) or sha256_file(path) != expected:
+            raise RuntimeError(f"AFE-RBF completion artifact hash mismatch: {relative}")
+    checkpoints = require_round_checkpoints(root, rounds)
+    contract = {
+        "kind": "single_afe_rbf_run",
+        "run_root": root,
+        "recipe_sha256": sha256_file(recipe_path),
+        "complete_sha256": sha256_file(complete_path),
+        "afe_source_git_commit": recipe["source_git_commit"],
+        "source_checkpoint_sha256": recipe["source_checkpoint_sha256"],
+        "source_checkpoint_model_sha256": recipe["source_checkpoint_model_sha256"],
+        "source_checkpoint_contract_sha256": recipe[
+            "source_checkpoint_contract_sha256"
+        ],
+    }
+    return checkpoints, contract
+
+
 def require_round_checkpoints(ckpt_dir, rounds):
     """Exact ckpt_0..ckpt_R required; abort on ANY missing round (no final.pt substitution)."""
     paths = {}
@@ -369,8 +428,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene-profile", required=True,
                     help="explicit scene profile (no default): claude_grid_v1 | codex_radius1_v1")
-    ap.add_argument("--pair-root", required=True,
-                    help="validated pair root containing afe_s910, pair manifest, and delivery manifest")
+    source = ap.add_mutually_exclusive_group(required=True)
+    source.add_argument("--pair-root",
+                        help="validated AFE2 pair root (legacy two-arm protocol)")
+    source.add_argument("--run-root",
+                        help="completed single-arm AFE-RBF run directory")
     ap.add_argument("--outdir", required=True)
     ap.add_argument("--sources", nargs="+", default=["policy", "expert", "kazuki"],
                     choices=["policy", "expert", "kazuki"])
@@ -379,14 +441,22 @@ def main():
     ap.add_argument("--M", type=int, default=100)
     ap.add_argument("--T", type=int, default=300)
     ap.add_argument("--reach", type=float, default=0.15)
+    ap.add_argument("--pilot", action="store_true",
+                    help="allow a labeled finite-M preflight instead of the locked M=100 paper run")
     args = ap.parse_args()
-    if (args.rounds != 10 or args.M != 100 or args.T != 300
-            or abs(args.reach - 0.15) > 1e-12
-            or tuple(float(g) for g in args.gammas) != EVAL_GAMMAS
-            or set(args.sources) != {"policy", "expert", "kazuki"}):
+    shared_wrong = (
+        args.T != 300
+        or abs(args.reach - 0.15) > 1e-12
+        or tuple(float(g) for g in args.gammas) != EVAL_GAMMAS
+        or set(args.sources) != {"policy", "expert", "kazuki"}
+    )
+    if shared_wrong or (
+        not args.pilot and (args.rounds != 10 or args.M != 100)
+    ) or (args.pilot and (args.rounds < 1 or args.M < 10)):
         raise ValueError(
-            "canonical true evaluation is locked to rounds=10, M=100, T=300, reach=0.15, "
-            "gammas={0.1,0.3,0.5,1.0}, and all three sources")
+            "evaluation requires T=300, reach=0.15, gammas={0.1,0.3,0.5,1.0}, and all "
+            "three sources; canonical mode also requires rounds=10/M=100, while --pilot "
+            "requires rounds>=1/M>=10")
 
     from afe2_scene_profiles import get_scene_profile, build_scene, scene_snapshot
     import grid_metrics2 as GM2
@@ -397,8 +467,17 @@ def main():
     snapshot = scene_snapshot(env, profile)
     GM2.GOAL_XY = np.asarray(profile.goal, dtype=float)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    ckpts, pair_contract = validate_afe_pair(args.pair_root, profile.name, args.rounds)
-    evaluation_source_commit = require_clean_source(pair_contract["afe_source_git_commit"])
+    if args.run_root is not None:
+        ckpts, expansion_contract = validate_afe_run(
+            args.run_root, profile.name, args.rounds
+        )
+    else:
+        ckpts, expansion_contract = validate_afe_pair(
+            args.pair_root, profile.name, args.rounds
+        )
+    evaluation_source_commit = require_clean_source(
+        expansion_contract["afe_source_git_commit"]
+    )
     os.makedirs(args.outdir, exist_ok=True)
     scene_path = os.path.join(args.outdir, "scene_snapshot.json")
     with open(scene_path, "w") as f:
@@ -406,7 +485,8 @@ def main():
     base_prov = dict(metric_version=METRIC_VERSION, stopping_rule=STOPPING_RULE,
                      scene_profile=profile.name, scene_sha256=snapshot["sha256"],
                      source_git_commit=evaluation_source_commit, M=int(args.M), T=int(args.T),
-                     reach=float(args.reach), expansion_pair=pair_contract)
+                     reach=float(args.reach), pilot=bool(args.pilot),
+                     expansion_source=expansion_contract)
     cfg = dict(M=args.M, T=args.T, reach=args.reach)
     artifacts = {"scene_snapshot.json": sha256_file(scene_path)}
     required_cells = []
