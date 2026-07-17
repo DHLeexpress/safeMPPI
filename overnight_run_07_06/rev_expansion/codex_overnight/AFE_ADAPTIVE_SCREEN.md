@@ -26,8 +26,10 @@ solver witness, realized ESS, and replay exposure. Panel I of each report shows
 the beta schedule and achieved calibration ESS.
 
 The optional RBF counterfactual diagnostic evaluates length-scale multipliers
-`{0.5,1,2}` and buffer caps `{128,512}` on the same unlabeled feature pools. It
-does not select, verify, execute, or train on a plan.
+`{0.5,1,2}` and buffer caps `{128,512}` once, on the pretrained-policy
+calibration feature pools. It is stored in `rbf_calibration.json` and is not
+repeated during expansion. It does not select, verify, execute, or train on a
+plan.
 
 The replay screen accepts finite `W` in `{1, 3, 5, 10}`. The append-only D+ archive
 is identical in semantics for every option. Only the positive IDs eligible for

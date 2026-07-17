@@ -581,6 +581,7 @@ def _calibration_score_vectors(policy, gp, store, cfg, device):
     """Build beta-neutral B-step score vectors at disjoint rollout contexts."""
 
     vectors = []
+    pools = []
     gamma_counts = {}
     chunk_size = 16
     for begin in range(0, len(store.ctx_state), chunk_size):
@@ -602,6 +603,7 @@ def _calibration_score_vectors(policy, gp, store, cfg, device):
             policy.phi_s(controls, repeated, s=cfg.s)
         ).reshape(len(sids), cfg.K, -1)
         for local_index, sid in enumerate(sids):
+            pools.append(features[local_index].detach())
             order_rng = np.random.default_rng(
                 AFE2.named_seed(cfg.seed, "rbf_operational_beta_order", sid)
             )
@@ -618,7 +620,7 @@ def _calibration_score_vectors(policy, gp, store, cfg, device):
             gamma_counts[gamma] = gamma_counts.get(gamma, 0) + 1
     if not vectors:
         raise RuntimeError("operational beta calibration produced no rollout-context scores")
-    return vectors, gamma_counts
+    return vectors, gamma_counts, pools
 
 
 @torch.no_grad()
@@ -690,7 +692,7 @@ def calibrate_rbf(policy, env, cfg, device, executor):
         purpose="rbf_operational_beta_contexts", acquisition_mode="uniform",
     )
     score_vector_start = time.perf_counter()
-    score_vectors, context_gamma_counts = _calibration_score_vectors(
+    score_vectors, context_gamma_counts, feature_pools = _calibration_score_vectors(
         policy, gp, beta_store, cfg, device
     )
     score_vector_seconds = time.perf_counter() - score_vector_start
@@ -700,6 +702,16 @@ def calibrate_rbf(policy, env, cfg, device, executor):
         else float(cfg.adaptive_ess_target)
     )
     solution = BC.solve_beta_ragged(score_vectors, target=target)
+    offline_sweep = None
+    if cfg.rbf_offline_sweep:
+        offline_sweep = AD.rbf_counterfactual_sweep(
+            feature_pools,
+            operational_features,
+            cfg,
+            round_i=0,
+            target=target,
+            lengthscale=lengthscale,
+        )
     seed_steps = [item for row in seed_episodes for item in row["step_stats"]]
     beta_steps = [item for row in beta_episodes for item in row["step_stats"]]
 
@@ -751,6 +763,7 @@ def calibrate_rbf(policy, env, cfg, device, executor):
         "beta_solution": solution,
         "score_vector_sha256": BC.score_vectors_sha256(score_vectors),
         "score_vectors": score_vectors,
+        "offline_sweep": offline_sweep,
     }
 
 
@@ -911,7 +924,10 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             ),
             "learning_memory": learning_memory,
             "replay_window": cfg.replay_window,
-            "rbf_offline_sweep": cfg.rbf_offline_sweep,
+            "rbf_offline_sweep": (
+                "one pretrained-policy counterfactual sweep stored in rbf_calibration.json"
+                if cfg.rbf_offline_sweep else False
+            ),
             "uncertainty_meaning": (
                 "RBF posterior variance conditioned on the acquisition buffer and only the "
                 "locations already selected within the same B-budget query; not validity "
@@ -1005,6 +1021,7 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             "n_Dpos": 0,
             "gp_buffer": bootstrap_gp.diagnostics(),
             "calibration_budget": calibration_public["calibration_budget"],
+            "rbf_offline_sweep": calibration_public["offline_sweep"],
             "rep_cos": 1.0,
             "evaluation_timing": eval0_timing,
         })
@@ -1051,32 +1068,21 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                 policy, store, query_ids, cfg, device, calibration["lengthscale"]
             )
             adaptive_calibration = None
-            offline_sweep = None
             beta_next = beta_used
-            if cfg.adaptive_ess_target is not None or cfg.rbf_offline_sweep:
+            if cfg.adaptive_ess_target is not None:
                 calibration_pools, calibration_gamma_counts = AD.feature_pools(
                     policy, store, cfg, device, round_i
                 )
-                if cfg.adaptive_ess_target is not None:
-                    adaptive_calibration = AD.calibrate_from_pools(
-                        gp_post,
-                        calibration_pools,
-                        cfg,
-                        round_i,
-                        cfg.adaptive_ess_target,
-                    )
-                    adaptive_calibration["context_gamma_counts"] = calibration_gamma_counts
-                    beta_next = float(adaptive_calibration["beta"])
-                    cfg.beta = beta_next
-                if cfg.rbf_offline_sweep and gp_post.X is not None:
-                    offline_sweep = AD.rbf_counterfactual_sweep(
-                        calibration_pools,
-                        gp_post.X,
-                        cfg,
-                        round_i,
-                        cfg.adaptive_ess_target or BC.ESS_TARGET,
-                        lengthscale=calibration["lengthscale"],
-                    )
+                adaptive_calibration = AD.calibrate_from_pools(
+                    gp_post,
+                    calibration_pools,
+                    cfg,
+                    round_i,
+                    cfg.adaptive_ess_target,
+                )
+                adaptive_calibration["context_gamma_counts"] = calibration_gamma_counts
+                beta_next = float(adaptive_calibration["beta"])
+                cfg.beta = beta_next
             audit = AC.run_audit(
                 policy, audit_contexts, env, goal, device,
                 n_plans=cfg.audit_plans, nfe=cfg.nfe, n_theta=cfg.n_theta,
@@ -1102,7 +1108,7 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                 "beta_used": beta_used,
                 "beta_next": beta_next,
                 "adaptive_beta_calibration": adaptive_calibration,
-                "rbf_offline_sweep": offline_sweep,
+                "rbf_offline_sweep": None,
                 "n_D": len(store),
                 "n_Dpos": store.n_pos(),
                 "per_gamma": per_gamma,
