@@ -257,6 +257,7 @@ Runs: `results/afe2/{prox_s910,afe_s910}` (+ `calib/`). Report: `analysis/afe2_r
 | `grid_expand_afe2.py` | the corrected two-arm trainer (§9): evolving φ_s⁽ⁿ⁾, per-round A rebuild, expert-free verify-or-terminate, argmax-progress J_exec, full 7-γ sweep, `--calibrate` ESS β-selection, both update arms, all §9 diagnostics, fixed-index controller eval. |
 | `video_afe2.py` | the 7-γ-panel spec-color video (gray/orange/green/red/blue/X + per-panel text). |
 | `analysis/afe2_report.py` | two-arm diagnostics figure (controller SR/NVP/CR, per-γ SR, per-γ raw validity, CFM + per-module grads, rep cosine drift + Δθ/θ, ESS/entropy/uplift with the calibration band, σ all-K vs selected + A effective rank, final per-γ Wilson-CI table). |
+| `AFE2_HANDOFF.md` | the RESULT story with final numbers (prox frozen SR 0; afe SR 0→0.34→0.16 oscillation + audit erosion −7.5 pts adverse; both walls located; σ blind effR≈1.1), exact file:line pinpoints of every mechanism/knob, and the prioritized recipe matrix for the next arms — the document to give a continuing agent. |
 | `README.md` | this document. |
 
 **Modified (existing files touched by this work):**
