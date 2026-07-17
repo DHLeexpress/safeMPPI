@@ -32,6 +32,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", required=True)
     parser.add_argument("--report", required=True)
+    parser.add_argument("--report-pdf", default=None)
     parser.add_argument("--video", required=True)
     parser.add_argument("--expected-video-frames", type=int, default=None)
     parser.add_argument("--out", required=True)
@@ -186,6 +187,8 @@ def main():
         "report": artifact(args.report),
         "video": {**artifact(args.video), "ffprobe": video_metadata},
     }
+    if args.report_pdf is not None:
+        delivery["report_pdf"] = artifact(args.report_pdf)
     with open(args.out, "w") as stream:
         json.dump(delivery, stream, indent=2, sort_keys=True)
         stream.write("\n")

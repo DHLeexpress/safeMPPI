@@ -47,3 +47,9 @@ only if the five-round learning/forgetting comparison is inconclusive.
 Both screens are fixed to five rounds and preserve `K=64`, `B=8`, batch 128,
 250 CFM steps, learning rate `1e-4`, the deterministic verifier, expert-free
 NVP termination, and maximum-progress verified execution.
+
+After the screen, `run_afe50_final.sh` runs the fixed single-arm confirmation:
+adaptive deep ensemble, median ESS target `0.5`, replay `W=5`, and 50 rounds.
+It emits authenticated PNG/PDF reports and a 14-frame video for rounds
+`1..10,20,30,40,50`. Final held-out M=20 evaluation remains a separate step so
+its seeds cannot select the training recipe or checkpoint.
