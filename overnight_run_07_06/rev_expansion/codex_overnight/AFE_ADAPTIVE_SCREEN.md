@@ -14,6 +14,9 @@ Set `AFE_SCREEN_PARALLEL=1` to schedule the three independent screen arms
 concurrently on the caller's single visible GPU. Each arm writes a separate
 `launcher.log`; estimator, seeds, and rollout semantics are unchanged. Leave it
 at the default `0` when shared-GPU scheduling is not appropriate.
+Both screen launchers cap OpenMP at 4 threads and BLAS pools at 1 thread by
+default, separately from `--verifier-workers`; use the `AFE_*_NUM_THREADS`
+environment overrides only after checking host load.
 
 For adaptive arms, beta-neutral K-pools are generated after round `n` at every
 context visited during that round, using the updated policy and estimator.

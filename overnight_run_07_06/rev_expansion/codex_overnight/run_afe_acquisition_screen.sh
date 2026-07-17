@@ -2,6 +2,13 @@
 # Five-round causal screen at W=5: uniform, adaptive RBF, adaptive ensemble.
 set -euo pipefail
 
+# Prevent each independent arm and each spawned verifier worker from creating a
+# full-machine BLAS/OpenMP pool. Callers may override the conservative caps.
+export OMP_NUM_THREADS=${AFE_OMP_NUM_THREADS:-4}
+export MKL_NUM_THREADS=${AFE_MKL_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${AFE_OPENBLAS_NUM_THREADS:-1}
+export NUMEXPR_NUM_THREADS=${AFE_NUMEXPR_NUM_THREADS:-1}
+
 if [[ $# -ne 7 ]]; then
   echo "usage: $0 SCENE_PROFILE CHECKPOINT SHA256 OUTPUT_ROOT REPLICAS M_EVAL VERIFIER_WORKERS" >&2
   exit 2

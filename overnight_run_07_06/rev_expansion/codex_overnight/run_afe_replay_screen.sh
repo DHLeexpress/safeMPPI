@@ -2,6 +2,12 @@
 # One five-round adaptive-estimator run at finite replay W=1, 3, 5, or 10.
 set -euo pipefail
 
+# Bound BLAS/OpenMP pools independently of the explicit SOCP worker budget.
+export OMP_NUM_THREADS=${AFE_OMP_NUM_THREADS:-4}
+export MKL_NUM_THREADS=${AFE_MKL_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${AFE_OPENBLAS_NUM_THREADS:-1}
+export NUMEXPR_NUM_THREADS=${AFE_NUMEXPR_NUM_THREADS:-1}
+
 if [[ $# -ne 9 ]]; then
   echo "usage: $0 rbf|ensemble 1|3|5|10 SCENE CHECKPOINT SHA256 OUTPUT_ROOT REPLICAS M_EVAL WORKERS" >&2
   exit 2
