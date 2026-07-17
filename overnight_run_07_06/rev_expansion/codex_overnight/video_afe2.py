@@ -182,7 +182,12 @@ def render_round(db, out_png, arm, allow_legacy_claude=False):
                label="NO_VERIFIED_POSITIVE (terminate; no expert, no fallback)"),
     ], loc="center", fontsize=10.5, frameon=False)
     scene_name = scene.get("profile", {}).get("name", "unknown_scene")
-    algorithm = "AFE-RBF" if "gp_diagnostics" in db else "AFE2"
+    if "ensemble_diagnostics" in db:
+        algorithm = "AFE-Deep-Ensemble"
+    elif "gp_diagnostics" in db:
+        algorithm = "AFE-RBF"
+    else:
+        algorithm = "AFE2"
     axL.text(0.5, 0.05, f"{algorithm}: {arm} — round {int(db['round'])} — {scene_name}\n"
              f"absorbing goal; terminal-prefix rescue is execution-only, never D+",
              ha="center", fontsize=10, color="#333333", transform=axL.transAxes)
