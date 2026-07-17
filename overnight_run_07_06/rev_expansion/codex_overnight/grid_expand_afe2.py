@@ -240,7 +240,11 @@ def validate_checkpoint_contract(profile_name, policy, checkpoint, checkpoint_sh
     if not common_architecture:
         raise RuntimeError("checkpoint violates the shared AFE2 32-D H=10 architecture")
 
-    if profile_name in {"codex_radius1_v1", "codex_radius04_v1"}:
+    if profile_name in {
+        "codex_radius1_v1",
+        "codex_radius03_v1",
+        "codex_radius04_v1",
+    }:
         if checkpoint_sha256 not in CODEX_PROMOTED_CHECKPOINTS:
             raise RuntimeError(
                 f"{profile_name} requires one of the two documented promoted Stage-3 "
@@ -1258,7 +1262,7 @@ def main():
         "--scene-profile",
         choices=sorted(SCENE_PROFILES),
         required=True,
-        help="explicit task adapter (no default): claude_grid_v1 or codex_radius1_v1",
+        help="explicit task adapter selected from the declared scene profiles",
     )
     ap.add_argument(
         "--wall-plugs", type=int, default=None,

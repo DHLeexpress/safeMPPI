@@ -155,6 +155,33 @@ def test_radius04_changes_only_the_sixteen_interior_disks() -> None:
     assert snapshot["goal"] == [4.5, 4.5]
 
 
+def test_radius03_changes_only_the_sixteen_interior_disks() -> None:
+    with _overnight_scene() as scene:
+        base = scene.build_scene(scene.AFE2SceneProfile(
+            name="test_base",
+            start=(0.5, 0.5),
+            goal=(4.5, 4.5),
+            wall_plugs=8,
+            center_replacement_radius=None,
+            description="test only",
+        ))
+        ood = scene.build_scene(scene.CODEX_RADIUS03_V1)
+        base_obstacles = base.obstacles.detach().cpu().numpy()
+        ood_obstacles = ood.obstacles.detach().cpu().numpy()
+        snapshot = scene.scene_snapshot(ood, scene.CODEX_RADIUS03_V1)
+        scene.assert_scene_snapshot(snapshot)
+
+    assert np.array_equal(base_obstacles[:, :2], ood_obstacles[:, :2])
+    changed = ~np.isclose(base_obstacles[:, 2], ood_obstacles[:, 2])
+    assert int(changed.sum()) == 16
+    assert np.allclose(base_obstacles[changed, 2], 0.2)
+    assert np.allclose(ood_obstacles[changed, 2], 0.3)
+    assert np.array_equal(base_obstacles[~changed], ood_obstacles[~changed])
+    assert snapshot["profile"]["interior_disk_radius"] == 0.3
+    assert snapshot["start_state"][:2] == [0.5, 0.5]
+    assert snapshot["goal"] == [4.5, 4.5]
+
+
 def test_scene_profile_matches_canonical_restart_radius1() -> None:
     with _overnight_scene() as scene:
         ours = scene.build_scene(scene.CODEX_RADIUS1_V1)

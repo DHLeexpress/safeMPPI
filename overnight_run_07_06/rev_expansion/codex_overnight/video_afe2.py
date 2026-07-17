@@ -1,4 +1,4 @@
-"""AFE2 expansion video (user spec 2026-07-16b): for every round, ALL SEVEN gamma panels.
+"""AFE2 expansion video with all seven gamma panels in every rendered round.
 
 Colors (fixed by spec):
   gray        all K=64 generated plans at every executed control step
@@ -46,6 +46,27 @@ from afe2_scene_profiles import (
 )
 
 GAMMAS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0]
+
+
+def select_video_rounds(rounds, dense_until=None, every_after=None):
+    """Select authenticated rounds for rendering without deleting trainer artifacts."""
+
+    values = [int(value) for value in rounds]
+    if (dense_until is None) != (every_after is None):
+        raise ValueError("--dense-until and --every-after must be supplied together")
+    if dense_until is None:
+        return values
+    dense_until = int(dense_until)
+    every_after = int(every_after)
+    if dense_until < 0 or every_after <= 0:
+        raise ValueError("video schedule requires dense-until >= 0 and every-after > 0")
+    selected = [
+        value for value in values
+        if value <= dense_until or (value > dense_until and value % every_after == 0)
+    ]
+    if not selected:
+        raise ValueError("video schedule selected no rounds")
+    return selected
 
 
 def sha256_file(path):
@@ -204,6 +225,18 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--fps", type=int, default=1)
     ap.add_argument(
+        "--dense-until",
+        type=int,
+        default=None,
+        help="render every round through this index (requires --every-after)",
+    )
+    ap.add_argument(
+        "--every-after",
+        type=int,
+        default=None,
+        help="after --dense-until, render rounds divisible by this value",
+    )
+    ap.add_argument(
         "--allow-legacy-claude",
         action="store_true",
         help="opt in to reconstructing claude_grid_v1 for old artifacts without scene snapshots",
@@ -238,9 +271,19 @@ def main():
         if not args.allow_legacy_claude:
             raise RuntimeError("run has no recipe.json; legacy mode must be explicit")
         expected_scene_sha = None
+    observed = [int(re.findall(r"round(\d+)\.pt", path)[0]) for path in dbs]
+    selected_rounds = select_video_rounds(
+        observed,
+        dense_until=args.dense_until,
+        every_after=args.every_after,
+    )
+    selected = set(selected_rounds)
+    render_dbs = [
+        path for path, round_i in zip(dbs, observed) if round_i in selected
+    ]
     tmp = tempfile.mkdtemp(prefix="afe2_vid_")
     try:
-        for k, p in enumerate(dbs):
+        for k, p in enumerate(render_dbs):
             db = torch.load(p, map_location="cpu", weights_only=False)
             if expected_scene_sha is not None and (db.get("scene") or {}).get("sha256") != expected_scene_sha:
                 raise RuntimeError(f"scene mismatch in {p}")
@@ -257,7 +300,7 @@ def main():
                         "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
                         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "22", args.out],
                        check=True)
-        print("saved", args.out, f"({len(dbs)} frames)")
+        print("saved", args.out, f"({len(render_dbs)} frames: {selected_rounds})")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

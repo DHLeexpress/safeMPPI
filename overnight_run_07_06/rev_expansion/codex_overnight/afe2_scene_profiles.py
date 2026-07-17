@@ -1,4 +1,4 @@
-"""Explicit scene adapters for running one AFE2 engine on two tasks.
+"""Explicit scene adapters for running one AFE2 engine on declared tasks.
 
 The profile is the only task-specific input to the shared AFE2 implementation.
 It fixes geometry and endpoints; the pretrained checkpoint remains an explicit
@@ -79,9 +79,28 @@ CODEX_RADIUS04_V1 = AFE2SceneProfile(
     ),
 )
 
+CODEX_RADIUS03_V1 = AFE2SceneProfile(
+    name="codex_radius03_v1",
+    start=(0.5, 0.5),
+    goal=(4.5, 4.5),
+    wall_plugs=8,
+    center_replacement_radius=None,
+    interior_disk_radius=0.3,
+    description=(
+        "Obstacle-size OOD task: retain the 4x4 interior grid but change exactly "
+        "those sixteen physical disk radii from 0.2 to 0.3; retain the "
+        "radius-0.2 boundary walls and eight plugs."
+    ),
+)
+
 SCENE_PROFILES = {
     profile.name: profile
-    for profile in (CLAUDE_GRID_V1, CODEX_RADIUS1_V1, CODEX_RADIUS04_V1)
+    for profile in (
+        CLAUDE_GRID_V1,
+        CODEX_RADIUS1_V1,
+        CODEX_RADIUS03_V1,
+        CODEX_RADIUS04_V1,
+    )
 }
 
 
@@ -155,7 +174,7 @@ def replace_interior_disk_radii(
         )
         if int(matches.sum()) != 1:
             raise RuntimeError(
-                "codex_radius04_v1 requires one canonical interior disk at "
+                "the interior-radius scene requires one canonical interior disk at "
                 f"{tuple(float(v) for v in center)}; found {int(matches.sum())}"
             )
         interior |= matches

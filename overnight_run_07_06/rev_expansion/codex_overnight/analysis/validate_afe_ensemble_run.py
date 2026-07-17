@@ -33,6 +33,7 @@ def main():
     parser.add_argument("--run", required=True)
     parser.add_argument("--report", required=True)
     parser.add_argument("--video", required=True)
+    parser.add_argument("--expected-video-frames", type=int, default=None)
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
     recipe_path = os.path.join(args.run, "recipe.json")
@@ -144,6 +145,14 @@ def main():
         raise RuntimeError("rendered video has invalid dimensions")
     if int(stream.get("nb_frames", 0)) <= 0:
         raise RuntimeError("rendered video has no frames")
+    if (
+        args.expected_video_frames is not None
+        and int(stream.get("nb_frames", 0)) != args.expected_video_frames
+    ):
+        raise RuntimeError(
+            f"rendered video has {stream.get('nb_frames')} frames; "
+            f"expected {args.expected_video_frames}"
+        )
     delivery = {
         "status": "AFE_ENSEMBLE_DELIVERY_COMPLETE",
         "algorithm": recipe["algorithm"],

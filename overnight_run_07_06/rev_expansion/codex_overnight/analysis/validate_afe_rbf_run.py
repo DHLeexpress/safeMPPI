@@ -31,6 +31,7 @@ def main():
     parser.add_argument("--run", required=True)
     parser.add_argument("--report", required=True)
     parser.add_argument("--video", required=True)
+    parser.add_argument("--expected-video-frames", type=int, default=None)
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
     recipe_path = os.path.join(args.run, "recipe.json")
@@ -57,6 +58,19 @@ def main():
         check=True, capture_output=True, text=True,
     )
     video_metadata = json.loads(probe.stdout)
+    streams = video_metadata.get("streams", [])
+    if len(streams) != 1:
+        raise RuntimeError("rendered video must contain exactly one video stream")
+    stream = streams[0]
+    if int(stream.get("width", 0)) <= 0 or int(stream.get("height", 0)) <= 0:
+        raise RuntimeError("rendered video has invalid dimensions")
+    frame_count = int(stream.get("nb_frames", 0))
+    if frame_count <= 0:
+        raise RuntimeError("rendered video has no frames")
+    if args.expected_video_frames is not None and frame_count != args.expected_video_frames:
+        raise RuntimeError(
+            f"rendered video has {frame_count} frames; expected {args.expected_video_frames}"
+        )
     delivery = {
         "status": "AFE_RBF_DELIVERY_COMPLETE",
         "algorithm": recipe["algorithm"],

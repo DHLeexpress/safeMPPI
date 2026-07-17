@@ -9,7 +9,7 @@ fi
 
 PROFILE="$1"
 case "$PROFILE" in
-  claude_grid_v1|codex_radius1_v1|codex_radius04_v1) ;;
+  claude_grid_v1|codex_radius1_v1|codex_radius03_v1|codex_radius04_v1) ;;
   *) echo "unknown scene profile: $PROFILE" >&2; exit 2 ;;
 esac
 
@@ -72,12 +72,15 @@ RUN="$OUT/afe_rbf_s910"
 
 "$PYTHON_BIN" video_afe2.py \
   --run "$RUN" \
-  --out "$OUT/afe_rbf_${PROFILE}.mp4"
+  --out "$OUT/afe_rbf_${PROFILE}.mp4" \
+  --dense-until 10 \
+  --every-after 10
 
 "$PYTHON_BIN" analysis/validate_afe_rbf_run.py \
   --run "$RUN" \
   --report "$OUT/afe_rbf_${PROFILE}_report.png" \
   --video "$OUT/afe_rbf_${PROFILE}.mp4" \
+  --expected-video-frames "$(( ROUNDS <= 10 ? ROUNDS : 10 + ROUNDS / 10 - 1 ))" \
   --out "$OUT/DELIVERY_COMPLETE.json"
 
 echo "AFE-RBF single-arm delivery complete: $OUT"
