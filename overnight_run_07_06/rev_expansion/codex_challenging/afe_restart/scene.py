@@ -11,10 +11,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-import gen_uniform_data as seed_geometry
 import grid_feats as grid_features
 
 from .config import DynamicsConfig, VerifierConfig
+from . import seed_geometry
 from .schemas import QueryContext
 from . import verifier as full_verifier
 
