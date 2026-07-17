@@ -8,6 +8,10 @@ making the control-specific memory semantics explicit:
 * cumulative uniform D+ replay for the CFM update;
 * multiple closed-loop replicas gathered synchronously; the GP is frozen for
   the whole round, so replicas do not depend on an arbitrary execution order;
+* B-budget sequential acquisition: only already-selected pending locations,
+  never the unqueried remainder of K, condition the next posterior variance;
+* one pretrained-only beta calibration at the operational 512-point GP size
+  using disjoint rollout contexts and beta-neutral pending orders;
 * one AFE update arm only (batch 128, lr 1e-4, 250 steps, no proximal term);
 * deterministic full verifier before execution and expert-free NVP termination.
 """
@@ -113,15 +117,74 @@ def _context_arrays(episodes, env):
     )
 
 
-def _acquisition_stats(sig, selected, features, controls, cfg, marginal_sigma=None):
-    weights = torch.exp(((sig - sig.max()) / max(cfg.beta, 1.0e-9)).clamp(-30, 30))
-    probability = (weights / weights.sum()).to(torch.float64)
-    ess = float(1.0 / probability.square().sum())
-    entropy = float(
-        -(probability * (probability + 1.0e-30).log()).sum() / np.log(cfg.K)
-    )
-    values = sig.detach().cpu().numpy()
-    quantiles = np.quantile(values, [0.1, 0.25, 0.5, 0.75, 0.9])
+def _proposal_noise(policy, active, cfg, purpose, round_i, control_t, device):
+    """Stable per-episode proposal streams, batched only after noise generation."""
+
+    seed_round = 0 if purpose == "controller_eval" else int(round_i)
+    chunks = []
+    for episode in active:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(AFE2.named_seed(
+            cfg.seed,
+            "proposal",
+            purpose,
+            seed_round,
+            episode["episode_id"],
+            control_t,
+        ))
+        chunks.append(torch.randn(
+            cfg.K, policy.d, device=device, generator=generator
+        ))
+    return torch.cat(chunks, dim=0)
+
+
+def _acquisition_stats(
+    sig,
+    selected,
+    features,
+    controls,
+    cfg,
+    marginal_sigma=None,
+    sequential_trace=None,
+):
+    if sequential_trace:
+        ess_by_step = [float(row["ess_norm"]) for row in sequential_trace]
+        entropy_by_step = [float(row["entropy_norm"]) for row in sequential_trace]
+        ess_norm = float(np.median(ess_by_step))
+        ess_first = ess_by_step[0]
+        entropy = float(np.median(entropy_by_step))
+        pool_vectors = [row["scores"].detach().cpu().numpy() for row in sequential_trace]
+        selected_values = np.asarray([
+            row["chosen_score"] for row in sequential_trace
+        ], dtype=np.float64)
+        pool_values = np.concatenate(pool_vectors)
+        step_spans = np.asarray([np.ptp(row) for row in pool_vectors])
+        step_iqrs = np.asarray([
+            np.quantile(row, 0.75) - np.quantile(row, 0.25)
+            for row in pool_vectors
+        ])
+        uplift = float(np.median([
+            float(row["chosen_score"]) - float(row["scores"].mean())
+            for row in sequential_trace
+        ]))
+    else:
+        weights = torch.exp(((sig - sig.max()) / max(cfg.beta, 1.0e-9)).clamp(-30, 30))
+        probability = (weights / weights.sum()).to(torch.float64)
+        ess_norm = float(1.0 / (probability.square().sum() * probability.numel()))
+        ess_first = ess_norm
+        ess_by_step = [ess_norm]
+        entropy = float(
+            -(probability * (probability + 1.0e-30).log()).sum() / np.log(cfg.K)
+        )
+        entropy_by_step = [entropy]
+        pool_values = sig.detach().cpu().numpy()
+        selected_values = sig[selected].detach().cpu().numpy()
+        step_spans = np.asarray([np.ptp(pool_values)])
+        step_iqrs = np.asarray([
+            np.quantile(pool_values, 0.75) - np.quantile(pool_values, 0.25)
+        ])
+        uplift = float(selected_values.mean() - pool_values.mean())
+    quantiles = np.quantile(pool_values, [0.1, 0.25, 0.5, 0.75, 0.9])
     normalized = features.detach().cpu().to(torch.float64)
     cosine_distance = (1.0 - normalized @ normalized.T).clamp_min(0.0)
     pairs = torch.triu_indices(cfg.K, cfg.K, offset=1)
@@ -135,15 +198,18 @@ def _acquisition_stats(sig, selected, features, controls, cfg, marginal_sigma=No
         else float("nan")
     )
     output = {
-        "ess": ess,
+        "ess_norm": ess_norm,
+        "ess_first": ess_first,
+        "ess_by_step": ess_by_step,
         "ent": entropy,
-        "uplift": float(sig[selected].mean() - sig.mean()),
-        "sig_span": float(values.max() - values.min()),
-        "sig_iqr": float(quantiles[3] - quantiles[1]),
+        "entropy_by_step": entropy_by_step,
+        "uplift": uplift,
+        "sig_span": float(np.median(step_spans)),
+        "sig_iqr": float(np.median(step_iqrs)),
         "sig_all": [float(quantiles[index]) for index in (0, 2, 4)],
         "sig_sel": [
             float(value)
-            for value in np.quantile(sig[selected].detach().cpu().numpy(), [0.1, 0.5, 0.9])
+            for value in np.quantile(selected_values, [0.1, 0.5, 0.9])
         ],
         "feature_cosine_distance_q": [
             float(value) for value in np.quantile(feature_distance, [0.1, 0.5, 0.9])
@@ -173,6 +239,7 @@ def run_parallel_episodes(
     collect,
     viz,
     purpose,
+    acquisition_mode="sequential",
 ):
     """Advance all gamma x replica episodes in lockstep with batched GPU proposals."""
 
@@ -196,48 +263,72 @@ def run_parallel_episodes(
         low = torch.as_tensor(low_np, device=device)
         hist = torch.as_tensor(hist_np, device=device)
         sampling_start = time.perf_counter()
-        with AC.isolated_random_state(
-            AFE2.named_seed(cfg.seed, purpose, round_i, control_t)
-        ):
-            context = policy.ctx_from(grid, low, hist)
-            repeated_context = context.repeat_interleave(cfg.K, dim=0)
-            candidates = policy.sample(
-                len(active) * cfg.K,
-                repeated_context,
-                nfe=cfg.nfe,
-                temp=cfg.temp,
-            ).reshape(len(active), cfg.K, policy.H_pred, 2)
-            features = policy.phi_s(
-                candidates.reshape(len(active) * cfg.K, policy.H_pred, 2),
-                repeated_context,
-                s=cfg.s,
-            )
-            features = RC.l2_normalize(features).reshape(len(active), cfg.K, -1)
-            marginal_sigma = gp.sigma(
-                features.reshape(len(active) * cfg.K, -1)
-            ).reshape(
-                len(active), cfg.K
-            )
-            # Reference peptide semantics: each plan is scored by its posterior
-            # variance conditioned on both the GP buffer and the other K-1 plans.
-            sigma = torch.stack([
-                gp.conditional_variance(features[episode_index])
-                for episode_index in range(len(active))
-            ])
-            selected = []
-            for episode_index in range(len(active)):
-                values = sigma[episode_index]
-                weights = torch.exp(
-                    ((values - values.max()) / max(cfg.beta, 1.0e-9)).clamp(-30, 30)
-                )
-                probability = weights / weights.sum()
-                selected.append(
-                    torch.multinomial(
-                        probability,
-                        min(cfg.B, cfg.K),
-                        replacement=False,
-                    ).tolist()
-                )
+        context = policy.ctx_from(grid, low, hist)
+        repeated_context = context.repeat_interleave(cfg.K, dim=0)
+        initial_noise = _proposal_noise(
+            policy, active, cfg, purpose, round_i, control_t, device
+        )
+        candidates = policy.sample(
+            len(active) * cfg.K,
+            repeated_context,
+            nfe=cfg.nfe,
+            temp=cfg.temp,
+            initial_noise=initial_noise,
+        ).reshape(len(active), cfg.K, policy.H_pred, 2)
+        features = policy.phi_s(
+            candidates.reshape(len(active) * cfg.K, policy.H_pred, 2),
+            repeated_context,
+            s=cfg.s,
+        )
+        features = RC.l2_normalize(features).reshape(len(active), cfg.K, -1)
+        marginal_sigma = gp.sigma(
+            features.reshape(len(active) * cfg.K, -1)
+        ).reshape(
+            len(active), cfg.K
+        )
+        selected = []
+        traces = []
+        first_scores = []
+        seed_round = 0 if purpose == "controller_eval" else int(round_i)
+        for episode_index, episode in enumerate(active):
+            with AC.isolated_random_state(AFE2.named_seed(
+                cfg.seed,
+                "acquisition",
+                purpose,
+                seed_round,
+                episode["episode_id"],
+                control_t,
+            )):
+                if acquisition_mode == "uniform":
+                    order = torch.randperm(cfg.K, device=features.device)
+                    vectors = gp.sequential_score_vectors(
+                        features[episode_index], order, min(cfg.B, cfg.K)
+                    )
+                    chosen = order[: min(cfg.B, cfg.K)].tolist()
+                    pending = list(range(cfg.K))
+                    trace = []
+                    for step, vector in enumerate(vectors):
+                        chosen_global = int(chosen[step])
+                        chosen_local = pending.index(chosen_global)
+                        trace.append({
+                            "scores": vector,
+                            "remaining": None,
+                            "chosen": chosen_global,
+                            "chosen_score": float(vector[chosen_local]),
+                            "ess_norm": 1.0,
+                            "entropy_norm": 1.0,
+                        })
+                        pending.pop(chosen_local)
+                elif acquisition_mode == "sequential":
+                    chosen, trace = gp.sequential_acquire(
+                        features[episode_index], min(cfg.B, cfg.K), cfg.beta
+                    )
+                else:
+                    raise ValueError(f"unknown acquisition mode: {acquisition_mode}")
+            selected.append(chosen)
+            traces.append(trace)
+            first_scores.append(trace[0]["scores"])
+        sigma = torch.stack(first_scores)
         if device.startswith("cuda"):
             torch.cuda.synchronize()
         timings["sampling"] += time.perf_counter() - sampling_start
@@ -276,6 +367,10 @@ def run_parallel_episodes(
         bookkeeping_start = time.perf_counter()
         for local_index, episode in enumerate(active):
             episode_results = by_episode[episode["episode_id"]]
+            acquired_scores = {
+                int(row["chosen"]): float(row["chosen_score"])
+                for row in traces[local_index]
+            }
             best = None
             query_rows = []
             verifier_cpu_seconds = 0.0
@@ -289,7 +384,7 @@ def run_parallel_episodes(
                         step_context_ids[episode["episode_id"]],
                         controls,
                         result,
-                        float(sigma_cpu[local_index, candidate_id]),
+                        acquired_scores[candidate_id],
                         episode["gamma"],
                         round_i,
                         segment,
@@ -308,6 +403,7 @@ def run_parallel_episodes(
                 torch.from_numpy(candidate_cpu[local_index]),
                 cfg,
                 marginal_sigma=marginal_sigma_cpu[local_index],
+                sequential_trace=traces[local_index],
             )
             full_positive_available = any(row[2]["y"] == 1 for row in query_rows)
             selected_rescue = bool(best is not None and best[4]["terminal_rescue"])
@@ -419,8 +515,10 @@ def _per_gamma_episode_stats(episodes, cfg):
                 for name in ("reached", "nvp", "timeout", "collision", "oob")
             },
             "steps": int(sum(record["steps"] for record in records)),
-            "ess_med": (float(np.median([item["ess"] for item in steps])) / cfg.K
+            "ess_med": (float(np.median([item["ess_norm"] for item in steps]))
                         if steps else None),
+            "ess_first_med": (float(np.median([item["ess_first"] for item in steps]))
+                              if steps else None),
             "ent_med": (float(np.median([item["ent"] for item in steps])) if steps else None),
             "uplift_med": (float(np.median([item["uplift"] for item in steps])) if steps else None),
             "sig_iqr_med": (float(np.median([item["sig_iqr"] for item in steps])) if steps else None),
@@ -475,9 +573,55 @@ def _controller_summary(episodes, cfg, env):
 
 
 @torch.no_grad()
-def calibrate_rbf(policy, env, cfg, device, executor):
-    """One pretrained-only ell/beta calibration and a verified-positive round-1 seed."""
+def _calibration_score_vectors(policy, gp, store, cfg, device):
+    """Build beta-neutral B-step score vectors at disjoint rollout contexts."""
 
+    vectors = []
+    gamma_counts = {}
+    chunk_size = 16
+    for begin in range(0, len(store.ctx_state), chunk_size):
+        sids = list(range(begin, min(begin + chunk_size, len(store.ctx_state))))
+        grid = store.grid3_of(sids).to(device)
+        low = torch.stack([torch.from_numpy(store.ctx_low5[sid]) for sid in sids]).to(device)
+        hist = torch.stack([
+            torch.from_numpy(store.ctx_hist[sid].astype(np.float32)) for sid in sids
+        ]).to(device)
+        context = policy.ctx_from(grid, low, hist)
+        repeated = context.repeat_interleave(cfg.K, dim=0)
+        with AC.isolated_random_state(
+            AFE2.named_seed(cfg.seed, "rbf_operational_beta_candidates", begin)
+        ):
+            controls = policy.sample(
+                len(sids) * cfg.K, repeated, nfe=cfg.nfe, temp=cfg.temp
+            )
+        features = RC.l2_normalize(
+            policy.phi_s(controls, repeated, s=cfg.s)
+        ).reshape(len(sids), cfg.K, -1)
+        for local_index, sid in enumerate(sids):
+            order_rng = np.random.default_rng(
+                AFE2.named_seed(cfg.seed, "rbf_operational_beta_order", sid)
+            )
+            order = torch.as_tensor(
+                order_rng.permutation(cfg.K), device=device, dtype=torch.long
+            )
+            vectors.extend([
+                score.detach().cpu().numpy()
+                for score in gp.sequential_score_vectors(
+                    features[local_index], order, min(cfg.B, cfg.K)
+                )
+            ])
+            gamma = str(round(float(store.ctx_low5[sid][-1]), 2))
+            gamma_counts[gamma] = gamma_counts.get(gamma, 0) + 1
+    if not vectors:
+        raise RuntimeError("operational beta calibration produced no rollout-context scores")
+    return vectors, gamma_counts
+
+
+@torch.no_grad()
+def calibrate_rbf(policy, env, cfg, device, executor):
+    """Calibrate ell and one fixed beta at the declared operational GP size."""
+
+    calibration_start = time.perf_counter()
     state = env.x0.detach().cpu().numpy().astype(np.float32)
     synthetic = [
         _episode(state, gamma, 0, index, env, cfg)
@@ -506,46 +650,98 @@ def calibrate_rbf(policy, env, cfg, device, executor):
             policy.phi_s(controls, context[context_index], s=cfg.s)
         )
     lengthscale = RC.mean_pairwise_lengthscale(features)
-    tasks = [
-        (index, index, state, controls[index].detach().cpu().numpy(),
-         cfg.gammas[context_indices[index]])
-        for index in range(cfg.lengthscale_samples)
-    ]
-    verified = list(executor.map(RC.verify_in_worker, tasks, chunksize=1))
-    positive = [candidate_id for _, candidate_id, result in verified if result["y"] == 1]
-    if not positive:
-        raise RuntimeError("pretrained RBF calibration produced no full-H verifier positives")
-    bootstrap_features = features[positive].detach()
-    gp = RC.RBFGPSigma(lengthscale, cfg.gp_lam)
-    gp.set_buffer(bootstrap_features)
 
-    sigma_pools = []
-    for gamma_index in range(len(cfg.gammas)):
-        with AC.isolated_random_state(
-            AFE2.named_seed(cfg.seed, "rbf_beta_pool", gamma_index)
-        ):
-            repeated = context[gamma_index:gamma_index + 1].expand(cfg.K, -1)
-            pool_controls = policy.sample(
-                cfg.K, repeated, nfe=cfg.nfe, temp=cfg.temp
-            )
-            pool_features = RC.l2_normalize(
-                policy.phi_s(pool_controls, repeated, s=cfg.s)
-            )
-            sigma_pools.append(
-                gp.conditional_variance(pool_features).detach().cpu().numpy()
-            )
-    sigma_pools = np.asarray(sigma_pools, dtype=np.float64)
-    solution = BC.solve_beta(sigma_pools)
+    # A beta calibrated on the 50-sample length-scale seed is not operational:
+    # the expansion GP has `gp_cap` points and sees rollout contexts.  Build a
+    # separate pretrained-only archive using uniform B-budget acquisition, then
+    # discard it from CFM training and evaluation.
+    empty_gp = RC.RBFGPSigma(lengthscale, cfg.gp_lam)
+    seed_store = AC.DStore()
+    seed_episodes, seed_timing = run_parallel_episodes(
+        policy, empty_gp, env, cfg, seed_store, 0, cfg.replicas,
+        device, executor, collect=True, viz=None,
+        purpose="rbf_operational_seed", acquisition_mode="uniform",
+    )
+    seed_ids = RC.previous_round_positive_ids(
+        seed_store, 0, cfg.gp_cap, cfg.gammas,
+        AFE2.named_seed(cfg.seed, "rbf_operational_seed_buffer"),
+    )
+    if len(seed_ids) != cfg.gp_cap:
+        raise RuntimeError(
+            f"operational GP calibration requires exactly {cfg.gp_cap} verified positives; "
+            f"found {len(seed_ids)}"
+        )
+    operational_features = AFE2.embed_queries(
+        policy, seed_store, cfg, device, ids=seed_ids
+    ).to(device)
+    gp = RC.RBFGPSigma(lengthscale, cfg.gp_lam)
+    gp.set_buffer(operational_features)
+
+    # Use an independent uniform-acquisition rollout archive for contexts.  The
+    # query plans in this archive are not GP points and never enter D+.
+    beta_store = AC.DStore()
+    beta_episodes, beta_timing = run_parallel_episodes(
+        policy, gp, env, cfg, beta_store, 0, cfg.replicas,
+        device, executor, collect=True, viz=None,
+        purpose="rbf_operational_beta_contexts", acquisition_mode="uniform",
+    )
+    score_vector_start = time.perf_counter()
+    score_vectors, context_gamma_counts = _calibration_score_vectors(
+        policy, gp, beta_store, cfg, device
+    )
+    score_vector_seconds = time.perf_counter() - score_vector_start
+    solution = BC.solve_beta_ragged(score_vectors)
+    seed_steps = [item for row in seed_episodes for item in row["step_stats"]]
+    beta_steps = [item for row in beta_episodes for item in row["step_stats"]]
+
+    def verifier_budget(steps):
+        return {
+            "queries": int(sum(item["n_drawn"] for item in steps)),
+            "positives": int(sum(item["n_pos"] for item in steps)),
+            "socp_solves": int(sum(item["n_socp_solve"] for item in steps)),
+            "socp_errors": int(sum(item["n_err"] for item in steps)),
+            "verifier_cpu_seconds": float(sum(item["verifier_seconds"] for item in steps)),
+        }
+
+    seed_budget = verifier_budget(seed_steps)
+    beta_budget = verifier_budget(beta_steps)
+    calibration_budget = {
+        "seed_archive": seed_budget,
+        "disjoint_context_archive": beta_budget,
+        "total_queries": seed_budget["queries"] + beta_budget["queries"],
+        "total_positives": seed_budget["positives"] + beta_budget["positives"],
+        "total_socp_solves": seed_budget["socp_solves"] + beta_budget["socp_solves"],
+        "total_socp_errors": seed_budget["socp_errors"] + beta_budget["socp_errors"],
+        "score_vector_seconds": float(score_vector_seconds),
+        "total_wall_seconds": float(time.perf_counter() - calibration_start),
+        "enters_training_Dplus": False,
+        "enters_round1_GP": "exactly the declared operational_gp_size seed positives",
+    }
     return {
         "lengthscale": float(lengthscale),
         "lengthscale_samples": cfg.lengthscale_samples,
-        "bootstrap_full_positive": len(positive),
-        "bootstrap_total": cfg.lengthscale_samples,
-        "bootstrap_features": bootstrap_features,
+        "operational_gp_size": gp.n,
+        "operational_seed_queries": len(seed_store),
+        "operational_seed_positives": seed_store.n_pos(),
+        "operational_seed_status_counts": {
+            name: sum(row["status"] == name for row in seed_episodes)
+            for name in ("reached", "nvp", "timeout", "collision", "oob")
+        },
+        "operational_seed_timing": seed_timing,
+        "beta_context_queries": len(beta_store),
+        "beta_context_count": len(beta_store.ctx_state),
+        "beta_context_gamma_counts": context_gamma_counts,
+        "beta_context_status_counts": {
+            name: sum(row["status"] == name for row in beta_episodes)
+            for name in ("reached", "nvp", "timeout", "collision", "oob")
+        },
+        "beta_context_timing": beta_timing,
+        "calibration_budget": calibration_budget,
+        "bootstrap_features": operational_features,
         "beta": float(solution["beta"]),
         "beta_solution": solution,
-        "sigma_pool_sha256": BC.sigma_pool_sha256(sigma_pools),
-        "sigma_pools": sigma_pools,
+        "score_vector_sha256": BC.score_vectors_sha256(score_vectors),
+        "score_vectors": score_vectors,
     }
 
 
@@ -574,7 +770,12 @@ def _aggregate_step_stats(episodes, cfg):
         for item in values if np.isfinite(item["feature_plan_distance_corr"])
     ]
     return {
-        "ess_med": float(np.median([item["ess"] for item in values])) / cfg.K,
+        "ess_med": float(np.median([item["ess_norm"] for item in values])),
+        "ess_first_med": float(np.median([item["ess_first"] for item in values])),
+        "ess_by_step_med": [
+            float(np.median([item["ess_by_step"][step] for item in values]))
+            for step in range(min(cfg.B, cfg.K))
+        ],
         "ent_med": float(np.median([item["ent"] for item in values])),
         "uplift_med": float(np.median([item["uplift"] for item in values])),
         "sig_span_med": float(np.median([item["sig_span"] for item in values])),
@@ -622,18 +823,18 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
         calibration_public = {
             key: AFE2._json_safe(value)
             for key, value in calibration.items()
-            if key not in {"bootstrap_features", "sigma_pools"}
+            if key not in {"bootstrap_features", "score_vectors"}
         }
         calibration_public.update({
-            "status": "CALIBRATED_AFE_RBF_BATCH_CONDITIONAL_V2",
+            "status": "CALIBRATED_AFE_RBF_SEQUENTIAL_OPERATIONAL_V3",
             "kernel": "RBF on L2-normalized phi_s",
             "lengthscale_rule": (
                 "mean pairwise embedding distance of exactly 50 samples from the pretrained model"
             ),
             "gp_buffer_label": "full-H verifier positive only",
             "acquisition_statistic": (
-                "normalized GP posterior variance of each candidate conditioned on the "
-                "other K-1 candidates and the GP training buffer"
+                "normalized GP posterior variance conditioned on the GP buffer and only "
+                "the already-selected pending locations in a B-step acquisition"
             ),
             "ess_target": BC.ESS_TARGET,
             "scene_sha256": scene["sha256"],
@@ -646,7 +847,7 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             stream.write("\n")
 
         recipe = {
-            "algorithm": "afe_rbf_batch_conditional_parallel_v2",
+            "algorithm": "afe_rbf_sequential_operational_parallel_v3",
             "arm": "afe",
             "single_arm": True,
             "kernel": "RBF",
@@ -654,19 +855,29 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             "lengthscale_protocol": calibration_public["lengthscale_rule"],
             "beta": cfg.beta,
             "beta_protocol": (
-                "one pretrained-only continuous ESS calibration of batch-conditional variance "
-                "against the verified-positive bootstrap GP; fixed for every expansion round"
+                f"one pretrained-only continuous ESS calibration against an operational "
+                f"{cfg.gp_cap}-positive GP and disjoint rollout-context B-step score vectors; "
+                "uniform beta-neutral pending orders; fixed for every expansion round"
             ),
             "acquisition_memory": (
                 "round 1: verified-positive pretrained calibration seed; later rounds: at most "
                 f"{cfg.gp_cap} full-H positives from immediately preceding round, gamma-balanced "
                 "random without replacement; re-embedded with current phi; frozen within round"
             ),
+            "calibration_budget": calibration_public["calibration_budget"],
+            "calibration_scope": (
+                "round-0 acquisition-only verifier budget; the seed archive supplies the "
+                "declared round-1 GP but neither archive enters cumulative training D+ or audit"
+            ),
+            "calibration_limitation": (
+                "beta is solved on beta-neutral random pending orders; realized first-step "
+                "ESS/K and stage-normalized ESS/M_remaining are logged during expansion"
+            ),
             "learning_memory": "uniform replay over the complete cumulative full-H D+ archive",
             "uncertainty_meaning": (
-                "RBF posterior variance conditioned on the acquisition buffer and the rest "
-                "of the same K-candidate batch; not validity probability and not a safety "
-                "certificate"
+                "RBF posterior variance conditioned on the acquisition buffer and only the "
+                "locations already selected within the same B-budget query; not validity "
+                "probability and not a safety certificate"
             ),
             "parallel_sampling": (
                 f"{cfg.replicas} closed-loop replicas per gamma advanced synchronously; one GPU "
@@ -707,8 +918,8 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                 "frozen acquisition are explicit computational assumptions"
             ),
             "reference_code_semantics": (
-                "batch-conditional variance uses 1/diag(C^-1), matching the public peptide "
-                "implementation's --gp_conditional_reward"
+                "sequential Schur complements are the B<K budget-consistent adaptation of "
+                "the public peptide implementation's batch-conditional covariance"
             ),
             "no_curriculum": True,
             "no_anchor": True,
@@ -752,6 +963,7 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             "n_D": 0,
             "n_Dpos": 0,
             "gp_buffer": bootstrap_gp.diagnostics(),
+            "calibration_budget": calibration_public["calibration_budget"],
             "rep_cos": 1.0,
             "evaluation_timing": eval0_timing,
         })
@@ -874,7 +1086,7 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             )
             print(
                 f"[afe-rbf] r{round_i:03d} D {len(store)} D+ {store.n_pos()} "
-                f"GP {gp_post.n}/{cfg.gp_cap} ESS/K {record.get('ess_med', float('nan')):.3f} "
+                f"GP {gp_post.n}/{cfg.gp_cap} ESS/M {record.get('ess_med', float('nan')):.3f} "
                 f"uplift {record.get('uplift_med', float('nan')):.4f} V {audit['V']:.3f} "
                 f"SR {pooled['SR']:.2f} NVP {pooled['NVP']:.2f} "
                 f"gather {gather_seconds:.1f}s update {update_seconds:.1f}s",

@@ -35,10 +35,16 @@ The two memories are intentionally different.
   replacement, and deterministic from the run seed.  The selected plans are
   re-embedded using the current `phi_s` before the GP is fitted.  The GP is then
   frozen for the whole round, making parallel replicas independent of arbitrary
-  completion order.  Within each `K=64` proposal pool, candidate `i` is scored
-  by `Var(f_i | f_{-i}, GP buffer) = 1 / [C^{-1}]_{ii}`.  This is the public
-  peptide implementation's batch-conditional rule: near-duplicate proposals
-  suppress one another instead of all receiving the same marginal variance.
+  completion order.  Proposal and acquisition RNG streams are keyed by
+  `(purpose, gamma, replica, control step)`; controller-evaluation streams do
+  not depend on the training round.  Acquisition draws `B=8` plans
+  sequentially.  At draw `b`,
+  each pending candidate is scored by its RBF posterior variance conditioned on
+  the GP buffer and only the first `b-1` selected locations.  A Schur-complement
+  update suppresses a selected plan's near duplicates; the other unqueried
+  members of `K` are never treated as observations.  This is the `B<K`
+  budget-consistent adaptation of the public peptide implementation's
+  batch-conditional covariance.
 * Learning: uniform replay with replacement from every full-window positive in
   cumulative `D+`.  Each round takes 250 CFM gradient steps, batch 128, Adam
   learning rate `1e-4`, with all encoder/trunk/head parameters trainable.
@@ -50,21 +56,34 @@ buffer.  It is not a probability of validity and it does not certify safety.
 
 Before expansion, sample exactly 50 plans from the pretrained model across the
 seven initial gamma contexts.  L2-normalize their `phi_s` embeddings and set the
-RBF length scale to their mean off-diagonal pairwise distance.  Only the plans
-that pass the full verifier seed the round-1 GP.  Against that fixed seed, solve
-once for beta on batch-conditional variance using the predeclared median
-`ESS/K=0.375` target.  Hold both
-length scale and beta fixed thereafter.
+RBF length scale to their mean off-diagonal pairwise distance.  The temperature
+calibration is separate and pretrained-only: uniform `B`-budget calibration
+rollouts provide exactly 512 gamma-balanced full-window positives for an
+operational-size GP.  An independent uniform-acquisition rollout archive
+provides the context distribution.  At every such context, a beta-neutral
+random pending order produces the eight sequential score vectors of lengths
+64 through 57.  Solve once for beta using the predeclared median normalized
+stage-normalized `ESS/M_remaining=0.375` target over those vectors.  The first
+archive supplies the round-1 GP, but neither archive enters `D+`, training,
+audit, or reported controller evaluation.  Every round-0 verifier query,
+positive, SOCP solve, and wall-clock component is recorded as calibration
+budget.  Hold length scale and beta fixed throughout expansion; there is no
+per-round recalibration.  Realized first-step `ESS/K` and median sequential
+`ESS/M_remaining` are reported separately.
 
 ## Scope and assumptions
 
 The RBF and positive-only choices follow the task-specific therapeutic-peptide
 implementation described in the AFE appendix; they are not requirements of the
 main linear-kernel AFE formulation.  The previous-round cap and frozen
-within-round GP are control-specific computational assumptions.  The random
-cap is unbiased compression, not a generalization guarantee.  Exact RBF
+within-round GP are control-specific computational assumptions.  The
+gamma-balanced random cap is stratified compression, not an unbiased estimate
+of the pooled trajectory distribution and not a generalization guarantee.  Exact RBF
 inference is cubic in the cap, which is why the acquisition archive is not the
-full cumulative `D+` archive.
+full cumulative `D+` archive.  The operational-size calibration is required
+because a temperature fitted to a 39-point start-state GP does not preserve the
+declared acquisition scale under a 512-point rollout-context GP; it is fixed
+before adaptation rather than tuned from pilot outcomes.
 
 ## First pilot
 

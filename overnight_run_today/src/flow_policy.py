@@ -73,13 +73,22 @@ class FlowPolicy(nn.Module):
 
     @torch.no_grad()
     def sample(self, n: int, ctx: torch.Tensor, nfe: int = 12,
-               temp: float = 1.0, churn: float = 0.0) -> torch.Tensor:
+               temp: float = 1.0, churn: float = 0.0,
+               initial_noise: torch.Tensor | None = None) -> torch.Tensor:
         """temp scales the initial-noise spread; churn injects per-step noise.
         temp>1 / churn>0 fatten the proposal's tails so active exploration can reach
         disconnected valid modes (e.g. the opposite homotopy leaf). Use defaults for eval."""
         device = self.head.weight.device
         ctx = self._expand_ctx(ctx, n)
-        x = temp * torch.randn(n, self.d, device=device)
+        if initial_noise is None:
+            initial_noise = torch.randn(n, self.d, device=device)
+        elif tuple(initial_noise.shape) != (n, self.d):
+            raise ValueError(
+                f"initial_noise shape {tuple(initial_noise.shape)} != {(n, self.d)}"
+            )
+        else:
+            initial_noise = initial_noise.to(device=device, dtype=self.head.weight.dtype)
+        x = temp * initial_noise
         for i in range(nfe):
             tau = torch.full((n,), i / nfe, device=device)
             x = x + (1.0 / nfe) * self.forward(x, tau, ctx)

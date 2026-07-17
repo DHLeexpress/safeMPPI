@@ -41,6 +41,123 @@ def sigma_pool_sha256(pools: Sequence[Sequence[float]]) -> str:
     return digest.hexdigest()
 
 
+def score_vectors_sha256(vectors: Sequence[Sequence[float]]) -> str:
+    """Content digest for a ragged sequence of sequential-acquisition scores."""
+
+    rows = _score_vectors(vectors)
+    digest = hashlib.sha256()
+    digest.update(str(tuple(len(row) for row in rows)).encode("ascii"))
+    for row in rows:
+        digest.update(np.ascontiguousarray(row, dtype=np.float32).tobytes())
+    return digest.hexdigest()
+
+
+def _score_vectors(vectors: Sequence[Sequence[float]]) -> tuple[np.ndarray, ...]:
+    rows = tuple(np.asarray(vector, dtype=np.float64).reshape(-1) for vector in vectors)
+    if not rows or any(row.size < 2 for row in rows):
+        raise ValueError("calibration requires nonempty score vectors of length at least two")
+    if any(not np.isfinite(row).all() for row in rows):
+        raise ValueError("calibration score vectors contain non-finite values")
+    return rows
+
+
+def ess_summary_ragged(
+    vectors: Sequence[Sequence[float]], beta: float
+) -> dict[str, float]:
+    """Normalized ESS statistics for sequential score vectors of varying length."""
+
+    rows = _score_vectors(vectors)
+    beta = float(beta)
+    if not math.isfinite(beta) or beta <= 0.0:
+        raise ValueError("beta must be finite and positive")
+    values = []
+    for row in rows:
+        logits = (row - row.max()) / beta
+        weights = np.exp(np.clip(logits, -745.0, 0.0))
+        probabilities = weights / weights.sum()
+        values.append(1.0 / (np.square(probabilities).sum() * row.size))
+    values = np.asarray(values, dtype=np.float64)
+    return {
+        "ess_p10": float(np.quantile(values, 0.1)),
+        "ess_med": float(np.median(values)),
+        "ess_p90": float(np.quantile(values, 0.9)),
+    }
+
+
+def solve_beta_ragged(vectors: Sequence[Sequence[float]]) -> dict[str, object]:
+    """Solve the fixed normalized-ESS target for B-step sequential acquisition."""
+
+    rows = _score_vectors(vectors)
+    spans = np.asarray([np.ptp(row) for row in rows], dtype=np.float64)
+    positive = spans[spans > 0.0]
+    if positive.size == 0:
+        raise ValueError("all calibration score vectors are flat")
+    scale = float(np.median(positive))
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("calibration score scale is not positive")
+
+    def evaluate(beta: float) -> dict[str, float]:
+        return ess_summary_ragged(rows, beta)
+
+    initial = evaluate(scale)
+    low = high = scale
+    low_stats = high_stats = initial
+    bracket_steps = 0
+    if initial["ess_med"] > ESS_TARGET:
+        for bracket_steps in range(1, MAX_BRACKET_STEPS + 1):
+            low *= 0.5
+            low_stats = evaluate(low)
+            if low_stats["ess_med"] <= ESS_TARGET:
+                break
+        else:
+            raise ValueError("median ESS target is below the attainable tied-mode floor")
+    elif initial["ess_med"] < ESS_TARGET:
+        for bracket_steps in range(1, MAX_BRACKET_STEPS + 1):
+            high *= 2.0
+            high_stats = evaluate(high)
+            if high_stats["ess_med"] >= ESS_TARGET:
+                break
+        else:
+            raise ValueError("median ESS target could not be bracketed")
+
+    candidates = [(abs(initial["ess_med"] - ESS_TARGET), scale, initial)]
+    if low != scale:
+        candidates.append((abs(low_stats["ess_med"] - ESS_TARGET), low, low_stats))
+    if high != scale:
+        candidates.append((abs(high_stats["ess_med"] - ESS_TARGET), high, high_stats))
+    iterations = 0
+    while low < high and iterations < MAX_BISECTION_STEPS:
+        iterations += 1
+        middle = math.sqrt(low * high)
+        stats = evaluate(middle)
+        candidates.append((abs(stats["ess_med"] - ESS_TARGET), middle, stats))
+        if abs(stats["ess_med"] - ESS_TARGET) <= ESS_TOLERANCE:
+            break
+        if stats["ess_med"] < ESS_TARGET:
+            low, low_stats = middle, stats
+        else:
+            high, high_stats = middle, stats
+
+    error, chosen, achieved = min(candidates, key=lambda item: (item[0], item[1]))
+    if error > ESS_TOLERANCE:
+        raise ValueError(f"continuous beta solver missed ESS target by {error:.6g}")
+    return {
+        "beta": float(chosen),
+        "achieved": achieved,
+        "target": ESS_TARGET,
+        "tolerance": ESS_TOLERANCE,
+        "bracket": [float(low), float(high)],
+        "bracket_steps": int(bracket_steps),
+        "bisection_steps": int(iterations),
+        "sigma_span_p10": float(np.quantile(spans, 0.1)),
+        "sigma_span_med": float(np.median(spans)),
+        "sigma_span_p90": float(np.quantile(spans, 0.9)),
+        "flat_pool_fraction": float(np.mean(spans == 0.0)),
+        "n_score_vectors": len(rows),
+        "score_vector_lengths": sorted(set(int(row.size) for row in rows), reverse=True),
+    }
+
+
 def ess_summary(pools: Sequence[Sequence[float]], beta: float) -> dict[str, float]:
     """Return normalized acquisition-ESS statistics at one positive temperature."""
 

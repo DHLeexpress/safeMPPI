@@ -143,6 +143,121 @@ class RBFGPSigma:
         # Same prior-variance normalization used by the reference peptide code.
         return (conditional / (1.0 + self.lam)).clamp(0.0, 1.0)
 
+    @staticmethod
+    def _condition_covariance(
+        covariance: torch.Tensor,
+        remaining: torch.Tensor,
+        chosen_local: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Condition a pending-point covariance on one newly selected location."""
+
+        keep = torch.ones(
+            covariance.shape[0], dtype=torch.bool, device=covariance.device
+        )
+        keep[int(chosen_local)] = False
+        if int(keep.sum()) == 0:
+            return covariance.new_zeros((0, 0)), remaining[keep]
+        cross = covariance[keep, int(chosen_local)]
+        denominator = covariance[int(chosen_local), int(chosen_local)].clamp_min(1.0e-12)
+        conditioned = covariance[keep][:, keep] - torch.outer(cross, cross) / denominator
+        conditioned = 0.5 * (conditioned + conditioned.T)
+        return conditioned, remaining[keep]
+
+    @torch.no_grad()
+    def sequential_score_vectors(
+        self,
+        features: torch.Tensor,
+        order: torch.Tensor,
+        steps: int,
+    ) -> list[torch.Tensor]:
+        """Scores seen under a fixed pending-point order for beta calibration.
+
+        ``order`` is deliberately chosen independently of beta.  At step ``b``,
+        the returned vector is the posterior variance of every still-pending
+        candidate conditioned only on the GP buffer and the first ``b`` selected
+        locations.  Unqueried candidates are never treated as observations.
+        """
+
+        if features.ndim != 2 or features.shape[0] < 2:
+            raise ValueError("sequential acquisition requires a K-by-D feature matrix")
+        if steps < 1 or steps > features.shape[0]:
+            raise ValueError("sequential acquisition steps must lie in [1, K]")
+        order = order.to(device=features.device, dtype=torch.long).flatten()
+        if order.numel() != features.shape[0] or sorted(order.tolist()) != list(
+            range(features.shape[0])
+        ):
+            raise ValueError("sequential calibration order must be a permutation of K")
+
+        covariance = self.posterior_covariance(features)
+        remaining = torch.arange(features.shape[0], device=features.device)
+        vectors: list[torch.Tensor] = []
+        for step in range(steps):
+            scores = (torch.diagonal(covariance) / (1.0 + self.lam)).clamp(0.0, 1.0)
+            vectors.append(scores)
+            chosen = int(order[step])
+            locations = torch.nonzero(remaining == chosen, as_tuple=False).flatten()
+            if locations.numel() != 1:
+                raise RuntimeError("sequential calibration order selected a missing candidate")
+            covariance, remaining = self._condition_covariance(
+                covariance, remaining, int(locations[0])
+            )
+        return vectors
+
+    @torch.no_grad()
+    def sequential_acquire(
+        self,
+        features: torch.Tensor,
+        steps: int,
+        beta: float,
+    ) -> tuple[list[int], list[dict[str, object]]]:
+        """Draw a B-budget batch sequentially from an RBF posterior.
+
+        After each draw, only that selected location is added to the pending-point
+        conditioning set.  This is the budget-consistent counterpart of the
+        peptide implementation's all-batch conditional variance when ``B < K``.
+        """
+
+        if not math.isfinite(beta) or beta <= 0.0:
+            raise ValueError("sequential acquisition beta must be finite and positive")
+        if steps < 1 or steps > features.shape[0]:
+            raise ValueError("sequential acquisition steps must lie in [1, K]")
+
+        covariance = self.posterior_covariance(features)
+        remaining = torch.arange(features.shape[0], device=features.device)
+        selected: list[int] = []
+        trace: list[dict[str, object]] = []
+        for _ in range(steps):
+            scores = (torch.diagonal(covariance) / (1.0 + self.lam)).clamp(0.0, 1.0)
+            weights = torch.exp(((scores - scores.max()) / beta).clamp(-30.0, 30.0))
+            probability = weights / weights.sum()
+            chosen_local = int(torch.multinomial(probability, 1).item())
+            chosen_global = int(remaining[chosen_local])
+            normalized_ess = float(
+                1.0 / (probability.to(torch.float64).square().sum() * probability.numel())
+            )
+            normalized_entropy = (
+                float(
+                    -(probability.to(torch.float64)
+                      * (probability.to(torch.float64) + 1.0e-30).log()).sum()
+                    / math.log(probability.numel())
+                )
+                if probability.numel() > 1
+                else 1.0
+            )
+            trace.append({
+                "scores": scores,
+                "remaining": remaining,
+                "chosen": chosen_global,
+                "chosen_score": float(scores[chosen_local]),
+                "ess_norm": normalized_ess,
+                "entropy_norm": normalized_entropy,
+            })
+            selected.append(chosen_global)
+            covariance, remaining = self._condition_covariance(
+                covariance, remaining, chosen_local
+            )
+        return selected, trace
+
     @torch.no_grad()
     def diagnostics(self) -> dict[str, object]:
         if self.X is None:

@@ -44,6 +44,7 @@ def main():
     if recipe.get("algorithm") not in {
         "afe_rbf_previous_round_parallel_v1",
         "afe_rbf_batch_conditional_parallel_v2",
+        "afe_rbf_sequential_operational_parallel_v3",
     }:
         raise RuntimeError("unexpected algorithm")
     for relative, expected in complete.get("artifact_sha256", {}).items():

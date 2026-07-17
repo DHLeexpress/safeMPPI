@@ -45,6 +45,7 @@ def load_completed_run(root):
     if recipe.get("algorithm") not in {
         "afe_rbf_previous_round_parallel_v1",
         "afe_rbf_batch_conditional_parallel_v2",
+        "afe_rbf_sequential_operational_parallel_v3",
     }:
         raise RuntimeError("report accepts only the declared AFE-RBF algorithm")
     for relative in ("recipe.json", "probe.jsonl"):
@@ -109,16 +110,18 @@ def main():
 
     ax = axes[1, 0]
     ax.plot(adapted_rounds, _values(adapted, "sig_all_med"), "-o",
-            label="conditional all-K median")
+            label="step-1 pool variance")
     ax.plot(adapted_rounds, _values(adapted, "sig_sel_med"), "-o",
-            label="conditional selected-B median")
-    ax.plot(adapted_rounds, _values(adapted, "marginal_sigma_med"), "--o",
-            label="marginal std median")
-    ax.set(title="E. RBF batch-conditional acquisition", xlabel="round", ylabel="uncertainty")
+            label="step-1 selected-B variance")
+    ax.set(title="E. RBF B-step sequential acquisition", xlabel="round",
+           ylabel="normalized posterior variance")
     ax.legend(fontsize=8)
 
     ax = axes[1, 1]
-    ax.plot(adapted_rounds, _values(adapted, "ess_med"), "-o", label="ESS/K")
+    ax.plot(adapted_rounds, _values(adapted, "ess_first_med"), "-o",
+            label="first-step ESS/K")
+    ax.plot(adapted_rounds, _values(adapted, "ess_med"), "-o",
+            label="median ESS/M remaining")
     ax.plot(adapted_rounds, _values(adapted, "ent_med"), "-o", label="entropy")
     ax.axhline(0.375, color="0.5", ls=":", label="calibration target")
     ax2 = ax.twinx()
@@ -152,6 +155,10 @@ def main():
            bottom=sampling + verifier, label="bookkeeping/other")
     ax.plot(adapted_rounds, update, "-ko", label="CFM update")
     ax.set(title="H. Measured round time", xlabel="round", ylabel="seconds")
+    calibration_wall = recipe.get("calibration_budget", {}).get("total_wall_seconds")
+    if calibration_wall is not None:
+        ax.text(0.02, 0.97, f"round-0 calibration: {calibration_wall:.1f}s",
+                transform=ax.transAxes, va="top", fontsize=8)
     ax.legend(fontsize=7)
 
     for axis in axes.flat:
@@ -162,7 +169,8 @@ def main():
         f"Single-arm AFE-RBF — {scene}; {recipe['rollout_replicas']} rollouts/γ/round; "
         f"GP cap {recipe['gp_cap']}; β={recipe['beta']:.4g}; ell={recipe['lengthscale']:.4g}\n"
         f"final Vsafe={final['V_safe']:.3f}, controller SR={final['ctrl_pooled']['SR']:.3f}, "
-        f"NVP={final['ctrl_pooled']['NVP']:.3f}",
+        f"NVP={final['ctrl_pooled']['NVP']:.3f}; "
+        f"round-0 calibration queries={recipe.get('calibration_budget', {}).get('total_queries', 0)}",
         fontsize=13,
     )
     figure.tight_layout(rect=[0, 0, 1, 0.93])
