@@ -93,6 +93,45 @@ CODEX_RADIUS03_V1 = AFE2SceneProfile(
     ),
 )
 
+# Endpoint-matched profiles for the low7 pretraining/OOD comparison.  The old
+# profiles above remain immutable so historical run hashes stay meaningful.
+LOW7_ID_CANONICAL_V1 = AFE2SceneProfile(
+    name="low7_id_canonical_v1",
+    start=(0.3, 0.3),
+    goal=(4.7, 4.7),
+    wall_plugs=8,
+    center_replacement_radius=None,
+    description=(
+        "Endpoint-matched low7 ID task: ordinary 4x4 radius-0.2 interior grid, "
+        "start (0.3,0.3), goal (4.7,4.7)."
+    ),
+)
+
+LOW7_RADIUS1_CANONICAL_V1 = AFE2SceneProfile(
+    name="low7_radius1_canonical_v1",
+    start=(0.3, 0.3),
+    goal=(4.7, 4.7),
+    wall_plugs=8,
+    center_replacement_radius=1.0,
+    description=(
+        "Endpoint-matched giant-obstacle OOD task: replace the four central "
+        "radius-0.2 disks by one radius-1.0 disk at (2.5,2.5)."
+    ),
+)
+
+LOW7_RADIUS03_CANONICAL_V1 = AFE2SceneProfile(
+    name="low7_radius03_canonical_v1",
+    start=(0.3, 0.3),
+    goal=(4.7, 4.7),
+    wall_plugs=8,
+    center_replacement_radius=None,
+    interior_disk_radius=0.3,
+    description=(
+        "Endpoint-matched obstacle-size OOD task: change all sixteen interior "
+        "disk radii from 0.2 to 0.3."
+    ),
+)
+
 SCENE_PROFILES = {
     profile.name: profile
     for profile in (
@@ -100,6 +139,9 @@ SCENE_PROFILES = {
         CODEX_RADIUS1_V1,
         CODEX_RADIUS03_V1,
         CODEX_RADIUS04_V1,
+        LOW7_ID_CANONICAL_V1,
+        LOW7_RADIUS1_CANONICAL_V1,
+        LOW7_RADIUS03_CANONICAL_V1,
     )
 }
 

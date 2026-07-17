@@ -68,6 +68,55 @@ def low5(state, goal, gamma):
     return np.array([rg[0], rg[1], v[0] / V_SCALE, v[1] / V_SCALE, float(gamma)], dtype=np.float32)
 
 
+def closest_boundary_vector(position, obstacles, r_robot=0.0, sensing=SENSING):
+    """World-frame vector to the closest inflated circular-obstacle boundary.
+
+    For a collision-free point, the vector points toward the nearest boundary
+    and its norm is the physical clearance.  Inside an obstacle, its signed
+    magnitude reverses the direction and therefore points toward the nearest
+    exit.  The vector is divided by the same sensing radius used by nominal
+    ``H_P``.  Zero can mean either no obstacle in range or exact contact; the
+    accompanying ``H_P`` grid disambiguates those cases.
+    """
+
+    point = np.asarray(position, dtype=np.float64).reshape(-1)[:2]
+    obs = _np(obstacles).astype(np.float64, copy=False)
+    if obs.size == 0:
+        return np.zeros(2, dtype=np.float32)
+    if obs.ndim != 2 or obs.shape[1] != 3:
+        raise ValueError(f"obstacles must have shape [N,3], got {obs.shape}")
+    if not np.isfinite(point).all() or not np.isfinite(obs).all():
+        raise ValueError("position and obstacles must be finite")
+    if sensing <= 0.0:
+        raise ValueError("sensing must be positive")
+    center_delta = obs[:, :2] - point[None]
+    center_distance = np.linalg.norm(center_delta, axis=1)
+    signed_clearance = center_distance - obs[:, 2] - float(r_robot)
+    index = int(np.argmin(signed_clearance))
+    if float(signed_clearance[index]) > float(sensing):
+        return np.zeros(2, dtype=np.float32)
+    distance = float(center_distance[index])
+    if distance <= 1.0e-12:
+        direction = np.asarray((1.0, 0.0), dtype=np.float64)
+    else:
+        direction = center_delta[index] / distance
+    return (direction * signed_clearance[index] / float(sensing)).astype(np.float32)
+
+
+def low7(state, goal, gamma, obstacles, r_robot=0.0):
+    """Relative goal, velocity, closest-boundary vector, then gamma.
+
+    Gamma remains the final scalar because acquisition, audit, and replay code
+    groups contexts using ``condition[-1]``.
+    """
+
+    base = low5(state, goal, gamma)
+    boundary = closest_boundary_vector(state[:2], obstacles, r_robot)
+    return np.concatenate((base[:4], boundary, base[4:5])).astype(
+        np.float32, copy=False
+    )
+
+
 def hist_pad(ctrl_hist, K=K_HIST):
     """Past executed controls -> front-zero-padded, u_max-normalized [K,2] float32 (recent last)."""
     ch = np.asarray(ctrl_hist, dtype=float).reshape(-1, 2)
@@ -82,6 +131,16 @@ def featurize(state, goal, gamma, ctrl_hist, obstacles, r_robot=0.0, K=K_HIST):
     return (axis_grid(state[:2], obstacles, r_robot),
             low5(state, goal, gamma),
             hist_pad(ctrl_hist, K))
+
+
+def featurize_low7(state, goal, gamma, ctrl_hist, obstacles, r_robot=0.0, K=K_HIST):
+    """Conditioning record with direct closest-boundary geometry (low7)."""
+
+    return (
+        axis_grid(state[:2], obstacles, r_robot),
+        low7(state, goal, gamma, obstacles, r_robot),
+        hist_pad(ctrl_hist, K),
+    )
 
 
 if __name__ == "__main__":

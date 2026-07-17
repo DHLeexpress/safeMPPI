@@ -3,10 +3,12 @@
 
 The policy context is exactly the established reference structure:
 
-    context = low5(current state, goal, gamma) + E(H_P)
+    context = raw_condition(current state, goal, gamma) + E(H_P)
 
-``low5`` already contains the world-frame relative-goal vector, velocity, and
-gamma.  No raw episode start or absolute goal coordinates are appended.
+The established checkpoint uses ``low5`` (relative goal, velocity, gamma).
+New checkpoints may opt into ``low7`` by appending the world-frame vector to
+the closest physical obstacle boundary.  No raw episode start or absolute goal
+coordinates are appended in either case.
 """
 from __future__ import annotations
 
@@ -47,6 +49,8 @@ class GridHPFlowPolicy(GP2.GridGRUFlowPolicy2):
         grid_hw: tuple[int, int] = (32, 32),
         trunk_hidden: tuple[int, ...] = (128, 64),
         enc_depth: int = 2,
+        raw_condition_dim: int = 5,
+        conditioning_schema: str = "low5",
         boundary_adapter: bool = False,
         boundary_adapter_hidden: int = 0,
         boundary_origin_gate: tuple[float, float, float, float] = (1.25, 0.65, 0.50, 0.47),
@@ -68,7 +72,19 @@ class GridHPFlowPolicy(GP2.GridGRUFlowPolicy2):
         self.trunk_hidden = tuple(trunk_hidden)
         self.enc_depth = int(enc_depth)
         self.depth = int(depth)
-        self.low_raw_dim = 5 + (self.gru_dim if use_gru else 0)
+        self.raw_condition_dim = int(raw_condition_dim)
+        if self.raw_condition_dim < 5:
+            raise ValueError("raw_condition_dim must include at least the established low5")
+        self.conditioning_schema = str(conditioning_schema)
+        if (self.raw_condition_dim, self.conditioning_schema) not in {
+            (5, "low5"),
+            (7, "low7_closest_boundary"),
+        }:
+            raise ValueError(
+                "conditioning dimension and schema must declare low5 or "
+                "low7_closest_boundary"
+            )
+        self.low_raw_dim = self.raw_condition_dim + (self.gru_dim if use_gru else 0)
 
         # Same shallow CNN/AAP visual encoder as the approved reference, using
         # only channel 2: the clipped nominal H_P level set.
@@ -121,13 +137,33 @@ class GridHPFlowPolicy(GP2.GridGRUFlowPolicy2):
             raise ValueError(f"grid must have shape [B,3,H,W] or [3,H,W], got {tuple(grid.shape)}")
         return self.enc_grid(grid[:, 2:3].float())
 
+    def _low_raw(self, low: torch.Tensor, hist: torch.Tensor) -> torch.Tensor:
+        """Return every declared raw condition; the parent keeps only low5."""
+
+        if low.ndim == 1:
+            low = low.unsqueeze(0)
+        if low.ndim != 2 or low.shape[1] != self.raw_condition_dim:
+            raise ValueError(
+                f"raw condition must have shape [B,{self.raw_condition_dim}], "
+                f"got {tuple(low.shape)}"
+            )
+        low = low.float()
+        if not self.use_gru:
+            return low
+        if hist.ndim == 2:
+            hist = hist.unsqueeze(0)
+        _, hidden = self.gru(hist.float())
+        # Preserve the original ordering around the GRU token and retain any
+        # explicitly declared conditions after gamma.
+        return torch.cat((low[:, :4], hidden[-1], low[:, 4:]), dim=1)
+
     def ctx_from(
         self,
         grid: torch.Tensor,
         low5: torch.Tensor,
         hist: torch.Tensor,
     ) -> torch.Tensor:
-        """Build the original ``low5 + E(H_P)`` context."""
+        """Build the declared raw-condition + ``E(H_P)`` context."""
         low_raw = self._low_raw(low5, hist)
         hp = self.hp_token(grid)
         return torch.cat((low_raw, hp), dim=1)
@@ -210,7 +246,11 @@ class GridHPFlowPolicy(GP2.GridGRUFlowPolicy2):
     def config(self) -> dict:
         return {
             "arch": "hp-repr" if self.repr_dim is not None else "hp-reduced-32",
-            "schema_version": "w8sg-hp-v2-low5-only",
+            "schema_version": (
+                "w8sg-hp-v3-low7-closest-boundary"
+                if self.conditioning_schema == "low7_closest_boundary"
+                else "w8sg-hp-v2-low5-only"
+            ),
             "raw_start_goal": False,
             "H_pred": self.H_pred,
             "grid_shape": (1, self.grid_hw[0], self.grid_hw[1]),
@@ -219,6 +259,8 @@ class GridHPFlowPolicy(GP2.GridGRUFlowPolicy2):
             "depth": self.depth,
             "u_max": self.u_max,
             "ctx_dim": self.ctx_dim,
+            "raw_condition_dim": self.raw_condition_dim,
+            "conditioning_schema": self.conditioning_schema,
             "use_gru": self.use_gru,
             "repr_dim": self.repr_dim,
             "grid_hw": list(self.grid_hw),
@@ -252,6 +294,8 @@ def load_hp(path: str | Path, device: str | torch.device = "cpu"):
         grid_hw=tuple(config.get("grid_hw", (32, 32))),
         trunk_hidden=tuple(config.get("trunk_hidden", (128, 64))),
         enc_depth=config.get("enc_depth", 2),
+        raw_condition_dim=config.get("raw_condition_dim", 5),
+        conditioning_schema=config.get("conditioning_schema", "low5"),
         boundary_adapter=config.get("boundary_adapter", False),
         boundary_adapter_hidden=config.get("boundary_adapter_hidden", 0),
         boundary_origin_gate=tuple(config.get("boundary_origin_gate", (1.25, 0.65, 0.50, 0.47))),

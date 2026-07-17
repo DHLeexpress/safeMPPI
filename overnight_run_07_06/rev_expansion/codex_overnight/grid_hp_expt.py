@@ -36,7 +36,8 @@ os.makedirs(OUT, exist_ok=True)
 class GridHPFlowPolicy(GP2.GridGRUFlowPolicy2):
     """ctx = raw low5(5) ⊕ E_g(H_P[1,16,12]→32). Slices channel 2 (clipped H_P) from the standard 3-ch grid."""
     def __init__(self, width=256, depth=2, u_max=1.0, use_gru=False, repr_dim=None, grid_hw=(16, 12),
-                 trunk_hidden=(128, 64), enc_depth=2, boundary_adapter=False,
+                 trunk_hidden=(128, 64), enc_depth=2, raw_condition_dim=5,
+                 conditioning_schema="low5", boundary_adapter=False,
                  boundary_adapter_hidden=0, boundary_origin_gate=(1.25, 0.65, 0.50, 0.47),
                  boundary_goal_gate=(3.95, 4.05, 0.55, 0.55), **kw):
         super().__init__(grid_shape=(1, grid_hw[0], grid_hw[1]), width=width, depth=depth, u_max=u_max,
@@ -45,6 +46,18 @@ class GridHPFlowPolicy(GP2.GridGRUFlowPolicy2):
         self.grid_hw = tuple(grid_hw)
         self.trunk_hidden = tuple(trunk_hidden)
         self.enc_depth = int(enc_depth)
+        self.raw_condition_dim = int(raw_condition_dim)
+        if self.raw_condition_dim < 5:
+            raise ValueError("raw_condition_dim must include at least low5")
+        self.conditioning_schema = str(conditioning_schema)
+        if (self.raw_condition_dim, self.conditioning_schema) not in {
+            (5, "low5"),
+            (7, "low7_closest_boundary"),
+        }:
+            raise ValueError(
+                "conditioning dimension and schema must declare low5 or "
+                "low7_closest_boundary"
+            )
         # 1-ch CNN (enc_depth conv layers) + AdaptiveAvgPool → 32 H_P token; pool scales with grid resolution
         ph, pw = (8, 8) if max(grid_hw) >= 24 else (4, 3)        # 32x32 -> (8,8); 16x12 -> (4,3)
         chs = [1, 8, 16]
@@ -56,7 +69,7 @@ class GridHPFlowPolicy(GP2.GridGRUFlowPolicy2):
         self.enc_grid = nn.Sequential(*conv, nn.AdaptiveAvgPool2d((ph, pw)), nn.Flatten(),
                                       nn.Linear(chs[self.enc_depth] * ph * pw, 32), nn.SiLU())
         gd = self.gru_dim if use_gru else 0                      # GRU(16) over past controls → curvature
-        self.ctx_dim = 5 + gd + 32                               # raw low5 (+ GRU token if on) + H_P token
+        self.ctx_dim = self.raw_condition_dim + gd + 32           # raw condition (+ GRU token) + H_P token
         in_dim = self.d + self.ctx_dim + self.t_dim              # 20 + 37 + 32 = 89 (105 with GRU)
         if repr_dim is None:                                     # legacy: plain MLP trunk (→ width), head width→d
             layers = [nn.Linear(in_dim, width), nn.SiLU()]
@@ -122,12 +135,36 @@ class GridHPFlowPolicy(GP2.GridGRUFlowPolicy2):
         hp = grid[..., 2:3, :, :]                                 # H_P channel from the standard [.,3,16,12]
         return super().ctx_from(hp, low5, hist)
 
+    def _low_raw(self, low, hist):
+        """Retain every declared raw condition; the inherited method drops extras."""
+        if low.dim() == 1:
+            low = low.unsqueeze(0)
+        if low.dim() != 2 or low.shape[1] != self.raw_condition_dim:
+            raise ValueError(
+                f"raw condition must have shape [B,{self.raw_condition_dim}], got {tuple(low.shape)}"
+            )
+        low = low.float()
+        if not self.use_gru:
+            return low
+        if hist.dim() == 2:
+            hist = hist.unsqueeze(0)
+        _, hidden = self.gru(hist.float())
+        return torch.cat((low[:, :4], hidden[-1], low[:, 4:]), dim=1)
+
     def config(self):
-        return dict(arch="hp-repr" if self.repr_dim else "hp-reduced-32", H_pred=self.H_pred,
+        return dict(arch="hp-repr" if self.repr_dim else "hp-reduced-32",
+                    schema_version=("w8sg-hp-v3-low7-closest-boundary"
+                                    if self.conditioning_schema == "low7_closest_boundary"
+                                    else "w8sg-hp-v2-low5-only"),
+                    raw_start_goal=False,
+                    H_pred=self.H_pred,
                     grid_shape=(1, self.grid_hw[0], self.grid_hw[1]), K_hist=self.K_hist,
                     width=self.width, depth=2, u_max=self.u_max, ctx_dim=self.ctx_dim,
+                    use_gru=self.use_gru,
                     repr_dim=self.repr_dim, grid_hw=list(self.grid_hw),
                     trunk_hidden=list(self.trunk_hidden), enc_depth=self.enc_depth,
+                    raw_condition_dim=self.raw_condition_dim,
+                    conditioning_schema=self.conditioning_schema,
                     boundary_adapter=bool(self.boundary_adapter),
                     boundary_adapter_hidden=int(self.boundary_adapter_hidden),
                     boundary_origin_gate=list(self.boundary_origin_gate),
@@ -144,9 +181,12 @@ def save_hp(policy, path, extra=None):
 def load_hp(path, device="cpu"):
     ck = torch.load(path, map_location=device, weights_only=False)
     c = ck["config"]
-    pol = GridHPFlowPolicy(width=c["width"], u_max=c["u_max"],
+    pol = GridHPFlowPolicy(width=c["width"], depth=c.get("depth", 2), u_max=c["u_max"],
+                           use_gru=c.get("use_gru", False),
                            repr_dim=c.get("repr_dim"), grid_hw=tuple(c.get("grid_hw", (16, 12))),
                            trunk_hidden=tuple(c.get("trunk_hidden", (128, 64))), enc_depth=c.get("enc_depth", 2),
+                           raw_condition_dim=c.get("raw_condition_dim", 5),
+                           conditioning_schema=c.get("conditioning_schema", "low5"),
                            boundary_adapter=c.get("boundary_adapter", False),
                            boundary_adapter_hidden=c.get("boundary_adapter_hidden", 0),
                            boundary_origin_gate=tuple(c.get("boundary_origin_gate", (1.25, .65, .50, .47))),

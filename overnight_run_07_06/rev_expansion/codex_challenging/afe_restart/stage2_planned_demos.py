@@ -514,6 +514,7 @@ def run_expert_rollout(
         "path_length_m": float(np.linalg.norm(np.diff(path, axis=0), axis=1).sum()),
         "wall_seconds": time.perf_counter() - started,
         "initial_state": initial_state.astype(np.float32),
+        "goal": goal.astype(np.float32),
         "states": states_array,
         "path": path,
         "executed_actions": actions_array,

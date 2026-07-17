@@ -206,6 +206,54 @@ def context_from_state(
     )
 
 
+def context_from_state_low7(
+    state: np.ndarray,
+    goal: np.ndarray,
+    gamma: float,
+    executed_controls: list[np.ndarray] | np.ndarray,
+    env,
+    *,
+    dynamics: DynamicsConfig = DynamicsConfig(),
+    verifier: VerifierConfig = VerifierConfig(),
+) -> QueryContext:
+    """Build ``low7 + E(H_P)`` without exposing absolute start or goal.
+
+    ``QueryContext.low5`` retains its legacy wire name, but this schema stores
+    seven values: relative goal, velocity, closest-boundary vector, and gamma.
+    Keeping gamma last preserves downstream grouping. Keeping the field name
+    avoids changing existing query identity and
+    ledger code; the checkpoint schema records the actual dimension.
+    """
+
+    verifier_state = np.asarray(state, dtype=np.float64).reshape(-1)
+    if verifier_state.shape != (4,) or not np.isfinite(verifier_state).all():
+        raise ValueError("verifier state must be a finite length-four vector")
+    state32 = verifier_state.astype(np.float32)
+    controls = np.asarray(executed_controls, dtype=np.float32).reshape(-1, 2)
+    obstacle_array = env.obstacles.detach().cpu().numpy()
+    grid, low7, history = grid_features.featurize_low7(
+        state32,
+        np.asarray(goal, dtype=np.float32),
+        float(gamma),
+        controls,
+        obstacle_array,
+        float(env.r_robot),
+        K=grid_features.K_HIST,
+    )
+    return QueryContext(
+        grid=grid,
+        low5=low7,
+        hist=history,
+        verifier_state=verifier_state,
+        verifier_spec_fingerprint=verifier_spec_fingerprint(
+            env,
+            np.asarray(goal, dtype=np.float64),
+            dynamics=dynamics,
+            verifier=verifier,
+        ),
+    )
+
+
 def minimum_endpoint_clearance(env) -> dict[str, float]:
     obstacles = env.obstacles.detach().cpu().numpy()
     rr = float(env.r_robot)
