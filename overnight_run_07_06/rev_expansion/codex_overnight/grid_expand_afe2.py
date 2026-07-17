@@ -147,6 +147,12 @@ CODEX_PROMOTED_CHECKPOINTS = {
     "bfbb925a8499205a4639b33b8fe819ae4527fa8cafcabcc8722dd9bedea21efb",
     "36cb9d6651d8aa86791ad6639be987f0da8f44d76b97fe9245a419f765ce0b08",
 }
+CLAUDE_LEGACY_CHECKPOINT_SHA256 = (
+    "0eede103cc7c24ce23d2cd0e83aa3a64fdeb1a1f644c24973c5aa33a242499f4"
+)
+CLAUDE_LEGACY_MODEL_SHA256 = (
+    "5af84097e47976e92669690073f81634edf5bebbc3cb139e641dcf1924331336"
+)
 
 
 def _sha256_file(path):
@@ -257,11 +263,13 @@ def validate_checkpoint_contract(profile_name, policy, checkpoint, checkpoint_sh
         }
     elif profile_name == "claude_grid_v1":
         legacy_ok = (
-            checkpoint.get("data") == "druni_"
+            checkpoint_sha256 == CLAUDE_LEGACY_CHECKPOINT_SHA256
+            and model_sha256 == CLAUDE_LEGACY_MODEL_SHA256
+            and checkpoint.get("data") == "druni_"
             and int(checkpoint.get("per_gamma_cap", -1)) == 0
             and math.isfinite(float(checkpoint.get("best_val", float("nan"))))
             and tuple(config.get("grid_hw", ())) == (32, 32)
-            and tuple(config.get("trunk_hidden", ())) == (128, 64)
+            and tuple(config.get("trunk_hidden", ())) == (160, 96)
             and int(config.get("enc_depth", -1)) == 2
         )
         if not legacy_ok:
@@ -270,9 +278,9 @@ def validate_checkpoint_contract(profile_name, policy, checkpoint, checkpoint_sh
                 "with its declared 32x32 architecture and finite validation loss"
             )
         contract = {
-            "name": "legacy_a32uni_forensic_v1",
+            "name": "legacy_a32uni_forensic_v2",
             "assumption_level": (
-                "legacy_metadata_contract; no retrospective Stage-3 promotion witness"
+                "exact audited legacy artifact; no retrospective Stage-3 promotion witness"
             ),
             "checkpoint_file_sha256": checkpoint_sha256,
             "checkpoint_model_state_sha256": model_sha256,

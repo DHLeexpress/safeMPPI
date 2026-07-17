@@ -195,9 +195,12 @@ across-training-run uncertainty.
 ## Checkpoint and artifact eligibility
 
 - `claude_grid_v1`: require the explicitly supplied 64-character file SHA-256,
-  the expected 32-D architecture, and the legacy forensic metadata contract
-  (`data=druni_`, `per_gamma_cap=0`). Record a stable model-state hash. This
-  compatibility gate does not upgrade a legacy checkpoint into a modern
+  `0eede103cc7c24ce23d2cd0e83aa3a64fdeb1a1f644c24973c5aa33a242499f4`,
+  model-state SHA-256
+  `5af84097e47976e92669690073f81634edf5bebbc3cb139e641dcf1924331336`,
+  the audited 32-D architecture including trunk `89->160->96->32`, and the
+  legacy metadata contract (`data=druni_`, `per_gamma_cap=0`). This exact-
+  artifact compatibility gate does not upgrade the checkpoint into a modern
   promoted model.
 - `codex_radius1_v1`: require a fresh Stage-3 checkpoint that passes
   `require_promoted_fresh_pretrain`; record both file and stable model-state

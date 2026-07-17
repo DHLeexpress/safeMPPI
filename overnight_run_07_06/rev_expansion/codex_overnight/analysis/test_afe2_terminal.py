@@ -254,27 +254,57 @@ def test_named_rng_stream_is_repeatable_and_restores_global_state(afe2_modules) 
 
 
 def test_legacy_claude_checkpoint_contract_is_explicit_and_profile_bound(
-    afe2_modules,
+    afe2_modules, monkeypatch,
 ) -> None:
     _, AFE2 = afe2_modules
-    policy = AFE2.HP.GridHPFlowPolicy(repr_dim=32, grid_hw=(32, 32))
+    import codex_challenging.afe_restart.policy as checkpoint_policy
+
+    policy = AFE2.HP.GridHPFlowPolicy(
+        repr_dim=32, grid_hw=(32, 32), trunk_hidden=(160, 96)
+    )
     checkpoint = {
         "config": policy.config(),
         "data": "druni_",
         "per_gamma_cap": 0,
-        "best_val": 0.25,
+        "best_val": 1.0101,
     }
-    model_hash, contract, digest = AFE2.validate_checkpoint_contract(
-        "claude_grid_v1", policy, checkpoint, "a" * 64
+    monkeypatch.setattr(
+        checkpoint_policy,
+        "model_state_hash",
+        lambda _: AFE2.CLAUDE_LEGACY_MODEL_SHA256,
     )
-    assert contract["name"] == "legacy_a32uni_forensic_v1"
+    model_hash, contract, digest = AFE2.validate_checkpoint_contract(
+        "claude_grid_v1",
+        policy,
+        checkpoint,
+        AFE2.CLAUDE_LEGACY_CHECKPOINT_SHA256,
+    )
+    assert contract["name"] == "legacy_a32uni_forensic_v2"
     assert contract["checkpoint_model_state_sha256"] == model_hash
     assert AFE2._canonical_json_sha256(contract) == digest
 
-    checkpoint["data"] = "some_other_dataset_"
+    wrong_trunk = dict(checkpoint)
+    wrong_trunk["config"] = dict(checkpoint["config"], trunk_hidden=[128, 64])
+    with pytest.raises(RuntimeError, match="legacy uncapped druni_"):
+        AFE2.validate_checkpoint_contract(
+            "claude_grid_v1",
+            policy,
+            wrong_trunk,
+            AFE2.CLAUDE_LEGACY_CHECKPOINT_SHA256,
+        )
+
     with pytest.raises(RuntimeError, match="legacy uncapped druni_"):
         AFE2.validate_checkpoint_contract(
             "claude_grid_v1", policy, checkpoint, "a" * 64
+        )
+
+    monkeypatch.setattr(checkpoint_policy, "model_state_hash", lambda _: "f" * 64)
+    with pytest.raises(RuntimeError, match="legacy uncapped druni_"):
+        AFE2.validate_checkpoint_contract(
+            "claude_grid_v1",
+            policy,
+            checkpoint,
+            AFE2.CLAUDE_LEGACY_CHECKPOINT_SHA256,
         )
 
 
