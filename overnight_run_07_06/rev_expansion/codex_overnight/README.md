@@ -1,5 +1,10 @@
 # Pure AFE-style Safe Flow Expansion (codex_overnight, 2026-07-16)
 
+> **Current AFE2 instructions:** [`AFE2_FINAL_PROTOCOL.md`](AFE2_FINAL_PROTOCOL.md)
+> is the canonical source of truth for both scene profiles. Sections 1--8 below
+> document Study 1, and Section 9 plus `AFE2_HANDOFF.md` preserve historical
+> Study-2 results; they do not override the final dual-scene protocol.
+
 This folder contains the complete implementation, runs, evaluations, and paper figures of the
 **minimal AFE-style Safe Flow Expansion** — the redesign that replaced the curriculum trainer after
 the 9-fault critique ("Faults in Claude's implementation"). The whole design reduces to one rule:
@@ -262,12 +267,15 @@ Runs: `results/afe2/{prox_s910,afe_s910}` (+ `calib/`). Report: `analysis/afe2_r
 |---|---|
 | `grid_expand_afe2.py` | shared two-arm trainer: e97 acquisition/update values plus the §11 absorbing-goal correction, evolving φ_s⁽ⁿ⁾, per-round A rebuild, expert-free verify-or-terminate, full 7-γ sweep, diagnostics, and fixed-index controller evaluation. |
 | `video_afe2.py` | the 7-γ-panel spec-color video (gray/orange/green/red/blue/X + per-panel text). |
-| `analysis/afe2_report.py` | two-arm diagnostics figure (controller SR/NVP/CR, per-γ SR, per-γ raw validity, CFM + per-module grads, rep cosine drift + Δθ/θ, ESS/entropy/uplift with the calibration band, σ all-K vs selected + A effective rank, final per-γ Wilson-CI table). |
-| `AFE2_HANDOFF.md` | the RESULT story with final numbers (prox frozen SR 0; afe SR 0→0.34→0.16 oscillation + audit erosion −7.5 pts adverse; both walls located; σ blind effR≈1.1), exact file:line pinpoints of every mechanism/knob, and the prioritized recipe matrix for the next arms — the document to give a continuing agent. |
+| `analysis/afe2_report.py` | two-arm diagnostics figure (controller SR/NVP/CR, per-γ SR, per-γ raw validity, CFM + per-module grads, rep cosine drift + Δθ/θ, ESS/entropy/uplift with the fixed round-0 target, σ all-K vs selected + centered feature rank, final per-γ Wilson-CI table). |
+| `AFE2_FINAL_PROTOCOL.md` | canonical shared algorithm, locked two-arm recipe, provenance gates, monitoring, and dual-scene launch contract. |
+| `AFE2_HANDOFF.md` | historical `e97eead` result and discarded follow-up recipe matrix; preserved for provenance, not executable guidance. |
 | `afe2_scene_profiles.py` | explicit `claude_grid_v1` and `codex_radius1_v1` task adapters plus immutable scene snapshots/fingerprints. |
-| `afe2_calibration.py` | shared fail-closed radius-1 beta-calibration contract used both before arm 1 and at pair promotion. |
-| `run_afe2_radius1_pair.sh` | sequential calibration→prox→afe launcher that locks the declared non-beta Claude recipe, absorbing-goal contract, scene profile, and supplied checkpoint hash. |
+| `afe2_calibration.py` | shared fail-closed continuous ESS-target beta-calibration contract, run independently per scene/checkpoint and shared by its two arms. |
+| `run_afe2_pair.sh` | shared sequential calibration→prox→afe launcher with an explicit scene profile and checkpoint hash. |
+| `run_true_eval.sh` | true-evaluation launcher bound to a completed matched pair and its exact AFE checkpoints. |
 | `analysis/validate_afe2_pair.py` | completion, seven-gamma/K/B semantic, report-decode, and ten-frame-video gate; emits a hash manifest only for a matched rounds-0--10 pair. |
+| `paper_results/HISTORICAL_TRUE_EVAL.md` | marks the pre-sealing true-evaluation figures as historical rather than final evidence. |
 | `README.md` | this document. |
 
 **Modified (existing files touched by this work):**
@@ -294,39 +302,22 @@ mirrored to `master`, pushed to origin.
 
 ---
 
-## 11. Codex radius 1 with an absorbing goal set
+## 11. Current dual-scene AFE2
 
-The Claude and Codex tasks now call the same `grid_expand_afe2.py`; there is no copied trainer to
-drift. The Codex run preserves Claude's K/B, lambda, acquisition, and two update recipes, with
-one declared shared correction: the unchanged radius-0.15 goal set is absorbing. A full-H rejected
-plan can be executed only when its prefix through the first goal hit is certified; that plan keeps
-its full-H negative label and never enters D+. Thus the safety claim is through the goal hitting
-time, not after termination. Execution progress is truncated at that same first hit, while the
-full-H progress remains separately logged for data analysis. Here B is the candidate-query budget; terminal rechecks make the
-SOCP-solve count variable, so solver count/time are logged separately. `--scene-profile codex_radius1_v1` replaces exactly the four center disks by one
-disk at `(2.5,2.5)` with physical radius `1.0`, retains the remaining obstacles/walls/plugs, and
-sets `(0.5,0.5) -> (4.5,4.5)`. The pretrained checkpoint is supplied explicitly and hash-recorded.
-Before either arm, the launcher performs one beta-neutral radius-1 round-0 ESS calibration over
-`{0.01,0.02,0.05}` and hash-binds its selected beta to both arms; it does not assume Claude's beta
-transfers across scenes. Archive embedding inputs remain float32, and named RNG streams isolate
-gathering from update/audit/evaluation randomness. The inherited task-box check is also explicit:
-it preserves Claude's legacy `[-0.12,5.12]` tolerance rather than silently claiming exact `[0,5]`
-containment. Evaluation uses M=8 fixed-index rollouts per gamma and is labeled as a pilot;
-the Wilson/bootstrap intervals are conditional on fixed contexts/episode indices and expose that
-limited power rather than claiming across-seed uncertainty or a safety guarantee.
-
-Run the two original arms sequentially, with no knob changes:
+Claude-grid and Codex-radius-1 now use the same committed trainer, verifier,
+absorbing-goal execution gate, continuous ESS calibration rule, two update
+arms, validator, and evaluation code. Invoke the shared launcher as
 
 ```bash
-./run_afe2_radius1_pair.sh \
-  /absolute/path/to/codex_pretrained_32d.pt \
+./run_afe2_pair.sh \
+  claude_grid_v1 \
+  /absolute/path/to/claude_checkpoint.pt \
   EXPECTED_CHECKPOINT_FILE_SHA256 \
-  /absolute/path/to/output/afe2_radius1
+  /absolute/path/to/new/output
 ```
 
-The launcher uses `--lock-reference-recipe`, so changing K/B, lambda, update rates/steps,
-horizon, evaluation count, or either arm's update rule is an error. It refuses existing arm
-directories, requires the shared beta-calibration artifact, validates the pair before rendering,
-and writes `DELIVERY_COMPLETE.json` only after hashing the calibration, report, and both videos.
-The complete continuation
-contract and completion gates are in `../codex_challenging/afe_restart/AFE2_RADIUS1_HANDOFF.md`.
+or replace the profile and checkpoint with `codex_radius1_v1` and its promoted
+Stage-3 checkpoint. The exact algorithm, linear-kernel decision, checkpoint
+eligibility, true-evaluation command, completion gates, and separate GPU-3/GPU-1
+worktree procedure are maintained only in
+[`AFE2_FINAL_PROTOCOL.md`](AFE2_FINAL_PROTOCOL.md).

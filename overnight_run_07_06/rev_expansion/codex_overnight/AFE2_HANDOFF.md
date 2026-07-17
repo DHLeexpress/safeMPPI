@@ -1,10 +1,9 @@
-# AFE2 handoff — what happened, where it lives in code, and which recipes to try next
+# AFE2 handoff — historical result and discarded follow-up proposals
 
-> **Historical result only.** Do not execute the recipe matrix below for the
-> radius-1 replication. The locked, non-sweep continuation contract is
-> `../codex_challenging/afe_restart/AFE2_RADIUS1_HANDOFF.md`; it first corrects
-> absorbing-goal termination and experimental provenance while leaving both
-> update arms unchanged.
+> **Historical and superseded.** This file preserves the `e97eead` result and
+> the proposals that followed it. Do not execute its recipe matrix or launch
+> skeleton. The canonical two-scene algorithm, terminal semantics, calibration,
+> evaluation, and launch commands are in `AFE2_FINAL_PROTOCOL.md`.
 
 Audience: another agent (codex) continuing this line, possibly on a different task. Read
 `README.md` §9-§10 first for the full spec; this document is the RESULT story + the exact code

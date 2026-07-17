@@ -1,4 +1,10 @@
-# Codex handoff: reproduce Claude AFE2 on the radius-1 scene
+# Codex radius-1 handoff — historical integration contract
+
+> **Historical and superseded.** This file records the first radius-1
+> integration contract, including the now-deleted scene-specific launcher and
+> discrete beta-candidate rule. Do not execute it. The canonical shared
+> dual-scene protocol and current launcher commands are in
+> `../../codex_overnight/AFE2_FINAL_PROTOCOL.md`.
 
 ## Goal
 

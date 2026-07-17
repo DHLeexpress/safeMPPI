@@ -39,6 +39,7 @@ import grid_scene as GS
 import grid_feats as GF
 import grid_hp_expt as HP
 import sr_cr_eval as SR
+import grid_metrics as GM
 
 NFE = 8                              # OUR linear ODE schedule (user caveat 2): knots i/8, i=0..8
 ODE_TIMES_FULL = [i / NFE for i in range(NFE + 1)]
@@ -57,6 +58,13 @@ MPPI_LAMBDA = 0.1
 MPPI_SIGMA = 0.2                     # their DI sigma 0.4 with u_max 2 -> scaled to our u_max 1
 MARKUP = 1.01
 R_MARGIN = 0.05
+
+
+def obstacle_collision_radii(obs, robot_radius, margin, *, device, dtype=torch.float32):
+    """Per-obstacle collision radii; heterogeneous scene radii must not be averaged."""
+    obs = np.asarray(obs, dtype=np.float32)
+    return torch.as_tensor(obs[:, 2] + float(robot_radius) + float(margin),
+                           dtype=dtype, device=device)
 
 
 def di_rollout_t(state, U, dt):
@@ -169,7 +177,7 @@ def kazuki_deploy(policy, env, safe_coefs, gamma_ctx=0.5, T=250, reach=0.1, devi
     torch.manual_seed(seed); np.random.seed(seed)
     obs = env.obstacles.detach().cpu().numpy(); rr = float(env.r_robot)
     obs_xy = torch.tensor(obs[:, :2], dtype=torch.float32, device=device)
-    r_col = float(obs[:, 2].mean()) + rr + R_MARGIN
+    r_col = obstacle_collision_radii(obs, rr, R_MARGIN, device=device)
     goal = env.goal.detach().cpu().numpy()
     goal_t = torch.tensor(goal, dtype=torch.float32, device=device)
     st = env.x0.detach().cpu().numpy().astype(np.float32)
@@ -181,7 +189,7 @@ def kazuki_deploy(policy, env, safe_coefs, gamma_ctx=0.5, T=250, reach=0.1, devi
         sc[size * i: size * (i + 1)] = c
     hist, path = [], [st[:2].copy()]
     prev_z = None; prev_U = None
-    reached = collided = False
+    reached = collided = oob = False
     for t in range(T):
         gT = torch.tensor(GF.axis_grid(st[:2], obs, rr), device=device)
         lT = torch.tensor(GF.low5(st, goal, gamma_ctx), device=device)
@@ -216,11 +224,14 @@ def kazuki_deploy(policy, env, safe_coefs, gamma_ctx=0.5, T=250, reach=0.1, devi
             collided = True; break
         if np.linalg.norm(st[:2] - goal) < reach:
             reached = True; break
+        if not GM.in_taskspace(st[:2][None]):
+            oob = True; break
         # dilution warm-start: shift executed step off, repeat last control
         U_shift = torch.cat([U_best[1:], U_best[-1:]], 0)
         prev_z = (U_shift / policy.u_max).reshape(-1).detach()
         prev_U = U_shift.detach()
-    return dict(path=np.array(path), reached=reached, collided=collided, steps=len(path) - 1)
+    return dict(path=np.array(path), reached=reached, collided=collided, oob=oob,
+                steps=len(path) - 1)
 
 
 def main():

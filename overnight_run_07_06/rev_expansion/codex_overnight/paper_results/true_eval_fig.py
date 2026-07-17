@@ -13,8 +13,8 @@ RAW stored paths with one uniform code path and full provenance checks:
 Binary metrics carry Wilson 95% intervals. These are finite-M, single-training-seed intervals,
 not a probabilistic safety guarantee.
 
-Caching is CONTENT-keyed (scene sha256, checkpoint sha256, seed-list sha256, M, metric version) —
-never pathname-only; a mismatch forces recomputation. Gallery panels show a
+Caching is CONTENT-keyed (raw NPZ bytes, scene/checkpoint/seeds, M, gamma, reach, dt, metric version)
+— never pathname-only; a mismatch forces recomputation. Gallery panels show a
 "pre-specified outcome-stratified, ratio-matched random subset": k = round(10*SR) successes and
 10-k non-successes drawn uniformly without replacement under a fixed named seed; the chosen
 archive indices are persisted. The Kazuki row is one gamma-blind batch (gamma_ctx=0.5), certified
@@ -41,12 +41,13 @@ import matplotlib.pyplot as plt
 
 import _paths  # noqa: F401
 
-METRIC_VERSION = "true_eval_v2_terminal"
+METRIC_VERSION = "true_eval_v3_pairbound"
 EVAL_GAMMAS = (0.1, 0.3, 0.5, 1.0)
 PLA = plt.get_cmap("plasma")
 GCOL = {0.1: PLA(0.08), 0.3: PLA(0.38), 0.5: PLA(0.58), 1.0: PLA(0.85)}
 SUBSET_LABEL = "pre-specified outcome-stratified, ratio-matched random subset (10 of 100)"
 Z95 = 1.959963984540054
+_VERIFIED_RAW_RUNS = {}
 
 
 def named_seed(*parts) -> int:
@@ -73,6 +74,40 @@ def bootstrap95(values, key, n_boot=2000):
     return (float(np.percentile(stats, 2.5)), float(np.percentile(stats, 97.5)))
 
 
+def sha256_file(path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_raw_run(eval_dir):
+    """Verify the runner's complete raw-artifact inventory once per process."""
+    root = os.path.abspath(eval_dir)
+    if root in _VERIFIED_RAW_RUNS:
+        return _VERIFIED_RAW_RUNS[root]
+    complete_path = os.path.join(root, "RUN_COMPLETE.json")
+    if not os.path.isfile(complete_path):
+        raise FileNotFoundError(f"true-evaluation completion marker is missing: {complete_path}")
+    with open(complete_path) as handle:
+        complete = json.load(handle)
+    if complete.get("status") != "TRUE_EVAL_RAW_COMPLETE":
+        raise RuntimeError("raw true-evaluation directory is not complete")
+    inventory = complete.get("artifact_sha256", {})
+    expected = {"scene_snapshot.json"}
+    for name in complete.get("required_cells", []):
+        expected.update({f"paths_{name}.npz", f"{name}.provenance.json"})
+    if set(inventory) != expected:
+        raise RuntimeError("raw true-evaluation artifact inventory is incomplete")
+    for relative, expected_sha in inventory.items():
+        path = os.path.join(root, relative)
+        if not os.path.isfile(path) or sha256_file(path) != expected_sha:
+            raise RuntimeError(f"raw true-evaluation artifact hash mismatch: {relative}")
+    _VERIFIED_RAW_RUNS[root] = complete
+    return complete
+
+
 class SceneCtx:
     """Environment + metric helpers rebuilt from the run's scene snapshot (never hardcoded)."""
 
@@ -80,6 +115,7 @@ class SceneCtx:
         from afe2_scene_profiles import get_scene_profile, build_scene, scene_snapshot, \
             assert_scene_snapshot
         import grid_metrics2 as GM2
+        complete = validate_raw_run(eval_dir)
         snap = json.load(open(os.path.join(eval_dir, "scene_snapshot.json")))
         assert_scene_snapshot(snap)
         if snap["profile"]["name"] != profile_name:
@@ -90,6 +126,8 @@ class SceneCtx:
         rebuilt = scene_snapshot(self.env, self.profile)
         if rebuilt["sha256"] != snap["sha256"]:
             raise ValueError("rebuilt scene disagrees with the stored snapshot")
+        if complete.get("scene_sha256") != snap["sha256"]:
+            raise ValueError("raw-run completion marker has the wrong scene")
         self.snapshot = snap
         GM2.GOAL_XY = np.asarray(self.profile.goal, dtype=float)
         self.GM2 = GM2
@@ -116,27 +154,52 @@ class SceneCtx:
 
 
 def load_cell(eval_dir, name):
-    prov = json.load(open(os.path.join(eval_dir, f"{name}.provenance.json")))
-    z = np.load(os.path.join(eval_dir, f"paths_{name}.npz"), allow_pickle=True)
-    paths = list(z["paths"])
+    complete = validate_raw_run(eval_dir)
+    if name not in complete.get("required_cells", []):
+        raise FileNotFoundError(f"cell is not part of the completed raw evaluation: {name}")
+    prov_path = os.path.join(eval_dir, f"{name}.provenance.json")
+    npz_path = os.path.join(eval_dir, f"paths_{name}.npz")
+    prov = json.load(open(prov_path))
+    npz_sha = sha256_file(npz_path)
+    inventory = complete["artifact_sha256"]
+    if sha256_file(prov_path) != inventory.get(f"{name}.provenance.json"):
+        raise RuntimeError(f"cell {name}: provenance artifact hash mismatch")
+    if npz_sha != inventory.get(f"paths_{name}.npz"):
+        raise RuntimeError(f"cell {name}: raw path artifact hash mismatch")
+    if prov.get("paths_sha256") != npz_sha:
+        raise RuntimeError(f"cell {name}: provenance does not authenticate raw path bytes")
+    with np.load(npz_path, allow_pickle=True) as archive:
+        paths = list(archive["paths"])
     if len(paths) != int(prov["M"]):
         raise RuntimeError(f"cell {name}: {len(paths)} paths != declared M {prov['M']}")
     return paths, prov
 
 
-def content_key(prov):
+def content_key(prov, gamma, reach, dt):
     seeds_sha = hashlib.sha256(json.dumps(prov.get("seeds", [])).encode()).hexdigest()
-    return hashlib.sha256("|".join([
-        str(prov.get("scene_sha256")), str(prov.get("checkpoint_sha256")),
-        seeds_sha, str(prov.get("M")), METRIC_VERSION,
-    ]).encode()).hexdigest()
+    payload = {
+        "metric_version": METRIC_VERSION,
+        "source_metric_version": prov.get("metric_version"),
+        "stopping_rule": prov.get("stopping_rule"),
+        "scene_sha256": prov.get("scene_sha256"),
+        "checkpoint_sha256": prov.get("checkpoint_sha256"),
+        "paths_sha256": prov.get("paths_sha256"),
+        "seeds_sha256": seeds_sha,
+        "M": prov.get("M"),
+        "T": prov.get("T"),
+        "certification_gamma": float(gamma),
+        "reach": float(reach),
+        "dt": float(dt),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 def cell_metrics(scene: SceneCtx, eval_dir, name, gamma, reach, dt):
     """Content-cached full-metric computation for one cell at one certification gamma."""
     cache_path = os.path.join(eval_dir, f"metrics_{name}_g{gamma}.json")
     paths, prov = load_cell(eval_dir, name)
-    key = content_key(prov)
+    key = content_key(prov, gamma, reach, dt)
     if os.path.exists(cache_path):
         cached = json.load(open(cache_path))
         if cached.get("content_key") == key:
@@ -218,6 +281,30 @@ def main():
     scene = SceneCtx(args.eval_dir, args.scene_profile)
     dt = float(scene.env.dt)
     ed = args.eval_dir
+    raw_complete = validate_raw_run(ed)
+    from true_eval_run import require_clean_source
+    figure_source_commit = require_clean_source(raw_complete.get("source_git_commit"))
+    if raw_complete.get("metric_version") != METRIC_VERSION:
+        raise RuntimeError("runner and figure metric versions disagree")
+    if int(raw_complete.get("M", -1)) != 100:
+        raise RuntimeError("paper true evaluation requires validated M=100 per cell")
+    if [float(g) for g in raw_complete.get("gammas", [])] != [float(g) for g in args.gammas]:
+        raise RuntimeError("figure gamma list disagrees with the completed raw evaluation")
+    if (list(raw_complete.get("rounds", [])) != list(range(args.rounds + 1))
+            or int(raw_complete.get("T", -1)) != 300
+            or abs(float(raw_complete.get("reach", -1.0)) - float(args.reach)) > 1e-12):
+        raise RuntimeError("figure protocol disagrees with the completed raw evaluation")
+    expected_cells = {
+        "kazuki_rNA_gblind",
+        *{f"expert_rNA_g{g}" for g in args.gammas},
+        *{f"policy_r{n}_g{g}" for n in range(args.rounds + 1) for g in args.gammas},
+    }
+    if set(raw_complete.get("required_cells", [])) != expected_cells:
+        missing = sorted(expected_cells - set(raw_complete.get("required_cells", [])))
+        extra = sorted(set(raw_complete.get("required_cells", [])) - expected_cells)
+        raise RuntimeError(f"completed raw evaluation has the wrong figure cells; missing={missing}, extra={extra}")
+    output_parent = os.path.dirname(os.path.abspath(args.out_prefix))
+    os.makedirs(output_parent, exist_ok=True)
 
     rows = [
         ("SafeMPPI oracle", lambda g: (f"expert_rNA_g{g}", g)),
@@ -230,12 +317,7 @@ def main():
         for ci, g in enumerate(args.gammas):
             name, cert_g = cellf(g)
             ax = axes[ri, ci]
-            try:
-                met = cell_metrics(scene, ed, name, cert_g, args.reach, dt)
-            except FileNotFoundError:
-                ax.text(0.5, 0.5, "missing cell", ha="center", transform=ax.transAxes)
-                ax.set_xticks([]); ax.set_yticks([])
-                continue
+            met = cell_metrics(scene, ed, name, cert_g, args.reach, dt)
             draw_panel(ax, scene, ed, name, g, met,
                        title=(f"γ = {g}" if ri == 0 else None),
                        row_label=(rlab if ci == 0 else None))
@@ -280,7 +362,54 @@ def main():
     fig.tight_layout(rect=[0, 0, 1, 0.92])
     for ext in ("png", "pdf"):
         fig.savefig(f"{args.out_prefix}_curves.{ext}", dpi=140)
-    print(f"wrote {args.out_prefix}_gallery/.curves (png+pdf)")
+    plt.close(fig)
+
+    output_paths = {
+        f"gallery_{ext}": os.path.abspath(f"{args.out_prefix}_gallery.{ext}")
+        for ext in ("png", "pdf")
+    }
+    output_paths.update({
+        f"curves_{ext}": os.path.abspath(f"{args.out_prefix}_curves.{ext}")
+        for ext in ("png", "pdf")
+    })
+    metric_paths = {
+        *{os.path.join(os.path.abspath(ed), f"metrics_expert_rNA_g{g}_g{g}.json")
+          for g in args.gammas},
+        *{os.path.join(os.path.abspath(ed), f"metrics_kazuki_rNA_gblind_g{g}.json")
+          for g in args.gammas},
+        *{os.path.join(os.path.abspath(ed), f"metrics_policy_r{n}_g{g}_g{g}.json")
+          for n in range(args.rounds + 1) for g in args.gammas},
+    }
+    output_paths.update({f"metric_{os.path.basename(path)}": path for path in metric_paths})
+    for label, path in output_paths.items():
+        if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+            raise RuntimeError(f"true-evaluation delivery artifact missing: {label}={path}")
+    raw_complete_path = os.path.join(os.path.abspath(ed), "RUN_COMPLETE.json")
+    delivery = {
+        "status": "TRUE_EVAL_DELIVERY_COMPLETE",
+        "metric_version": METRIC_VERSION,
+        "source_git_commit": figure_source_commit,
+        "scene_profile": args.scene_profile,
+        "scene_sha256": raw_complete["scene_sha256"],
+        "M": raw_complete["M"],
+        "gammas": [float(g) for g in args.gammas],
+        "rounds": list(range(args.rounds + 1)),
+        "raw_run_complete": {
+            "path": raw_complete_path,
+            "sha256": sha256_file(raw_complete_path),
+        },
+        "expansion_pair": raw_complete["expansion_pair"],
+        "artifacts": {
+            label: {"path": path, "sha256": sha256_file(path), "bytes": os.path.getsize(path)}
+            for label, path in output_paths.items()
+        },
+        "ci_note": "finite-M single-training-seed intervals; not a safety guarantee",
+    }
+    delivery_path = f"{args.out_prefix}_DELIVERY_COMPLETE.json"
+    with open(delivery_path, "w") as handle:
+        json.dump(delivery, handle, indent=2, sort_keys=True, allow_nan=False)
+        handle.write("\n")
+    print(f"wrote {args.out_prefix}_gallery/.curves (png+pdf) and {delivery_path}")
 
 
 if __name__ == "__main__":

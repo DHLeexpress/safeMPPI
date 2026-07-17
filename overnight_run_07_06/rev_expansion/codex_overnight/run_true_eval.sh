@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Shared TRUE-evaluation launcher (integration/afe2-terminal-dualscene-v1).
+# Shared TRUE-evaluation launcher (canonical protocol: AFE2_FINAL_PROTOCOL.md).
 # Runs the portable bare-policy/oracle/baseline evaluation for ONE scene profile against the
-# exact round checkpoints of ONE AFE2 arm directory, then renders the gallery + curves.
+# completed AFE arm in ONE validated/delivered pair root, then renders the gallery + curves.
 set -euo pipefail
 
 if [[ $# -ne 3 ]]; then
-  echo "usage: $0 SCENE_PROFILE /absolute/path/to/arm_run_dir /absolute/output/root" >&2
-  echo "  arm_run_dir must contain EXACT ckpt_0.pt .. ckpt_10.pt (no substitutions)" >&2
+  echo "usage: $0 SCENE_PROFILE /absolute/path/to/pair_root /absolute/output/root" >&2
+  echo "  pair_root must contain afe_s910, the matched-pair manifest, and DELIVERY_COMPLETE.json" >&2
   exit 2
 fi
 
@@ -15,7 +15,7 @@ case "$PROFILE" in
   claude_grid_v1|codex_radius1_v1) ;;
   *) echo "unknown scene profile: $PROFILE" >&2; exit 2 ;;
 esac
-CKPT_DIR=$(cd "$2" && pwd)
+PAIR_ROOT=$(cd "$2" && pwd)
 if [[ -e "$3" && ! -d "$3" ]]; then
   echo "output root exists and is not a directory: $3" >&2
   exit 2
@@ -30,16 +30,9 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 PYTHON_BIN=${PYTHON:-python}
 cd "$HERE"
 
-for n in $(seq 0 10); do
-  if [[ ! -f "$CKPT_DIR/ckpt_${n}.pt" ]]; then
-    echo "missing required round checkpoint: $CKPT_DIR/ckpt_${n}.pt" >&2
-    exit 2
-  fi
-done
-
 "$PYTHON_BIN" paper_results/true_eval_run.py \
   --scene-profile "$PROFILE" \
-  --ckpt-dir "$CKPT_DIR" \
+  --pair-root "$PAIR_ROOT" \
   --outdir "$OUT/cells" \
   --rounds 10 --M 100 --T 300 --reach 0.15
 

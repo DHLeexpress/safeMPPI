@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Shared dual-scene AFE2 launcher (integration/afe2-terminal-dualscene-v1).
+# Shared dual-scene AFE2 launcher (canonical protocol: AFE2_FINAL_PROTOCOL.md).
 # One trainer, verifier, terminal semantics, acquisition, replay, and update implementation for
 # both scene profiles; the profile is the ONLY task-specific input. The identical beta-calibration
-# rule runs independently per (scene, checkpoint); if no candidate enters ESS/K [0.25,0.5] the
-# calibration artifact is persisted and this launcher stops (fail-closed, no nearest-beta fallback).
+# rule runs independently per (scene, checkpoint): continuous log-bisection targets median
+# ESS/K=3B/K=0.375. Flat/unbracketable pools stop fail-closed; there is no fallback temperature.
 set -euo pipefail
 
 if [[ $# -ne 4 ]]; then

@@ -5,7 +5,7 @@ Panels:
   C full-H untilted validity per gamma (audit)       D update: mean CFM loss, per-module grad norms,
                                                        relative parameter change, fixed-probe
                                                        representation cosine drift (NO "encoder loss")
-  E uncertainty: all-K vs selected-B sigma medians, A effective rank
+  E uncertainty: all-K vs selected-B sigma medians, sigma IQR, centered feature rank
   F acquisition: ESS/K, normalized entropy, selected-vs-pool uplift
   G data: |D|, |D+|, distinct trained, dither share   H text: final per-gamma table with Wilson CIs
 Usage: python analysis/afe2_report.py --arms PROX AFE --pair-manifest PAIR.json
@@ -140,11 +140,15 @@ def main():
     for ai, (lab, recs) in enumerate(arms):
         R = [r["round"] for r in recs]
         for g in GAMMAS:
-            ys = [r["V_gamma"][g] for r in recs]
-            ax.plot(R, ys, LS[ai], color=GC[g], lw=1.3, label=(f"γ{g}" if ai == 0 else None))
+            safe = [r.get("V_safe_gamma", r["V_gamma"])[g] for r in recs]
+            full = [r.get("V_full_gamma", r.get("Vprog_gamma", r["V_gamma"]))[g]
+                    for r in recs]
+            ax.plot(R, safe, LS[ai], color=GC[g], lw=1.4,
+                    label=(f"γ{g}" if ai == 0 else None))
+            ax.plot(R, full, LS[ai], color=GC[g], lw=.8, alpha=.28)
         ax.plot(R, [r.get("V_adverse") for r in recs], LS[ai], color="k", lw=1.8,
                 label=("adverse (pooled)" if ai == 0 else None))
-    ax.set_title("(C) full-H untilted validity per γ (terminal rescue excluded)")
+    ax.set_title("(C) untilted validity per γ: opaque V_safe, faint V_full")
     ax.set_xlabel("round"); ax.set_ylim(-0.02, 1.02); ax.grid(alpha=.3); ax.legend(fontsize=7, ncol=2)
 
     ax = axes[0, 3]
@@ -187,8 +191,8 @@ def main():
                 label=("median entropy/log K" if ai == 0 else None))
         ax.plot(R, [r["uplift_med"] for r in rr], LS[ai], color="#999933", lw=1.4,
                 label=("σ uplift (sel−pool)" if ai == 0 else None))
-    ax.axhspan(0.25, 0.5, color="#117733", alpha=0.08)
-    ax.set_title("(F) acquisition: ESS/K (band = calibration target), entropy, uplift")
+    ax.axhline(0.375, color="#117733", alpha=0.45, lw=1.0, ls=":")
+    ax.set_title("(F) acquisition: ESS/K (round-0 target=.375), entropy, uplift")
     ax.set_xlabel("round"); ax.grid(alpha=.3); ax.legend(fontsize=8)
 
     ax = axes[1, 2]
@@ -200,9 +204,13 @@ def main():
                 label=("median σ all-K" if ai == 0 else None))
         ax.plot(R, [r["sig_sel_med"] for r in rr], LS[ai], color="#35b779", lw=1.6,
                 label=("median σ selected-B" if ai == 0 else None))
-        ax2.plot(R, [r["A_eff_rank"] for r in rr], LS[ai], color="#888888", lw=1.2)
-    ax2.set_ylabel("effective rank of A (grey)", color="#666666")
-    ax.set_title("(G) uncertainty distribution (evolving rep, A rebuilt/round)")
+        ax.plot(R, [r.get("sig_iqr_med", np.nan) for r in rr], LS[ai],
+                color="#31688e", lw=1.0, alpha=.8,
+                label=("median σ IQR" if ai == 0 else None))
+        ax2.plot(R, [r.get("S_centered_eff_rank", np.nan) for r in rr], LS[ai],
+                 color="#888888", lw=1.2)
+    ax2.set_ylabel("centered feature effective rank (grey)", color="#666666")
+    ax.set_title("(G) uncertainty + centered feature rank (A rebuilt/round)")
     ax.set_xlabel("round"); ax.grid(alpha=.3); ax.legend(fontsize=8)
 
     ax = axes[1, 3]
@@ -213,7 +221,7 @@ def main():
         M = int(metadata[lab]["M_eval"])
         lines.append(f"[{lab}] final round {last['round']}  D {last.get('n_D')}  D+ {last.get('n_Dpos')}")
         lines.append(" γ  SR[95%W]    NVP[95%W]   CR[95%W]")
-        lines.append("    V_H[95%W]/Vadv · q/solve/accept/prefix/train-draw(distinct) · clr/ttg[95%B] · R/Rreq")
+        lines.append("    Vsafe/Vfull[95%W]/Vadv · q/solve/accept/prefix/train-draw(distinct) · clr/ttg[95%B] · R/Rreq")
         for g in GAMMAS:
             c = last["ctrl"][g]
             sr_lo, sr_hi = wilson(c["SR"], M)
@@ -221,6 +229,9 @@ def main():
             cr_lo, cr_hi = wilson(c["CR"], M)
             v_counts = last["V_counts_gamma"][g]
             v_lo, v_hi = wilson(last["V_gamma"][g], int(v_counts["n"]))
+            v_full = last.get("V_full_gamma", last.get("Vprog_gamma", last["V_gamma"]))[g]
+            vf_counts = last.get("V_counts_gamma_full", {}).get(g, v_counts)
+            vf_lo, vf_hi = wilson(v_full, int(vf_counts["n"]))
             v_adv = (last.get("V_gamma_adverse") or {}).get(g, np.nan)
             v_adv_counts = (last.get("V_counts_gamma_adverse") or {}).get(g, {})
             va_lo, va_hi = wilson(v_adv, int(v_adv_counts.get("n", 0)))
@@ -235,6 +246,7 @@ def main():
             )
             lines.append(
                 f"    {last['V_gamma'][g]:.2f}[{v_lo:.2f},{v_hi:.2f}]/"
+                f"{v_full:.2f}[{vf_lo:.2f},{vf_hi:.2f}]/"
                 f"{v_adv:.2f}[{va_lo:.2f},{va_hi:.2f}] · "
                 f"{pg.get('n_q', '-')}/{pg.get('n_socp_solve', '-')}/"
                 f"{pg.get('n_pos', '-')}/{pg.get('n_terminal_rescue', '-')}/"

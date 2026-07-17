@@ -214,6 +214,8 @@ def test_terminal_execution_does_not_leak_into_positive_replay(
     assert store.n_pos() == 1
     assert stats["n_pos"] == 1
     assert stats["n_exec_pos"] == 2
+    assert stats["sig_span"] >= 0.0 and stats["sig_iqr"] >= 0.0
+    assert len(stats["feature_cosine_distance_q"]) == 3
     assert stats["selected_terminal_rescue"] is True
     store.mark_executed(best[1])
     store.validate_execution_witnesses()
@@ -249,6 +251,78 @@ def test_named_rng_stream_is_repeatable_and_restores_global_state(afe2_modules) 
         second_torch = torch.randn(5)
     assert np.array_equal(first_numpy, second_numpy)
     assert torch.equal(first_torch, second_torch)
+
+
+def test_legacy_claude_checkpoint_contract_is_explicit_and_profile_bound(
+    afe2_modules,
+) -> None:
+    _, AFE2 = afe2_modules
+    policy = AFE2.HP.GridHPFlowPolicy(repr_dim=32, grid_hw=(32, 32))
+    checkpoint = {
+        "config": policy.config(),
+        "data": "druni_",
+        "per_gamma_cap": 0,
+        "best_val": 0.25,
+    }
+    model_hash, contract, digest = AFE2.validate_checkpoint_contract(
+        "claude_grid_v1", policy, checkpoint, "a" * 64
+    )
+    assert contract["name"] == "legacy_a32uni_forensic_v1"
+    assert contract["checkpoint_model_state_sha256"] == model_hash
+    assert AFE2._canonical_json_sha256(contract) == digest
+
+    checkpoint["data"] = "some_other_dataset_"
+    with pytest.raises(RuntimeError, match="legacy uncapped druni_"):
+        AFE2.validate_checkpoint_contract(
+            "claude_grid_v1", policy, checkpoint, "a" * 64
+        )
+
+
+def test_codex_checkpoint_contract_requires_both_allowlist_and_promotion_witness(
+    afe2_modules,
+) -> None:
+    _, AFE2 = afe2_modules
+    from codex_challenging.afe_restart.policy import model_state_hash
+
+    policy = AFE2.HP.GridHPFlowPolicy(repr_dim=32, grid_hw=(32, 32))
+    config = policy.config()
+    config.update(
+        schema_version="w8sg-hp-v2-low5-only",
+        raw_start_goal=False,
+        use_gru=False,
+    )
+    checkpoint = {
+        "config": config,
+        "stage_schema": "afe_fresh_pretrain_v1",
+        "fresh_from_scratch": True,
+        "endpoint_free": True,
+        "expansion_promotion": True,
+        "id_mode_diversity_gate_passed": True,
+        "id_evaluation_temperature": 1.0,
+        "id_evaluation_uncertainty_tilting": False,
+        "model_state_sha256": model_state_hash(policy),
+        "source_query_hash_digest": "b" * 64,
+        "source_manifest": "/sealed/stage2/manifest.json",
+        "id_metrics_sha256": "c" * 64,
+        "frozen_feature_snapshot": False,
+    }
+    documented_hash = next(iter(AFE2.CODEX_PROMOTED_CHECKPOINTS))
+    model_hash, contract, digest = AFE2.validate_checkpoint_contract(
+        "codex_radius1_v1", policy, checkpoint, documented_hash
+    )
+    assert contract["name"] == "fresh_stage3_promoted_v1"
+    assert contract["checkpoint_model_state_sha256"] == model_hash
+    assert AFE2._canonical_json_sha256(contract) == digest
+
+    unpromoted = dict(checkpoint, expansion_promotion=False)
+    with pytest.raises(RuntimeError, match="promoted only"):
+        AFE2.validate_checkpoint_contract(
+            "codex_radius1_v1", policy, unpromoted, documented_hash
+        )
+    with pytest.raises(RuntimeError, match="documented promoted"):
+        AFE2.validate_checkpoint_contract(
+            "codex_radius1_v1", policy, checkpoint, "d" * 64
+        )
 
 
 def test_query_context_archive_preserves_embedding_inputs_in_float32(afe2_modules) -> None:

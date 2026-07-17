@@ -37,6 +37,13 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _canonical_json_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _validate_png(path: Path) -> None:
     try:
         pixels = np.asarray(mpl_image.imread(path))
@@ -102,9 +109,16 @@ def _common_recipe(recipe: dict) -> dict:
 
 def _validate_beta_calibration(recipe: dict) -> None:
     calibration = recipe.get("beta_calibration") or {}
+    if calibration.get("checkpoint_contract") != recipe.get(
+        "source_checkpoint_contract"
+    ):
+        raise RuntimeError("beta calibration embeds a different checkpoint contract")
     expected_fields = {
         "checkpoint_sha256": recipe.get("source_checkpoint_sha256"),
         "checkpoint_model_sha256": recipe.get("source_checkpoint_model_sha256"),
+        "checkpoint_contract_sha256": recipe.get(
+            "source_checkpoint_contract_sha256"
+        ),
         "scene_sha256": recipe.get("scene", {}).get("sha256"),
         "source_git_commit": recipe.get("source_git_commit"),
         "lam": recipe.get("lam"),
@@ -115,12 +129,27 @@ def _validate_beta_calibration(recipe: dict) -> None:
     try:
         chosen = BC.validate_success(calibration, expected_fields)
     except ValueError as exc:
-        raise RuntimeError("locked run has an invalid radius-1 beta calibration") from exc
+        raise RuntimeError("locked run has an invalid continuous-ESS beta calibration") from exc
     if float(recipe.get("beta")) != chosen:
         raise RuntimeError("run beta is not the declared calibration choice")
     digest = str(recipe.get("beta_calibration_sha256") or "")
     if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
         raise RuntimeError("run has no valid beta calibration artifact digest")
+
+
+def _validate_checkpoint_contract(recipe: dict) -> None:
+    contract = recipe.get("source_checkpoint_contract")
+    if not isinstance(contract, dict):
+        raise RuntimeError("run has no profile-bound checkpoint eligibility contract")
+    digest = recipe.get("source_checkpoint_contract_sha256")
+    if digest != _canonical_json_sha256(contract):
+        raise RuntimeError("run checkpoint eligibility contract digest mismatch")
+    if contract.get("checkpoint_file_sha256") != recipe.get("source_checkpoint_sha256"):
+        raise RuntimeError("run checkpoint contract has the wrong file identity")
+    if contract.get("checkpoint_model_state_sha256") != recipe.get(
+        "source_checkpoint_model_sha256"
+    ):
+        raise RuntimeError("run checkpoint contract has the wrong model-state identity")
 
 
 def _validate_viz_round(db, recipe, scene, q_y, run_name: str, round_i: int) -> None:
@@ -210,6 +239,14 @@ def _validate_complete_identity(complete: dict, recipe: dict, run_name: str) -> 
         raise RuntimeError(f"{run_name} completion marker has the wrong checkpoint")
     if complete.get("source_git_commit") != recipe.get("source_git_commit"):
         raise RuntimeError(f"{run_name} completion marker has the wrong source commit")
+    if complete.get("checkpoint_model_sha256") != recipe.get(
+        "source_checkpoint_model_sha256"
+    ):
+        raise RuntimeError(f"{run_name} completion marker has the wrong model-state hash")
+    if complete.get("checkpoint_contract_sha256") != recipe.get(
+        "source_checkpoint_contract_sha256"
+    ):
+        raise RuntimeError(f"{run_name} completion marker has the wrong checkpoint contract")
 
 
 def main() -> None:
@@ -236,6 +273,7 @@ def main() -> None:
     if _common_recipe(recipes["prox"]) != _common_recipe(recipes["afe"]):
         raise RuntimeError("AFE2 pair differs outside the declared update arm")
     for recipe in recipes.values():
+        _validate_checkpoint_contract(recipe)
         _validate_beta_calibration(recipe)
     calibration_path = args.beta_calibration.resolve()
     calibration = _load_json(calibration_path)
@@ -327,12 +365,21 @@ def main() -> None:
         "scene_profile": scene["profile"]["name"],
         "scene_sha256": scene["sha256"],
         "source_checkpoint_sha256": recipes["prox"]["source_checkpoint_sha256"],
+        "source_checkpoint_model_sha256": recipes["prox"][
+            "source_checkpoint_model_sha256"
+        ],
+        "source_checkpoint_contract_sha256": recipes["prox"][
+            "source_checkpoint_contract_sha256"
+        ],
         "source_git_commit": recipes["prox"].get("source_git_commit"),
         "reference_recipe": recipes["prox"]["reference_recipe"],
         "beta_calibration": {
             "path": str(calibration_path),
             "sha256": calibration_sha256,
             "chosen": calibration["chosen"],
+            "ess_target": calibration["ess_target"],
+            "solver": calibration["solver"],
+            "sigma_pool_sha256": calibration["sigma_pool_sha256"],
         },
         "runs": {
             name: {
@@ -347,7 +394,7 @@ def main() -> None:
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-    print(f"validated matched AFE2 radius-1 pair: {args.out}")
+    print(f"validated matched AFE2 {scene['profile']['name']} pair: {args.out}")
     delivery_values = (args.report, args.prox_video, args.afe_video, args.delivery_out)
     if any(value is not None for value in delivery_values):
         if not all(value is not None for value in delivery_values):
@@ -369,6 +416,12 @@ def main() -> None:
             "status": "DELIVERY_COMPLETE",
             "scene_sha256": scene["sha256"],
             "source_checkpoint_sha256": recipes["prox"]["source_checkpoint_sha256"],
+            "source_checkpoint_model_sha256": recipes["prox"][
+                "source_checkpoint_model_sha256"
+            ],
+            "source_checkpoint_contract_sha256": recipes["prox"][
+                "source_checkpoint_contract_sha256"
+            ],
             "source_git_commit": recipes["prox"]["source_git_commit"],
             "artifacts": {
                 name: {"path": str(path), "sha256": _sha256(path), "bytes": path.stat().st_size}

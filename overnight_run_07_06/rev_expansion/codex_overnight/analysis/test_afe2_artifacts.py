@@ -115,6 +115,63 @@ def test_completion_source_commit_is_bound() -> None:
             validator._validate_complete_identity(complete, recipe, "arm")
 
 
+def test_pair_validator_accepts_only_locked_continuous_ess_artifact() -> None:
+    with _validator_modules() as (validator, _):
+        spans = np.linspace(0.02, 0.20, 31, dtype=np.float64)
+        pools = np.stack([np.linspace(0.0, span, 64) for span in spans])
+        solution = validator.BC.solve_beta(pools)
+        contract = {
+            "name": "test_contract",
+            "checkpoint_file_sha256": "a" * 64,
+            "checkpoint_model_state_sha256": "b" * 64,
+        }
+        contract_sha = validator._canonical_json_sha256(contract)
+        calibration = {
+            "status": validator.BC.SUCCESS_STATUS,
+            "chosen": solution["beta"],
+            "ess_target": validator.BC.ESS_TARGET,
+            "ess_tolerance": validator.BC.ESS_TOLERANCE,
+            "solver": validator.BC.SOLVER,
+            "acquisition": validator.BC.ACQUISITION,
+            "pool_weighting": validator.BC.POOL_WEIGHTING,
+            "solution": solution,
+            "failure_reason": None,
+            "n_pools": len(pools),
+            "sigma_pool_sha256": validator.BC.sigma_pool_sha256(pools),
+            "checkpoint_sha256": "a" * 64,
+            "checkpoint_model_sha256": "b" * 64,
+            "checkpoint_contract": contract,
+            "checkpoint_contract_sha256": contract_sha,
+            "scene_sha256": "c" * 64,
+            "source_git_commit": "d" * 40,
+            "lam": 1.0,
+            "K": 64,
+            "B": 8,
+            "seed": 20260716,
+        }
+        recipe = {
+            "source_checkpoint_sha256": calibration["checkpoint_sha256"],
+            "source_checkpoint_model_sha256": calibration["checkpoint_model_sha256"],
+            "source_checkpoint_contract": contract,
+            "source_checkpoint_contract_sha256": contract_sha,
+            "source_git_commit": calibration["source_git_commit"],
+            "scene": {"sha256": calibration["scene_sha256"]},
+            "lam": calibration["lam"],
+            "K": calibration["K"],
+            "B": calibration["B"],
+            "seed": calibration["seed"],
+            "beta": calibration["chosen"],
+            "beta_calibration": calibration,
+            "beta_calibration_sha256": "e" * 64,
+        }
+
+        validator._validate_checkpoint_contract(recipe)
+        validator._validate_beta_calibration(recipe)
+        calibration["solution"]["achieved"]["ess_med"] = 0.5
+        with pytest.raises(RuntimeError, match="continuous-ESS"):
+            validator._validate_beta_calibration(recipe)
+
+
 def test_corrupt_report_cannot_be_promoted(tmp_path: Path) -> None:
     with _validator_modules() as (validator, _):
         corrupt = tmp_path / "report.png"

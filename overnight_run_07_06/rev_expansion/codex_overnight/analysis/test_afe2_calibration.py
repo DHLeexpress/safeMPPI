@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import copy
 import importlib.util
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -14,46 +16,90 @@ BC = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(BC)
 
 
-def _table(medians):
-    return {
-        str(beta): {
-            "ess_p10": max(0.0, median - 0.05),
-            "ess_med": median,
-            "ess_p90": min(1.0, median + 0.05),
-        }
-        for beta, median in zip(BC.CANDIDATES, medians)
-    }
+def _pools() -> np.ndarray:
+    """Deterministic non-tied K=64 pools with a well-defined ESS root."""
+
+    spans = np.linspace(0.02, 0.20, 31, dtype=np.float64)
+    return np.stack([np.linspace(0.0, span, 64) for span in spans])
 
 
-def test_calibration_selects_only_an_in_band_candidate() -> None:
-    table = _table((0.10, 0.36, 0.70))
-    assert BC.select_beta(table) == 0.02
-
-
-def test_calibration_refuses_nearest_fallback_when_none_is_in_band() -> None:
-    with pytest.raises(ValueError, match="no beta candidate"):
-        BC.select_beta(_table((0.05, 0.12, 0.63)))
-
-
-def test_success_artifact_recomputes_choice_and_provenance() -> None:
+def _success_payload(pools: np.ndarray) -> tuple[dict, dict]:
+    solution = BC.solve_beta(pools)
     expected = {
         "checkpoint_sha256": "a" * 64,
-        "scene_sha256": "b" * 64,
+        "checkpoint_model_sha256": "b" * 64,
+        "scene_sha256": "c" * 64,
+        "source_git_commit": "d" * 40,
+        "lam": 1.0,
         "K": 64,
+        "B": 8,
+        "seed": 20260716,
     }
     payload = {
         **expected,
         "status": BC.SUCCESS_STATUS,
-        "candidates": list(BC.CANDIDATES),
-        "target_ess_band": list(BC.ESS_BAND),
+        "chosen": solution["beta"],
+        "ess_target": BC.ESS_TARGET,
+        "ess_tolerance": BC.ESS_TOLERANCE,
+        "solver": BC.SOLVER,
         "acquisition": BC.ACQUISITION,
         "pool_weighting": BC.POOL_WEIGHTING,
-        "selection": BC.SELECTION,
-        "n_pools": 20,
-        "table": _table((0.12, 0.37, 0.61)),
-        "chosen": 0.02,
+        "solution": solution,
+        "failure_reason": None,
+        "n_pools": len(pools),
+        "sigma_pool_sha256": BC.sigma_pool_sha256(pools),
     }
-    assert BC.validate_success(payload, expected) == 0.02
-    payload["chosen"] = 0.05
-    with pytest.raises(ValueError, match="chosen value"):
-        BC.validate_success(payload, expected)
+    return payload, expected
+
+
+def test_continuous_solver_attains_predeclared_median_ess_target() -> None:
+    solution = BC.solve_beta(_pools())
+    achieved = solution["achieved"]
+
+    assert solution["target"] == BC.ESS_TARGET
+    assert solution["tolerance"] == BC.ESS_TOLERANCE
+    assert abs(achieved["ess_med"] - BC.ESS_TARGET) <= BC.ESS_TOLERANCE
+    assert 0.0 < achieved["ess_p10"] <= achieved["ess_med"] <= achieved["ess_p90"] <= 1.0
+    assert solution["beta"] > 0.0
+
+
+@pytest.mark.parametrize("scale", [0.01, 7.0, 100.0])
+def test_continuous_solver_is_scale_equivariant(scale: float) -> None:
+    base = BC.solve_beta(_pools())
+    scaled = BC.solve_beta(_pools() * scale)
+
+    assert scaled["beta"] == pytest.approx(base["beta"] * scale, rel=1e-12)
+    for name in ("ess_p10", "ess_med", "ess_p90"):
+        assert scaled["achieved"][name] == pytest.approx(
+            base["achieved"][name], abs=1e-12
+        )
+
+
+def test_continuous_solver_fails_closed_for_flat_sigma_pools() -> None:
+    with pytest.raises(ValueError, match="sigma pools are flat"):
+        BC.solve_beta(np.ones((20, 64), dtype=np.float64))
+
+
+def test_continuous_solver_and_pool_digest_are_repeatable() -> None:
+    pools = _pools()
+    assert BC.solve_beta(pools) == BC.solve_beta(pools.copy())
+    assert BC.sigma_pool_sha256(pools) == BC.sigma_pool_sha256(pools.copy())
+
+
+def test_success_artifact_validates_solver_witness_and_provenance() -> None:
+    payload, expected = _success_payload(_pools())
+    assert BC.validate_success(payload, expected) == payload["chosen"]
+
+    wrong_provenance = dict(expected, scene_sha256="e" * 64)
+    with pytest.raises(ValueError, match="provenance mismatch"):
+        BC.validate_success(payload, wrong_provenance)
+
+    corrupt_digest = copy.deepcopy(payload)
+    corrupt_digest["sigma_pool_sha256"] = "not-a-digest"
+    with pytest.raises(ValueError, match="sigma-pool digest"):
+        BC.validate_success(corrupt_digest, expected)
+
+    missed_target = copy.deepcopy(payload)
+    missed_target["solution"]["achieved"]["ess_med"] = BC.ESS_TARGET + 2 * BC.ESS_TOLERANCE
+    with pytest.raises(ValueError, match="did not attain"):
+        BC.validate_success(missed_target, expected)

@@ -475,6 +475,18 @@ def run_audit(policy, ctxs, env, goal_np, device, n_plans=4, nfe=8, n_theta=180,
     }
     out["V"] = float(np.mean([p["V"] for p in per]))
     out["Vprog"] = float(np.mean([p["Vprog"] for p in per]))
+    # Explicit paper-facing names.  Keep the legacy keys above for historical plots.
+    out["V_safe"] = out["V"]
+    out["V_full"] = out["Vprog"]
+    out["V_safe_gamma"] = out["V_gamma"]
+    out["V_full_gamma"] = out["Vprog_gamma"]
+    out["counts_gamma_full"] = {
+        str(g): {
+            "k": int(sum(p["k_prog"] for p in per if p["gamma"] == g)),
+            "n": int(sum(p["n_prog"] for p in per if p["gamma"] == g)),
+        }
+        for g in gammas
+    }
     for vk in ("rest", "adverse"):
         sub = [p for p in per if p.get("vel", "rest") == vk]
         if sub:

@@ -1,5 +1,10 @@
 # Planned-window AFE restart
 
+> The matched two-arm Claude-grid/Codex-radius-1 AFE2 study no longer runs a
+> trainer from this directory. Its canonical shared protocol and launcher are
+> [`../../codex_overnight/AFE2_FINAL_PROTOCOL.md`](../../codex_overnight/AFE2_FINAL_PROTOCOL.md).
+> `AFE2_RADIUS1_HANDOFF.md` is historical.
+
 This directory is the authoritative clean implementation of Safe Flow
 Expansion for the challenging stadium. The legacy trainer is archived and is
 not imported into this package.

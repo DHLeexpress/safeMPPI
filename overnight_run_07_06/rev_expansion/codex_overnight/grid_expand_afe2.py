@@ -19,8 +19,8 @@ Differences from grid_expand_afe.py (v1), all per spec:
       --arm prox : corrected proximal control (batch 128, lr 2e-5, eta 0.01, stop fstep>=0.03 or 40)
       --arm afe  : uniform cumulative D+ replay, batch 128, lr 1e-4, 250 steps, NO proximal term.
     No curriculum, expert replay, anchors, easy/frontier, or automatic collapse rollback.
-  * beta fixed from a pre-training ESS calibration (--calibrate): the beta in {0.01,0.02,0.05}
-    whose median acquisition ESS/K over representative round-0 all-K pools lies in [0.25,0.5].
+  * beta fixed from a pre-training ESS calibration (--calibrate): deterministic continuous
+    log-bisection solves median acquisition ESS/K = 3B/K = 0.375 on beta-neutral round-0 pools.
   * Diagnostics per round: all-K and selected-B sigma quantiles, ESS, acquisition entropy,
     selected-vs-pool sigma uplift, eigen spectrum + effective rank of A, total CFM loss, per-module
     gradient norms (encoder/trunk/head), relative per-module parameter change, fixed-probe
@@ -44,6 +44,7 @@ import argparse
 import copy
 import hashlib
 import json
+import math
 import random
 import subprocess
 import time
@@ -142,6 +143,10 @@ REFERENCE_RECIPE = {
     "seed": 910,
 }
 REFERENCE_BEHAVIOR_COMMIT = "e97eeadeabffc93775ea96332dbf3b56210442a7"
+CODEX_PROMOTED_CHECKPOINTS = {
+    "bfbb925a8499205a4639b33b8fe819ae4527fa8cafcabcc8722dd9bedea21efb",
+    "36cb9d6651d8aa86791ad6639be987f0da8f44d76b97fe9245a419f765ce0b08",
+}
 
 
 def _sha256_file(path):
@@ -155,6 +160,131 @@ def _sha256_file(path):
 def _module_provenance(module):
     path = os.path.abspath(module.__file__)
     return {"path": path, "sha256": _sha256_file(path)}
+
+
+def _canonical_json_sha256(value):
+    payload = json.dumps(
+        _json_safe(value), sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _runtime_provenance(device):
+    record = {
+        "python": sys.version,
+        "numpy": np.__version__,
+        "torch": torch.__version__,
+        "cuda_runtime": torch.version.cuda,
+        "requested_device": str(device),
+        "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "cuda_available": bool(torch.cuda.is_available()),
+        "logical_cuda_index": None,
+        "cuda_device_name": None,
+        "cuda_device_uuid": None,
+    }
+    if torch.cuda.is_available() and str(device).startswith("cuda"):
+        index = int(torch.cuda.current_device())
+        properties = torch.cuda.get_device_properties(index)
+        record.update(
+            logical_cuda_index=index,
+            cuda_device_name=torch.cuda.get_device_name(index),
+            cuda_device_uuid=(
+                None if getattr(properties, "uuid", None) is None
+                else str(properties.uuid)
+            ),
+        )
+    return record
+
+
+def validate_checkpoint_contract(profile_name, policy, checkpoint, checkpoint_sha256):
+    """Validate profile-bound expansion eligibility, then seal its exact contract.
+
+    File SHA identifies bytes.  The contract separately records why those bytes are
+    eligible.  The fresh radius-1 model has a machine-checkable Stage-3 promotion
+    witness; the historical Claude model predates that schema and therefore uses a
+    deliberately weaker, explicit legacy-data/architecture contract.
+    """
+
+    from codex_challenging.afe_restart.policy import (
+        model_state_hash,
+        require_promoted_fresh_pretrain,
+    )
+
+    model_sha256 = model_state_hash(policy)
+    config = checkpoint.get("config")
+    if not isinstance(config, dict):
+        raise RuntimeError("checkpoint is missing its model config")
+
+    common_architecture = (
+        config.get("arch") == "hp-repr"
+        and int(config.get("H_pred", -1)) == 10
+        and tuple(config.get("grid_shape", ())) == (1, 32, 32)
+        and int(config.get("K_hist", -1)) == 16
+        and float(config.get("u_max", float("nan"))) == 1.0
+        and config.get("use_gru", False) is False
+        and config.get("boundary_adapter", False) is False
+        and int(config.get("repr_dim", -1)) == 32
+        and int(config.get("ctx_dim", -1)) == 37
+        and int(getattr(policy, "repr_dim", -1)) == 32
+        and int(getattr(policy, "ctx_dim", -1)) == 37
+        and int(getattr(policy, "H_pred", -1)) == 10
+        and tuple(getattr(policy, "grid_shape", ())) == (1, 32, 32)
+        and getattr(policy, "boundary_adapter", None) is False
+    )
+    if not common_architecture:
+        raise RuntimeError("checkpoint violates the shared AFE2 32-D H=10 architecture")
+
+    if profile_name == "codex_radius1_v1":
+        if checkpoint_sha256 not in CODEX_PROMOTED_CHECKPOINTS:
+            raise RuntimeError(
+                "codex_radius1_v1 requires one of the two documented promoted Stage-3 "
+                "checkpoint file hashes"
+            )
+        promoted_hash = require_promoted_fresh_pretrain(policy, checkpoint)
+        if promoted_hash != model_sha256:
+            raise RuntimeError("Stage-3 promotion gate returned the wrong model-state hash")
+        contract = {
+            "name": "fresh_stage3_promoted_v1",
+            "assumption_level": "machine_checked_promotion_witness",
+            "checkpoint_file_sha256": checkpoint_sha256,
+            "checkpoint_model_state_sha256": model_sha256,
+            "fresh_from_scratch": checkpoint.get("fresh_from_scratch"),
+            "endpoint_free": checkpoint.get("endpoint_free"),
+            "promotion": checkpoint.get("expansion_promotion"),
+            "source_manifest": checkpoint.get("source_manifest"),
+            "source_query_hash_digest": checkpoint.get("source_query_hash_digest"),
+            "id_metrics_sha256": checkpoint.get("id_metrics_sha256"),
+        }
+    elif profile_name == "claude_grid_v1":
+        legacy_ok = (
+            checkpoint.get("data") == "druni_"
+            and int(checkpoint.get("per_gamma_cap", -1)) == 0
+            and math.isfinite(float(checkpoint.get("best_val", float("nan"))))
+            and tuple(config.get("grid_hw", ())) == (32, 32)
+            and tuple(config.get("trunk_hidden", ())) == (128, 64)
+            and int(config.get("enc_depth", -1)) == 2
+        )
+        if not legacy_ok:
+            raise RuntimeError(
+                "claude_grid_v1 requires the legacy uncapped druni_ a32uni checkpoint "
+                "with its declared 32x32 architecture and finite validation loss"
+            )
+        contract = {
+            "name": "legacy_a32uni_forensic_v1",
+            "assumption_level": (
+                "legacy_metadata_contract; no retrospective Stage-3 promotion witness"
+            ),
+            "checkpoint_file_sha256": checkpoint_sha256,
+            "checkpoint_model_state_sha256": model_sha256,
+            "data": checkpoint.get("data"),
+            "per_gamma_cap": checkpoint.get("per_gamma_cap"),
+            "best_val": float(checkpoint["best_val"]),
+            "config_sha256": _canonical_json_sha256(config),
+        }
+    else:
+        raise ValueError(f"unsupported checkpoint-contract profile: {profile_name}")
+
+    return model_sha256, contract, _canonical_json_sha256(contract)
 
 
 def _json_safe(value):
@@ -222,7 +352,7 @@ def _git_state():
 
 
 def assert_reference_recipe(cfg):
-    """Prevent a radius-1 replication from silently becoming a knob sweep."""
+    """Prevent either scene replication from silently becoming a knob sweep."""
 
     mismatches = {
         name: (getattr(cfg, name), expected)
@@ -269,6 +399,7 @@ def rebuild_A(policy, store, cfg, device):
     diag = dict(
         n=0,
         S_eff_rank=0.0,
+        S_centered_eff_rank=0.0,
         A_eff_rank=float(dim),
         A_eigenvalues=[1.0] * int(dim),
         A_eig_top=1.0,
@@ -282,11 +413,16 @@ def rebuild_A(policy, store, cfg, device):
     blr.A_inv = torch.linalg.inv(A)
     blr.n = Z.shape[0]
     ev_s = torch.linalg.eigvalsh(S).clamp_min(0)
+    Z_centered = Z - Z.mean(dim=0, keepdim=True)
+    ev_centered = torch.linalg.eigvalsh(Z_centered.T @ Z_centered).clamp_min(0)
     ev_a = 1.0 + ev_s / cfg.lam
     diag = dict(
         n=int(Z.shape[0]),
         S_eff_rank=float(
             ev_s.sum() ** 2 / (ev_s ** 2).sum().clamp_min(1e-12)
+        ),
+        S_centered_eff_rank=float(
+            ev_centered.sum() ** 2 / (ev_centered ** 2).sum().clamp_min(1e-12)
         ),
         A_eff_rank=float(
             ev_a.sum() ** 2 / (ev_a ** 2).sum().clamp_min(1e-12)
@@ -353,6 +489,20 @@ def acquire_and_execute(policy, blr, env, cfg, st, hist, g, store, round_i, ep, 
     ent = float(-(pi * (pi + 1e-30).log()).sum() / np.log(cfg.K))     # normalized entropy
     drawn = torch.multinomial(pi.float(), min(cfg.B, cfg.K), replacement=False).tolist()
     uplift = float(sig[drawn].mean() - sig.mean())
+    sig_np = sig.numpy()
+    sig_q = np.quantile(sig_np, [0.1, 0.25, 0.5, 0.75, 0.9])
+    z_cpu = Z.detach().cpu().to(torch.float64)
+    cosine_distance = (1.0 - z_cpu @ z_cpu.T).clamp_min(0.0)
+    pair = torch.triu_indices(cfg.K, cfg.K, offset=1)
+    feature_pair = cosine_distance[pair[0], pair[1]].numpy()
+    plan_pair = torch.pdist(
+        Ucand.detach().cpu().to(torch.float64).reshape(cfg.K, -1)
+    ).numpy()
+    feature_plan_corr = (
+        float(np.corrcoef(feature_pair, plan_pair)[0, 1])
+        if np.std(feature_pair) > 0.0 and np.std(plan_pair) > 0.0
+        else float("nan")
+    )
     sid = store.add_step_ctx(st, grid_np, l5_np, h_np, (round_i, ep, t)) if collect else -1
     best = None
     n_err = 0
@@ -407,6 +557,12 @@ def acquire_and_execute(policy, blr, env, cfg, st, hist, g, store, round_i, ep, 
         selected_terminal_rescue and not full_positive_available
     )
     stats = dict(ess=ess, ent=ent, uplift=uplift, n_err=n_err,
+                 sig_span=float(sig_np.max() - sig_np.min()),
+                 sig_iqr=float(sig_q[3] - sig_q[1]),
+                 feature_cosine_distance_q=[
+                     float(value) for value in np.quantile(feature_pair, [0.1, 0.5, 0.9])
+                 ],
+                 feature_plan_distance_corr=feature_plan_corr,
                  n_socp_solve=sum(int(d["v"]["n_socp_solve"]) for d in dres),
                  verifier_seconds=sum(float(d["v"]["verifier_seconds"]) for d in dres),
                  n_terminal_error=sum(
@@ -420,7 +576,7 @@ def acquire_and_execute(policy, blr, env, cfg, st, hist, g, store, round_i, ep, 
                  selected_terminal_required=selected_terminal_required,
                  full_positive_available=full_positive_available,
                  n_drawn=len(dres),
-                 sig_all=[float(q) for q in np.quantile(sig.numpy(), [0.1, 0.5, 0.9])],
+                 sig_all=[float(sig_q[index]) for index in (0, 2, 4)],
                  sig_sel=[float(q) for q in np.quantile(sig[drawn].numpy(), [0.1, 0.5, 0.9])])
     return best, stats
 
@@ -619,13 +775,13 @@ def controller_eval(policy, blr, env, cfg, device, round_i):
 
 
 # ------------------------------------------------------------------ beta calibration
-def calibrate_beta(policy, env, cfg, device, betas=BC.CANDIDATES, log=print):
-    """Calibrate beta once on radius-1 round-0 pools under beta-neutral acquisition.
+def calibrate_beta(policy, env, cfg, device, log=print):
+    """Calibrate beta once on round-0 pools under beta-neutral acquisition.
 
     Uniform B-without-replacement queries evolve A during this dry pass, so no
-    candidate beta changes the pools on which it is evaluated. The chosen beta
-    is closest to the center of the declared ESS/K band among in-band
-    candidates; calibration fails if none exists.
+    beta changes the pools on which it is evaluated.  One fixed beta is solved
+    continuously for the predeclared median ESS/K target and then shared by the
+    two update arms.
     """
 
     policy.eval()
@@ -677,25 +833,24 @@ def calibrate_beta(policy, env, cfg, device, betas=BC.CANDIDATES, log=print):
         log(f"[calib] gamma {g}: {len(raw_sigs)} cumulative sigma pools")
     if not raw_sigs:
         raise RuntimeError("beta calibration produced no round-0 candidate pools")
-    table = {}
-    for b in betas:
-        esss = []
-        for sg in raw_sigs:
-            w = np.exp(np.clip((sg - sg.max()) / max(b, 1e-9), -30, 30))
-            p = w / w.sum()
-            esss.append(1.0 / (p ** 2).sum() / cfg.K)
-        table[b] = dict(ess_med=float(np.median(esss)), ess_p10=float(np.quantile(esss, 0.1)),
-                        ess_p90=float(np.quantile(esss, 0.9)))
-        log(f"[calib] beta {b}: median ESS/K {table[b]['ess_med']:.3f} "
-            f"(p10 {table[b]['ess_p10']:.3f} p90 {table[b]['ess_p90']:.3f})")
-    table_json = {str(beta): row for beta, row in table.items()}
     try:
-        pick = BC.select_beta(table_json)
-    except ValueError:
-        pick = None
-        log("[calib] no beta is in-band; recording failure and refusing a nearest fallback")
-    log(f"[calib] chosen beta = {pick} (band [0.25,0.5]; {len(raw_sigs)} pools over 7 gammas)")
-    return pick, table, len(raw_sigs)
+        solution = BC.solve_beta(raw_sigs)
+        pick = float(solution["beta"])
+        achieved = solution["achieved"]
+        failure = None
+        log(
+            f"[calib] beta {pick:.8g}: median ESS/K {achieved['ess_med']:.4f} "
+            f"(p10 {achieved['ess_p10']:.4f} p90 {achieved['ess_p90']:.4f})"
+        )
+    except ValueError as exc:
+        pick, solution, failure = None, None, str(exc)
+        log(f"[calib] continuous ESS solve failed: {failure}")
+    digest = BC.sigma_pool_sha256(raw_sigs)
+    log(
+        f"[calib] chosen beta = {pick} (target ESS/K {BC.ESS_TARGET}; "
+        f"{len(raw_sigs)} pools over 7 gammas; pools {digest[:12]})"
+    )
+    return solution, len(raw_sigs), digest, failure
 
 
 # ------------------------------------------------------------------ run
@@ -710,6 +865,8 @@ def run_afe2(
     checkpoint_path=None,
     checkpoint_sha256=None,
     checkpoint_model_sha256=None,
+    checkpoint_contract=None,
+    checkpoint_contract_sha256=None,
     beta_calibration=None,
     beta_calibration_sha256=None,
     reference_recipe_locked=False,
@@ -770,8 +927,9 @@ def run_afe2(
                   ),
                   K=cfg.K, B=cfg.B, beta=cfg.beta, lam=cfg.lam, s=cfg.s,
                   beta_protocol=(
-                      "one shared radius-1 round-0 beta-neutral ESS calibration; median is "
-                      "control-step-pool-weighted across the fixed gamma sweep"
+                      "one beta-neutral round-0 calibration per (scene,checkpoint); solve one "
+                      "fixed beta for median ESS/K=0.375 and share it across both arms; median "
+                      "is control-step-pool-weighted across the fixed gamma sweep"
                   ),
                   beta_calibration=beta_calibration,
                   beta_calibration_sha256=beta_calibration_sha256,
@@ -791,22 +949,14 @@ def run_afe2(
                   ),
                   source_checkpoint_sha256=checkpoint_sha256,
                   source_checkpoint_model_sha256=checkpoint_model_sha256,
+                  source_checkpoint_contract=checkpoint_contract,
+                  source_checkpoint_contract_sha256=checkpoint_contract_sha256,
                   source_git_commit=source_git_state["commit"],
                   source_git_tracked_dirty=source_git_state["tracked_dirty"],
                   source_git_untracked_runtime_sources=source_git_state[
                       "untracked_runtime_sources"
                   ],
-                  runtime={
-                      "python": sys.version,
-                      "numpy": np.__version__,
-                      "torch": torch.__version__,
-                      "cuda_runtime": torch.version.cuda,
-                      "device": str(device),
-                      "cuda_device": (
-                          torch.cuda.get_device_name(device)
-                          if str(device).startswith("cuda") else None
-                      ),
-                  },
+                  runtime=_runtime_provenance(device),
                   module_provenance={
                       "trainer": _module_provenance(sys.modules[__name__]),
                       "afe_core": _module_provenance(AC),
@@ -819,14 +969,14 @@ def run_afe2(
                   reference_behavior_commit=REFERENCE_BEHAVIOR_COMMIT,
                   intentional_reference_deviation=(
                       "terminal-aware prefix eligibility/progress replaces fixed-H evaluation "
-                      "after a plan reaches the unchanged goal set; beta is recalibrated once on "
-                      "the radius-1 checkpoint; acquisition form and both update recipes match"
+                      "after a plan reaches the unchanged goal set; beta is scale-calibrated once "
+                      "per scene/checkpoint; acquisition form and both update recipes match"
                   ),
                   reference_recipe_locked=bool(reference_recipe_locked),
                   reference_recipe=REFERENCE_RECIPE,
                   no_curriculum=True, no_anchor=True, no_collapse_rollback=True)
     with open(os.path.join(outdir, "recipe.json"), "w") as f:
-        json.dump(recipe, f, indent=2)
+        json.dump(_json_safe(recipe), f, indent=2, sort_keys=True, allow_nan=False)
 
     def probe_write(rec):
         with open(os.path.join(outdir, "probe.jsonl"), "a") as f:
@@ -841,7 +991,11 @@ def run_afe2(
     log(f"[{cfg.arm}] round000 BASELINE V {audit0['V']:.3f} (adv {audit0.get('V_adverse', float('nan')):.3f}) | "
         f"ctrl SR {pooled0['SR']:.2f} CR {pooled0['CR']:.2f} NVP {pooled0['NVP']:.2f}", flush=True)
     probe_write(dict(round=0, arm=cfg.arm, V=audit0["V"], V_gamma=audit0["V_gamma"],
+                     V_safe=audit0["V_safe"], V_full=audit0["V_full"],
+                     V_safe_gamma=audit0["V_safe_gamma"],
+                     V_full_gamma=audit0["V_full_gamma"],
                      V_counts_gamma=audit0["counts_gamma"],
+                     V_counts_gamma_full=audit0["counts_gamma_full"],
                      V_counts_gamma_adverse=audit0.get("counts_gamma_adverse"),
                      V_adverse=audit0.get("V_adverse"), V_gamma_adverse=audit0.get("V_gamma_adverse"),
                      ctrl=rows0, ctrl_pooled=pooled0, n_D=0, n_Dpos=0, rep_cos=1.0))
@@ -883,6 +1037,22 @@ def run_afe2(
             ss = r["step_stats"]
             per_g[str(g)] = dict(status=r["status"], steps=r["steps"], term_t=r["term_t"],
                                  clear=r["clear_min"],
+                                 ess_med=(
+                                     float(np.median([s["ess"] for s in ss])) / cfg.K
+                                     if ss else None
+                                 ),
+                                 ent_med=(
+                                     float(np.median([s["ent"] for s in ss])) if ss else None
+                                 ),
+                                 uplift_med=(
+                                     float(np.median([s["uplift"] for s in ss])) if ss else None
+                                 ),
+                                 sig_iqr_med=(
+                                     float(np.median([s["sig_iqr"] for s in ss])) if ss else None
+                                 ),
+                                 sig_span_med=(
+                                     float(np.median([s["sig_span"] for s in ss])) if ss else None
+                                 ),
                                  n_q=sum(s["n_drawn"] for s in ss),
                                  n_pos=sum(s["n_pos"] for s in ss),
                                  n_exec_pos=sum(s["n_exec_pos"] for s in ss),
@@ -918,22 +1088,41 @@ def run_afe2(
             tr_gamma_draws[gq] = tr_gamma_draws.get(gq, 0) + int(count)
             tr_gamma_distinct[gq] = tr_gamma_distinct.get(gq, 0) + 1
         pos_prog = np.asarray([store.q_prog[q] for q in store.pos_ids], float)
+        feature_plan_corr = [
+            s["feature_plan_distance_corr"]
+            for s in all_ss
+            if np.isfinite(s["feature_plan_distance_corr"])
+        ]
         rec = dict(round=n, arm=cfg.arm, n_D=len(store), n_Dpos=store.n_pos(),
                    per_gamma=per_g,
                    ess_med=float(np.median([s["ess"] for s in all_ss])) / cfg.K,
                    ent_med=float(np.median([s["ent"] for s in all_ss])),
                    uplift_med=float(np.median([s["uplift"] for s in all_ss])),
+                   sig_span_med=float(np.median([s["sig_span"] for s in all_ss])),
+                   sig_iqr_med=float(np.median([s["sig_iqr"] for s in all_ss])),
+                   feature_cosine_distance_q_med=[
+                       float(np.median([s["feature_cosine_distance_q"][index] for s in all_ss]))
+                       for index in range(3)
+                   ],
+                   feature_plan_distance_corr_med=(
+                       float(np.median(feature_plan_corr)) if feature_plan_corr else None
+                   ),
                    sig_all_med=float(np.median([s["sig_all"][1] for s in all_ss])),
                    sig_sel_med=float(np.median([s["sig_sel"][1] for s in all_ss])),
                    A_n=spec_post["n"], A_eff_rank=spec_post["A_eff_rank"],
                    A_eig_top=spec_post["A_eig_top"], A_eig_med=spec_post["A_eig_med"],
                    S_eff_rank=spec_post["S_eff_rank"],
+                   S_centered_eff_rank=spec_post["S_centered_eff_rank"],
                    A_eigenvalues=spec_post["A_eigenvalues"],
                    A_round_start=spec_start, A_gather_end=spec_gather_end,
                    rep_cos=rep_cos_drift(policy, probe0, cfg),
                    dither_cum=float((pos_prog < cfg.dither_bar).mean()) if pos_prog.size else None,
                    V=audit["V"], V_gamma=audit["V_gamma"],
+                   V_safe=audit["V_safe"], V_full=audit["V_full"],
+                   V_safe_gamma=audit["V_safe_gamma"],
+                   V_full_gamma=audit["V_full_gamma"],
                    V_counts_gamma=audit["counts_gamma"], V_adverse=audit.get("V_adverse"),
+                   V_counts_gamma_full=audit["counts_gamma_full"],
                    V_counts_gamma_adverse=audit.get("counts_gamma_adverse"),
                    V_gamma_adverse=audit.get("V_gamma_adverse"),
                    ctrl=rows, ctrl_pooled=pooled,
@@ -966,7 +1155,8 @@ def run_afe2(
         completed_round = n
         log(f"[{cfg.arm}] round{n:03d} D {len(store)} D+ {store.n_pos()} | "
             f"ESS/K {rec['ess_med']:.2f} uplift {rec['uplift_med']:.3f} "
-            f"S-effR {spec_post['S_eff_rank']:.1f} "
+            f"S-effR {spec_post['S_eff_rank']:.1f}/centered "
+            f"{spec_post['S_centered_eff_rank']:.1f} "
             f"cos {rec['rep_cos']:.3f} | upd {0 if upd is None else upd['steps']}st "
             f"fstep {rec.get('fstep_final', 0):.3f} | V {audit['V']:.3f} | "
             f"ctrl SR {pooled['SR']:.2f} NVP {pooled['NVP']:.2f} | {t_gather:.0f}s+{t_upd:.0f}s",
@@ -980,6 +1170,8 @@ def run_afe2(
                     "required_round": cfg.rounds,
                     "scene_sha256": scene["sha256"],
                     "checkpoint_sha256": checkpoint_sha256,
+                    "checkpoint_model_sha256": checkpoint_model_sha256,
+                    "checkpoint_contract_sha256": checkpoint_contract_sha256,
                 },
                 f,
                 indent=2,
@@ -1014,6 +1206,8 @@ def run_afe2(
                 "completed_round": completed_round,
                 "scene_sha256": scene["sha256"],
                 "checkpoint_sha256": checkpoint_sha256,
+                "checkpoint_model_sha256": checkpoint_model_sha256,
+                "checkpoint_contract_sha256": checkpoint_contract_sha256,
                 "source_git_commit": source_git_state["commit"],
                 "artifact_sha256": artifact_sha256,
             },
@@ -1077,7 +1271,7 @@ def main():
         action="store_true",
         help=(
             "lock all e97eead arm/training/acquisition values except beta, which must come "
-            "from the shared radius-1 calibration"
+            "from the shared per-(scene,checkpoint) continuous-ESS calibration"
         ),
     )
     args = ap.parse_args()
@@ -1109,10 +1303,14 @@ def main():
             + ", ".join(frozen_parameters[:8])
         )
     profile = get_scene_profile(args.scene_profile)
-    # The identical beta-calibration rule applies independently to every (scene, checkpoint);
-    # checkpoint provenance is enforced uniformly by --expected-ckpt-sha256 (the previous
-    # radius1-only promoted-checkpoint gate imported a module absent from this branch).
-    checkpoint_model_sha256 = None
+    checkpoint_model_sha256, checkpoint_contract, checkpoint_contract_sha256 = (
+        validate_checkpoint_contract(
+            profile.name,
+            policy,
+            ck,
+            checkpoint_sha256,
+        )
+    )
     if args.wall_plugs is not None and args.wall_plugs != profile.wall_plugs:
         raise ValueError("--wall-plugs disagrees with --scene-profile")
     if args.start_eps is not None and not (
@@ -1141,6 +1339,7 @@ def main():
         expected_calibration = {
             "checkpoint_sha256": checkpoint_sha256,
             "checkpoint_model_sha256": checkpoint_model_sha256,
+            "checkpoint_contract_sha256": checkpoint_contract_sha256,
             "scene_sha256": scene_snapshot(env, profile)["sha256"],
             "lam": cfg.lam,
             "K": cfg.K,
@@ -1175,23 +1374,29 @@ def main():
     if args.calibrate:
         if os.path.isdir(args.outdir) and os.listdir(args.outdir):
             raise RuntimeError("beta calibration requires a new or empty output directory")
-        pick, table, npools = calibrate_beta(policy, env, cfg, dev)
+        solution, npools, pool_digest, failure = calibrate_beta(policy, env, cfg, dev)
+        pick = None if solution is None else float(solution["beta"])
         os.makedirs(args.outdir, exist_ok=True)
         with open(os.path.join(args.outdir, "beta_calibration.json"), "w") as f:
             json.dump(_json_safe(dict(
                 status=(BC.SUCCESS_STATUS if pick is not None else BC.FAILURE_STATUS),
                 chosen=pick,
-                candidates=list(BC.CANDIDATES),
-                target_ess_band=list(BC.ESS_BAND),
-                selection=BC.SELECTION,
+                ess_target=BC.ESS_TARGET,
+                ess_tolerance=BC.ESS_TOLERANCE,
+                solver=BC.SOLVER,
                 acquisition=BC.ACQUISITION,
                 pool_weighting=BC.POOL_WEIGHTING,
-                table={str(k): v for k, v in table.items()},
+                solution=solution,
+                failure_reason=failure,
                 n_pools=npools,
+                sigma_pool_sha256=pool_digest,
                 scene_sha256=scene_snapshot(env, profile)["sha256"],
                 checkpoint_sha256=checkpoint_sha256,
                 checkpoint_model_sha256=checkpoint_model_sha256,
+                checkpoint_contract=checkpoint_contract,
+                checkpoint_contract_sha256=checkpoint_contract_sha256,
                 source_git_commit=source_git_state["commit"],
+                runtime=_runtime_provenance(dev),
                 lam=cfg.lam,
                 K=cfg.K,
                 B=cfg.B,
@@ -1199,8 +1404,8 @@ def main():
             )), f, indent=2, sort_keys=True, allow_nan=False)
         if pick is None:
             raise RuntimeError(
-                "no declared beta candidate reached ESS/K in [0.25,0.5]; "
-                "failure table was persisted; refusing an ad-hoc nearest fallback"
+                "continuous beta calibration could not attain its ESS/K target; "
+                "the failure artifact was persisted and no fallback was applied"
             )
         return
     run_afe2(
@@ -1212,6 +1417,8 @@ def main():
         checkpoint_path=args.ckpt,
         checkpoint_sha256=checkpoint_sha256,
         checkpoint_model_sha256=checkpoint_model_sha256,
+        checkpoint_contract=checkpoint_contract,
+        checkpoint_contract_sha256=checkpoint_contract_sha256,
         beta_calibration=beta_calibration,
         beta_calibration_sha256=beta_calibration_sha256,
         reference_recipe_locked=args.lock_reference_recipe,
