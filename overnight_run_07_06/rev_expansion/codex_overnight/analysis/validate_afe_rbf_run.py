@@ -46,8 +46,37 @@ def main():
         "afe_rbf_previous_round_parallel_v1",
         "afe_rbf_batch_conditional_parallel_v2",
         "afe_rbf_sequential_operational_parallel_v3",
+        "afe_rbf_adaptive_ess_parallel_v4",
+        "afe_uniform_parallel_v1",
     }:
         raise RuntimeError("unexpected algorithm")
+    records = [
+        json.loads(line)
+        for line in open(os.path.join(args.run, "probe.jsonl"))
+        if line.strip()
+    ]
+    if [int(record["round"]) for record in records] != list(
+        range(int(recipe["rounds"]) + 1)
+    ):
+        raise RuntimeError("probe does not contain exactly round 0..R")
+    if recipe["algorithm"] == "afe_rbf_adaptive_ess_parallel_v4":
+        target = float(recipe["adaptive_ess_target"])
+        for round_i, record in enumerate(records[1:], start=1):
+            calibration = record.get("adaptive_beta_calibration") or {}
+            if float(calibration.get("target", -1.0)) != target:
+                raise RuntimeError(f"round {round_i} adaptive beta target is inconsistent")
+            if float(record["beta_next"]) != float(calibration["beta"]):
+                raise RuntimeError(f"round {round_i} beta_next is inconsistent")
+            if round_i > 1 and float(record["beta_used"]) != float(
+                records[round_i - 1]["beta_next"]
+            ):
+                raise RuntimeError(f"round {round_i} did not use prior beta_next")
+    if recipe["algorithm"] == "afe_uniform_parallel_v1":
+        for round_i, record in enumerate(records[1:], start=1):
+            if record.get("acquisition_mode") != "uniform":
+                raise RuntimeError(f"round {round_i} is not uniform acquisition")
+            if abs(float(record.get("ess_med", 0.0)) - 1.0) > 1.0e-12:
+                raise RuntimeError(f"round {round_i} uniform acquisition ESS is not one")
     for relative, expected in complete.get("artifact_sha256", {}).items():
         path = os.path.join(args.run, relative)
         if not os.path.isfile(path) or sha256_file(path) != expected:

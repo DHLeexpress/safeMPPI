@@ -46,6 +46,8 @@ def load_completed_run(root):
         "afe_rbf_previous_round_parallel_v1",
         "afe_rbf_batch_conditional_parallel_v2",
         "afe_rbf_sequential_operational_parallel_v3",
+        "afe_rbf_adaptive_ess_parallel_v4",
+        "afe_uniform_parallel_v1",
     }:
         raise RuntimeError("report accepts only the declared AFE-RBF algorithm")
     for relative in ("recipe.json", "probe.jsonl"):
@@ -71,9 +73,9 @@ def main():
     rounds = [int(record["round"]) for record in records]
     adapted = records[1:]
     adapted_rounds = rounds[1:]
-    figure, axes = plt.subplots(2, 4, figsize=(22, 10.5))
+    figure, axes = plt.subplots(3, 3, figsize=(18, 15.5))
 
-    ax = axes[0, 0]
+    ax = axes.flat[0]
     for key, label, color in (("SR", "SR", "#118833"), ("NVP", "NVP", "#cc3311"),
                               ("CR", "CR", "#332288")):
         ax.plot(rounds, [record["ctrl_pooled"][key] for record in records], "-o",
@@ -81,14 +83,14 @@ def main():
     ax.set(title="A. Expert-free verified controller", xlabel="round", ylim=(-0.03, 1.03))
     ax.legend()
 
-    ax = axes[0, 1]
+    ax = axes.flat[1]
     for gamma in GAMMAS:
         ax.plot(rounds, [record["ctrl"][gamma]["SR"] for record in records], "-o",
                 color=COLORS[gamma], label=f"γ={gamma}")
     ax.set(title="B. Controller SR by γ", xlabel="round", ylim=(-0.03, 1.03))
     ax.legend(fontsize=7, ncol=2)
 
-    ax = axes[0, 2]
+    ax = axes.flat[2]
     for gamma in GAMMAS:
         ax.plot(rounds, [record["V_safe_gamma"][gamma] for record in records], "-o",
                 color=COLORS[gamma], lw=1.6)
@@ -97,7 +99,7 @@ def main():
     ax.set(title="C. Untilted validity (safe solid / +progress dashed)", xlabel="round",
            ylim=(-0.03, 1.03))
 
-    ax = axes[0, 3]
+    ax = axes.flat[3]
     ax.plot(adapted_rounds, _values(adapted, "cfm"), "-o", color="#0077bb", label="CFM loss")
     ax.plot(adapted_rounds, _values(adapted, "cfm_last"), "--o", color="#33bbee",
             label="last-step CFM")
@@ -108,7 +110,7 @@ def main():
     lines = ax.lines + ax2.lines
     ax.legend(lines, [line.get_label() for line in lines], fontsize=8)
 
-    ax = axes[1, 0]
+    ax = axes.flat[4]
     ax.plot(adapted_rounds, _values(adapted, "sig_all_med"), "-o",
             label="step-1 pool variance")
     ax.plot(adapted_rounds, _values(adapted, "sig_sel_med"), "-o",
@@ -117,13 +119,14 @@ def main():
            ylabel="normalized posterior variance")
     ax.legend(fontsize=8)
 
-    ax = axes[1, 1]
+    ax = axes.flat[5]
     ax.plot(adapted_rounds, _values(adapted, "ess_first_med"), "-o",
             label="first-step ESS/K")
     ax.plot(adapted_rounds, _values(adapted, "ess_med"), "-o",
             label="median ESS/M remaining")
     ax.plot(adapted_rounds, _values(adapted, "ent_med"), "-o", label="entropy")
-    ax.axhline(0.375, color="0.5", ls=":", label="calibration target")
+    ess_target = recipe.get("adaptive_ess_target") or 0.375
+    ax.axhline(ess_target, color="0.5", ls=":", label=f"ESS target {ess_target:g}")
     ax2 = ax.twinx()
     ax2.plot(adapted_rounds, _values(adapted, "uplift_med"), "-s", color="#cc3311",
              label="σ uplift")
@@ -132,7 +135,7 @@ def main():
     lines = ax.lines + ax2.lines
     ax.legend(lines, [line.get_label() for line in lines], fontsize=8)
 
-    ax = axes[1, 2]
+    ax = axes.flat[6]
     ax.plot(rounds, _values(records, "n_D", 0), "-o", label="all verified queries D")
     ax.plot(rounds, _values(records, "n_Dpos", 0), "-o", label="cumulative D+")
     gp_sizes = [record.get("gp_buffer", {}).get("n", 0) for record in records]
@@ -140,7 +143,7 @@ def main():
     ax.set(title="G. Learning vs acquisition memory", xlabel="round", ylabel="samples")
     ax.legend(fontsize=8)
 
-    ax = axes[1, 3]
+    ax = axes.flat[7]
     gathering = np.asarray(_values(adapted, "t_gather", 0.0), dtype=float)
     sampling = np.asarray([
         record.get("gather_timing", {}).get("sampling", 0.0) for record in adapted
@@ -161,6 +164,32 @@ def main():
                 transform=ax.transAxes, va="top", fontsize=8)
     ax.legend(fontsize=7)
 
+    ax = axes.flat[8]
+    beta_used = [
+        record.get("beta_used", recipe.get("beta")) for record in records
+    ]
+    beta_next = [
+        record.get("beta_next", recipe.get("beta")) for record in records
+    ]
+    ax.plot(rounds, beta_used, "-o", label=r"$\beta_n$ used")
+    ax.plot(rounds, beta_next, "--s", label=r"$\beta_{n+1}$ calibrated")
+    if all(value is not None and float(value) > 0.0 for value in beta_next):
+        ax.set_yscale("log")
+    target = recipe.get("adaptive_ess_target")
+    achieved = [
+        ((record.get("adaptive_beta_calibration") or {}).get("solution") or {})
+        .get("achieved", {}).get("ess_med", np.nan)
+        for record in records
+    ]
+    ax2 = ax.twinx()
+    ax2.plot(rounds, achieved, ":^", color="#cc3311", label="calibration ESS")
+    if target is not None:
+        ax2.axhline(float(target), color="0.4", ls="--", label=f"ESS target {target:g}")
+    ax.set(title="I. Acquisition temperature schedule", xlabel="round", ylabel=r"$\beta$")
+    ax2.set_ylabel("normalized ESS")
+    lines = ax.lines + ax2.lines
+    ax.legend(lines, [line.get_label() for line in lines], fontsize=7)
+
     for axis in axes.flat:
         axis.grid(alpha=0.25)
     final = records[-1]
@@ -173,7 +202,7 @@ def main():
         f"round-0 calibration queries={recipe.get('calibration_budget', {}).get('total_queries', 0)}",
         fontsize=13,
     )
-    figure.tight_layout(rect=[0, 0, 1, 0.93])
+    figure.tight_layout(rect=[0, 0, 1, 0.95])
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     figure.savefig(args.out, dpi=140)
     plt.close(figure)

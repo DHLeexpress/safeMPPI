@@ -220,7 +220,8 @@ class DStore:
 
     Normalized by control step: the B queries of one step share one stored context. The H_P grid
     channel and action history are kept in float32, exactly matching the tensors embedded during
-    acquisition. Positives never leave; replay is uniform over the cumulative D+.
+    acquisition. Positives never leave the archive. Replay is cumulative by
+    default and may opt into an explicit recent-round window.
     """
 
     def __init__(self):
@@ -339,11 +340,27 @@ class DStore:
         g[:, 2:3] = hp
         return g
 
-    def sample_pos(self, nb, rng):
-        """Uniform-with-replacement draw over the CUMULATIVE D+ -> (G,L,H,U) cpu tensors + qids."""
-        if not self.pos_ids:
+    def positive_ids(self, *, round_i=None, replay_window=None):
+        """Return the positive replay population, optionally limited to recent rounds."""
+        if replay_window is None:
+            return list(self.pos_ids)
+        if round_i is None:
+            raise ValueError("windowed positive replay requires the current round")
+        replay_window = int(replay_window)
+        if replay_window < 1:
+            raise ValueError("positive replay window must be at least one round")
+        first_round = max(1, int(round_i) - replay_window + 1)
+        return [
+            query_id for query_id in self.pos_ids
+            if first_round <= int(self.q_round[query_id]) <= int(round_i)
+        ]
+
+    def sample_pos(self, nb, rng, *, eligible_ids=None):
+        """Uniform-with-replacement draw over an explicit positive replay population."""
+        population = self.pos_ids if eligible_ids is None else eligible_ids
+        if not population:
             return None
-        ids = [self.pos_ids[i] for i in rng.integers(0, len(self.pos_ids), nb)]
+        ids = [population[i] for i in rng.integers(0, len(population), nb)]
         sids = [self.q_sid[q] for q in ids]
         G = self.grid3_of(sids)
         L = torch.stack([torch.from_numpy(self.ctx_low5[s]) for s in sids])

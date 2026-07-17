@@ -44,8 +44,12 @@ def main():
         complete = json.load(stream)
     if complete.get("status") != "COMPLETE":
         raise RuntimeError("run is not complete")
-    if recipe.get("algorithm") != "afe_deep_ensemble_parallel_v1":
+    if recipe.get("algorithm") not in {
+        "afe_deep_ensemble_parallel_v1",
+        "afe_deep_ensemble_adaptive_ess_parallel_v2",
+    }:
         raise RuntimeError("unexpected algorithm")
+    adaptive = recipe["algorithm"] == "afe_deep_ensemble_adaptive_ess_parallel_v2"
     if recipe.get("kernel") is not None:
         raise RuntimeError("deep-ensemble arm must not declare a kernel")
     if recipe.get("beta") is None:
@@ -75,7 +79,19 @@ def main():
         expected_mode = "uniform_bootstrap" if round_i == 1 else "ensemble_tilt"
         if record.get("acquisition_mode") != expected_mode:
             raise RuntimeError(f"round {round_i} has the wrong acquisition mode")
-        if float(record.get("beta")) != float(recipe["beta"]):
+        if adaptive:
+            if float(record.get("beta_next")) != float(record.get("beta")):
+                raise RuntimeError(f"round {round_i} beta record is inconsistent")
+            calibration = record.get("beta_calibration") or {}
+            if float(calibration.get("target", -1.0)) != float(
+                recipe["adaptive_ess_target"]
+            ):
+                raise RuntimeError(f"round {round_i} adaptive beta target is inconsistent")
+            if round_i > 1 and float(record.get("beta_used")) != float(
+                records[round_i - 1]["beta_next"]
+            ):
+                raise RuntimeError(f"round {round_i} did not use prior beta_next")
+        elif float(record.get("beta")) != float(recipe["beta"]):
             raise RuntimeError(f"round {round_i} did not keep beta fixed")
         ensemble = record.get("ensemble", {})
         if int(ensemble.get("n", -1)) != int(record["n_D"]):
@@ -116,7 +132,12 @@ def main():
         )
         if int(payload.get("round", -1)) != round_i:
             raise RuntimeError(f"ensemble checkpoint {round_i} has the wrong round")
-        expected_beta = None if round_i == 0 else float(recipe["beta"])
+        expected_beta = (
+            None if round_i == 0 else (
+                float(records[round_i]["beta_next"])
+                if adaptive else float(recipe["beta"])
+            )
+        )
         if payload.get("beta") != expected_beta:
             raise RuntimeError(f"ensemble checkpoint {round_i} has the wrong beta")
         if payload.get("source_git_commit") != recipe["source_git_commit"]:

@@ -84,10 +84,17 @@ def ess_summary_ragged(
     }
 
 
-def solve_beta_ragged(vectors: Sequence[Sequence[float]]) -> dict[str, object]:
-    """Solve the fixed normalized-ESS target for B-step sequential acquisition."""
+def solve_beta_ragged(
+    vectors: Sequence[Sequence[float]],
+    *,
+    target: float = ESS_TARGET,
+) -> dict[str, object]:
+    """Solve a declared normalized-ESS target for B-step sequential acquisition."""
 
     rows = _score_vectors(vectors)
+    target = float(target)
+    if not math.isfinite(target) or not 0.0 < target < 1.0:
+        raise ValueError("normalized ESS target must lie strictly between zero and one")
     spans = np.asarray([np.ptp(row) for row in rows], dtype=np.float64)
     positive = spans[spans > 0.0]
     if positive.size == 0:
@@ -103,37 +110,37 @@ def solve_beta_ragged(vectors: Sequence[Sequence[float]]) -> dict[str, object]:
     low = high = scale
     low_stats = high_stats = initial
     bracket_steps = 0
-    if initial["ess_med"] > ESS_TARGET:
+    if initial["ess_med"] > target:
         for bracket_steps in range(1, MAX_BRACKET_STEPS + 1):
             low *= 0.5
             low_stats = evaluate(low)
-            if low_stats["ess_med"] <= ESS_TARGET:
+            if low_stats["ess_med"] <= target:
                 break
         else:
             raise ValueError("median ESS target is below the attainable tied-mode floor")
-    elif initial["ess_med"] < ESS_TARGET:
+    elif initial["ess_med"] < target:
         for bracket_steps in range(1, MAX_BRACKET_STEPS + 1):
             high *= 2.0
             high_stats = evaluate(high)
-            if high_stats["ess_med"] >= ESS_TARGET:
+            if high_stats["ess_med"] >= target:
                 break
         else:
             raise ValueError("median ESS target could not be bracketed")
 
-    candidates = [(abs(initial["ess_med"] - ESS_TARGET), scale, initial)]
+    candidates = [(abs(initial["ess_med"] - target), scale, initial)]
     if low != scale:
-        candidates.append((abs(low_stats["ess_med"] - ESS_TARGET), low, low_stats))
+        candidates.append((abs(low_stats["ess_med"] - target), low, low_stats))
     if high != scale:
-        candidates.append((abs(high_stats["ess_med"] - ESS_TARGET), high, high_stats))
+        candidates.append((abs(high_stats["ess_med"] - target), high, high_stats))
     iterations = 0
     while low < high and iterations < MAX_BISECTION_STEPS:
         iterations += 1
         middle = math.sqrt(low * high)
         stats = evaluate(middle)
-        candidates.append((abs(stats["ess_med"] - ESS_TARGET), middle, stats))
-        if abs(stats["ess_med"] - ESS_TARGET) <= ESS_TOLERANCE:
+        candidates.append((abs(stats["ess_med"] - target), middle, stats))
+        if abs(stats["ess_med"] - target) <= ESS_TOLERANCE:
             break
-        if stats["ess_med"] < ESS_TARGET:
+        if stats["ess_med"] < target:
             low, low_stats = middle, stats
         else:
             high, high_stats = middle, stats
@@ -144,7 +151,7 @@ def solve_beta_ragged(vectors: Sequence[Sequence[float]]) -> dict[str, object]:
     return {
         "beta": float(chosen),
         "achieved": achieved,
-        "target": ESS_TARGET,
+        "target": target,
         "tolerance": ESS_TOLERANCE,
         "bracket": [float(low), float(high)],
         "bracket_steps": int(bracket_steps),
@@ -176,7 +183,11 @@ def ess_summary(pools: Sequence[Sequence[float]], beta: float) -> dict[str, floa
     }
 
 
-def solve_beta(pools: Sequence[Sequence[float]]) -> dict[str, object]:
+def solve_beta(
+    pools: Sequence[Sequence[float]],
+    *,
+    target: float = ESS_TARGET,
+) -> dict[str, object]:
     """Solve the predeclared median-ESS equation without a post-hoc candidate grid.
 
     ESS is monotone in beta.  The bracket is expanded from the median within-pool
@@ -185,6 +196,9 @@ def solve_beta(pools: Sequence[Sequence[float]]) -> dict[str, object]:
     """
 
     array = _pool_array(pools)
+    target = float(target)
+    if not math.isfinite(target) or not 0.0 < target < 1.0:
+        raise ValueError("normalized ESS target must lie strictly between zero and one")
     spans = np.ptp(array, axis=1)
     positive = spans[spans > 0.0]
     if positive.size == 0:
@@ -200,37 +214,37 @@ def solve_beta(pools: Sequence[Sequence[float]]) -> dict[str, object]:
     low = high = scale
     low_stats = high_stats = initial
     bracket_steps = 0
-    if initial["ess_med"] > ESS_TARGET:
+    if initial["ess_med"] > target:
         for bracket_steps in range(1, MAX_BRACKET_STEPS + 1):
             low *= 0.5
             low_stats = evaluate(low)
-            if low_stats["ess_med"] <= ESS_TARGET:
+            if low_stats["ess_med"] <= target:
                 break
         else:
             raise ValueError("median ESS target is below the attainable tied-mode floor")
-    elif initial["ess_med"] < ESS_TARGET:
+    elif initial["ess_med"] < target:
         for bracket_steps in range(1, MAX_BRACKET_STEPS + 1):
             high *= 2.0
             high_stats = evaluate(high)
-            if high_stats["ess_med"] >= ESS_TARGET:
+            if high_stats["ess_med"] >= target:
                 break
         else:
             raise ValueError("median ESS target could not be bracketed")
 
-    candidates = [(abs(initial["ess_med"] - ESS_TARGET), scale, initial)]
+    candidates = [(abs(initial["ess_med"] - target), scale, initial)]
     if low != scale:
-        candidates.append((abs(low_stats["ess_med"] - ESS_TARGET), low, low_stats))
+        candidates.append((abs(low_stats["ess_med"] - target), low, low_stats))
     if high != scale:
-        candidates.append((abs(high_stats["ess_med"] - ESS_TARGET), high, high_stats))
+        candidates.append((abs(high_stats["ess_med"] - target), high, high_stats))
     iterations = 0
     while low < high and iterations < MAX_BISECTION_STEPS:
         iterations += 1
         middle = math.sqrt(low * high)
         stats = evaluate(middle)
-        candidates.append((abs(stats["ess_med"] - ESS_TARGET), middle, stats))
-        if abs(stats["ess_med"] - ESS_TARGET) <= ESS_TOLERANCE:
+        candidates.append((abs(stats["ess_med"] - target), middle, stats))
+        if abs(stats["ess_med"] - target) <= ESS_TOLERANCE:
             break
-        if stats["ess_med"] < ESS_TARGET:
+        if stats["ess_med"] < target:
             low, low_stats = middle, stats
         else:
             high, high_stats = middle, stats
@@ -243,7 +257,7 @@ def solve_beta(pools: Sequence[Sequence[float]]) -> dict[str, object]:
     return {
         "beta": float(chosen),
         "achieved": achieved,
-        "target": ESS_TARGET,
+        "target": target,
         "tolerance": ESS_TOLERANCE,
         "bracket": [float(low), float(high)],
         "bracket_steps": int(bracket_steps),

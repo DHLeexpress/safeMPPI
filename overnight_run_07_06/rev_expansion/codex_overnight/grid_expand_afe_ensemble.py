@@ -5,7 +5,8 @@ the validated AFE control, verifier, execution, and CFM pipeline is shared.
 Round 1 is an explicit uniform-query bootstrap.  After
 each flow update, all cumulative successful verifier queries are re-embedded
 with the current flow representation and the reference AFE five-MLP ensemble
-is refit from scratch.  Positive queries alone enter cumulative CFM replay.
+is refit from scratch. Positive queries alone enter the append-only D+ archive;
+CFM replay is cumulative by default and may use an explicit recent-round window.
 """
 from __future__ import annotations
 
@@ -34,6 +35,7 @@ import grid_metrics2 as GM2
 import grid_expand_hardtail as HT
 
 import afe_core as AC
+import afe_adaptive as AD
 import afe2_calibration as BC
 import afe_ensemble_core as EC
 import afe_rbf_core as RC
@@ -177,8 +179,20 @@ def _recipe(cfg, env, checkpoint_path, checkpoint_sha256, checkpoint_model_sha25
             checkpoint_contract, checkpoint_contract_sha256, source_git_state, device):
     profile = get_scene_profile(cfg.scene_profile)
     scene = scene_snapshot(env, profile)
+    adaptive = cfg.adaptive_ess_target is not None
+    learning_memory = (
+        "uniform replay over complete cumulative full-H D+ only"
+        if cfg.replay_window is None
+        else (
+            f"uniform replay over full-H positives from the current and previous "
+            f"{cfg.replay_window - 1} rounds; cumulative D+ archive is retained"
+        )
+    )
     return {
-        "algorithm": "afe_deep_ensemble_parallel_v1",
+        "algorithm": (
+            "afe_deep_ensemble_adaptive_ess_parallel_v2"
+            if adaptive else "afe_deep_ensemble_parallel_v1"
+        ),
         "arm": "afe",
         "single_arm": True,
         "kernel": None,
@@ -203,15 +217,22 @@ def _recipe(cfg, env, checkpoint_path, checkpoint_sha256, checkpoint_model_sha25
         ),
         "beta": None,
         "beta_protocol": (
-            "after round-1 refit, solve once for stage-normalized ESS/M_remaining=0.375 "
-            "using beta-neutral random removal orders on unverified candidate pools at stored "
-            "bootstrap contexts; fixed thereafter; realized Gibbs ESS is logged separately"
+            f"after every refit, calibrate beta_(n+1) on beta-neutral current-policy pools at "
+            f"all contexts visited in round n for median ESS={cfg.adaptive_ess_target:g}; "
+            "no verifier labels or verifier calls; beta is frozen during the next round"
+            if adaptive else (
+                "after round-1 refit, solve once for stage-normalized ESS/M_remaining=0.375 "
+                "using beta-neutral random removal orders on unverified candidate pools at stored "
+                "bootstrap contexts; fixed thereafter; realized Gibbs ESS is logged separately"
+            )
         ),
+        "adaptive_ess_target": cfg.adaptive_ess_target,
         "acquisition_memory": (
             "all successful full-verifier queries with binary labels; cumulative, re-embedded "
             "under current phi; frozen ensemble during each parallel gather"
         ),
-        "learning_memory": "uniform replay over complete cumulative full-H D+ only",
+        "learning_memory": learning_memory,
+        "replay_window": cfg.replay_window,
         "uncertainty_meaning": (
             "population standard deviation of five raw verifier-label regressors; epistemic "
             "ensemble disagreement, not validity probability and not a safety certificate"
@@ -320,6 +341,8 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             "round": 0,
             "arm": "afe",
             "acquisition_mode": "uniform_unfit",
+            "beta_used": None,
+            "beta_next": None,
             "V": audit0["V"],
             "V_safe": audit0["V_safe"],
             "V_full": audit0["V_full"],
@@ -351,6 +374,7 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
         estimator_start_diagnostics = estimator.diagnostics()
         for round_i in range(1, cfg.rounds + 1):
             round_started = time.perf_counter()
+            beta_used = None if round_i == 1 else float(cfg.beta)
             policy.eval()
             viz = []
             acquisition_mode = "uniform" if round_i == 1 else "sequential"
@@ -366,7 +390,9 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             update_started = time.perf_counter()
             replay_rng = np.random.default_rng(AFE2.named_seed(cfg.seed, "replay", round_i))
             with AC.isolated_random_state(AFE2.named_seed(cfg.seed, "update", round_i)):
-                update = AFE2.update_round(policy, optimizer, store, cfg, device, replay_rng)
+                update = AFE2.update_round(
+                    policy, optimizer, store, cfg, device, replay_rng, round_i
+                )
             update_seconds = time.perf_counter() - update_started
             policy.eval()
 
@@ -374,7 +400,25 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                 policy, store, cfg, device, round_i
             )
             beta_calibration = None
-            if round_i == 1:
+            if cfg.adaptive_ess_target is not None:
+                calibration_started = time.perf_counter()
+                calibration_pools, context_gamma_counts = AD.feature_pools(
+                    policy, store, cfg, device, round_i
+                )
+                beta_calibration = AD.calibrate_from_pools(
+                    estimator,
+                    calibration_pools,
+                    cfg,
+                    round_i,
+                    cfg.adaptive_ess_target,
+                )
+                beta_calibration["context_gamma_counts"] = context_gamma_counts
+                beta_calibration["candidate_pools_enter_D_or_Dplus"] = False
+                beta_calibration["seconds"] = float(
+                    time.perf_counter() - calibration_started
+                )
+                cfg.beta = float(beta_calibration["beta"])
+            elif round_i == 1:
                 calibration_started = time.perf_counter()
                 score_vectors, context_gamma_counts = _beta_score_vectors(
                     policy, estimator, store, cfg, device
@@ -393,10 +437,12 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                     "candidate_pools_enter_D_or_Dplus": False,
                     "seconds": float(time.perf_counter() - calibration_started),
                 }
+            if round_i == 1:
                 recipe["beta"] = cfg.beta
                 recipe["beta_calibration"] = beta_calibration
                 _write_json(os.path.join(outdir, "ensemble_calibration.json"), beta_calibration)
                 _write_json(recipe_path, recipe)
+            beta_next = float(cfg.beta)
 
             _save_estimator(
                 os.path.join(outdir, f"ensemble_round{round_i}.pt"),
@@ -431,6 +477,8 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                 "acquisition_mode": (
                     "uniform_bootstrap" if round_i == 1 else "ensemble_tilt"
                 ),
+                "beta_used": beta_used,
+                "beta_next": beta_next,
                 "n_D": len(store),
                 "n_Dpos": store.n_pos(),
                 "per_gamma": per_gamma,
@@ -477,6 +525,10 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                     "fstep_max": update["fstep_max"],
                     "grad_norm": update["grad_norm"],
                     "rel_param_change": update["rel_param_change"],
+                    "replay_window": update["replay_window"],
+                    "replay_eligible": update["replay_eligible"],
+                    "replay_fresh_draws": update["replay_fresh_draws"],
+                    "replay_fresh_distinct": update["replay_fresh_distinct"],
                 })
             checkpoint_started = time.perf_counter()
             torch.save({
@@ -509,6 +561,7 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                 f"[afe-ensemble] r{round_i:03d} D {len(store)} D+ {store.n_pos()} "
                 f"labels+ {estimator_diagnostics['positive_fraction']:.3f} "
                 f"ESS/M {record.get('ess_med', float('nan')):.3f} "
+                f"beta {beta_used}->{beta_next:.4g} "
                 f"uplift {record.get('uplift_med', float('nan')):.4f} V {audit['V']:.3f} "
                 f"SR {pooled['SR']:.2f} NVP {pooled['NVP']:.2f} "
                 f"gather {gather_seconds:.1f}s CFM {update_seconds:.1f}s "
@@ -570,6 +623,8 @@ def main():
     parser.add_argument("--batch", type=int, default=128)
     parser.add_argument("--afe-steps", type=int, default=250)
     parser.add_argument("--afe-lr", type=float, default=1.0e-4)
+    parser.add_argument("--adaptive-ess-target", type=float, default=None)
+    parser.add_argument("--replay-window", type=int, default=None)
     parser.add_argument("--verifier-workers", type=int, default=16)
     parser.add_argument("--seed", type=int, default=910)
     args = parser.parse_args()
@@ -581,6 +636,10 @@ def main():
         raise ValueError("rounds, rollout replicas, and M-eval must be positive")
     if args.verifier_workers < 1:
         raise ValueError("verifier worker count must be positive")
+    if args.adaptive_ess_target is not None and not 0.0 < args.adaptive_ess_target < 1.0:
+        raise ValueError("adaptive ESS target must lie strictly between zero and one")
+    if args.replay_window is not None and args.replay_window < 1:
+        raise ValueError("replay window must be at least one round")
 
     np.random.seed(args.seed)
     random.seed(args.seed)
@@ -630,11 +689,14 @@ def main():
         seed=args.seed,
         replicas=args.rollout_replicas,
         verifier_workers=args.verifier_workers,
+        adaptive_ess_target=args.adaptive_ess_target,
+        replay_window=args.replay_window,
     )
     print(
         f"[afe-ensemble] scene={profile.name} rounds={cfg.rounds} "
         f"replicas/gamma={cfg.replicas} K={cfg.K} B={cfg.B} "
-        f"ensemble=5x100x100 workers={cfg.verifier_workers}",
+        f"ensemble=5x100x100 workers={cfg.verifier_workers} "
+        f"adaptive_ESS={cfg.adaptive_ess_target} replay_W={cfg.replay_window}",
         flush=True,
     )
     run(

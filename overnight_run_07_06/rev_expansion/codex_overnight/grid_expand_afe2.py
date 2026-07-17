@@ -660,10 +660,16 @@ def run_episode(policy, blr, env, cfg, g, store, round_i, ep, device, collect=Tr
 
 
 # ------------------------------------------------------------------ updates (the two arms)
-def update_round(policy, opt, store, cfg, device, rng):
-    """Both arms: uniform replay over CUMULATIVE D+. prox: l_CFM + ||th-th_n||^2/2eta, lr 2e-5,
-    stop at fstep>=0.03 or 40 steps. afe: plain l_CFM, lr 1e-4, exactly 250 steps, no prox."""
+def update_round(policy, opt, store, cfg, device, rng, round_i=None):
+    """Uniform positive replay, cumulative unless cfg declares a recent-round window."""
     if store.n_pos() == 0:
+        return None
+    replay_window = getattr(cfg, "replay_window", None)
+    eligible_ids = store.positive_ids(
+        round_i=round_i,
+        replay_window=replay_window,
+    )
+    if not eligible_ids:
         return None
     policy.train()
     groups = {k: list(m.parameters()) for k, m in policy.module_groups().items()}
@@ -679,7 +685,9 @@ def update_round(policy, opt, store, cfg, device, rng):
     gnorm = {k: [] for k in groups}
     stop = "all_steps"
     for k_step in range(n_steps):
-        G, L, Hh, U, ids = store.sample_pos(cfg.batch, rng)
+        G, L, Hh, U, ids = store.sample_pos(
+            cfg.batch, rng, eligible_ids=eligible_ids
+        )
         for q in ids:
             drawn_ids[q] = drawn_ids.get(q, 0) + 1
         G, L, Hh, U = G.to(device), L.to(device), Hh.to(device), U.to(device)
@@ -716,11 +724,22 @@ def update_round(policy, opt, store, cfg, device, rng):
     for kg, ps in groups.items():
         num = torch.sqrt(sum(((p.detach() - q) ** 2).sum() for p, q in zip(ps, snap[kg]))).item()
         rel_dp[kg] = num / max(g_before[kg], 1e-12)
+    fresh_draws = (
+        0 if round_i is None else
+        sum(count for qid, count in drawn_ids.items() if store.q_round[qid] == round_i)
+    )
+    fresh_distinct = (
+        0 if round_i is None else
+        sum(store.q_round[qid] == round_i for qid in drawn_ids)
+    )
     return dict(steps=len(cfm_hist), stop=stop, cfm=float(np.mean(cfm_hist)),
                 cfm_first=cfm_hist[0], cfm_last=cfm_hist[-1],
                 fstep_final=fstep_hist[-1], fstep_max=max(fstep_hist),
                 grad_norm={k: float(np.mean(v)) for k, v in gnorm.items()},
-                rel_param_change=rel_dp, drawn_ids=drawn_ids, n_distinct=len(drawn_ids))
+                rel_param_change=rel_dp, drawn_ids=drawn_ids, n_distinct=len(drawn_ids),
+                replay_window=replay_window, replay_eligible=len(eligible_ids),
+                replay_fresh_draws=int(fresh_draws),
+                replay_fresh_distinct=int(fresh_distinct))
 
 
 # ------------------------------------------------------------------ controller evaluation

@@ -5,13 +5,12 @@ requires an RBF kernel.  It follows the peptide experiment's RBF choices while
 making the control-specific memory semantics explicit:
 
 * exact RBF-GP on at most 512 full-H positives from the previous round;
-* cumulative uniform D+ replay for the CFM update;
+* append-only D+ with cumulative replay by default and an opt-in round window;
 * multiple closed-loop replicas gathered synchronously; the GP is frozen for
   the whole round, so replicas do not depend on an arbitrary execution order;
 * B-budget sequential acquisition: only already-selected pending locations,
   never the unqueried remainder of K, condition the next posterior variance;
-* one pretrained-only beta calibration at the operational 512-point GP size
-  using disjoint rollout contexts and beta-neutral pending orders;
+* fixed pretrained-only beta by default, with an opt-in round-local ESS target;
 * one AFE update arm only (batch 128, lr 1e-4, 250 steps, no proximal term);
 * deterministic full verifier before execution and expert-free NVP termination.
 """
@@ -46,6 +45,7 @@ import grid_expand_hardtail as HT
 from di_grid_viz import di_step
 
 import afe_core as AC
+import afe_adaptive as AD
 import afe2_calibration as BC
 import afe_rbf_core as RC
 import grid_expand_afe2 as AFE2
@@ -66,6 +66,10 @@ class AFERBFConfig(AFE2.AFE2Config):
     gp_lam: float = 1.0e-2
     verifier_workers: int = 16
     lengthscale_samples: int = 50
+    acquisition_mode: str = "sequential"
+    adaptive_ess_target: float | None = None
+    replay_window: int | None = None
+    rbf_offline_sweep: bool = False
 
 
 def _episode(state, gamma, replica, episode_id, env, cfg):
@@ -690,7 +694,12 @@ def calibrate_rbf(policy, env, cfg, device, executor):
         policy, gp, beta_store, cfg, device
     )
     score_vector_seconds = time.perf_counter() - score_vector_start
-    solution = BC.solve_beta_ragged(score_vectors)
+    target = (
+        BC.ESS_TARGET
+        if cfg.adaptive_ess_target is None
+        else float(cfg.adaptive_ess_target)
+    )
+    solution = BC.solve_beta_ragged(score_vectors, target=target)
     seed_steps = [item for row in seed_episodes for item in row["step_stats"]]
     beta_steps = [item for row in beta_episodes for item in row["step_stats"]]
 
@@ -836,7 +845,7 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                 "normalized GP posterior variance conditioned on the GP buffer and only "
                 "the already-selected pending locations in a B-step acquisition"
             ),
-            "ess_target": BC.ESS_TARGET,
+            "ess_target": calibration["beta_solution"]["target"],
             "scene_sha256": scene["sha256"],
             "checkpoint_sha256": checkpoint_sha256,
             "source_git_commit": source_git_state["commit"],
@@ -846,19 +855,46 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             json.dump(calibration_public, stream, indent=2, sort_keys=True, allow_nan=False)
             stream.write("\n")
 
+        if cfg.acquisition_mode == "uniform":
+            algorithm = "afe_uniform_parallel_v1"
+        elif cfg.adaptive_ess_target is not None:
+            algorithm = "afe_rbf_adaptive_ess_parallel_v4"
+        else:
+            algorithm = "afe_rbf_sequential_operational_parallel_v3"
+        beta_protocol = (
+            "uniform B-without-replacement; RBF beta is diagnostic only"
+            if cfg.acquisition_mode == "uniform"
+            else (
+                f"round-1 operational calibration followed after every round by a beta-neutral "
+                f"current-policy calibration targeting median ESS={cfg.adaptive_ess_target:g}; "
+                "beta_n is frozen during round n"
+                if cfg.adaptive_ess_target is not None
+                else (
+                    f"one pretrained-only continuous ESS calibration against an operational "
+                    f"{cfg.gp_cap}-positive GP and disjoint rollout-context B-step score vectors; "
+                    "uniform beta-neutral pending orders; fixed for every expansion round"
+                )
+            )
+        )
+        learning_memory = (
+            "uniform replay over the complete cumulative full-H D+ archive"
+            if cfg.replay_window is None
+            else (
+                f"uniform replay over full-H positives from the current and previous "
+                f"{cfg.replay_window - 1} rounds; cumulative D+ archive is retained"
+            )
+        )
         recipe = {
-            "algorithm": "afe_rbf_sequential_operational_parallel_v3",
+            "algorithm": algorithm,
             "arm": "afe",
             "single_arm": True,
             "kernel": "RBF",
             "lengthscale": calibration["lengthscale"],
             "lengthscale_protocol": calibration_public["lengthscale_rule"],
             "beta": cfg.beta,
-            "beta_protocol": (
-                f"one pretrained-only continuous ESS calibration against an operational "
-                f"{cfg.gp_cap}-positive GP and disjoint rollout-context B-step score vectors; "
-                "uniform beta-neutral pending orders; fixed for every expansion round"
-            ),
+            "beta_protocol": beta_protocol,
+            "adaptive_ess_target": cfg.adaptive_ess_target,
+            "acquisition_mode": cfg.acquisition_mode,
             "acquisition_memory": (
                 "round 1: verified-positive pretrained calibration seed; later rounds: at most "
                 f"{cfg.gp_cap} full-H positives from immediately preceding round, gamma-balanced "
@@ -873,7 +909,9 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                 "beta is solved on beta-neutral random pending orders; realized first-step "
                 "ESS/K and stage-normalized ESS/M_remaining are logged during expansion"
             ),
-            "learning_memory": "uniform replay over the complete cumulative full-H D+ archive",
+            "learning_memory": learning_memory,
+            "replay_window": cfg.replay_window,
+            "rbf_offline_sweep": cfg.rbf_offline_sweep,
             "uncertainty_meaning": (
                 "RBF posterior variance conditioned on the acquisition buffer and only the "
                 "locations already selected within the same B-budget query; not validity "
@@ -952,6 +990,9 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
         write_probe({
             "round": 0,
             "arm": "afe",
+            "acquisition_mode": cfg.acquisition_mode,
+            "beta_used": cfg.beta,
+            "beta_next": cfg.beta,
             "V": audit0["V"],
             "V_safe": audit0["V_safe"],
             "V_full": audit0["V_full"],
@@ -981,11 +1022,13 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
         gp_start_diagnostics = bootstrap_gp.diagnostics()
         for round_i in range(1, cfg.rounds + 1):
             round_start = time.perf_counter()
+            beta_used = float(cfg.beta)
             policy.eval()
             viz = []
             episodes, gather_timing = run_parallel_episodes(
                 policy, gp_for_gather, env, cfg, store, round_i, cfg.replicas,
                 device, executor, collect=True, viz=viz, purpose="gather",
+                acquisition_mode=cfg.acquisition_mode,
             )
             gather_seconds = time.perf_counter() - round_start
             per_gamma = _per_gamma_episode_stats(episodes, cfg)
@@ -994,7 +1037,9 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             update_start = time.perf_counter()
             replay_rng = np.random.default_rng(AFE2.named_seed(cfg.seed, "replay", round_i))
             with AC.isolated_random_state(AFE2.named_seed(cfg.seed, "update", round_i)):
-                update = AFE2.update_round(policy, optimizer, store, cfg, device, replay_rng)
+                update = AFE2.update_round(
+                    policy, optimizer, store, cfg, device, replay_rng, round_i
+                )
             update_seconds = time.perf_counter() - update_start
             policy.eval()
 
@@ -1005,6 +1050,33 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             gp_post, gp_post_diagnostics = _gp_from_query_ids(
                 policy, store, query_ids, cfg, device, calibration["lengthscale"]
             )
+            adaptive_calibration = None
+            offline_sweep = None
+            beta_next = beta_used
+            if cfg.adaptive_ess_target is not None or cfg.rbf_offline_sweep:
+                calibration_pools, calibration_gamma_counts = AD.feature_pools(
+                    policy, store, cfg, device, round_i
+                )
+                if cfg.adaptive_ess_target is not None:
+                    adaptive_calibration = AD.calibrate_from_pools(
+                        gp_post,
+                        calibration_pools,
+                        cfg,
+                        round_i,
+                        cfg.adaptive_ess_target,
+                    )
+                    adaptive_calibration["context_gamma_counts"] = calibration_gamma_counts
+                    beta_next = float(adaptive_calibration["beta"])
+                    cfg.beta = beta_next
+                if cfg.rbf_offline_sweep and gp_post.X is not None:
+                    offline_sweep = AD.rbf_counterfactual_sweep(
+                        calibration_pools,
+                        gp_post.X,
+                        cfg,
+                        round_i,
+                        cfg.adaptive_ess_target or BC.ESS_TARGET,
+                        lengthscale=calibration["lengthscale"],
+                    )
             audit = AC.run_audit(
                 policy, audit_contexts, env, goal, device,
                 n_plans=cfg.audit_plans, nfe=cfg.nfe, n_theta=cfg.n_theta,
@@ -1013,6 +1085,7 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             evaluation, evaluation_timing = run_parallel_episodes(
                 policy, gp_post, env, cfg, store, round_i, cfg.M_eval,
                 device, executor, collect=False, viz=None, purpose="controller_eval",
+                acquisition_mode=cfg.acquisition_mode,
             )
             rows, pooled = _controller_summary(evaluation, cfg, env)
             drawn = (update or {}).get("drawn_ids", {})
@@ -1025,6 +1098,11 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             record = {
                 "round": round_i,
                 "arm": "afe",
+                "acquisition_mode": cfg.acquisition_mode,
+                "beta_used": beta_used,
+                "beta_next": beta_next,
+                "adaptive_beta_calibration": adaptive_calibration,
+                "rbf_offline_sweep": offline_sweep,
                 "n_D": len(store),
                 "n_Dpos": store.n_pos(),
                 "per_gamma": per_gamma,
@@ -1060,6 +1138,10 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                     "fstep_max": update["fstep_max"],
                     "grad_norm": update["grad_norm"],
                     "rel_param_change": update["rel_param_change"],
+                    "replay_window": update["replay_window"],
+                    "replay_eligible": update["replay_eligible"],
+                    "replay_fresh_draws": update["replay_fresh_draws"],
+                    "replay_fresh_distinct": update["replay_fresh_distinct"],
                 })
             write_probe(record)
             torch.save({
@@ -1087,6 +1169,7 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             print(
                 f"[afe-rbf] r{round_i:03d} D {len(store)} D+ {store.n_pos()} "
                 f"GP {gp_post.n}/{cfg.gp_cap} ESS/M {record.get('ess_med', float('nan')):.3f} "
+                f"beta {beta_used:.4g}->{beta_next:.4g} "
                 f"uplift {record.get('uplift_med', float('nan')):.4f} V {audit['V']:.3f} "
                 f"SR {pooled['SR']:.2f} NVP {pooled['NVP']:.2f} "
                 f"gather {gather_seconds:.1f}s update {update_seconds:.1f}s",
@@ -1151,6 +1234,14 @@ def main():
     parser.add_argument("--afe-lr", type=float, default=1.0e-4)
     parser.add_argument("--gp-cap", type=int, default=512)
     parser.add_argument("--gp-lam", type=float, default=1.0e-2)
+    parser.add_argument(
+        "--acquisition-mode",
+        choices=("sequential", "uniform"),
+        default="sequential",
+    )
+    parser.add_argument("--adaptive-ess-target", type=float, default=None)
+    parser.add_argument("--replay-window", type=int, default=None)
+    parser.add_argument("--rbf-offline-sweep", action="store_true")
     parser.add_argument("--verifier-workers", type=int, default=16)
     parser.add_argument("--seed", type=int, default=910)
     args = parser.parse_args()
@@ -1162,6 +1253,12 @@ def main():
         raise ValueError("rounds, rollout replicas, and M-eval must be positive")
     if args.verifier_workers < 1:
         raise ValueError("verifier worker count must be positive")
+    if args.adaptive_ess_target is not None and not 0.0 < args.adaptive_ess_target < 1.0:
+        raise ValueError("adaptive ESS target must lie strictly between zero and one")
+    if args.acquisition_mode == "uniform" and args.adaptive_ess_target is not None:
+        raise ValueError("uniform acquisition does not use adaptive beta")
+    if args.replay_window is not None and args.replay_window < 1:
+        raise ValueError("replay window must be at least one round")
 
     np.random.seed(args.seed)
     random.seed(args.seed)
@@ -1213,10 +1310,16 @@ def main():
         gp_cap=args.gp_cap,
         gp_lam=args.gp_lam,
         verifier_workers=args.verifier_workers,
+        acquisition_mode=args.acquisition_mode,
+        adaptive_ess_target=args.adaptive_ess_target,
+        replay_window=args.replay_window,
+        rbf_offline_sweep=args.rbf_offline_sweep,
     )
     print(
         f"[afe-rbf] scene={profile.name} rounds={cfg.rounds} replicas/gamma={cfg.replicas} "
-        f"K={cfg.K} B={cfg.B} GPcap={cfg.gp_cap} workers={cfg.verifier_workers}",
+        f"K={cfg.K} B={cfg.B} GPcap={cfg.gp_cap} workers={cfg.verifier_workers} "
+        f"acquisition={cfg.acquisition_mode} adaptive_ESS={cfg.adaptive_ess_target} "
+        f"replay_W={cfg.replay_window}",
         flush=True,
     )
     run(

@@ -63,6 +63,27 @@ def test_continuous_solver_attains_predeclared_median_ess_target() -> None:
     assert solution["beta"] > 0.0
 
 
+@pytest.mark.parametrize("target", [0.25, 0.5, 0.75])
+def test_continuous_solver_accepts_explicit_ess_targets(target: float) -> None:
+    solution = BC.solve_beta(_pools(), target=target)
+    ragged = BC.solve_beta_ragged(list(_pools()), target=target)
+
+    assert solution["target"] == target
+    assert ragged["target"] == target
+    assert solution["achieved"]["ess_med"] == pytest.approx(
+        target, abs=BC.ESS_TOLERANCE
+    )
+    assert ragged["achieved"]["ess_med"] == pytest.approx(
+        target, abs=BC.ESS_TOLERANCE
+    )
+
+
+@pytest.mark.parametrize("target", [0.0, 1.0, np.nan])
+def test_continuous_solver_rejects_invalid_ess_targets(target: float) -> None:
+    with pytest.raises(ValueError, match="strictly between"):
+        BC.solve_beta(_pools(), target=target)
+
+
 @pytest.mark.parametrize("scale", [0.01, 7.0, 100.0])
 def test_continuous_solver_is_scale_equivariant(scale: float) -> None:
     base = BC.solve_beta(_pools())
