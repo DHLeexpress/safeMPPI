@@ -8,7 +8,7 @@ import math
 CANDIDATES = (0.01, 0.02, 0.05)
 ESS_BAND = (0.25, 0.5)
 ESS_TARGET = 0.375
-SUCCESS_STATUS = "CALIBRATED_AFE2_RADIUS1_BETA"
+SUCCESS_STATUS = "CALIBRATED_AFE2_BETA"
 FAILURE_STATUS = "CALIBRATION_FAILED_NO_BETA_IN_BAND"
 ACQUISITION = "uniform B-without-replacement; beta-neutral"
 POOL_WEIGHTING = "one equal vote per visited control-step K-pool across gamma sweep"

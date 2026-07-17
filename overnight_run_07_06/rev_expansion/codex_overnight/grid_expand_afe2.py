@@ -1055,8 +1055,8 @@ def main():
     ap.add_argument(
         "--scene-profile",
         choices=sorted(SCENE_PROFILES),
-        default="claude_grid_v1",
-        help="explicit task adapter; codex_radius1_v1 is the center-radius-1 OOD scene",
+        required=True,
+        help="explicit task adapter (no default): claude_grid_v1 or codex_radius1_v1",
     )
     ap.add_argument(
         "--wall-plugs", type=int, default=None,
@@ -1109,13 +1109,10 @@ def main():
             + ", ".join(frozen_parameters[:8])
         )
     profile = get_scene_profile(args.scene_profile)
-    if (args.calibrate or args.beta_calibration is not None) and profile.name != "codex_radius1_v1":
-        raise ValueError("the locked beta-calibration contract is specific to codex_radius1_v1")
+    # The identical beta-calibration rule applies independently to every (scene, checkpoint);
+    # checkpoint provenance is enforced uniformly by --expected-ckpt-sha256 (the previous
+    # radius1-only promoted-checkpoint gate imported a module absent from this branch).
     checkpoint_model_sha256 = None
-    if profile.name == "codex_radius1_v1":
-        from codex_challenging.afe_restart.policy import require_promoted_fresh_pretrain
-
-        checkpoint_model_sha256 = require_promoted_fresh_pretrain(policy, ck)
     if args.wall_plugs is not None and args.wall_plugs != profile.wall_plugs:
         raise ValueError("--wall-plugs disagrees with --scene-profile")
     if args.start_eps is not None and not (

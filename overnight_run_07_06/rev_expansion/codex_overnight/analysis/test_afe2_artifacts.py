@@ -124,7 +124,7 @@ def test_corrupt_report_cannot_be_promoted(tmp_path: Path) -> None:
 
 
 def test_launcher_rejects_missing_args_and_contaminated_output(tmp_path: Path) -> None:
-    launcher = _ROOT / "run_afe2_radius1_pair.sh"
+    launcher = _ROOT / "run_afe2_pair.sh"
     missing = subprocess.run([str(launcher)], capture_output=True, text=True)
     assert missing.returncode == 2
     assert "usage:" in missing.stderr
@@ -135,7 +135,7 @@ def test_launcher_rejects_missing_args_and_contaminated_output(tmp_path: Path) -
     output.mkdir()
     (output / "stale.txt").write_text("stale")
     contaminated = subprocess.run(
-        [str(launcher), str(checkpoint), "0" * 64, str(output)],
+        [str(launcher), "codex_radius1_v1", str(checkpoint), "0" * 64, str(output)],
         capture_output=True,
         text=True,
     )

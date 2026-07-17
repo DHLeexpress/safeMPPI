@@ -78,7 +78,7 @@ def main():
     metadata = {}
     with open(args.pair_manifest) as stream:
         pair_manifest = json.load(stream)
-    if pair_manifest.get("status") != "VALIDATED_MATCHED_AFE2_RADIUS1_PAIR":
+    if pair_manifest.get("status") != "VALIDATED_MATCHED_AFE2_PAIR":
         raise RuntimeError("pair manifest status is not validated")
     for a in args.arms:
         recs = [json.loads(l) for l in open(os.path.join(a, "probe.jsonl"))]

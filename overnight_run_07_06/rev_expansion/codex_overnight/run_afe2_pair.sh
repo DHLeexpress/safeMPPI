@@ -1,25 +1,37 @@
 #!/usr/bin/env bash
+# Shared dual-scene AFE2 launcher (integration/afe2-terminal-dualscene-v1).
+# One trainer, verifier, terminal semantics, acquisition, replay, and update implementation for
+# both scene profiles; the profile is the ONLY task-specific input. The identical beta-calibration
+# rule runs independently per (scene, checkpoint); if no candidate enters ESS/K [0.25,0.5] the
+# calibration artifact is persisted and this launcher stops (fail-closed, no nearest-beta fallback).
 set -euo pipefail
 
-if [[ $# -ne 3 ]]; then
-  echo "usage: $0 /absolute/path/to/codex_pretrained.pt EXPECTED_SHA256 /absolute/output/root" >&2
+if [[ $# -ne 4 ]]; then
+  echo "usage: $0 SCENE_PROFILE /absolute/path/to/pretrained.pt EXPECTED_SHA256 /absolute/output/root" >&2
+  echo "  SCENE_PROFILE: claude_grid_v1 | codex_radius1_v1" >&2
   exit 2
 fi
 
+PROFILE="$1"
+case "$PROFILE" in
+  claude_grid_v1|codex_radius1_v1) ;;
+  *) echo "unknown scene profile: $PROFILE" >&2; exit 2 ;;
+esac
+
 HERE=$(cd "$(dirname "$0")" && pwd)
-CKPT_DIR=$(cd "$(dirname "$1")" && pwd)
-CKPT="$CKPT_DIR/$(basename "$1")"
-EXPECTED_CKPT_SHA256=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
-if [[ -e "$3" && ! -d "$3" ]]; then
-  echo "output root exists and is not a directory: $3" >&2
+CKPT_DIR=$(cd "$(dirname "$2")" && pwd)
+CKPT="$CKPT_DIR/$(basename "$2")"
+EXPECTED_CKPT_SHA256=$(printf '%s' "$3" | tr '[:upper:]' '[:lower:]')
+if [[ -e "$4" && ! -d "$4" ]]; then
+  echo "output root exists and is not a directory: $4" >&2
   exit 2
 fi
-if [[ -d "$3" && -n "$(find "$3" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
-  echo "locked AFE2 launcher requires a new or empty output root: $3" >&2
+if [[ -d "$4" && -n "$(find "$4" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+  echo "locked AFE2 launcher requires a new or empty output root: $4" >&2
   exit 2
 fi
-mkdir -p "$3"
-OUT=$(cd "$3" && pwd)
+mkdir -p "$4"
+OUT=$(cd "$4" && pwd)
 PYTHON_BIN=${PYTHON:-python}
 
 if [[ ! -f "$CKPT" ]]; then
@@ -56,14 +68,12 @@ fi
 "$PYTHON_BIN" -c 'import matplotlib, numpy, torch' >/dev/null
 "$PYTHON_BIN" grid_expand_afe2.py --help >/dev/null
 
-# These are the immutable non-beta e97eead acquisition/update values. Both arms also
-# share the trainer's declared absorbing-goal correction. The lock rejects
-# accidental knob changes. Beta is the sole scene-specific calibration: it is
-# selected once under a beta-neutral dry pass and then hash-bound to both arms.
+# Immutable non-beta e97eead acquisition/update values, shared by both profiles. The lock rejects
+# accidental knob changes; beta is the sole per-(scene,checkpoint) calibration output.
 COMMON=(
   --ckpt "$CKPT"
   --expected-ckpt-sha256 "$EXPECTED_CKPT_SHA256"
-  --scene-profile codex_radius1_v1
+  --scene-profile "$PROFILE"
   --rounds 10
   --K 64
   --B 8
@@ -80,7 +90,7 @@ COMMON=(
 "$PYTHON_BIN" grid_expand_afe2.py \
   --ckpt "$CKPT" \
   --expected-ckpt-sha256 "$EXPECTED_CKPT_SHA256" \
-  --scene-profile codex_radius1_v1 \
+  --scene-profile "$PROFILE" \
   --rounds 10 \
   --K 64 \
   --B 8 \
@@ -94,8 +104,8 @@ COMMON=(
   --calibrate \
   --outdir "$OUT/beta_calibration"
 
-# Deliberately sequential: both arms receive the full GPU and cannot share or
-# mutate runtime state.  Both reload the exact same checkpoint from disk.
+# Deliberately sequential: both arms receive the full GPU and cannot share or mutate runtime
+# state. Both reload the exact same checkpoint from disk.
 "$PYTHON_BIN" grid_expand_afe2.py \
   "${COMMON[@]}" \
   --arm prox \
@@ -111,32 +121,34 @@ COMMON=(
   --outdir "$OUT/afe_s910"
 
 "$PYTHON_BIN" analysis/validate_afe2_pair.py \
+  --scene-profile "$PROFILE" \
   --prox "$OUT/prox_s910" \
   --afe "$OUT/afe_s910" \
   --beta-calibration "$OUT/beta_calibration/beta_calibration.json" \
-  --out "$OUT/afe2_radius1_pair_manifest.json"
+  --out "$OUT/afe2_${PROFILE}_pair_manifest.json"
 
 "$PYTHON_BIN" analysis/afe2_report.py \
   --arms "$OUT/prox_s910" "$OUT/afe_s910" \
-  --pair-manifest "$OUT/afe2_radius1_pair_manifest.json" \
-  --out "$OUT/afe2_radius1_report.png"
+  --pair-manifest "$OUT/afe2_${PROFILE}_pair_manifest.json" \
+  --out "$OUT/afe2_${PROFILE}_report.png"
 
 "$PYTHON_BIN" video_afe2.py \
   --run "$OUT/prox_s910" \
-  --out "$OUT/afe2_radius1_prox.mp4"
+  --out "$OUT/afe2_${PROFILE}_prox.mp4"
 
 "$PYTHON_BIN" video_afe2.py \
   --run "$OUT/afe_s910" \
-  --out "$OUT/afe2_radius1_afe.mp4"
+  --out "$OUT/afe2_${PROFILE}_afe.mp4"
 
 "$PYTHON_BIN" analysis/validate_afe2_pair.py \
+  --scene-profile "$PROFILE" \
   --prox "$OUT/prox_s910" \
   --afe "$OUT/afe_s910" \
   --beta-calibration "$OUT/beta_calibration/beta_calibration.json" \
-  --out "$OUT/afe2_radius1_pair_manifest.json" \
-  --report "$OUT/afe2_radius1_report.png" \
-  --prox-video "$OUT/afe2_radius1_prox.mp4" \
-  --afe-video "$OUT/afe2_radius1_afe.mp4" \
+  --out "$OUT/afe2_${PROFILE}_pair_manifest.json" \
+  --report "$OUT/afe2_${PROFILE}_report.png" \
+  --prox-video "$OUT/afe2_${PROFILE}_prox.mp4" \
+  --afe-video "$OUT/afe2_${PROFILE}_afe.mp4" \
   --delivery-out "$OUT/DELIVERY_COMPLETE.json"
 
-echo "AFE2 radius-1 pair complete: $OUT"
+echo "AFE2 pair complete [$PROFILE]: $OUT"

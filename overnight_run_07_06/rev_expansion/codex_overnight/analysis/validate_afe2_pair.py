@@ -215,6 +215,8 @@ def _validate_complete_identity(complete: dict, recipe: dict, run_name: str) -> 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prox", type=Path, required=True)
+    parser.add_argument("--scene-profile", required=True,
+                        help="expected scene profile name for this pair (explicit, no default)")
     parser.add_argument("--afe", type=Path, required=True)
     parser.add_argument("--beta-calibration", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
@@ -223,6 +225,7 @@ def main() -> None:
     parser.add_argument("--afe-video", type=Path)
     parser.add_argument("--delivery-out", type=Path)
     args = parser.parse_args()
+    expected_profile = str(args.scene_profile)
 
     roots = {"prox": args.prox.resolve(), "afe": args.afe.resolve()}
     recipes = {name: _load_json(root / "recipe.json") for name, root in roots.items()}
@@ -282,8 +285,9 @@ def main() -> None:
 
     scene = recipes["prox"]["scene"]
     assert_scene_snapshot(scene)
-    if scene["profile"]["name"] != "codex_radius1_v1":
-        raise RuntimeError("pair does not use codex_radius1_v1")
+    if scene["profile"]["name"] != expected_profile:
+        raise RuntimeError(
+            f"pair scene profile {scene['profile']['name']!r} != expected {expected_profile!r}")
     for name, root in roots.items():
         complete = _load_json(root / "COMPLETE.json")
         _validate_complete_identity(complete, recipes[name], name)
@@ -319,7 +323,8 @@ def main() -> None:
             _validate_viz_round(db, recipes[name], scene, q_y, name, round_i)
 
     manifest = {
-        "status": "VALIDATED_MATCHED_AFE2_RADIUS1_PAIR",
+        "status": "VALIDATED_MATCHED_AFE2_PAIR",
+        "scene_profile": scene["profile"]["name"],
         "scene_sha256": scene["sha256"],
         "source_checkpoint_sha256": recipes["prox"]["source_checkpoint_sha256"],
         "source_git_commit": recipes["prox"].get("source_git_commit"),
