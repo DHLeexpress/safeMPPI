@@ -42,7 +42,10 @@ def load_completed_run(root):
     records = [json.loads(line) for line in open(paths["probe.jsonl"]) if line.strip()]
     if complete.get("status") != "COMPLETE":
         raise RuntimeError("trainer completion marker is not COMPLETE")
-    if recipe.get("algorithm") != "afe_rbf_previous_round_parallel_v1":
+    if recipe.get("algorithm") not in {
+        "afe_rbf_previous_round_parallel_v1",
+        "afe_rbf_batch_conditional_parallel_v2",
+    }:
         raise RuntimeError("report accepts only the declared AFE-RBF algorithm")
     for relative in ("recipe.json", "probe.jsonl"):
         expected = complete.get("artifact_sha256", {}).get(relative)
@@ -105,10 +108,13 @@ def main():
     ax.legend(lines, [line.get_label() for line in lines], fontsize=8)
 
     ax = axes[1, 0]
-    ax.plot(adapted_rounds, _values(adapted, "sig_all_med"), "-o", label="all-K median")
-    ax.plot(adapted_rounds, _values(adapted, "sig_sel_med"), "-o", label="selected-B median")
-    ax.plot(adapted_rounds, _values(adapted, "sig_iqr_med"), "--o", label="all-K IQR")
-    ax.set(title="E. RBF posterior uncertainty", xlabel="round", ylabel="σ")
+    ax.plot(adapted_rounds, _values(adapted, "sig_all_med"), "-o",
+            label="conditional all-K median")
+    ax.plot(adapted_rounds, _values(adapted, "sig_sel_med"), "-o",
+            label="conditional selected-B median")
+    ax.plot(adapted_rounds, _values(adapted, "marginal_sigma_med"), "--o",
+            label="marginal std median")
+    ax.set(title="E. RBF batch-conditional acquisition", xlabel="round", ylabel="uncertainty")
     ax.legend(fontsize=8)
 
     ax = axes[1, 1]

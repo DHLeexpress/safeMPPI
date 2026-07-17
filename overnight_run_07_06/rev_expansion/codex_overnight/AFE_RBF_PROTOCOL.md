@@ -35,7 +35,10 @@ The two memories are intentionally different.
   replacement, and deterministic from the run seed.  The selected plans are
   re-embedded using the current `phi_s` before the GP is fitted.  The GP is then
   frozen for the whole round, making parallel replicas independent of arbitrary
-  completion order.
+  completion order.  Within each `K=64` proposal pool, candidate `i` is scored
+  by `Var(f_i | f_{-i}, GP buffer) = 1 / [C^{-1}]_{ii}`.  This is the public
+  peptide implementation's batch-conditional rule: near-duplicate proposals
+  suppress one another instead of all receiving the same marginal variance.
 * Learning: uniform replay with replacement from every full-window positive in
   cumulative `D+`.  Each round takes 250 CFM gradient steps, batch 128, Adam
   learning rate `1e-4`, with all encoder/trunk/head parameters trainable.
@@ -49,7 +52,8 @@ Before expansion, sample exactly 50 plans from the pretrained model across the
 seven initial gamma contexts.  L2-normalize their `phi_s` embeddings and set the
 RBF length scale to their mean off-diagonal pairwise distance.  Only the plans
 that pass the full verifier seed the round-1 GP.  Against that fixed seed, solve
-once for beta using the predeclared median `ESS/K=0.375` target.  Hold both
+once for beta on batch-conditional variance using the predeclared median
+`ESS/K=0.375` target.  Hold both
 length scale and beta fixed thereafter.
 
 ## Scope and assumptions

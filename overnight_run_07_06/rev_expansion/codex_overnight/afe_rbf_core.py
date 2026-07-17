@@ -96,6 +96,54 @@ class RBFGPSigma:
         return (1.0 - reduction).clamp_min(0.0).sqrt()
 
     @torch.no_grad()
+    def posterior_covariance(
+        self,
+        features: torch.Tensor,
+        *,
+        include_observation_noise: bool = True,
+    ) -> torch.Tensor:
+        """Joint GP posterior covariance for one candidate batch."""
+
+        query = l2_normalize(features.detach())
+        covariance = self._kernel(query, query)
+        if self.X is not None:
+            cross = self._kernel(query, self.X)
+            solved = torch.cholesky_solve(cross.T.to(torch.float64), self.L)
+            covariance = covariance - cross @ solved.to(cross.dtype)
+        covariance = 0.5 * (covariance + covariance.T)
+        if include_observation_noise:
+            covariance = covariance + self.lam * torch.eye(
+                covariance.shape[0], dtype=covariance.dtype, device=covariance.device
+            )
+        return covariance
+
+    @torch.no_grad()
+    def conditional_variance(self, features: torch.Tensor, jitter: float = 1.0e-6) -> torch.Tensor:
+        """Var(f_i | f_{-i}, GP buffer), matching the peptide implementation.
+
+        For joint posterior covariance ``C``, the Schur-complement identity is
+        ``Var(f_i | f_{-i}) = 1 / [C^{-1}]_ii``.  Conditioning on the rest of
+        the K-pool makes near-duplicate candidates suppress one another even
+        when their marginal variances are similar.
+        """
+
+        covariance = self.posterior_covariance(features)
+        eye = torch.eye(
+            covariance.shape[0], dtype=covariance.dtype, device=covariance.device
+        )
+        covariance = covariance + float(jitter) * eye
+        factor = torch.linalg.cholesky(covariance.to(torch.float64))
+        inverse_factor = torch.linalg.solve_triangular(
+            factor,
+            eye.to(torch.float64),
+            upper=False,
+        )
+        inverse_diagonal = inverse_factor.square().sum(dim=0).clamp_min(1.0e-12)
+        conditional = (1.0 / inverse_diagonal).to(features.dtype)
+        # Same prior-variance normalization used by the reference peptide code.
+        return (conditional / (1.0 + self.lam)).clamp(0.0, 1.0)
+
+    @torch.no_grad()
     def diagnostics(self) -> dict[str, object]:
         if self.X is None:
             return {

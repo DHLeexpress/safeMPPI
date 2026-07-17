@@ -254,7 +254,10 @@ def validate_afe_run(run_root, scene_profile, rounds):
             raise FileNotFoundError(f"completed AFE-RBF artifact is missing: {path}")
     recipe = load_json(recipe_path)
     complete = load_json(complete_path)
-    if recipe.get("algorithm") != "afe_rbf_previous_round_parallel_v1":
+    if recipe.get("algorithm") not in {
+        "afe_rbf_previous_round_parallel_v1",
+        "afe_rbf_batch_conditional_parallel_v2",
+    }:
         raise RuntimeError("--run-root accepts only the declared single-arm AFE-RBF algorithm")
     if recipe.get("arm") != "afe" or recipe.get("single_arm") is not True:
         raise RuntimeError("--run-root is not a single AFE arm")

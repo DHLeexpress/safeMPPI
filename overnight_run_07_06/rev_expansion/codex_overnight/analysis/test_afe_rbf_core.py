@@ -30,6 +30,20 @@ def test_lengthscale_is_mean_pairwise_normalized_distance() -> None:
     assert RC.mean_pairwise_lengthscale(features) == pytest.approx(expected)
 
 
+def test_batch_conditional_variance_penalizes_near_duplicates() -> None:
+    gp = RC.RBFGPSigma(lengthscale=0.25, lam=1.0e-3)
+    candidates = torch.tensor([
+        [1.0, 0.0],
+        [1.0, 0.0],
+        [0.0, 1.0],
+    ])
+    conditional = gp.conditional_variance(candidates)
+
+    assert float(conditional[0]) == pytest.approx(float(conditional[1]), rel=1.0e-5)
+    assert float(conditional[0]) < 0.01
+    assert float(conditional[2]) > 0.9
+
+
 class _Store:
     def __init__(self):
         self.pos_ids = list(range(36))

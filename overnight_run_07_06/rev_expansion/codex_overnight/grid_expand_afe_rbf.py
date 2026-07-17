@@ -113,7 +113,7 @@ def _context_arrays(episodes, env):
     )
 
 
-def _acquisition_stats(sig, selected, features, controls, cfg):
+def _acquisition_stats(sig, selected, features, controls, cfg, marginal_sigma=None):
     weights = torch.exp(((sig - sig.max()) / max(cfg.beta, 1.0e-9)).clamp(-30, 30))
     probability = (weights / weights.sum()).to(torch.float64)
     ess = float(1.0 / probability.square().sum())
@@ -134,7 +134,7 @@ def _acquisition_stats(sig, selected, features, controls, cfg):
         if np.std(feature_distance) > 0.0 and np.std(plan_distance) > 0.0
         else float("nan")
     )
-    return {
+    output = {
         "ess": ess,
         "ent": entropy,
         "uplift": float(sig[selected].mean() - sig.mean()),
@@ -150,6 +150,12 @@ def _acquisition_stats(sig, selected, features, controls, cfg):
         ],
         "feature_plan_distance_corr": correlation,
     }
+    if marginal_sigma is not None:
+        output["marginal_sigma_med"] = float(marginal_sigma.median())
+        output["marginal_sigma_iqr"] = float(
+            torch.quantile(marginal_sigma, 0.75) - torch.quantile(marginal_sigma, 0.25)
+        )
+    return output
 
 
 @torch.no_grad()
@@ -207,9 +213,17 @@ def run_parallel_episodes(
                 s=cfg.s,
             )
             features = RC.l2_normalize(features).reshape(len(active), cfg.K, -1)
-            sigma = gp.sigma(features.reshape(len(active) * cfg.K, -1)).reshape(
+            marginal_sigma = gp.sigma(
+                features.reshape(len(active) * cfg.K, -1)
+            ).reshape(
                 len(active), cfg.K
             )
+            # Reference peptide semantics: each plan is scored by its posterior
+            # variance conditioned on both the GP buffer and the other K-1 plans.
+            sigma = torch.stack([
+                gp.conditional_variance(features[episode_index])
+                for episode_index in range(len(active))
+            ])
             selected = []
             for episode_index in range(len(active)):
                 values = sigma[episode_index]
@@ -230,6 +244,7 @@ def run_parallel_episodes(
 
         candidate_cpu = candidates.detach().cpu().numpy()
         sigma_cpu = sigma.detach().cpu()
+        marginal_sigma_cpu = marginal_sigma.detach().cpu()
         feature_cpu = features.detach().cpu()
         step_context_ids = {}
         if collect:
@@ -292,6 +307,7 @@ def run_parallel_episodes(
                 feature_cpu[local_index],
                 torch.from_numpy(candidate_cpu[local_index]),
                 cfg,
+                marginal_sigma=marginal_sigma_cpu[local_index],
             )
             full_positive_available = any(row[2]["y"] == 1 for row in query_rows)
             selected_rescue = bool(best is not None and best[4]["terminal_rescue"])
@@ -515,7 +531,9 @@ def calibrate_rbf(policy, env, cfg, device, executor):
             pool_features = RC.l2_normalize(
                 policy.phi_s(pool_controls, repeated, s=cfg.s)
             )
-            sigma_pools.append(gp.sigma(pool_features).detach().cpu().numpy())
+            sigma_pools.append(
+                gp.conditional_variance(pool_features).detach().cpu().numpy()
+            )
     sigma_pools = np.asarray(sigma_pools, dtype=np.float64)
     solution = BC.solve_beta(sigma_pools)
     return {
@@ -567,6 +585,12 @@ def _aggregate_step_stats(episodes, cfg):
             float(np.median(correlations)) if correlations else None
         ),
         "verifier_cpu_seconds": float(sum(item["verifier_seconds"] for item in values)),
+        "marginal_sigma_med": float(np.median([
+            item["marginal_sigma_med"] for item in values
+        ])),
+        "marginal_sigma_iqr_med": float(np.median([
+            item["marginal_sigma_iqr"] for item in values
+        ])),
     }
 
 
@@ -601,12 +625,16 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             if key not in {"bootstrap_features", "sigma_pools"}
         }
         calibration_public.update({
-            "status": "CALIBRATED_AFE_RBF_PRETRAINED_V1",
+            "status": "CALIBRATED_AFE_RBF_BATCH_CONDITIONAL_V2",
             "kernel": "RBF on L2-normalized phi_s",
             "lengthscale_rule": (
                 "mean pairwise embedding distance of exactly 50 samples from the pretrained model"
             ),
             "gp_buffer_label": "full-H verifier positive only",
+            "acquisition_statistic": (
+                "normalized GP posterior variance of each candidate conditioned on the "
+                "other K-1 candidates and the GP training buffer"
+            ),
             "ess_target": BC.ESS_TARGET,
             "scene_sha256": scene["sha256"],
             "checkpoint_sha256": checkpoint_sha256,
@@ -618,7 +646,7 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             stream.write("\n")
 
         recipe = {
-            "algorithm": "afe_rbf_previous_round_parallel_v1",
+            "algorithm": "afe_rbf_batch_conditional_parallel_v2",
             "arm": "afe",
             "single_arm": True,
             "kernel": "RBF",
@@ -626,8 +654,8 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             "lengthscale_protocol": calibration_public["lengthscale_rule"],
             "beta": cfg.beta,
             "beta_protocol": (
-                "one pretrained-only continuous ESS calibration against the verified-positive "
-                "bootstrap GP; fixed for every expansion round"
+                "one pretrained-only continuous ESS calibration of batch-conditional variance "
+                "against the verified-positive bootstrap GP; fixed for every expansion round"
             ),
             "acquisition_memory": (
                 "round 1: verified-positive pretrained calibration seed; later rounds: at most "
@@ -636,8 +664,9 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             ),
             "learning_memory": "uniform replay over the complete cumulative full-H D+ archive",
             "uncertainty_meaning": (
-                "RBF posterior novelty relative to the acquisition buffer; not validity "
-                "probability and not a safety certificate"
+                "RBF posterior variance conditioned on the acquisition buffer and the rest "
+                "of the same K-candidate batch; not validity probability and not a safety "
+                "certificate"
             ),
             "parallel_sampling": (
                 f"{cfg.replicas} closed-loop replicas per gamma advanced synchronously; one GPU "
@@ -676,6 +705,10 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             "methodological_scope": (
                 "task-specific peptide-style RBF AFE adaptation; previous-round cap and parallel "
                 "frozen acquisition are explicit computational assumptions"
+            ),
+            "reference_code_semantics": (
+                "batch-conditional variance uses 1/diag(C^-1), matching the public peptide "
+                "implementation's --gp_conditional_reward"
             ),
             "no_curriculum": True,
             "no_anchor": True,
