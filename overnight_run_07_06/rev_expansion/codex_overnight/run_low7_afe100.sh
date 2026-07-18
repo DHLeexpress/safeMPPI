@@ -15,13 +15,13 @@ export NUMEXPR_NUM_THREADS=${AFE_NUMEXPR_NUM_THREADS:-1}
 HERE=$(cd "$(dirname "$0")" && pwd)
 PYTHON_BIN=${PYTHON:-/home/dohyun/miniforge3/envs/cfm_mppi/bin/python}
 PROFILE=low7_radius1_canonical_v1
-EXPECTED_UUID=GPU-b5993142-760d-a6fe-9430-3d0e65203b6d
+EXPECTED_UUID=GPU-50fb5dae-52a8-5843-bc81-b869586dccde
 CKPT=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 EXPECTED=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
 OUT=$3
 
-if [[ "${CUDA_DEVICE_ORDER:-}" != PCI_BUS_ID || "${CUDA_VISIBLE_DEVICES:-}" != 3 ]]; then
-  echo "canonical low7 run requires CUDA_DEVICE_ORDER=PCI_BUS_ID and CUDA_VISIBLE_DEVICES=3" >&2
+if [[ "${CUDA_DEVICE_ORDER:-}" != PCI_BUS_ID || "${CUDA_VISIBLE_DEVICES:-}" != 1 ]]; then
+  echo "canonical low7 run requires CUDA_DEVICE_ORDER=PCI_BUS_ID and CUDA_VISIBLE_DEVICES=1" >&2
   exit 2
 fi
 if [[ ! -f "$CKPT" || ! "$EXPECTED" =~ ^[0-9a-f]{64}$ ]]; then
@@ -37,7 +37,7 @@ OUT=$(cd "$OUT" && pwd)
 cd "$HERE"
 
 "$PYTHON_BIN" analysis/write_gpu_provenance.py \
-  --physical-index 3 --expected-uuid "$EXPECTED_UUID" \
+  --physical-index 1 --expected-uuid "$EXPECTED_UUID" \
   --out "$OUT/gpu_provenance.json"
 "$PYTHON_BIN" analysis/preflight_low7_afe.py \
   --checkpoint "$CKPT" --expected-sha256 "$EXPECTED" \
