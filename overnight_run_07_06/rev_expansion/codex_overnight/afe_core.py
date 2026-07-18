@@ -457,6 +457,94 @@ class DStore:
             ids.append(int(queries[int(rng.integers(0, len(queries)))]))
         return ids
 
+    def positive_epoch_ids(
+        self,
+        rng,
+        *,
+        eligible_ids=None,
+        sampling="query_uniform",
+    ):
+        """Order every eligible positive exactly once for one replay epoch.
+
+        The hierarchical option interleaves round/gamma/replica/context cells
+        while they remain nonempty.  It balances *order*, not total cell mass:
+        an exact epoch necessarily retains every query from longer cells.
+        """
+
+        population = list(self.pos_ids if eligible_ids is None else eligible_ids)
+        if not population:
+            return []
+        if len({int(query_id) for query_id in population}) != len(population):
+            raise ValueError("positive replay epoch population contains duplicate query ids")
+        if sampling == "query_uniform":
+            order = [population[int(index)] for index in rng.permutation(len(population))]
+        elif sampling == "round_gamma_replica_context":
+            hierarchy = self.positive_replay_hierarchy(eligible_ids=population)
+
+            def shuffled(values):
+                ordered = sorted(values)
+                return [ordered[int(index)] for index in rng.permutation(len(ordered))]
+
+            def interleave(generators):
+                active = [generators[key] for key in shuffled(generators)]
+                while active:
+                    next_active = []
+                    for generator in active:
+                        try:
+                            yield next(generator)
+                            next_active.append(generator)
+                        except StopIteration:
+                            pass
+                    active = next_active
+
+            def queries(query_ids):
+                yield from shuffled(query_ids)
+
+            def contexts(context_map):
+                yield from interleave({
+                    context_id: queries(query_ids)
+                    for context_id, query_ids in context_map.items()
+                })
+
+            def replicas(replica_map):
+                yield from interleave({
+                    replica: contexts(context_map)
+                    for replica, context_map in replica_map.items()
+                })
+
+            def gammas(gamma_map):
+                yield from interleave({
+                    gamma: replicas(replica_map)
+                    for gamma, replica_map in gamma_map.items()
+                })
+
+            order = list(interleave({
+                query_round: gammas(gamma_map)
+                for query_round, gamma_map in hierarchy.items()
+            }))
+        else:
+            raise ValueError(f"unknown positive replay sampling rule: {sampling}")
+
+        order = [int(query_id) for query_id in order]
+        if len(order) != len(population) or set(order) != {int(q) for q in population}:
+            raise RuntimeError("positive replay epoch did not cover its population exactly once")
+        return order
+
+    def positive_batch(self, query_ids):
+        """Reconstruct one explicit positive-query batch without resampling."""
+
+        ids = [int(query_id) for query_id in query_ids]
+        if not ids:
+            raise ValueError("positive replay batch cannot be empty")
+        if any(query_id < 0 or query_id >= len(self.q_sid) for query_id in ids):
+            raise IndexError("positive replay query id is out of range")
+        sids = [self.q_sid[q] for q in ids]
+        G = self.grid3_of(sids)
+        L = torch.stack([torch.from_numpy(self.ctx_low5[s]) for s in sids])
+        H = torch.stack([torch.from_numpy(self.ctx_hist[s].astype(np.float32)) for s in sids])
+        U = torch.stack([torch.from_numpy(self.q_U[q]) for q in ids])
+        return G, L, H, U, ids
+
     def sample_pos(
         self,
         nb,
@@ -477,12 +565,7 @@ class DStore:
         )
         if ids is None:
             return None
-        sids = [self.q_sid[q] for q in ids]
-        G = self.grid3_of(sids)
-        L = torch.stack([torch.from_numpy(self.ctx_low5[s]) for s in sids])
-        H = torch.stack([torch.from_numpy(self.ctx_hist[s].astype(np.float32)) for s in sids])
-        U = torch.stack([torch.from_numpy(self.q_U[q]) for q in ids])
-        return G, L, H, U, ids
+        return self.positive_batch(ids)
 
     def round_slice(self, round_i):
         """Query ids belonging to one round (for per-round stats/viz)."""

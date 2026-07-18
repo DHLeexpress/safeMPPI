@@ -109,18 +109,29 @@ def render(run: Path, output: Path) -> None:
     ax.legend(frameon=False)
 
     ax = axes[1, 3]
-    ax.plot(rounds, _series(rows, "replay_fresh_fraction"), marker=".")
+    ax.plot(
+        rounds, _series(rows, "replay_fresh_fraction"), marker=".", label="current round"
+    )
+    coverage = _series(rows, "replay_epoch_coverage")
+    if np.isfinite(coverage).any():
+        ax.plot(rounds, coverage, marker=".", label="eligible unique coverage")
     ax.set(
-        title="Optimizer draws from current round",
+        title="Replay recency and coverage",
         xlabel="round",
-        ylabel="fresh replay fraction",
+        ylabel="fraction",
     )
     ax.set_ylim(-0.03, 1.03)
+    ax.legend(frameon=False, fontsize=7)
 
+    update_label = (
+        "one exact D+ epoch (dynamic steps)"
+        if recipe.get("replay_update_mode") == "one_epoch_without_replacement"
+        else f"steps={recipe['afe_steps']}"
+    )
     fig.suptitle(
         "Gather/update diagnostics only — SR and CR are intentionally absent\n"
         f"ell={recipe['lengthscale_multiplier']:g}×ell0, alpha={recipe['negative_alpha']:g}, "
-        f"steps={recipe['afe_steps']}, execution={recipe['execution']}",
+        f"{update_label}, execution={recipe['execution']}",
         fontsize=11,
     )
     output.parent.mkdir(parents=True, exist_ok=True)

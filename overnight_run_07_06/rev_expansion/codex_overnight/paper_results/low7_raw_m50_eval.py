@@ -80,6 +80,7 @@ SUPPORTED_ALGORITHMS = {
     "afe_uniform_parallel_v1",
     "afe_rbf_low7_signed_execution_sweep_v1",
     "afe_rbf_low7_v2_smoke_v1",
+    "afe_rbf_low7_v2_sample_complete_smoke_v2",
 }
 
 

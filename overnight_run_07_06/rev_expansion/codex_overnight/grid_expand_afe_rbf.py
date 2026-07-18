@@ -77,6 +77,7 @@ class AFERBFConfig(AFE2.AFE2Config):
     adaptive_beta_equalize_gammas: bool = False
     replay_window: int | None = None
     replay_sampling: str = "query_uniform"
+    replay_update_mode: str = "fixed_steps_with_replacement"
     gp_replay_window: int = 1
     gp_replay_sampling: str = "round_gamma"
     lengthscale_multiplier: float = 1.0
@@ -1152,7 +1153,7 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             stream.write("\n")
 
         if cfg.protocol_profile == "v2_smoke":
-            algorithm = "afe_rbf_low7_v2_smoke_v1"
+            algorithm = "afe_rbf_low7_v2_sample_complete_smoke_v2"
         elif cfg.execution_rule != "legacy_max_horizon_progress":
             algorithm = "afe_rbf_low7_signed_execution_sweep_v1"
         elif cfg.acquisition_mode == "uniform":
@@ -1188,10 +1189,32 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             f"uniform query replay over {replay_population}"
             if cfg.replay_sampling == "query_uniform"
             else (
-                "hierarchical round/gamma/replica/context/query-balanced replay over "
+                "hierarchically round/gamma/replica/context/query-interleaved replay over "
                 f"{replay_population}"
             )
         )
+        if cfg.replay_update_mode == "one_epoch_without_replacement":
+            update_description = (
+                f"positive-only CFM lr {cfg.afe_lr:g}, batch {cfg.batch}, one exact "
+                "without-replacement epoch over eligible D+; dynamic optimizer steps "
+                "ceil(|eligible D+|/batch), alpha 0, no prox"
+            )
+            optimizer_draws_per_round = None
+            optimizer_draw_interpretation = (
+                "exactly |eligible D+| unique positive draws; every eligible positive appears "
+                "once; samples are partitioned into ceil(|eligible D+|/batch) minibatches whose "
+                "sizes differ by at most one; hierarchical interleaving balances order but not "
+                "unequal cell mass"
+            )
+        else:
+            update_description = (
+                f"signed CFM lr {cfg.afe_lr:g}, separate batch {cfg.batch}, "
+                f"{cfg.afe_steps} steps, alpha {cfg.negative_alpha:g}, no prox"
+            )
+            optimizer_draws_per_round = int(cfg.batch * cfg.afe_steps)
+            optimizer_draw_interpretation = (
+                "stochastic replay draws, not an epoch over the eligible archive"
+            )
         recipe = {
             "algorithm": algorithm,
             "protocol_profile": cfg.protocol_profile,
@@ -1230,6 +1253,10 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             "learning_memory": learning_memory,
             "replay_window": cfg.replay_window,
             "replay_sampling": cfg.replay_sampling,
+            "replay_update_mode": cfg.replay_update_mode,
+            "replay_epochs": (
+                1 if cfg.replay_update_mode == "one_epoch_without_replacement" else None
+            ),
             "gp_replay_window": cfg.gp_replay_window,
             "gp_replay_sampling": cfg.gp_replay_sampling,
             "rbf_offline_sweep": (
@@ -1251,18 +1278,17 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                 "and, for nominal_hp rules, the first executed state satisfies the nominal "
                 "SafeMPPI DTCBF level-set condition; NVP terminates; no expert/fallback"
             ),
-            "update": (
-                f"signed CFM lr {cfg.afe_lr:g}, separate batch {cfg.batch}, "
-                f"{cfg.afe_steps} steps, alpha {cfg.negative_alpha:g}, no prox"
+            "update": update_description,
+            "optimizer_draws_per_round": optimizer_draws_per_round,
+            "optimizer_draws_formula": (
+                "|eligible D+|" if optimizer_draws_per_round is None else None
             ),
-            "optimizer_draws_per_round": int(cfg.batch * cfg.afe_steps),
-            "optimizer_draw_interpretation": (
-                "stochastic replay draws, not one epoch and not an attempt to use every "
-                "newly collected positive; V2 uses balanced replay and deliberately gentle "
-                "lr=1e-5"
-                if cfg.protocol_profile == "v2_smoke"
-                else "stochastic replay draws, not an epoch over the eligible archive"
+            "optimizer_steps_formula": (
+                "ceil(|eligible D+|/batch)"
+                if cfg.replay_update_mode == "one_epoch_without_replacement"
+                else str(cfg.afe_steps)
             ),
+            "optimizer_draw_interpretation": optimizer_draw_interpretation,
             "rounds": cfg.rounds,
             "rollout_replicas": cfg.replicas,
             "T": cfg.T,
@@ -1721,13 +1747,13 @@ def validate_protocol_args(args) -> None:
     exact = {
         "scene_profile": "low7_radius1_canonical_v1",
         "rounds": 10,
-        "rollout_replicas": 16,
+        "rollout_replicas": 8,
         "K": 16,
         "B": 4,
         "T": 300,
         "M_eval": 0,
         "batch": 128,
-        "afe_steps": 8,
+        "afe_steps": 0,
         "afe_lr": 1.0e-5,
         "gp_cap": 512,
         "gp_lam": 1.0e-2,
@@ -1737,6 +1763,7 @@ def validate_protocol_args(args) -> None:
         "adaptive_beta_equalize_gammas": True,
         "replay_window": 2,
         "replay_sampling": "round_gamma_replica_context",
+        "replay_update_mode": "one_epoch_without_replacement",
         "gp_replay_window": 2,
         "gp_replay_sampling": "round_gamma_replica_context",
         "lengthscale_multiplier": 1.0,
@@ -1745,7 +1772,7 @@ def validate_protocol_args(args) -> None:
         "conditioning_schema": CX.LOW7_SCHEMA,
         "freeze_visual_encoder": True,
         "skip_training_probes": True,
-        "calibration_replicas": 16,
+        "calibration_replicas": 8,
         "calibration_control_steps": 4,
         "sweep_compact_artifacts": True,
         "compact_checkpoint_every": 1,
@@ -1801,6 +1828,11 @@ def main():
         choices=("query_uniform", "round_gamma_replica_context"),
         default="query_uniform",
     )
+    parser.add_argument(
+        "--replay-update-mode",
+        choices=("fixed_steps_with_replacement", "one_epoch_without_replacement"),
+        default="fixed_steps_with_replacement",
+    )
     parser.add_argument("--gp-replay-window", type=int, default=1)
     parser.add_argument(
         "--gp-replay-sampling",
@@ -1841,8 +1873,15 @@ def main():
     parser.add_argument("--seed", type=int, default=910)
     args = parser.parse_args()
     validate_protocol_args(args)
-    if args.afe_steps < 1 or args.afe_lr <= 0.0:
-        raise ValueError("AFE steps and learning rate must be positive")
+    if args.afe_lr <= 0.0:
+        raise ValueError("AFE learning rate must be positive")
+    if args.replay_update_mode == "fixed_steps_with_replacement":
+        if args.afe_steps < 1:
+            raise ValueError("fixed-step replay requires positive AFE steps")
+    elif args.afe_steps != 0:
+        raise ValueError("exact-epoch replay requires --afe-steps 0 as a non-operative sentinel")
+    if args.replay_update_mode == "one_epoch_without_replacement" and args.negative_alpha != 0.0:
+        raise ValueError("exact positive replay epoch currently requires negative alpha zero")
     if args.rounds < 1 or args.rollout_replicas < 1 or args.M_eval < 0:
         raise ValueError("rounds and rollout replicas must be positive; M-eval cannot be negative")
     if not args.skip_training_probes and args.M_eval < 1:
@@ -1954,6 +1993,7 @@ def main():
         adaptive_beta_equalize_gammas=args.adaptive_beta_equalize_gammas,
         replay_window=args.replay_window,
         replay_sampling=args.replay_sampling,
+        replay_update_mode=args.replay_update_mode,
         gp_replay_window=args.gp_replay_window,
         gp_replay_sampling=args.gp_replay_sampling,
         lengthscale_multiplier=args.lengthscale_multiplier,
@@ -1975,9 +2015,11 @@ def main():
         f"[afe-rbf] scene={profile.name} rounds={cfg.rounds} replicas/gamma={cfg.replicas} "
         f"K={cfg.K} B={cfg.B} GPcap={cfg.gp_cap} workers={cfg.verifier_workers} "
         f"acquisition={cfg.acquisition_mode} adaptive_ESS={cfg.adaptive_ess_target} "
-        f"replay_W={cfg.replay_window} gp_W={cfg.gp_replay_window} "
+        f"replay_W={cfg.replay_window} replay_mode={cfg.replay_update_mode} "
+        f"gp_W={cfg.gp_replay_window} "
         f"ell_mult={cfg.lengthscale_multiplier:g} alpha={cfg.negative_alpha:g} "
-        f"steps={cfg.afe_steps} exec={cfg.execution_rule} "
+        f"steps={'dynamic' if cfg.afe_steps == 0 else cfg.afe_steps} "
+        f"exec={cfg.execution_rule} "
         f"frozen={len(trainability['frozen'])}",
         flush=True,
     )

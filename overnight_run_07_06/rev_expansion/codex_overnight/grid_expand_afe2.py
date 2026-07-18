@@ -772,9 +772,23 @@ def update_round(policy, opt, store, cfg, device, rng, round_i=None):
         "replay_sampling",
         getattr(cfg, "positive_replay_sampling", "query_uniform"),
     )
+    replay_update_mode = getattr(
+        cfg, "replay_update_mode", "fixed_steps_with_replacement"
+    )
+    if replay_update_mode not in {
+        "fixed_steps_with_replacement", "one_epoch_without_replacement"
+    }:
+        raise ValueError(f"unknown replay update mode: {replay_update_mode}")
+    if cfg.arm == "prox" and replay_update_mode != "fixed_steps_with_replacement":
+        raise ValueError("prox update does not support exact-epoch replay")
+    if int(cfg.batch) < 1:
+        raise ValueError("positive replay batch size must be positive")
     replay_hierarchy = (
         store.positive_replay_hierarchy(eligible_ids=eligible_ids)
-        if replay_sampling == "round_gamma_replica_context"
+        if (
+            replay_update_mode == "fixed_steps_with_replacement"
+            and replay_sampling == "round_gamma_replica_context"
+        )
         else None
     )
     policy.train()
@@ -784,24 +798,45 @@ def update_round(policy, opt, store, cfg, device, rng, round_i=None):
     snap = {k: [p.detach().clone() for p in ps] for k, ps in groups.items()}
     trainable = [p for p in policy.parameters() if p.requires_grad]
     refs = [p.detach().clone() for p in trainable] if cfg.arm == "prox" else None
-    n_steps = cfg.prox_max_inner if cfg.arm == "prox" else cfg.afe_steps
+    epoch_batches = None
+    if replay_update_mode == "one_epoch_without_replacement":
+        epoch_ids = store.positive_epoch_ids(
+            rng,
+            eligible_ids=eligible_ids,
+            sampling=replay_sampling,
+        )
+        n_steps = (len(epoch_ids) + int(cfg.batch) - 1) // int(cfg.batch)
+        base_size, larger_batches = divmod(len(epoch_ids), n_steps)
+        epoch_batches = []
+        offset = 0
+        for batch_index in range(n_steps):
+            size = base_size + int(batch_index < larger_batches)
+            epoch_batches.append(epoch_ids[offset : offset + size])
+            offset += size
+        if offset != len(epoch_ids):
+            raise RuntimeError("failed to partition the exact positive replay epoch")
+    else:
+        n_steps = cfg.prox_max_inner if cfg.arm == "prox" else cfg.afe_steps
     probe = v_before = None
     drawn_ids = {}
     cfm_hist, fstep_hist = [], []
     gnorm = {k: [] for k in groups}
     stop = "all_steps"
     for k_step in range(n_steps):
-        positive_batch = (
-            store.sample_pos(cfg.batch, rng, eligible_ids=eligible_ids)
-            if replay_sampling == "query_uniform"
-            else store.sample_pos(
-                cfg.batch,
-                rng,
-                eligible_ids=eligible_ids,
-                sampling=replay_sampling,
-                hierarchy=replay_hierarchy,
+        if epoch_batches is not None:
+            positive_batch = store.positive_batch(epoch_batches[k_step])
+        else:
+            positive_batch = (
+                store.sample_pos(cfg.batch, rng, eligible_ids=eligible_ids)
+                if replay_sampling == "query_uniform"
+                else store.sample_pos(
+                    cfg.batch,
+                    rng,
+                    eligible_ids=eligible_ids,
+                    sampling=replay_sampling,
+                    hierarchy=replay_hierarchy,
+                )
             )
-        )
         G, L, Hh, U, ids = positive_batch
         for q in ids:
             drawn_ids[q] = drawn_ids.get(q, 0) + 1
@@ -856,6 +891,14 @@ def update_round(policy, opt, store, cfg, device, rng, round_i=None):
         key = str(int(store.q_round[query_id]))
         replay_draw_round_counts[key] = replay_draw_round_counts.get(key, 0) + int(count)
     total_draws = int(sum(drawn_ids.values()))
+    duplicate_draws = total_draws - len(drawn_ids)
+    epoch_coverage = (
+        float(len(drawn_ids) / len(eligible_ids)) if eligible_ids else 0.0
+    )
+    if replay_update_mode == "one_epoch_without_replacement":
+        if duplicate_draws != 0 or len(drawn_ids) != len(eligible_ids):
+            raise RuntimeError("exact replay epoch did not use every eligible positive once")
+        stop = "one_epoch_complete"
     return dict(steps=len(cfm_hist), stop=stop, cfm=float(np.mean(cfm_hist)),
                 cfm_first=cfm_hist[0], cfm_last=cfm_hist[-1],
                 fstep_final=fstep_hist[-1], fstep_max=max(fstep_hist),
@@ -863,6 +906,12 @@ def update_round(policy, opt, store, cfg, device, rng, round_i=None):
                 rel_param_change=rel_dp, drawn_ids=drawn_ids, n_distinct=len(drawn_ids),
                 replay_window=replay_window, replay_eligible=len(eligible_ids),
                 replay_sampling=replay_sampling,
+                replay_update_mode=replay_update_mode,
+                optimizer_draws=total_draws,
+                replay_duplicate_draws=int(duplicate_draws),
+                replay_epoch_coverage=epoch_coverage,
+                replay_batch_sizes=[len(batch) for batch in epoch_batches]
+                if epoch_batches is not None else None,
                 replay_fresh_draws=int(fresh_draws),
                 replay_fresh_distinct=int(fresh_distinct),
                 replay_eligible_round_counts=replay_eligible_round_counts,

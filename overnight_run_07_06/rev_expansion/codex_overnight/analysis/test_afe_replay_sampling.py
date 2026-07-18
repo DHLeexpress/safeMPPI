@@ -97,6 +97,38 @@ def test_hierarchical_positive_replay_respects_the_eligible_window() -> None:
     assert set(draws).issubset(set(eligible))
 
 
+@pytest.mark.parametrize(
+    "sampling", ("query_uniform", "round_gamma_replica_context")
+)
+def test_positive_epoch_is_deterministic_and_uses_every_query_once(sampling) -> None:
+    store = _imbalanced_store()
+    eligible = list(store.pos_ids)
+
+    first = store.positive_epoch_ids(
+        np.random.default_rng(31), eligible_ids=eligible, sampling=sampling
+    )
+    second = store.positive_epoch_ids(
+        np.random.default_rng(31), eligible_ids=eligible, sampling=sampling
+    )
+
+    assert first == second
+    assert len(first) == len(eligible)
+    assert len(set(first)) == len(eligible)
+    assert set(first) == set(eligible)
+
+
+def test_hierarchical_positive_epoch_interleaves_before_long_cell_tail() -> None:
+    store = _imbalanced_store()
+    order = store.positive_epoch_ids(
+        np.random.default_rng(7),
+        eligible_ids=store.pos_ids,
+        sampling="round_gamma_replica_context",
+    )
+
+    # All four singleton cells appear before the 100-query cell is exhausted.
+    assert {100, 101, 102, 103}.issubset(set(order[:12]))
+
+
 def test_hierarchical_positive_replay_rejects_query_context_round_mismatch() -> None:
     store = _imbalanced_store()
     store.ctx_meta[0] = (99, 0, 0)
@@ -181,3 +213,45 @@ def test_update_round_routes_the_hierarchical_replay_option(monkeypatch) -> None
     assert result["replay_sampling"] == "round_gamma_replica_context"
     assert calls[0]["sampling"] == "round_gamma_replica_context"
     assert calls[0]["hierarchy"]
+
+
+def test_update_round_exact_epoch_has_dynamic_tail_and_full_unique_coverage(monkeypatch) -> None:
+    store = _trainable_store()
+    policy = _TinyPolicy()
+    optimizer = torch.optim.SGD(policy.parameters(), lr=0.01)
+    cfg = SimpleNamespace(
+        arm="afe",
+        replay_window=2,
+        replay_sampling="round_gamma_replica_context",
+        replay_update_mode="one_epoch_without_replacement",
+        batch=2,
+        afe_steps=0,
+        grad_clip=0.0,
+    )
+    batch_sizes = []
+    original = store.positive_batch
+
+    def batch_spy(query_ids):
+        batch_sizes.append(len(query_ids))
+        return original(query_ids)
+
+    monkeypatch.setattr(store, "positive_batch", batch_spy)
+    result = AFE2.update_round(
+        policy,
+        optimizer,
+        store,
+        cfg,
+        torch.device("cpu"),
+        np.random.default_rng(3),
+        round_i=2,
+    )
+
+    assert batch_sizes == [2, 1]
+    assert result["steps"] == 2
+    assert result["stop"] == "one_epoch_complete"
+    assert result["optimizer_draws"] == 3
+    assert result["n_distinct"] == 3
+    assert result["replay_duplicate_draws"] == 0
+    assert result["replay_epoch_coverage"] == 1.0
+    assert result["replay_batch_sizes"] == [2, 1]
+    assert set(result["drawn_ids"]) == set(store.pos_ids)
