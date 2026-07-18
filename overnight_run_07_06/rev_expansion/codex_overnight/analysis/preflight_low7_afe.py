@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import subprocess
 import sys
 
 import numpy as np
@@ -19,6 +20,9 @@ from codex_challenging.afe_restart.evaluate_low7_pretrained import (
 )
 import grid_expand_afe2 as AFE2
 import grid_hp_expt as HP
+
+
+FROZEN_BASE = "8c80cf05acee04be052bb5e8b1084a1339a2baba"
 
 
 def main() -> None:
@@ -67,9 +71,20 @@ def main() -> None:
         or source["untracked_runtime_sources"]
     ):
         raise RuntimeError(f"preflight requires clean committed source: {source}")
+    repository = subprocess.check_output(
+        ["git", "rev-parse", "--show-toplevel"], cwd=HERE, text=True
+    ).strip()
+    if subprocess.run(
+        ["git", "merge-base", "--is-ancestor", FROZEN_BASE, source["commit"]],
+        cwd=repository,
+    ).returncode != 0:
+        raise RuntimeError(
+            f"source {source['commit']} is not a descendant of frozen base {FROZEN_BASE}"
+        )
     result = {
         "status": "LOW7_AFE_PREFLIGHT_COMPLETE",
         "source": source,
+        "frozen_base_commit": FROZEN_BASE,
         "checkpoint": {
             "path": str(args.checkpoint.resolve()),
             "file_sha256": checkpoint_sha,
