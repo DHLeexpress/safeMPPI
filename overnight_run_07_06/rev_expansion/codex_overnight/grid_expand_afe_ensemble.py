@@ -35,6 +35,7 @@ import grid_metrics2 as GM2
 import grid_expand_hardtail as HT
 
 import afe_core as AC
+import afe_context as CX
 import afe_adaptive as AD
 import afe2_calibration as BC
 import afe_ensemble_core as EC
@@ -59,6 +60,36 @@ class AFEEnsembleConfig(RBF.AFERBFConfig):
     ensemble_lr: float = 1.0e-3
     ensemble_steps: int = 1000
     ensemble_early_window: int = 30
+    plumbing_smoke: bool = False
+
+
+def configure_policy_trainability(policy, freeze_visual_encoder: bool) -> dict:
+    """Freeze exactly E(H_P), leaving the flow trunk and head trainable."""
+
+    for parameter in policy.parameters():
+        parameter.requires_grad_(True)
+    if freeze_visual_encoder:
+        for parameter in policy.enc_grid.parameters():
+            parameter.requires_grad_(False)
+    frozen = {
+        name for name, parameter in policy.named_parameters() if not parameter.requires_grad
+    }
+    encoder_names = {f"enc_grid.{name}" for name, _ in policy.enc_grid.named_parameters()}
+    if freeze_visual_encoder:
+        if frozen != encoder_names:
+            raise RuntimeError(
+                f"only the visual grid encoder may be frozen; got {sorted(frozen)}"
+            )
+    elif frozen:
+        raise RuntimeError(f"unexpected frozen policy parameters: {sorted(frozen)}")
+    trainable = {
+        name for name, parameter in policy.named_parameters() if parameter.requires_grad
+    }
+    if not any(name.startswith("trunk.") for name in trainable):
+        raise RuntimeError("flow trunk is not trainable")
+    if not any(name.startswith("head.") for name in trainable):
+        raise RuntimeError("flow output head is not trainable")
+    return {"frozen": sorted(frozen), "trainable": sorted(trainable)}
 
 
 def _new_estimator(cfg, device):
@@ -190,8 +221,12 @@ def _recipe(cfg, env, checkpoint_path, checkpoint_sha256, checkpoint_model_sha25
     )
     return {
         "algorithm": (
-            "afe_deep_ensemble_adaptive_ess_parallel_v2"
-            if adaptive else "afe_deep_ensemble_parallel_v1"
+            "afe_low7_deep_ensemble_adaptive_ess_parallel_v1"
+            if cfg.conditioning_schema == CX.LOW7_SCHEMA
+            else (
+                "afe_deep_ensemble_adaptive_ess_parallel_v2"
+                if adaptive else "afe_deep_ensemble_parallel_v1"
+            )
         ),
         "arm": "afe",
         "single_arm": True,
@@ -233,6 +268,27 @@ def _recipe(cfg, env, checkpoint_path, checkpoint_sha256, checkpoint_model_sha25
         ),
         "learning_memory": learning_memory,
         "replay_window": cfg.replay_window,
+        "conditioning": {
+            "schema": cfg.conditioning_schema,
+            "raw_condition_dim": cfg.raw_condition_dim,
+            "ctx_dim": 39 if cfg.conditioning_schema == CX.LOW7_SCHEMA else 37,
+            "trunk_input_dim": (
+                91 if cfg.conditioning_schema == CX.LOW7_SCHEMA else 89
+            ),
+            "gamma_last": True,
+            "builder": (
+                "afe_restart.scene.context_from_state_low7"
+                if cfg.conditioning_schema == CX.LOW7_SCHEMA
+                else "afe_restart.scene.context_from_state"
+            ),
+        },
+        "freeze_visual_encoder": bool(cfg.freeze_visual_encoder),
+        "trainable_modules": (
+            ["trunk", "head"]
+            if cfg.freeze_visual_encoder else ["visual_grid_encoder", "trunk", "head"]
+        ),
+        "video_include_round0": bool(cfg.conditioning_schema == CX.LOW7_SCHEMA),
+        "plumbing_smoke": bool(cfg.plumbing_smoke),
         "uncertainty_meaning": (
             "population standard deviation of five raw verifier-label regressors; epistemic "
             "ensemble disagreement, not validity probability and not a safety certificate"
@@ -240,6 +296,14 @@ def _recipe(cfg, env, checkpoint_path, checkpoint_sha256, checkpoint_model_sha25
         "selection": (
             "K=64 scored once; B=8 Gibbs draws without replacement; no GP-style posterior "
             "conditioning after a selected but still-unlabeled candidate"
+        ),
+        "sigma_usage": "verifier-query acquisition only; no replay reweighting",
+        "label_separation": (
+            "safety is the deterministic full verifier label; progress ranks only "
+            "execution-admissible queries; training accepts full-H positives only"
+        ),
+        "socp_error": (
+            "any full-H or terminal-prefix SOCP error updates neither D nor D+"
         ),
         "parallel_sampling": (
             f"{cfg.replicas} closed-loop replicas per gamma advanced synchronously; one GPU "
@@ -288,6 +352,9 @@ def _recipe(cfg, env, checkpoint_path, checkpoint_sha256, checkpoint_model_sha25
         "no_anchor": True,
         "no_prox": True,
         "no_fallback": True,
+        "no_expert_replay": True,
+        "no_rollback": True,
+        "no_curated_recovery_starts": True,
     }
 
 
@@ -308,9 +375,25 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
     recipe_path = os.path.join(outdir, "recipe.json")
     _write_json(recipe_path, recipe)
 
-    store = AC.DStore()
-    optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.afe_lr)
-    audit_contexts = AC.build_audit_contexts(env, cfg.gammas, n_pos=cfg.audit_pos)
+    CX.require_declared_contract(
+        policy, cfg.conditioning_schema, cfg.raw_condition_dim
+    )
+    store = AC.DStore(
+        conditioning_schema=cfg.conditioning_schema,
+        condition_dim=cfg.raw_condition_dim,
+    )
+    trainable_parameters = [
+        parameter for parameter in policy.parameters() if parameter.requires_grad
+    ]
+    if not trainable_parameters:
+        raise RuntimeError("expansion has no trainable policy parameters")
+    optimizer = torch.optim.Adam(trainable_parameters, lr=cfg.afe_lr)
+    audit_contexts = AC.build_audit_contexts(
+        env,
+        cfg.gammas,
+        n_pos=cfg.audit_pos,
+        conditioning_schema=cfg.conditioning_schema,
+    )
     representation_probe = AFE2.rep_probe_build(policy, env, cfg, device)
     goal = env.goal.detach().cpu().numpy()
     estimator = _new_estimator(cfg, device)
@@ -332,9 +415,10 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             n_plans=cfg.audit_plans, nfe=cfg.nfe, n_theta=cfg.n_theta,
             seed=AFE2.named_seed(cfg.seed, "audit"),
         )
+        viz0 = []
         eval0, eval0_timing = RBF.run_parallel_episodes(
             policy, estimator, env, cfg, store, 0, cfg.M_eval, device, executor,
-            collect=False, viz=None, purpose="controller_eval", acquisition_mode="uniform",
+            collect=False, viz=viz0, purpose="controller_eval", acquisition_mode="uniform",
         )
         rows0, pooled0 = RBF._controller_summary(eval0, cfg, env)
         write_probe({
@@ -365,6 +449,24 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             os.path.join(outdir, "ensemble_round0.pt"), estimator, 0, None,
             source_git_state["commit"],
         )
+        if recipe["video_include_round0"]:
+            torch.save({
+                "round": 0,
+                "viz": viz0,
+                "eps": [
+                    {key: value for key, value in episode.items() if key != "step_stats"}
+                    for episode in eval0
+                ],
+                "ensemble_diagnostics": estimator.diagnostics(),
+                "acquisition_ensemble_checkpoint": "ensemble_round0.pt",
+                "post_update_ensemble_checkpoint": "ensemble_round0.pt",
+                "scene": scene,
+                "audit": audit0,
+                "train_ids": np.zeros(0, dtype=np.int64),
+                "train_counts": np.zeros(0, dtype=np.int64),
+                "goal": goal,
+                "x0": env.x0.detach().cpu().numpy(),
+            }, os.path.join(outdir, "viz_db", "round0.pt"))
         print(
             f"[afe-ensemble] r000 V {audit0['V']:.3f} ctrl SR {pooled0['SR']:.2f} "
             f"NVP {pooled0['NVP']:.2f} estimator=unfit",
@@ -529,6 +631,11 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                     "replay_eligible": update["replay_eligible"],
                     "replay_fresh_draws": update["replay_fresh_draws"],
                     "replay_fresh_distinct": update["replay_fresh_distinct"],
+                    "replay_fresh_fraction": update["replay_fresh_fraction"],
+                    "replay_eligible_round_counts": update[
+                        "replay_eligible_round_counts"
+                    ],
+                    "replay_draw_round_counts": update["replay_draw_round_counts"],
                 })
             checkpoint_started = time.perf_counter()
             torch.save({
@@ -585,7 +692,13 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
         "dstore.pt",
         *[f"ckpt_{index}.pt" for index in range(cfg.rounds + 1)],
         *[f"ensemble_round{index}.pt" for index in range(cfg.rounds + 1)],
-        *[f"viz_db/round{index}.pt" for index in range(1, cfg.rounds + 1)],
+        *[
+            f"viz_db/round{index}.pt"
+            for index in range(
+                0 if recipe["video_include_round0"] else 1,
+                cfg.rounds + 1,
+            )
+        ],
     ]
     inventory = {}
     for relative in required:
@@ -627,6 +740,13 @@ def main():
     parser.add_argument("--replay-window", type=int, default=None)
     parser.add_argument("--verifier-workers", type=int, default=16)
     parser.add_argument("--seed", type=int, default=910)
+    parser.add_argument(
+        "--conditioning-schema",
+        choices=(CX.LOW5_SCHEMA, CX.LOW7_SCHEMA),
+        default=CX.LOW5_SCHEMA,
+    )
+    parser.add_argument("--freeze-visual-encoder", action="store_true")
+    parser.add_argument("--plumbing-smoke", action="store_true")
     args = parser.parse_args()
     if args.K != 64 or args.B != 8 or args.batch != 128:
         raise ValueError("the first ensemble study holds K=64, B=8, and batch=128 fixed")
@@ -640,11 +760,28 @@ def main():
         raise ValueError("adaptive ESS target must lie strictly between zero and one")
     if args.replay_window is not None and args.replay_window < 1:
         raise ValueError("replay window must be at least one round")
+    if args.conditioning_schema == CX.LOW7_SCHEMA:
+        expected_rounds = 1 if args.plumbing_smoke else 100
+        exact = {
+            "rounds": (args.rounds, expected_rounds),
+            "rollout_replicas": (args.rollout_replicas, 2),
+            "M_eval": (args.M_eval, 2),
+            "verifier_workers": (args.verifier_workers, 16),
+            "T": (args.T, 300),
+            "adaptive_ess_target": (args.adaptive_ess_target, 0.5),
+            "replay_window": (args.replay_window, 5),
+            "seed": (args.seed, 910),
+        }
+        mismatches = {
+            key: values for key, values in exact.items() if values[0] != values[1]
+        }
+        if mismatches:
+            raise ValueError(f"low7 canonical recipe mismatch: {mismatches}")
 
     np.random.seed(args.seed)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
     checkpoint_sha256 = AFE2._sha256_file(args.ckpt)
     if checkpoint_sha256 != args.expected_ckpt_sha256.lower():
         raise ValueError(
@@ -658,8 +795,19 @@ def main():
             profile.name, policy, checkpoint, checkpoint_sha256
         )
     )
-    if any(not parameter.requires_grad for parameter in policy.parameters()):
-        raise ValueError("all encoder, trunk, and head parameters must remain trainable")
+    policy_contract = CX.require_declared_contract(
+        policy,
+        args.conditioning_schema,
+        7 if args.conditioning_schema == CX.LOW7_SCHEMA else 5,
+    )
+    if profile.name == "low7_radius1_canonical_v1":
+        if args.conditioning_schema != CX.LOW7_SCHEMA or not args.freeze_visual_encoder:
+            raise ValueError(
+                "low7 radius-1 expansion requires exact low7 conditioning and a frozen visual encoder"
+            )
+    elif args.conditioning_schema != CX.LOW5_SCHEMA or args.freeze_visual_encoder:
+        raise ValueError("legacy scenes retain their declared low5/all-trainable contract")
+    configure_policy_trainability(policy, args.freeze_visual_encoder)
     source_git_state = AFE2._git_state()
     if (
         source_git_state["commit"] is None
@@ -691,6 +839,10 @@ def main():
         verifier_workers=args.verifier_workers,
         adaptive_ess_target=args.adaptive_ess_target,
         replay_window=args.replay_window,
+        conditioning_schema=policy_contract.schema,
+        raw_condition_dim=policy_contract.raw_condition_dim,
+        freeze_visual_encoder=args.freeze_visual_encoder,
+        plumbing_smoke=args.plumbing_smoke,
     )
     print(
         f"[afe-ensemble] scene={profile.name} rounds={cfg.rounds} "

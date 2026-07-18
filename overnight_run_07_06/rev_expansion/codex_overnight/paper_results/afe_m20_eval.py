@@ -41,6 +41,7 @@ import torch
 
 import _paths  # noqa: F401
 import afe_core as AC
+import afe_context as CX
 import afe_ensemble_core as EC
 import afe_rbf_core as RC
 from afe2_scene_profiles import (
@@ -71,6 +72,8 @@ SCREENING_NOTE = (
 )
 GALLERY_INDICES = tuple(range(10))
 SUPPORTED_ALGORITHM = "afe_deep_ensemble_adaptive_ess_parallel_v2"
+LOW7_ALGORITHM = "afe_low7_deep_ensemble_adaptive_ess_parallel_v1"
+SUPPORTED_ALGORITHMS = {SUPPORTED_ALGORITHM, LOW7_ALGORITHM}
 Z95 = 1.959963984540054
 
 _WORKER_ENV = None
@@ -136,9 +139,10 @@ def git_state() -> dict[str, Any]:
 
 def require_clean_additive_source(expected_base: str) -> dict[str, Any]:
     state = git_state()
-    if state["parent"] != expected_base:
+    if state["commit"] != expected_base and state["parent"] != expected_base:
         raise RuntimeError(
-            f"evaluation commit parent {state['parent']} != frozen base {expected_base}"
+            "evaluation source is neither the trainer commit nor its direct additive child: "
+            f"commit={state['commit']} parent={state['parent']} trainer={expected_base}"
         )
     if state["tracked_dirty"] or state["untracked_runtime_sources"]:
         raise RuntimeError(
@@ -157,11 +161,14 @@ def expected_inventory(algorithm: str, rounds: int) -> set[str]:
         *{f"ckpt_{round_i}.pt" for round_i in range(rounds + 1)},
         *{f"viz_db/round{round_i}.pt" for round_i in range(1, rounds + 1)},
     }
-    if algorithm == SUPPORTED_ALGORITHM:
-        return common | {
+    if algorithm in SUPPORTED_ALGORITHMS:
+        required = common | {
             "ensemble_calibration.json",
             *{f"ensemble_round{round_i}.pt" for round_i in range(rounds + 1)},
         }
+        if algorithm == LOW7_ALGORITHM:
+            required.add("viz_db/round0.pt")
+        return required
     raise ValueError(f"unsupported completed algorithm: {algorithm}")
 
 
@@ -180,7 +187,9 @@ def validate_completed_run(
             raise FileNotFoundError(f"completed run artifact is missing: {path}")
     recipe = load_json(recipe_path)
     complete = load_json(complete_path)
-    expected_algorithm = SUPPORTED_ALGORITHM
+    expected_algorithm = str(recipe.get("algorithm"))
+    if expected_algorithm not in SUPPORTED_ALGORITHMS:
+        raise RuntimeError(f"unsupported recipe algorithm: {expected_algorithm}")
     method = "afe"
     if recipe.get("algorithm") != expected_algorithm:
         raise RuntimeError(
@@ -191,8 +200,11 @@ def validate_completed_run(
     if recipe.get("arm") != "afe" or recipe.get("single_arm") is not True:
         raise RuntimeError(f"{method} is not a declared single AFE arm")
     completed_round = int(complete.get("completed_round", -1))
-    if complete.get("status") != "COMPLETE" or completed_round != 50:
-        raise RuntimeError(f"{method} is not a completed 50-round trainer run")
+    required_round = 100 if expected_algorithm == LOW7_ALGORITHM else 50
+    if complete.get("status") != "COMPLETE" or completed_round != required_round:
+        raise RuntimeError(
+            f"{method} is not a completed {required_round}-round trainer run"
+        )
     if recipe.get("source_git_commit") != complete.get("source_git_commit"):
         raise RuntimeError(f"{method} recipe and COMPLETE disagree on source commit")
     if recipe.get("scene", {}).get("profile", {}).get("name") != scene_profile:
@@ -240,9 +252,15 @@ def validate_completed_run(
             raise RuntimeError(f"{method} checkpoint {round_i} is not the inventoried artifact")
         selected[int(round_i)] = {"path": str(path), "sha256": actual}
 
-    delivery_path = root.parent / "DELIVERY_COMPLETE.json"
-    if not delivery_path.is_file():
-        raise FileNotFoundError(f"completed run lacks its delivery manifest: {delivery_path}")
+    delivery_candidates = (
+        root.parent / "DELIVERY_COMPLETE.json",
+        root.parent / "TRAINER_DELIVERY_COMPLETE.json",
+    )
+    delivery_path = next((path for path in delivery_candidates if path.is_file()), None)
+    if delivery_path is None:
+        raise FileNotFoundError(
+            f"completed run lacks a trainer delivery manifest under {root.parent}"
+        )
     delivery = load_json(delivery_path)
     if delivery.get("status") != "AFE_ENSEMBLE_DELIVERY_COMPLETE":
         raise RuntimeError("run parent is not a validated AFE ensemble delivery")
@@ -337,6 +355,9 @@ def _gpu_record() -> dict[str, Any]:
 
 def _cfg_from_contract(contract: dict[str, Any], scene_profile: str):
     recipe = contract["recipe"]
+    conditioning = recipe.get("conditioning", {})
+    schema = str(conditioning.get("schema", CX.LOW5_SCHEMA))
+    raw_condition_dim = int(conditioning.get("raw_condition_dim", 5))
     common = dict(
         rounds=int(contract["completed_round"]),
         T=int(recipe["T"]),
@@ -359,6 +380,9 @@ def _cfg_from_contract(contract: dict[str, Any], scene_profile: str):
         verifier_workers=VERIFIER_WORKERS,
         replay_window=int(recipe["replay_window"]),
         adaptive_ess_target=float(recipe["adaptive_ess_target"]),
+        conditioning_schema=schema,
+        raw_condition_dim=raw_condition_dim,
+        freeze_visual_encoder=bool(recipe.get("freeze_visual_encoder", False)),
     )
     if tuple(common["gammas"]) != GAMMAS or common["T"] != T or common["reach"] != REACH:
         raise RuntimeError("run recipe disagrees with the screening protocol")
@@ -366,6 +390,12 @@ def _cfg_from_contract(contract: dict[str, Any], scene_profile: str):
         raise RuntimeError("run recipe proposal semantics are not canonical")
     if common["replay_window"] != 5 or common["adaptive_ess_target"] != 0.5:
         raise RuntimeError("run recipe is not the canonical W=5 / ESS=0.5 confirmation")
+    expected_schema = (
+        CX.LOW7_SCHEMA if contract["algorithm"] == LOW7_ALGORITHM else CX.LOW5_SCHEMA
+    )
+    expected_dim = CX.SCHEMA_DIMS[expected_schema]
+    if schema != expected_schema or raw_condition_dim != expected_dim:
+        raise RuntimeError("run recipe conditioning schema is inconsistent")
     return ENS.AFEEnsembleConfig(**common)
 
 
@@ -394,7 +424,10 @@ def _model_state_sha256(policy) -> str:
 
 def _restore_store(path: str | os.PathLike[str]) -> AC.DStore:
     state = torch.load(path, map_location="cpu", weights_only=False)
-    store = AC.DStore()
+    store = AC.DStore(
+        conditioning_schema=state.get("conditioning_schema", CX.LOW5_SCHEMA),
+        condition_dim=int(state.get("condition_dim", 5)),
+    )
     for key, value in state.items():
         setattr(store, key, value)
     store.pos_ids = [int(index) for index, label in enumerate(store.q_y) if int(label) == 1]
@@ -474,10 +507,17 @@ def run_raw_batch(policy, env, cfg, device: str) -> list[dict[str, Any]]:
         noises = []
         for episode in active:
             state = episode["state"]
-            grids.append(GF.axis_grid(state[:2], obstacles, robot_radius))
-            lows.append(GF.low5(state, goal, episode["gamma"]))
-            history = np.asarray(episode["history"][-GF.K_HIST:], dtype=np.float32)
-            histories.append(GF.hist_pad(history if history.size else np.zeros((0, 2)), GF.K_HIST))
+            record = CX.build_context(
+                state,
+                goal,
+                episode["gamma"],
+                episode["history"],
+                env,
+                cfg.conditioning_schema,
+            )
+            grids.append(record.grid)
+            lows.append(record.low5)
+            histories.append(record.hist)
             generator = torch.Generator(device=device)
             generator.manual_seed(paired_seed(
                 cfg.scene_profile, "raw", episode["gamma"], episode["rollout_index"], control_t
@@ -1013,7 +1053,10 @@ def run_evaluation(args) -> None:
             )
             acquisition_mode = "uniform" if round_i == 0 else "sequential"
 
-            scratch = AC.DStore()
+            scratch = AC.DStore(
+                conditioning_schema=cfg.conditioning_schema,
+                condition_dim=cfg.raw_condition_dim,
+            )
             verified_episodes, _ = RBF.run_parallel_episodes(
                 policy, estimator, env, cfg, scratch, round_i, M, device, executor,
                 collect=False, viz=None, purpose="controller_eval",

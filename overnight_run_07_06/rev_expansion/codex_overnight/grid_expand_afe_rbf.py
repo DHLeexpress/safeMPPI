@@ -45,6 +45,7 @@ import grid_expand_hardtail as HT
 from di_grid_viz import di_step
 
 import afe_core as AC
+import afe_context as CX
 import afe_adaptive as AD
 import afe2_calibration as BC
 import afe_rbf_core as RC
@@ -103,21 +104,16 @@ def _episode(state, gamma, replica, episode_id, env, cfg):
     }
 
 
-def _context_arrays(episodes, env):
-    obstacles = env.obstacles.detach().cpu().numpy()
-    robot_radius = float(env.r_robot)
-    goal = env.goal.detach().cpu().numpy()
-    grids, lows, histories = [], [], []
-    for episode in episodes:
-        state = episode["state"]
-        grids.append(GF.axis_grid(state[:2], obstacles, robot_radius))
-        lows.append(GF.low5(state, goal, episode["gamma"]))
-        history = np.asarray(episode["hist"][-GF.K_HIST:], dtype=np.float32)
-        histories.append(GF.hist_pad(history if history.size else np.zeros((0, 2)), GF.K_HIST))
+def _context_arrays(episodes, env, cfg):
+    return CX.arrays_for_episodes(episodes, env, cfg.conditioning_schema)
+
+
+def query_has_socp_error(result):
+    """Any full-H or terminal verifier SOCP error makes the query unobserved."""
+
     return (
-        np.asarray(grids, dtype=np.float32),
-        np.asarray(lows, dtype=np.float32),
-        np.asarray(histories, dtype=np.float32),
+        result.get("reason") == "socp_error"
+        or result.get("terminal_reason") == "socp_error"
     )
 
 
@@ -262,7 +258,7 @@ def run_parallel_episodes(
         active = [episode for episode in episodes if episode["status"] is None]
         if not active:
             break
-        grid_np, low_np, hist_np = _context_arrays(active, env)
+        grid_np, low_np, hist_np = _context_arrays(active, env, cfg)
         grid = torch.as_tensor(grid_np, device=device)
         low = torch.as_tensor(low_np, device=device)
         hist = torch.as_tensor(hist_np, device=device)
@@ -383,7 +379,7 @@ def run_parallel_episodes(
                 query_id = -1
                 controls = candidate_cpu[local_index, candidate_id]
                 segment = GR.window_positions(episode["state"], controls, env.dt)
-                if result["reason"] != "socp_error" and collect:
+                if not query_has_socp_error(result) and collect:
                     query_id = store.add_query(
                         step_context_ids[episode["episode_id"]],
                         controls,
@@ -633,7 +629,7 @@ def calibrate_rbf(policy, env, cfg, device, executor):
         _episode(state, gamma, 0, index, env, cfg)
         for index, gamma in enumerate(cfg.gammas)
     ]
-    grid_np, low_np, hist_np = _context_arrays(synthetic, env)
+    grid_np, low_np, hist_np = _context_arrays(synthetic, env, cfg)
     grid = torch.as_tensor(grid_np, device=device)
     low = torch.as_tensor(low_np, device=device)
     hist = torch.as_tensor(hist_np, device=device)
@@ -662,7 +658,10 @@ def calibrate_rbf(policy, env, cfg, device, executor):
     # separate pretrained-only archive using uniform B-budget acquisition, then
     # discard it from CFM training and evaluation.
     empty_gp = RC.RBFGPSigma(lengthscale, cfg.gp_lam)
-    seed_store = AC.DStore()
+    seed_store = AC.DStore(
+        conditioning_schema=cfg.conditioning_schema,
+        condition_dim=cfg.raw_condition_dim,
+    )
     seed_episodes, seed_timing = run_parallel_episodes(
         policy, empty_gp, env, cfg, seed_store, 0, cfg.replicas,
         device, executor, collect=True, viz=None,
@@ -685,7 +684,10 @@ def calibrate_rbf(policy, env, cfg, device, executor):
 
     # Use an independent uniform-acquisition rollout archive for contexts.  The
     # query plans in this archive are not GP points and never enter D+.
-    beta_store = AC.DStore()
+    beta_store = AC.DStore(
+        conditioning_schema=cfg.conditioning_schema,
+        condition_dim=cfg.raw_condition_dim,
+    )
     beta_episodes, beta_timing = run_parallel_episodes(
         policy, gp, env, cfg, beta_store, 0, cfg.replicas,
         device, executor, collect=True, viz=None,
@@ -827,9 +829,17 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
     profile = get_scene_profile(cfg.scene_profile)
     scene = scene_snapshot(env, profile)
     assert_scene_snapshot(scene)
-    store = AC.DStore()
+    store = AC.DStore(
+        conditioning_schema=cfg.conditioning_schema,
+        condition_dim=cfg.raw_condition_dim,
+    )
     optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.afe_lr)
-    audit_contexts = AC.build_audit_contexts(env, cfg.gammas, n_pos=cfg.audit_pos)
+    audit_contexts = AC.build_audit_contexts(
+        env,
+        cfg.gammas,
+        n_pos=cfg.audit_pos,
+        conditioning_schema=cfg.conditioning_schema,
+    )
     representation_probe = AFE2.rep_probe_build(policy, env, cfg, device)
     goal = env.goal.detach().cpu().numpy()
 

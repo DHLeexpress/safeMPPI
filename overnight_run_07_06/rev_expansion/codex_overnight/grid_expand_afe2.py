@@ -63,6 +63,7 @@ import grid_expand_hardtail as HT              # reuse: _apply_wall_plugs, _save
 from di_grid_viz import di_step
 
 import afe_core as AC
+import afe_context as CX
 import afe2_calibration as BC
 from afe2_scene_profiles import (
     SCENE_PROFILES,
@@ -110,6 +111,9 @@ class AFE2Config:
     start_eps: float = 0.3
     goal_xy: tuple = (4.7, 4.7)
     scene_profile: str = "claude_grid_v1"
+    conditioning_schema: str = CX.LOW5_SCHEMA
+    raw_condition_dim: int = 5
+    freeze_visual_encoder: bool = False
     seed: int = 910
 
 
@@ -147,6 +151,12 @@ CODEX_PROMOTED_CHECKPOINTS = {
     "bfbb925a8499205a4639b33b8fe819ae4527fa8cafcabcc8722dd9bedea21efb",
     "36cb9d6651d8aa86791ad6639be987f0da8f44d76b97fe9245a419f765ce0b08",
 }
+LOW7_CANDIDATE_CHECKPOINT_SHA256 = (
+    "7ae44f773b3f5fe36579c4101542e495119cf6e348f622f5edbfedaa2855a46c"
+)
+LOW7_CANDIDATE_MODEL_SHA256 = (
+    "070ea40dda8c94a7bec503942c48cb046f1dd7ef0bde8ccd00c3805b9a9af368"
+)
 CLAUDE_LEGACY_CHECKPOINT_SHA256 = (
     "0eede103cc7c24ce23d2cd0e83aa3a64fdeb1a1f644c24973c5aa33a242499f4"
 )
@@ -221,7 +231,7 @@ def validate_checkpoint_contract(profile_name, policy, checkpoint, checkpoint_sh
     if not isinstance(config, dict):
         raise RuntimeError("checkpoint is missing its model config")
 
-    common_architecture = (
+    low5_architecture = (
         config.get("arch") == "hp-repr"
         and int(config.get("H_pred", -1)) == 10
         and tuple(config.get("grid_shape", ())) == (1, 32, 32)
@@ -237,14 +247,37 @@ def validate_checkpoint_contract(profile_name, policy, checkpoint, checkpoint_sh
         and tuple(getattr(policy, "grid_shape", ())) == (1, 32, 32)
         and getattr(policy, "boundary_adapter", None) is False
     )
-    if not common_architecture:
-        raise RuntimeError("checkpoint violates the shared AFE2 32-D H=10 architecture")
+    low7_architecture = (
+        config.get("arch") == "hp-repr"
+        and config.get("schema_version") == "w8sg-hp-v3-low7-closest-boundary"
+        and int(config.get("H_pred", -1)) == 10
+        and tuple(config.get("grid_shape", ())) == (1, 32, 32)
+        and int(config.get("K_hist", -1)) == 16
+        and float(config.get("u_max", float("nan"))) == 1.0
+        and config.get("use_gru", False) is False
+        and config.get("boundary_adapter", False) is False
+        and int(config.get("repr_dim", -1)) == 32
+        and int(config.get("raw_condition_dim", -1)) == 7
+        and config.get("conditioning_schema") == CX.LOW7_SCHEMA
+        and int(config.get("ctx_dim", -1)) == 39
+        and int(getattr(policy, "repr_dim", -1)) == 32
+        and int(getattr(policy, "raw_condition_dim", -1)) == 7
+        and getattr(policy, "conditioning_schema", None) == CX.LOW7_SCHEMA
+        and int(getattr(policy, "ctx_dim", -1)) == 39
+        and int(getattr(policy, "H_pred", -1)) == 10
+        and tuple(getattr(policy, "grid_shape", ())) == (1, 32, 32)
+        and getattr(policy, "boundary_adapter", None) is False
+        and int(policy.trunk[0].in_features) == 91
+        and sum(parameter.numel() for parameter in policy.parameters()) == 70_308
+    )
 
     if profile_name in {
         "codex_radius1_v1",
         "codex_radius03_v1",
         "codex_radius04_v1",
     }:
+        if not low5_architecture:
+            raise RuntimeError("checkpoint violates the shared low5 AFE2 architecture")
         if checkpoint_sha256 not in CODEX_PROMOTED_CHECKPOINTS:
             raise RuntimeError(
                 f"{profile_name} requires one of the two documented promoted Stage-3 "
@@ -266,6 +299,8 @@ def validate_checkpoint_contract(profile_name, policy, checkpoint, checkpoint_sh
             "id_metrics_sha256": checkpoint.get("id_metrics_sha256"),
         }
     elif profile_name == "claude_grid_v1":
+        if not low5_architecture:
+            raise RuntimeError("checkpoint violates the shared low5 AFE2 architecture")
         legacy_ok = (
             checkpoint_sha256 == CLAUDE_LEGACY_CHECKPOINT_SHA256
             and model_sha256 == CLAUDE_LEGACY_MODEL_SHA256
@@ -292,6 +327,50 @@ def validate_checkpoint_contract(profile_name, policy, checkpoint, checkpoint_sh
             "per_gamma_cap": checkpoint.get("per_gamma_cap"),
             "best_val": float(checkpoint["best_val"]),
             "config_sha256": _canonical_json_sha256(config),
+        }
+    elif profile_name == "low7_radius1_canonical_v1":
+        if not low7_architecture:
+            raise RuntimeError(
+                "low7 expansion requires ctx=39, trunk input=91, and 70,308 parameters"
+            )
+        if checkpoint_sha256 != LOW7_CANDIDATE_CHECKPOINT_SHA256:
+            raise RuntimeError("low7 expansion requires the declared candidate checkpoint bytes")
+        if model_sha256 != LOW7_CANDIDATE_MODEL_SHA256:
+            raise RuntimeError("low7 candidate model-state hash mismatch")
+        required_payload = {
+            "stage_schema": "afe_fresh_pretrain_v2_low7_uniform_pairs",
+            "fresh_from_scratch": True,
+            "endpoint_free": True,
+            "encoder_trainable_during_pretraining": True,
+            "expansion_promotion": False,
+        }
+        for field, expected in required_payload.items():
+            if checkpoint.get(field) != expected:
+                raise RuntimeError(
+                    f"low7 checkpoint payload {field}={checkpoint.get(field)!r}, "
+                    f"expected {expected!r}"
+                )
+        if checkpoint.get("fixed_goal") != [4.7, 4.7]:
+            raise RuntimeError("low7 checkpoint is not the authenticated fixed-goal candidate")
+        source_digest = checkpoint.get("source_query_hash_digest")
+        if not isinstance(source_digest, str) or len(source_digest) != 64:
+            raise RuntimeError("low7 checkpoint lacks its source-query digest")
+        contract = {
+            "name": "authenticated_low7_candidate_v1",
+            "assumption_level": "exact_file_model_architecture_and_provenance_contract",
+            "checkpoint_file_sha256": checkpoint_sha256,
+            "checkpoint_model_state_sha256": model_sha256,
+            "stage_schema": checkpoint["stage_schema"],
+            "fresh_from_scratch": checkpoint["fresh_from_scratch"],
+            "endpoint_free": checkpoint["endpoint_free"],
+            "expansion_promotion": checkpoint["expansion_promotion"],
+            "source_manifest": checkpoint.get("source_manifest"),
+            "source_query_hash_digest": source_digest,
+            "conditioning_schema": CX.LOW7_SCHEMA,
+            "raw_condition_dim": 7,
+            "ctx_dim": 39,
+            "trunk_input_dim": 91,
+            "parameter_count": 70_308,
         }
     else:
         raise ValueError(f"unsupported checkpoint-contract profile: {profile_name}")
@@ -450,7 +529,13 @@ def rebuild_A(policy, store, cfg, device):
 def rep_probe_build(policy, env, cfg, device, n_ctx=24, n_plans=8, seed=20260716):
     """Fixed probe set for representation cosine drift: (c,U) pairs sampled ONCE from the round-0
     policy at fixed audit-like contexts. Returns tensors + their phi^(0) features."""
-    ctxs = AC.build_audit_contexts(env, [0.1, 0.5, 1.0], n_pos=n_ctx // 4, seed=seed)[:n_ctx]
+    ctxs = AC.build_audit_contexts(
+        env,
+        [0.1, 0.5, 1.0],
+        n_pos=n_ctx // 4,
+        seed=seed,
+        conditioning_schema=cfg.conditioning_schema,
+    )[:n_ctx]
     G, L, Hh, U = [], [], [], []
     with AC.isolated_random_state(seed):
         for c in ctxs:
@@ -486,9 +571,17 @@ def acquire_and_execute(policy, blr, env, cfg, st, hist, g, store, round_i, ep, 
     obs = env.obstacles.detach().cpu().numpy()
     rr = float(env.r_robot)
     goal_np = env.goal.detach().cpu().numpy()
-    grid_np = GF.axis_grid(st[:2], obs, rr)
-    l5_np = GF.low5(st, goal_np, g)
-    h_np = GF.hist_pad(np.array(hist[-GF.K_HIST:]) if hist else np.zeros((0, 2)), GF.K_HIST)
+    record = CX.build_context(
+        st,
+        goal_np,
+        g,
+        hist,
+        env,
+        getattr(cfg, "conditioning_schema", CX.LOW5_SCHEMA),
+    )
+    grid_np = np.asarray(record.grid, dtype=np.float32)
+    l5_np = np.asarray(record.low5, dtype=np.float32)
+    h_np = np.asarray(record.hist, dtype=np.float32)
     gT = torch.tensor(grid_np, device=device)
     lT = torch.tensor(l5_np, device=device)
     hT = torch.tensor(h_np, device=device)
@@ -732,6 +825,15 @@ def update_round(policy, opt, store, cfg, device, rng, round_i=None):
         0 if round_i is None else
         sum(store.q_round[qid] == round_i for qid in drawn_ids)
     )
+    replay_eligible_round_counts = {}
+    for query_id in eligible_ids:
+        key = str(int(store.q_round[query_id]))
+        replay_eligible_round_counts[key] = replay_eligible_round_counts.get(key, 0) + 1
+    replay_draw_round_counts = {}
+    for query_id, count in drawn_ids.items():
+        key = str(int(store.q_round[query_id]))
+        replay_draw_round_counts[key] = replay_draw_round_counts.get(key, 0) + int(count)
+    total_draws = int(sum(drawn_ids.values()))
     return dict(steps=len(cfm_hist), stop=stop, cfm=float(np.mean(cfm_hist)),
                 cfm_first=cfm_hist[0], cfm_last=cfm_hist[-1],
                 fstep_final=fstep_hist[-1], fstep_max=max(fstep_hist),
@@ -739,7 +841,12 @@ def update_round(policy, opt, store, cfg, device, rng, round_i=None):
                 rel_param_change=rel_dp, drawn_ids=drawn_ids, n_distinct=len(drawn_ids),
                 replay_window=replay_window, replay_eligible=len(eligible_ids),
                 replay_fresh_draws=int(fresh_draws),
-                replay_fresh_distinct=int(fresh_distinct))
+                replay_fresh_distinct=int(fresh_distinct),
+                replay_eligible_round_counts=replay_eligible_round_counts,
+                replay_draw_round_counts=replay_draw_round_counts,
+                replay_fresh_fraction=(
+                    float(fresh_draws / total_draws) if total_draws else 0.0
+                ))
 
 
 # ------------------------------------------------------------------ controller evaluation
@@ -747,7 +854,10 @@ def controller_eval(policy, blr, env, cfg, device, round_i):
     """Expert-free verified controller, NO fallback, fixed-index equal-count rollouts: the SAME
     M_eval rollout seeds per gamma at every round (paired across rounds). Nothing is stored;
     A is used read-only."""
-    dummy = AC.DStore()                             # scratch store; discarded (collect=False anyway)
+    dummy = AC.DStore(                              # scratch store; discarded (collect=False anyway)
+        conditioning_schema=cfg.conditioning_schema,
+        condition_dim=cfg.raw_condition_dim,
+    )
     rows = {}
     for g in cfg.gammas:
         recs = []
@@ -825,9 +935,12 @@ def calibrate_beta(policy, env, cfg, device, log=print):
         st = env.x0.detach().cpu().numpy().astype(np.float32).copy()
         hist = []
         for t in range(cfg.T):
-            grid_np = GF.axis_grid(st[:2], obs, rr)
-            l5 = GF.low5(st, goal_np, float(g))
-            h_np = GF.hist_pad(np.array(hist[-GF.K_HIST:]) if hist else np.zeros((0, 2)), GF.K_HIST)
+            record = CX.build_context(
+                st, goal_np, float(g), hist, env, cfg.conditioning_schema
+            )
+            grid_np = np.asarray(record.grid, dtype=np.float32)
+            l5 = np.asarray(record.low5, dtype=np.float32)
+            h_np = np.asarray(record.hist, dtype=np.float32)
             gT = torch.tensor(grid_np, device=device); lT = torch.tensor(l5, device=device)
             hT = torch.tensor(h_np, device=device)
             with AC.isolated_random_state(named_seed(cfg.seed, "beta_calibration", ep, t)):
@@ -910,11 +1023,19 @@ def run_afe2(
     ):
         raise RuntimeError(f"locked AFE2 run requires an empty output directory: {outdir}")
     os.makedirs(outdir, exist_ok=True)
-    store = AC.DStore()
+    store = AC.DStore(
+        conditioning_schema=cfg.conditioning_schema,
+        condition_dim=cfg.raw_condition_dim,
+    )
     opt = torch.optim.Adam(policy.parameters(),
                            lr=(cfg.prox_lr if cfg.arm == "prox" else cfg.afe_lr))
     policy.eval()
-    audit_ctxs = AC.build_audit_contexts(env, cfg.gammas, n_pos=cfg.audit_pos)
+    audit_ctxs = AC.build_audit_contexts(
+        env,
+        cfg.gammas,
+        n_pos=cfg.audit_pos,
+        conditioning_schema=cfg.conditioning_schema,
+    )
     probe0 = rep_probe_build(policy, env, cfg, device)
     goal_np = env.goal.detach().cpu().numpy()
     profile = get_scene_profile(cfg.scene_profile)

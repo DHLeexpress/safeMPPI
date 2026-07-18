@@ -249,7 +249,10 @@ def main():
     if os.path.isfile(recipe_path):
         with open(recipe_path) as stream:
             recipe = json.load(stream)
-        expected = list(range(1, int(recipe["rounds"]) + 1))
+        expected = list(range(
+            0 if recipe.get("video_include_round0") else 1,
+            int(recipe["rounds"]) + 1,
+        ))
         observed = [int(re.findall(r"round(\d+)\.pt", path)[0]) for path in dbs]
         if observed != expected:
             raise RuntimeError(f"viz rounds are {observed}; expected {expected}")

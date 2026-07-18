@@ -45,6 +45,7 @@ def load_completed_run(root):
     if recipe.get("algorithm") not in {
         "afe_deep_ensemble_parallel_v1",
         "afe_deep_ensemble_adaptive_ess_parallel_v2",
+        "afe_low7_deep_ensemble_adaptive_ess_parallel_v1",
     }:
         raise RuntimeError("report accepts only the declared AFE ensemble algorithm")
     for relative in ("recipe.json", "probe.jsonl"):

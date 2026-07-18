@@ -39,6 +39,7 @@ import _paths  # noqa: F401
 import grid_feats as GF
 import grid_metrics as GM
 import grid_metrics2 as GM2
+import afe_context as CX
 import grid_rollout as GR
 import grid_scene as GS
 
@@ -224,11 +225,19 @@ class DStore:
     default and may opt into an explicit recent-round window.
     """
 
-    def __init__(self):
+    def __init__(self, *, conditioning_schema=CX.LOW5_SCHEMA, condition_dim=5):
+        self.conditioning_schema = str(conditioning_schema)
+        self.condition_dim = int(condition_dim)
+        expected_dim = CX.SCHEMA_DIMS.get(self.conditioning_schema)
+        if expected_dim is None or self.condition_dim != expected_dim:
+            raise ValueError(
+                "query-store conditioning contract is invalid: "
+                f"{(self.conditioning_schema, self.condition_dim)}"
+            )
         # per-step context tables
         self.ctx_state = []      # np float32 [4]
         self.ctx_hp = []         # np float32 [1,32,32]  (grid channel 2)
-        self.ctx_low5 = []       # np float32 [5]
+        self.ctx_low5 = []       # legacy wire name; np float32 [condition_dim]
         self.ctx_hist = []       # np float32 [K_HIST,2]
         self.ctx_meta = []       # (round, episode, t)
         # per-query tables
@@ -257,9 +266,15 @@ class DStore:
         self.pos_ids = []        # indices into the query tables with y==1
 
     def add_step_ctx(self, state4, grid_np, low5_np, hist_np, meta):
+        condition = np.asarray(low5_np, np.float32)
+        if condition.shape != (self.condition_dim,) or not np.isfinite(condition).all():
+            raise RuntimeError(
+                f"stored {self.conditioning_schema} condition has shape {condition.shape}; "
+                f"expected {(self.condition_dim,)}"
+            )
         self.ctx_state.append(np.asarray(state4, np.float32).copy())
         self.ctx_hp.append(np.asarray(grid_np[2:3], np.float32).copy())
-        self.ctx_low5.append(np.asarray(low5_np, np.float32).copy())
+        self.ctx_low5.append(condition.copy())
         self.ctx_hist.append(np.asarray(hist_np, np.float32).copy())
         self.ctx_meta.append(tuple(meta))
         return len(self.ctx_state) - 1
@@ -375,9 +390,15 @@ class DStore:
     def save(self, path):
         self.validate_execution_witnesses()
         torch.save(dict(
+            conditioning_schema=self.conditioning_schema,
+            condition_dim=self.condition_dim,
             ctx_state=np.stack(self.ctx_state) if self.ctx_state else np.zeros((0, 4), np.float32),
             ctx_hp=np.stack(self.ctx_hp) if self.ctx_hp else np.zeros((0, 1, 32, 32), np.float32),
-            ctx_low5=np.stack(self.ctx_low5) if self.ctx_low5 else np.zeros((0, 5), np.float32),
+            ctx_low5=(
+                np.stack(self.ctx_low5)
+                if self.ctx_low5
+                else np.zeros((0, self.condition_dim), np.float32)
+            ),
             ctx_hist=np.stack(self.ctx_hist) if self.ctx_hist else np.zeros((0, GF.K_HIST, 2), np.float32),
             ctx_meta=np.asarray(self.ctx_meta, np.int32) if self.ctx_meta else np.zeros((0, 3), np.int32),
             q_sid=np.asarray(self.q_sid, np.int64), q_U=np.stack(self.q_U) if self.q_U else np.zeros((0, GF.H_PRED, 2), np.float32),
@@ -423,7 +444,15 @@ class SafeMPPIFallback:
 
 
 # ------------------------------------------------------------------ audit (rho_eval)
-def build_audit_contexts(env, gammas, n_pos=12, seed=20260716, min_clear=0.05, v_adverse=0.65):
+def build_audit_contexts(
+    env,
+    gammas,
+    n_pos=12,
+    seed=20260716,
+    min_clear=0.05,
+    v_adverse=0.65,
+    conditioning_schema=CX.LOW5_SCHEMA,
+):
     """Fixed held-out rho_eval: n_pos free-space positions (position 0 = the episode start), each in
     TWO velocity conditions -- rest (v=0) and ADVERSE (moving at v_adverse toward the nearest
     obstacle: where window certification is actually hard; rest-only audits sit at ~99% ceiling) --
@@ -448,11 +477,20 @@ def build_audit_contexts(env, gammas, n_pos=12, seed=20260716, min_clear=0.05, v
         for vk, v in (("rest", np.zeros(2, np.float32)),
                       ("adverse", (v_adverse * d).astype(np.float32))):
             st = np.array([p[0], p[1], v[0], v[1]], np.float32)
-            grid_np = GF.axis_grid(st[:2], obs, rr)
-            h_np = GF.hist_pad(np.zeros((0, 2)), GF.K_HIST)
             for g in gammas:
-                ctxs.append(dict(pos_id=pi, vel=vk, state=st, gamma=float(g), grid=grid_np,
-                                 low5=GF.low5(st, goal_np, float(g)), hist=h_np))
+                record = CX.build_context(
+                    st, goal_np, float(g), [], env, conditioning_schema
+                )
+                ctxs.append(dict(
+                    pos_id=pi,
+                    vel=vk,
+                    state=st,
+                    gamma=float(g),
+                    grid=np.asarray(record.grid, dtype=np.float32),
+                    low5=np.asarray(record.low5, dtype=np.float32),
+                    hist=np.asarray(record.hist, dtype=np.float32),
+                    conditioning_schema=conditioning_schema,
+                ))
     return ctxs
 
 

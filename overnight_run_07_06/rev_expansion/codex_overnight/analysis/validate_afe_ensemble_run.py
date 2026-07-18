@@ -49,9 +49,35 @@ def main():
     if recipe.get("algorithm") not in {
         "afe_deep_ensemble_parallel_v1",
         "afe_deep_ensemble_adaptive_ess_parallel_v2",
+        "afe_low7_deep_ensemble_adaptive_ess_parallel_v1",
     }:
         raise RuntimeError("unexpected algorithm")
-    adaptive = recipe["algorithm"] == "afe_deep_ensemble_adaptive_ess_parallel_v2"
+    adaptive = recipe["algorithm"] in {
+        "afe_deep_ensemble_adaptive_ess_parallel_v2",
+        "afe_low7_deep_ensemble_adaptive_ess_parallel_v1",
+    }
+    low7 = recipe["algorithm"] == "afe_low7_deep_ensemble_adaptive_ess_parallel_v1"
+    if low7:
+        conditioning = recipe.get("conditioning", {})
+        if conditioning != {
+            "schema": "low7_closest_boundary",
+            "raw_condition_dim": 7,
+            "ctx_dim": 39,
+            "trunk_input_dim": 91,
+            "gamma_last": True,
+            "builder": "afe_restart.scene.context_from_state_low7",
+        }:
+            raise RuntimeError("low7 recipe conditioning contract is invalid")
+        if recipe.get("freeze_visual_encoder") is not True:
+            raise RuntimeError("low7 recipe did not freeze the visual grid encoder")
+        if recipe.get("replay_window") != 5 or recipe.get("adaptive_ess_target") != 0.5:
+            raise RuntimeError("low7 recipe is not canonical W=5 / ESS=0.5")
+        for flag in (
+            "no_curriculum", "no_anchor", "no_prox", "no_fallback",
+            "no_expert_replay", "no_rollback", "no_curated_recovery_starts",
+        ):
+            if recipe.get(flag) is not True:
+                raise RuntimeError(f"low7 recipe no longer declares {flag}=true")
     if recipe.get("kernel") is not None:
         raise RuntimeError("deep-ensemble arm must not declare a kernel")
     if recipe.get("beta") is None:
@@ -109,6 +135,7 @@ def main():
         )
         if gamma_total != int(record["n_D"]):
             raise RuntimeError(f"round {round_i} per-gamma labels do not sum to D")
+    viz_first = 0 if recipe.get("video_include_round0") else 1
     canonical = {
         "recipe.json",
         "ensemble_calibration.json",
@@ -117,7 +144,7 @@ def main():
         "dstore.pt",
         *[f"ckpt_{index}.pt" for index in expected_rounds],
         *[f"ensemble_round{index}.pt" for index in expected_rounds],
-        *[f"viz_db/round{index}.pt" for index in expected_rounds[1:]],
+        *[f"viz_db/round{index}.pt" for index in expected_rounds[viz_first:]],
     }
     inventory = complete.get("artifact_sha256", {})
     if set(inventory) != canonical:
@@ -154,6 +181,22 @@ def main():
             records[round_i]["n_D"]
         ):
             raise RuntimeError(f"ensemble checkpoint {round_i} fit rows do not match D")
+    if low7:
+        dstore = torch.load(
+            os.path.join(args.run, "dstore.pt"),
+            map_location="cpu",
+            weights_only=False,
+        )
+        if dstore.get("conditioning_schema") != "low7_closest_boundary":
+            raise RuntimeError("low7 DStore lost its feature schema")
+        if int(dstore.get("condition_dim", -1)) != 7:
+            raise RuntimeError("low7 DStore lost its seven-dimensional condition")
+        if dstore["ctx_low5"].ndim != 2 or dstore["ctx_low5"].shape[1] != 7:
+            raise RuntimeError("low7 DStore serialized a non-low7 context matrix")
+        for record in records[1:]:
+            changes = record.get("rel_param_change", {})
+            if float(changes.get("E_g", float("nan"))) != 0.0:
+                raise RuntimeError("frozen low7 visual encoder changed during expansion")
     probe = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=nb_frames,width,height", "-of", "json", args.video],
