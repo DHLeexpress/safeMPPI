@@ -168,6 +168,16 @@ def update_round_signed(
     )
     if not eligible_positive:
         return None
+    replay_sampling = getattr(
+        cfg,
+        "replay_sampling",
+        getattr(cfg, "positive_replay_sampling", "query_uniform"),
+    )
+    replay_hierarchy = (
+        store.positive_replay_hierarchy(eligible_ids=eligible_positive)
+        if replay_sampling == "round_gamma_replica_context"
+        else None
+    )
     eligible_negative = _negative_ids(
         store,
         round_i=round_i,
@@ -232,8 +242,16 @@ def update_round_signed(
     value_before = None
 
     for _ in range(n_steps):
-        positive_batch = store.sample_pos(
-            batch, rng, eligible_ids=eligible_positive
+        positive_batch = (
+            store.sample_pos(batch, rng, eligible_ids=eligible_positive)
+            if replay_sampling == "query_uniform"
+            else store.sample_pos(
+                batch,
+                rng,
+                eligible_ids=eligible_positive,
+                sampling=replay_sampling,
+                hierarchy=replay_hierarchy,
+            )
         )
         if positive_batch is None:
             raise RuntimeError("positive replay population became empty during update")
@@ -431,6 +449,7 @@ def update_round_signed(
         "negative_drawn_ids": negative_draws,
         "negative_n_distinct": len(negative_draws),
         "replay_window": replay_window,
+        "replay_sampling": replay_sampling,
         "replay_eligible": len(eligible_positive),
         "replay_fresh_draws": positive_stats["fresh_draws"],
         "replay_fresh_distinct": positive_stats["fresh_distinct"],

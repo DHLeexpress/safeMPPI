@@ -1,6 +1,7 @@
 """Round-local acquisition-temperature calibration for AFE uncertainty models."""
 from __future__ import annotations
 
+from collections import defaultdict
 import time
 
 import numpy as np
@@ -24,11 +25,127 @@ def round_context_ids(store, round_i: int) -> list[int]:
     return output
 
 
+def round_gamma_episode_balanced_context_ids(
+    store,
+    round_i: int,
+    gammas,
+    cap_per_gamma: int,
+    seed: int,
+    *,
+    equalize_gammas: bool = False,
+) -> list[int]:
+    """Select a deterministic, episode-balanced context cap in each gamma cell.
+
+    Contexts are first restricted to one round, then grouped by conditioning
+    gamma and episode id.  Within each gamma, a seeded round-robin over episodes
+    prevents a long-lived replica from supplying most of the beta-calibration
+    contexts.  The returned ids are sorted so downstream chunking is stable.
+    """
+
+    cap_per_gamma = int(cap_per_gamma)
+    if cap_per_gamma < 1:
+        raise ValueError("adaptive-beta context cap per gamma must be positive")
+
+    gamma_keys = [round(float(gamma), 8) for gamma in gammas]
+    grouped: dict[float, dict[int, list[int]]] = {
+        gamma: defaultdict(list) for gamma in gamma_keys
+    }
+    for context_id, meta in enumerate(store.ctx_meta):
+        if int(meta[0]) != int(round_i):
+            continue
+        gamma = round(float(store.ctx_low5[context_id][-1]), 8)
+        if gamma not in grouped:
+            raise ValueError(
+                f"round {round_i} contains undeclared conditioning gamma {gamma}"
+            )
+        grouped[gamma][int(meta[1])].append(int(context_id))
+
+    available_by_gamma = {
+        gamma: sum(len(values) for values in grouped[gamma].values())
+        for gamma in gamma_keys
+    }
+    if equalize_gammas:
+        if any(count == 0 for count in available_by_gamma.values()):
+            raise RuntimeError(
+                "equalized adaptive-beta calibration requires every declared gamma"
+            )
+        target_per_gamma = min(cap_per_gamma, min(available_by_gamma.values()))
+    else:
+        target_per_gamma = cap_per_gamma
+
+    selected: list[int] = []
+    for gamma_index, gamma in enumerate(gamma_keys):
+        episodes = grouped[gamma]
+        if not episodes:
+            continue
+        available = available_by_gamma[gamma]
+        if available <= target_per_gamma:
+            selected.extend(
+                context_id
+                for episode_id in sorted(episodes)
+                for context_id in episodes[episode_id]
+            )
+            continue
+
+        rng = np.random.default_rng(AFE2.named_seed(
+            int(seed),
+            "adaptive_beta_context_cap",
+            int(round_i),
+            int(gamma_index),
+            float(gamma),
+        ))
+        episode_ids = np.asarray(sorted(episodes), dtype=np.int64)
+        episode_ids = episode_ids[rng.permutation(len(episode_ids))].tolist()
+        queues = {
+            int(episode_id): np.asarray(
+                episodes[int(episode_id)], dtype=np.int64
+            )[rng.permutation(len(episodes[int(episode_id)]))].tolist()
+            for episode_id in episode_ids
+        }
+        offsets = {int(episode_id): 0 for episode_id in episode_ids}
+        selected_gamma: list[int] = []
+        while len(selected_gamma) < target_per_gamma:
+            progressed = False
+            for episode_id in episode_ids:
+                offset = offsets[int(episode_id)]
+                queue = queues[int(episode_id)]
+                if offset >= len(queue):
+                    continue
+                selected_gamma.append(int(queue[offset]))
+                offsets[int(episode_id)] = offset + 1
+                progressed = True
+                if len(selected_gamma) >= target_per_gamma:
+                    break
+            if not progressed:
+                raise RuntimeError("episode-balanced context selection exhausted early")
+        selected.extend(selected_gamma)
+
+    if len(selected) != len(set(selected)):
+        raise RuntimeError("adaptive-beta context selection sampled with replacement")
+    return sorted(selected)
+
+
 @torch.no_grad()
 def feature_pools(policy, store, cfg, device, round_i: int) -> tuple[list[torch.Tensor], dict]:
     """Generate beta-neutral K-pools at every context from one completed round."""
 
-    context_ids = round_context_ids(store, round_i)
+    cap_per_gamma = getattr(cfg, "adaptive_beta_contexts_per_gamma", None)
+    context_ids = (
+        round_context_ids(store, round_i)
+        if cap_per_gamma is None
+        else round_gamma_episode_balanced_context_ids(
+            store,
+            round_i,
+            cfg.gammas,
+            int(cap_per_gamma),
+            cfg.seed,
+            equalize_gammas=bool(getattr(
+                cfg, "adaptive_beta_equalize_gammas", False
+            )),
+        )
+    )
+    if not context_ids:
+        raise ValueError(f"round {round_i} contains no selected acquisition contexts")
     pools: list[torch.Tensor] = []
     gamma_counts: dict[str, int] = {}
     chunk_size = 16

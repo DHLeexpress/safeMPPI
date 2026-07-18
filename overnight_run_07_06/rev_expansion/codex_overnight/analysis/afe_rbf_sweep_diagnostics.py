@@ -26,6 +26,17 @@ def _series(rows, key):
     ], dtype=float)
 
 
+def _route_stat(rows, population, statistic):
+    return np.asarray([
+        float(
+            row.get("route_modes_early", {})
+            .get(population, {})
+            .get(statistic, np.nan)
+        )
+        for row in rows
+    ], dtype=float)
+
+
 def render(run: Path, output: Path) -> None:
     recipe = _load_json(run / "recipe.json")
     rows = _load_jsonl(run / "probe.jsonl")
@@ -33,7 +44,7 @@ def render(run: Path, output: Path) -> None:
         raise RuntimeError("probe rows must be a contiguous round-0 sequence")
     rounds = _series(rows, "round")
 
-    fig, axes = plt.subplots(2, 3, figsize=(13.5, 7.3), constrained_layout=True)
+    fig, axes = plt.subplots(2, 4, figsize=(17.5, 7.3), constrained_layout=True)
     ax = axes[0, 0]
     ax.plot(rounds, _series(rows, "beta_used"), marker=".")
     ax.set(title="Adaptive acquisition temperature", xlabel="round", ylabel=r"$\beta_n$")
@@ -51,6 +62,24 @@ def render(run: Path, output: Path) -> None:
     ax.plot(rounds, _series(rows, "uplift_med"), marker=".")
     ax.axhline(0.0, color="k", linewidth=0.8)
     ax.set(title="Selected minus pool uncertainty", xlabel="round", ylabel="uplift")
+
+    ax = axes[0, 3]
+    for population, label in (
+        ("all_K", "all K"),
+        ("selected_B", "selected B"),
+        ("full_H_positive", r"full-H $D^+$"),
+        ("executed", "executed"),
+    ):
+        values = _route_stat(rows, population, "coverage_weighted_balance")
+        if np.isfinite(values).any():
+            ax.plot(rounds, values, marker=".", label=label)
+    ax.set(
+        title="Early U/R diversification (diagnostic)",
+        xlabel="round",
+        ylabel="resolved fraction x U/R balance",
+    )
+    ax.set_ylim(-0.03, 1.03)
+    ax.legend(frameon=False, fontsize=7)
 
     ax = axes[1, 0]
     ax.plot(rounds, _series(rows, "cfm"), label=r"$L^+$")
@@ -78,6 +107,15 @@ def render(run: Path, output: Path) -> None:
         ax.plot(rounds, n_overlap, linestyle="--", label=r"$D^+\cap D^-$")
     ax.set(title="Stored verifier labels", xlabel="round", ylabel="count")
     ax.legend(frameon=False)
+
+    ax = axes[1, 3]
+    ax.plot(rounds, _series(rows, "replay_fresh_fraction"), marker=".")
+    ax.set(
+        title="Optimizer draws from current round",
+        xlabel="round",
+        ylabel="fresh replay fraction",
+    )
+    ax.set_ylim(-0.03, 1.03)
 
     fig.suptitle(
         "Gather/update diagnostics only — SR and CR are intentionally absent\n"

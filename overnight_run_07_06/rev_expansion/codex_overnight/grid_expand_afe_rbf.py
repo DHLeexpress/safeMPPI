@@ -49,6 +49,7 @@ import afe_context as CX
 import afe_adaptive as AD
 import afe2_calibration as BC
 import afe_rbf_core as RC
+import afe_route_metrics as RM
 import afe_execution as EX
 import afe_signed_update as SU
 import grid_expand_afe2 as AFE2
@@ -63,6 +64,7 @@ from afe2_scene_profiles import (
 
 @dataclass
 class AFERBFConfig(AFE2.AFE2Config):
+    protocol_profile: str = "v1"
     arm: str = "afe"
     replicas: int = 2
     gp_cap: int = 512
@@ -71,8 +73,12 @@ class AFERBFConfig(AFE2.AFE2Config):
     lengthscale_samples: int = 50
     acquisition_mode: str = "sequential"
     adaptive_ess_target: float | None = None
+    adaptive_beta_contexts_per_gamma: int | None = None
+    adaptive_beta_equalize_gammas: bool = False
     replay_window: int | None = None
+    replay_sampling: str = "query_uniform"
     gp_replay_window: int = 1
+    gp_replay_sampling: str = "round_gamma"
     lengthscale_multiplier: float = 1.0
     negative_alpha: float = 0.0
     execution_rule: str = "legacy_max_horizon_progress"
@@ -80,6 +86,9 @@ class AFERBFConfig(AFE2.AFE2Config):
     calibration_replicas: int | None = None
     calibration_control_steps: int | None = None
     sweep_compact_artifacts: bool = False
+    compact_checkpoint_every: int = 10
+    route_metric_steps: int = 0
+    route_ambiguity_band: float = RM.DEFAULT_AMBIGUITY_BAND
     rbf_offline_sweep: bool = False
 
 
@@ -294,6 +303,12 @@ def run_parallel_episodes(
     goal = env.goal.detach().cpu().numpy()
     obstacles = env.obstacles.detach().cpu().numpy()
     robot_radius = float(env.r_robot)
+    route_metric_steps = int(getattr(cfg, "route_metric_steps", 0))
+    route_ambiguity_band = float(getattr(
+        cfg,
+        "route_ambiguity_band",
+        RM.DEFAULT_AMBIGUITY_BAND,
+    ))
 
     control_horizon = cfg.T if max_control_steps is None else min(
         cfg.T, int(max_control_steps)
@@ -410,6 +425,19 @@ def run_parallel_episodes(
 
         bookkeeping_start = time.perf_counter()
         for local_index, episode in enumerate(active):
+            need_segments = (
+                viz is not None
+                or (
+                    route_metric_steps > 0
+                    and control_t < route_metric_steps
+                )
+            )
+            segments_all = (
+                GR.di_rollout_batch(
+                    episode["state"], candidate_cpu[local_index], env.dt
+                )
+                if need_segments else None
+            )
             episode_results = by_episode[episode["episode_id"]]
             acquired_scores = {
                 int(row["chosen"]): float(row["chosen_score"])
@@ -505,12 +533,37 @@ def run_parallel_episodes(
                 full_positive_available=full_positive_available,
                 n_drawn=len(query_rows),
             )
+            if route_metric_steps > 0 and control_t < route_metric_steps:
+                if segments_all is None:
+                    raise RuntimeError("route diagnostics require candidate segments")
+                route_labels = RM.classify_plan_endpoints(
+                    segments_all[:, -1, :],
+                    start=env.x0.detach().cpu().numpy()[:2],
+                    goal=goal,
+                    ambiguity_band=route_ambiguity_band,
+                )
+                queried_labels = route_labels[np.asarray(drawn, dtype=np.int64)]
+                positive_labels = np.asarray([
+                    route_labels[candidate_id]
+                    for candidate_id, _, result in query_rows
+                    if result["y"] == 1
+                ], dtype=np.int8)
+                executed_labels = np.asarray(
+                    [] if best is None else [route_labels[best[3]]],
+                    dtype=np.int8,
+                )
+                stats["route_modes"] = {
+                    "all_K": route_labels.astype(np.int8).tolist(),
+                    "selected_B": queried_labels.astype(np.int8).tolist(),
+                    "full_H_positive": positive_labels.tolist(),
+                    "executed": executed_labels.tolist(),
+                }
             episode["step_stats"].append(stats)
 
             if viz is not None:
-                segments = GR.di_rollout_batch(
-                    episode["state"], candidate_cpu[local_index], env.dt
-                ).astype(np.float16)
+                if segments_all is None:
+                    raise RuntimeError("visualization requires candidate segments")
+                segments = segments_all.astype(np.float16)
                 admissible = [row[2] for row in query_rows if row[2]["exec_y"]]
                 viz.append({
                     "t": control_t,
@@ -620,7 +673,7 @@ def _per_gamma_episode_stats(episodes, cfg):
     for gamma in cfg.gammas:
         records = [record for record in episodes if record["gamma"] == float(gamma)]
         steps = [item for record in records for item in record["step_stats"]]
-        output[str(gamma)] = {
+        row = {
             "episodes": len(records),
             "status_counts": {
                 name: sum(record["status"] == name for record in records)
@@ -648,6 +701,22 @@ def _per_gamma_episode_stats(episodes, cfg):
             "verifier_cpu_seconds": float(sum(item["verifier_seconds"] for item in steps)),
             "n_err": int(sum(item["n_err"] for item in steps)),
         }
+        route_steps = [item for item in steps if "route_modes" in item]
+        if route_steps:
+            row["route_modes_early"] = {
+                population: RM.summarize_modes([
+                    label
+                    for item in route_steps
+                    for label in item["route_modes"][population]
+                ])
+                for population in (
+                    "all_K",
+                    "selected_B",
+                    "full_H_positive",
+                    "executed",
+                )
+            }
+        output[str(gamma)] = row
     return output
 
 
@@ -691,15 +760,20 @@ def _controller_summary(episodes, cfg, env):
 
 
 @torch.no_grad()
-def _calibration_score_vectors(policy, gp, store, cfg, device):
+def _calibration_score_vectors(policy, gp, store, cfg, device, context_ids=None):
     """Build beta-neutral B-step score vectors at disjoint rollout contexts."""
 
     vectors = []
     pools = []
     gamma_counts = {}
     chunk_size = 16
-    for begin in range(0, len(store.ctx_state), chunk_size):
-        sids = list(range(begin, min(begin + chunk_size, len(store.ctx_state))))
+    legacy_all_contexts = context_ids is None
+    if legacy_all_contexts:
+        context_ids = list(range(len(store.ctx_state)))
+    else:
+        context_ids = [int(context_id) for context_id in context_ids]
+    for begin in range(0, len(context_ids), chunk_size):
+        sids = context_ids[begin:begin + chunk_size]
         grid = store.grid3_of(sids).to(device)
         low = torch.stack([torch.from_numpy(store.ctx_low5[sid]) for sid in sids]).to(device)
         hist = torch.stack([
@@ -708,7 +782,11 @@ def _calibration_score_vectors(policy, gp, store, cfg, device):
         context = policy.ctx_from(grid, low, hist)
         repeated = context.repeat_interleave(cfg.K, dim=0)
         with AC.isolated_random_state(
-            AFE2.named_seed(cfg.seed, "rbf_operational_beta_candidates", begin)
+            AFE2.named_seed(
+                cfg.seed,
+                "rbf_operational_beta_candidates",
+                begin if legacy_all_contexts else tuple(sids),
+            )
         ):
             controls = policy.sample(
                 len(sids) * cfg.K, repeated, nfe=cfg.nfe, temp=cfg.temp
@@ -771,6 +849,23 @@ def calibrate_rbf(policy, env, cfg, device, executor):
         )
     base_lengthscale = RC.mean_pairwise_lengthscale(features)
     lengthscale = float(base_lengthscale * cfg.lengthscale_multiplier)
+    lengthscale_segments = GR.di_rollout_batch(
+        state,
+        controls.detach().cpu().numpy().reshape(
+            cfg.lengthscale_samples, policy.H_pred, 2
+        ),
+        env.dt,
+    )
+    lengthscale_seed_route_modes = RM.summarize_modes(
+        RM.classify_plan_endpoints(
+            lengthscale_segments[:, -1, :],
+            start=env.x0.detach().cpu().numpy()[:2],
+            goal=env.goal.detach().cpu().numpy(),
+            ambiguity_band=float(getattr(
+                cfg, "route_ambiguity_band", RM.DEFAULT_AMBIGUITY_BAND
+            )),
+        )
+    )
 
     # A beta calibrated on the 50-sample length-scale seed is not operational:
     # the expansion GP has `gp_cap` points and sees rollout contexts.  Build a
@@ -788,9 +883,15 @@ def calibrate_rbf(policy, env, cfg, device, executor):
         purpose="rbf_operational_seed", acquisition_mode="uniform",
         max_control_steps=cfg.calibration_control_steps,
     )
-    seed_ids = RC.previous_round_positive_ids(
-        seed_store, 0, cfg.gp_cap, cfg.gammas,
-        AFE2.named_seed(cfg.seed, "rbf_operational_seed_buffer"),
+    seed_buffer_seed = AFE2.named_seed(cfg.seed, "rbf_operational_seed_buffer")
+    seed_ids = (
+        RC.previous_round_positive_ids(
+            seed_store, 0, cfg.gp_cap, cfg.gammas, seed_buffer_seed
+        )
+        if cfg.gp_replay_sampling == "round_gamma"
+        else RC.recent_round_positive_ids_hierarchical(
+            seed_store, 0, 1, cfg.gp_cap, seed_buffer_seed
+        )
     )
     if len(seed_ids) != cfg.gp_cap:
         raise RuntimeError(
@@ -816,8 +917,23 @@ def calibrate_rbf(policy, env, cfg, device, executor):
         max_control_steps=cfg.calibration_control_steps,
     )
     score_vector_start = time.perf_counter()
+    beta_context_ids = None
+    if cfg.adaptive_beta_contexts_per_gamma is not None:
+        beta_context_ids = AD.round_gamma_episode_balanced_context_ids(
+            beta_store,
+            0,
+            cfg.gammas,
+            cfg.adaptive_beta_contexts_per_gamma,
+            cfg.seed,
+            equalize_gammas=cfg.adaptive_beta_equalize_gammas,
+        )
     score_vectors, context_gamma_counts, feature_pools = _calibration_score_vectors(
-        policy, gp, beta_store, cfg, device
+        policy,
+        gp,
+        beta_store,
+        cfg,
+        device,
+        context_ids=beta_context_ids,
     )
     score_vector_seconds = time.perf_counter() - score_vector_start
     target = (
@@ -867,6 +983,8 @@ def calibrate_rbf(policy, env, cfg, device, executor):
         "lengthscale_multiplier": float(cfg.lengthscale_multiplier),
         "lengthscale": float(lengthscale),
         "lengthscale_samples": cfg.lengthscale_samples,
+        "lengthscale_seed_route_modes": lengthscale_seed_route_modes,
+        "lengthscale_seed_route_intervention": False,
         "calibration_replicas": int(calibration_replicas),
         "calibration_control_steps": cfg.calibration_control_steps,
         "operational_gp_size": gp.n,
@@ -879,6 +997,11 @@ def calibrate_rbf(policy, env, cfg, device, executor):
         "operational_seed_timing": seed_timing,
         "beta_context_queries": len(beta_store),
         "beta_context_count": len(beta_store.ctx_state),
+        "beta_context_selected_count": (
+            len(beta_store.ctx_state)
+            if beta_context_ids is None else len(beta_context_ids)
+        ),
+        "beta_context_cap_per_gamma": cfg.adaptive_beta_contexts_per_gamma,
         "beta_context_gamma_counts": context_gamma_counts,
         "beta_context_status_counts": {
             name: sum(row["status"] == name for row in beta_episodes)
@@ -919,7 +1042,7 @@ def _aggregate_step_stats(episodes, cfg):
         item["feature_plan_distance_corr"]
         for item in values if np.isfinite(item["feature_plan_distance_corr"])
     ]
-    return {
+    output = {
         "ess_med": float(np.median([item["ess_norm"] for item in values])),
         "ess_first_med": float(np.median([item["ess_first"] for item in values])),
         "ess_by_step_med": [
@@ -943,6 +1066,23 @@ def _aggregate_step_stats(episodes, cfg):
             item["marginal_sigma_iqr"] for item in values
         ])),
     }
+    route_values = [item for item in values if "route_modes" in item]
+    if route_values:
+        output["route_modes_early"] = {
+            population: RM.summarize_modes([
+                label
+                for item in route_values
+                for label in item["route_modes"][population]
+            ])
+            for population in (
+                "all_K",
+                "selected_B",
+                "full_H_positive",
+                "executed",
+            )
+        }
+        output["route_metric_contexts"] = len(route_values)
+    return output
 
 
 def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
@@ -1011,7 +1151,9 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             json.dump(calibration_public, stream, indent=2, sort_keys=True, allow_nan=False)
             stream.write("\n")
 
-        if cfg.execution_rule != "legacy_max_horizon_progress":
+        if cfg.protocol_profile == "v2_smoke":
+            algorithm = "afe_rbf_low7_v2_smoke_v1"
+        elif cfg.execution_rule != "legacy_max_horizon_progress":
             algorithm = "afe_rbf_low7_signed_execution_sweep_v1"
         elif cfg.acquisition_mode == "uniform":
             algorithm = "afe_uniform_parallel_v1"
@@ -1034,16 +1176,25 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                 )
             )
         )
-        learning_memory = (
-            "uniform replay over the complete cumulative full-H D+ archive"
+        replay_population = (
+            "the complete cumulative full-H D+ archive"
             if cfg.replay_window is None
             else (
-                f"uniform replay over full-H positives from the current and previous "
+                f"full-H positives from the current and previous "
                 f"{cfg.replay_window - 1} rounds; cumulative D+ archive is retained"
+            )
+        )
+        learning_memory = (
+            f"uniform query replay over {replay_population}"
+            if cfg.replay_sampling == "query_uniform"
+            else (
+                "hierarchical round/gamma/replica/context/query-balanced replay over "
+                f"{replay_population}"
             )
         )
         recipe = {
             "algorithm": algorithm,
+            "protocol_profile": cfg.protocol_profile,
             "arm": "afe",
             "single_arm": True,
             "kernel": "RBF",
@@ -1054,12 +1205,16 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             "beta": cfg.beta,
             "beta_protocol": beta_protocol,
             "adaptive_ess_target": cfg.adaptive_ess_target,
+            "adaptive_beta_contexts_per_gamma": (
+                cfg.adaptive_beta_contexts_per_gamma
+            ),
+            "adaptive_beta_equalize_gammas": cfg.adaptive_beta_equalize_gammas,
             "acquisition_mode": cfg.acquisition_mode,
             "acquisition_memory": (
                 "round 1: verified-positive pretrained calibration seed; later rounds: at most "
                 f"{cfg.gp_cap} full-H positives from the current and previous "
-                f"{cfg.gp_replay_window - 1} rounds, round/gamma-balanced random without "
-                "replacement; re-embedded with current phi; frozen within round"
+                f"{cfg.gp_replay_window - 1} rounds, selected without replacement by "
+                f"{cfg.gp_replay_sampling}; re-embedded with current phi; frozen within round"
             ),
             "calibration_budget": calibration_public["calibration_budget"],
             "calibration_replicas": calibration["calibration_replicas"],
@@ -1074,7 +1229,9 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             ),
             "learning_memory": learning_memory,
             "replay_window": cfg.replay_window,
+            "replay_sampling": cfg.replay_sampling,
             "gp_replay_window": cfg.gp_replay_window,
+            "gp_replay_sampling": cfg.gp_replay_sampling,
             "rbf_offline_sweep": (
                 "one pretrained-policy counterfactual sweep stored in rbf_calibration.json"
                 if cfg.rbf_offline_sweep else False
@@ -1098,6 +1255,14 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                 f"signed CFM lr {cfg.afe_lr:g}, separate batch {cfg.batch}, "
                 f"{cfg.afe_steps} steps, alpha {cfg.negative_alpha:g}, no prox"
             ),
+            "optimizer_draws_per_round": int(cfg.batch * cfg.afe_steps),
+            "optimizer_draw_interpretation": (
+                "stochastic replay draws, not one epoch and not an attempt to use every "
+                "newly collected positive; V2 uses balanced replay and deliberately gentle "
+                "lr=1e-5"
+                if cfg.protocol_profile == "v2_smoke"
+                else "stochastic replay draws, not an epoch over the eligible archive"
+            ),
             "rounds": cfg.rounds,
             "rollout_replicas": cfg.replicas,
             "T": cfg.T,
@@ -1120,11 +1285,25 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                 "sweep_compact" if cfg.sweep_compact_artifacts else "full"
             ),
             "artifact_profile_description": (
-                "omit final DStore; retain checkpoints r0/every10/final and training-viz "
-                "rounds 1..10/every10; probe, calibration, and completion hashes remain complete"
+                "omit final DStore; retain checkpoints at the declared compact interval and "
+                "training-viz rounds 1..10/every10; probe, calibration, and completion hashes "
+                "remain complete"
                 if cfg.sweep_compact_artifacts
                 else "retain complete DStore, every checkpoint, and every training-viz round"
             ),
+            "compact_checkpoint_every": cfg.compact_checkpoint_every,
+            "route_diagnostics": {
+                "intervention": False,
+                "early_control_steps": cfg.route_metric_steps,
+                "ambiguity_band_m": cfg.route_ambiguity_band,
+                "mode_definition": (
+                    "U/R is the sign of plan-endpoint cross-track displacement from the "
+                    "oriented canonical start-goal line; ambiguous values are retained"
+                ),
+                "training_populations": [
+                    "all_K", "selected_B", "full_H_positive", "executed"
+                ],
+            },
             "gp_cap": cfg.gp_cap,
             "gp_lam": cfg.gp_lam,
             "s": cfg.s,
@@ -1263,9 +1442,24 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             update_seconds = time.perf_counter() - update_start
             policy.eval()
 
-            query_ids = RC.recent_round_positive_ids(
-                store, round_i, cfg.gp_replay_window, cfg.gp_cap, cfg.gammas,
-                AFE2.named_seed(cfg.seed, "gp_buffer", round_i),
+            gp_buffer_seed = AFE2.named_seed(cfg.seed, "gp_buffer", round_i)
+            query_ids = (
+                RC.recent_round_positive_ids(
+                    store,
+                    round_i,
+                    cfg.gp_replay_window,
+                    cfg.gp_cap,
+                    cfg.gammas,
+                    gp_buffer_seed,
+                )
+                if cfg.gp_replay_sampling == "round_gamma"
+                else RC.recent_round_positive_ids_hierarchical(
+                    store,
+                    round_i,
+                    cfg.gp_replay_window,
+                    cfg.gp_cap,
+                    gp_buffer_seed,
+                )
             )
             gp_post, gp_post_diagnostics = _gp_from_query_ids(
                 policy, store, query_ids, cfg, device, calibration["lengthscale"]
@@ -1394,7 +1588,7 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                 }, os.path.join(outdir, "viz_db", f"round{round_i}.pt"))
             keep_checkpoint = (
                 not cfg.sweep_compact_artifacts
-                or round_i % 10 == 0
+                or round_i % cfg.compact_checkpoint_every == 0
                 or round_i == cfg.rounds
             )
             if keep_checkpoint:
@@ -1471,7 +1665,15 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
     checkpoint_rounds = (
         list(range(cfg.rounds + 1))
         if not cfg.sweep_compact_artifacts
-        else sorted({0, cfg.rounds, *range(10, cfg.rounds + 1, 10)})
+        else sorted({
+            0,
+            cfg.rounds,
+            *range(
+                cfg.compact_checkpoint_every,
+                cfg.rounds + 1,
+                cfg.compact_checkpoint_every,
+            ),
+        })
     )
     required = [
         "recipe.json",
@@ -1506,8 +1708,70 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
     print(f"[afe-rbf] COMPLETE: {outdir}", flush=True)
 
 
+def validate_protocol_args(args) -> None:
+    """Fail closed on study-specific contracts without changing V1 defaults."""
+
+    if args.protocol_profile == "v1":
+        if args.K != 64 or args.B != 8 or args.batch != 128:
+            raise ValueError("the first RBF study holds K=64, B=8, and batch=128 fixed")
+        return
+    if args.protocol_profile != "v2_smoke":
+        raise ValueError(f"unknown RBF protocol profile: {args.protocol_profile}")
+
+    exact = {
+        "scene_profile": "low7_radius1_canonical_v1",
+        "rounds": 10,
+        "rollout_replicas": 16,
+        "K": 16,
+        "B": 4,
+        "T": 300,
+        "M_eval": 0,
+        "batch": 128,
+        "afe_steps": 8,
+        "afe_lr": 1.0e-5,
+        "gp_cap": 512,
+        "gp_lam": 1.0e-2,
+        "acquisition_mode": "sequential",
+        "adaptive_ess_target": 0.5,
+        "adaptive_beta_contexts_per_gamma": 64,
+        "adaptive_beta_equalize_gammas": True,
+        "replay_window": 2,
+        "replay_sampling": "round_gamma_replica_context",
+        "gp_replay_window": 2,
+        "gp_replay_sampling": "round_gamma_replica_context",
+        "lengthscale_multiplier": 1.0,
+        "negative_alpha": 0.0,
+        "execution_rule": "nominal_hp_max_step_margin_only",
+        "conditioning_schema": CX.LOW7_SCHEMA,
+        "freeze_visual_encoder": True,
+        "skip_training_probes": True,
+        "calibration_replicas": 16,
+        "calibration_control_steps": 4,
+        "sweep_compact_artifacts": True,
+        "compact_checkpoint_every": 1,
+        "route_metric_steps": 10,
+        "route_ambiguity_band": RM.DEFAULT_AMBIGUITY_BAND,
+    }
+    mismatches = []
+    for name, expected in exact.items():
+        actual = getattr(args, name)
+        if isinstance(expected, float):
+            matches = np.isclose(float(actual), expected, rtol=0.0, atol=1.0e-12)
+        else:
+            matches = actual == expected
+        if not matches:
+            mismatches.append(f"{name}={actual!r} (expected {expected!r})")
+    if mismatches:
+        raise ValueError("V2 smoke protocol mismatch: " + "; ".join(mismatches))
+
+
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--protocol-profile",
+        choices=("v1", "v2_smoke"),
+        default="v1",
+    )
     parser.add_argument("--ckpt", required=True)
     parser.add_argument("--expected-ckpt-sha256", required=True)
     parser.add_argument("--scene-profile", choices=sorted(SCENE_PROFILES), required=True)
@@ -1529,8 +1793,20 @@ def main():
         default="sequential",
     )
     parser.add_argument("--adaptive-ess-target", type=float, default=None)
+    parser.add_argument("--adaptive-beta-contexts-per-gamma", type=int, default=None)
+    parser.add_argument("--adaptive-beta-equalize-gammas", action="store_true")
     parser.add_argument("--replay-window", type=int, default=None)
+    parser.add_argument(
+        "--replay-sampling",
+        choices=("query_uniform", "round_gamma_replica_context"),
+        default="query_uniform",
+    )
     parser.add_argument("--gp-replay-window", type=int, default=1)
+    parser.add_argument(
+        "--gp-replay-sampling",
+        choices=("round_gamma", "round_gamma_replica_context"),
+        default="round_gamma",
+    )
     parser.add_argument("--lengthscale-multiplier", type=float, default=1.0)
     parser.add_argument("--negative-alpha", type=float, default=0.0)
     parser.add_argument(
@@ -1539,6 +1815,7 @@ def main():
             "legacy_max_horizon_progress",
             "nominal_hp_max_step_progress",
             "nominal_hp_max_step_margin",
+            "nominal_hp_max_step_margin_only",
         ),
         default="legacy_max_horizon_progress",
     )
@@ -1552,12 +1829,18 @@ def main():
     parser.add_argument("--calibration-replicas", type=int, default=None)
     parser.add_argument("--calibration-control-steps", type=int, default=None)
     parser.add_argument("--sweep-compact-artifacts", action="store_true")
+    parser.add_argument("--compact-checkpoint-every", type=int, default=10)
+    parser.add_argument("--route-metric-steps", type=int, default=0)
+    parser.add_argument(
+        "--route-ambiguity-band",
+        type=float,
+        default=RM.DEFAULT_AMBIGUITY_BAND,
+    )
     parser.add_argument("--rbf-offline-sweep", action="store_true")
     parser.add_argument("--verifier-workers", type=int, default=16)
     parser.add_argument("--seed", type=int, default=910)
     args = parser.parse_args()
-    if args.K != 64 or args.B != 8 or args.batch != 128:
-        raise ValueError("the first RBF study holds K=64, B=8, and batch=128 fixed")
+    validate_protocol_args(args)
     if args.afe_steps < 1 or args.afe_lr <= 0.0:
         raise ValueError("AFE steps and learning rate must be positive")
     if args.rounds < 1 or args.rollout_replicas < 1 or args.M_eval < 0:
@@ -1568,6 +1851,11 @@ def main():
         raise ValueError("verifier worker count must be positive")
     if args.adaptive_ess_target is not None and not 0.0 < args.adaptive_ess_target < 1.0:
         raise ValueError("adaptive ESS target must lie strictly between zero and one")
+    if (
+        args.adaptive_beta_contexts_per_gamma is not None
+        and args.adaptive_beta_contexts_per_gamma < 1
+    ):
+        raise ValueError("adaptive-beta context cap per gamma must be positive")
     if args.acquisition_mode == "uniform" and args.adaptive_ess_target is not None:
         raise ValueError("uniform acquisition does not use adaptive beta")
     if args.replay_window is not None and args.replay_window < 1:
@@ -1582,6 +1870,15 @@ def main():
         raise ValueError("calibration replicas must be positive")
     if args.calibration_control_steps is not None and args.calibration_control_steps < 1:
         raise ValueError("calibration control steps must be positive")
+    if args.compact_checkpoint_every < 1:
+        raise ValueError("compact checkpoint interval must be positive")
+    if args.route_metric_steps < 0:
+        raise ValueError("route metric step count must be nonnegative")
+    if (
+        not np.isfinite(args.route_ambiguity_band)
+        or args.route_ambiguity_band < 0.0
+    ):
+        raise ValueError("route ambiguity band must be finite and nonnegative")
 
     np.random.seed(args.seed)
     random.seed(args.seed)
@@ -1630,6 +1927,7 @@ def main():
     env = build_scene(profile)
     GM2.GOAL_XY = np.asarray(profile.goal, dtype=float)
     cfg = AFERBFConfig(
+        protocol_profile=args.protocol_profile,
         rounds=args.rounds,
         T=args.T,
         K=args.K,
@@ -1650,8 +1948,14 @@ def main():
         verifier_workers=args.verifier_workers,
         acquisition_mode=args.acquisition_mode,
         adaptive_ess_target=args.adaptive_ess_target,
+        adaptive_beta_contexts_per_gamma=(
+            args.adaptive_beta_contexts_per_gamma
+        ),
+        adaptive_beta_equalize_gammas=args.adaptive_beta_equalize_gammas,
         replay_window=args.replay_window,
+        replay_sampling=args.replay_sampling,
         gp_replay_window=args.gp_replay_window,
+        gp_replay_sampling=args.gp_replay_sampling,
         lengthscale_multiplier=args.lengthscale_multiplier,
         negative_alpha=args.negative_alpha,
         execution_rule=args.execution_rule,
@@ -1659,6 +1963,9 @@ def main():
         calibration_replicas=args.calibration_replicas,
         calibration_control_steps=args.calibration_control_steps,
         sweep_compact_artifacts=args.sweep_compact_artifacts,
+        compact_checkpoint_every=args.compact_checkpoint_every,
+        route_metric_steps=args.route_metric_steps,
+        route_ambiguity_band=args.route_ambiguity_band,
         rbf_offline_sweep=args.rbf_offline_sweep,
         conditioning_schema=policy_contract.schema,
         raw_condition_dim=policy_contract.raw_condition_dim,

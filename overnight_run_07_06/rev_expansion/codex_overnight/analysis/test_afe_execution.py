@@ -87,6 +87,27 @@ def test_exact_nominal_builder_and_deterministic_selectors(monkeypatch) -> None:
     assert calls["predict_gain"] == 0.4
 
 
+def test_margin_only_selector_does_not_use_progress_as_a_tie_break(monkeypatch) -> None:
+    calls = {}
+    _patch_nominal_hp(monkeypatch, lambda points: np.ones(len(points)), calls)
+    state, controls, env = _inputs(count=2)
+    segments = np.asarray([[[0.8, 0.0]], [[-0.2, 0.0]]])
+
+    selection = EX.nominal_hp_max_step_margin_only(
+        state,
+        controls,
+        [{"y": 1}, {"y": 1}],
+        0.5,
+        env,
+        segments=segments,
+        candidate_ids=[9, 3],
+    )
+
+    assert selection["per_candidate"][0]["step_progress"] > 0.0
+    assert selection["per_candidate"][1]["step_progress"] < 0.0
+    assert selection["chosen"]["candidate_id"] == 3
+
+
 def test_exec_y_gate_preserves_terminal_prefix_and_negative_progress(monkeypatch) -> None:
     calls = {}
     _patch_nominal_hp(

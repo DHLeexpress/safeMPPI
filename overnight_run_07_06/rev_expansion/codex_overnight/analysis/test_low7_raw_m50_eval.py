@@ -22,7 +22,12 @@ def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _fake_run(root: Path, rounds: int = 23, artifact_profile: str = "full") -> Path:
+def _fake_run(
+    root: Path,
+    rounds: int = 23,
+    artifact_profile: str = "full",
+    compact_checkpoint_every: int = 10,
+) -> Path:
     run = root / "run"
     run.mkdir(parents=True)
     recipe = {
@@ -47,10 +52,13 @@ def _fake_run(root: Path, rounds: int = 23, artifact_profile: str = "full") -> P
         "no_prox": True,
         "no_fallback": True,
         "artifact_profile": artifact_profile,
+        "compact_checkpoint_every": compact_checkpoint_every,
     }
     (run / "recipe.json").write_text(json.dumps(recipe))
     (run / "probe.jsonl").write_text("{}\n")
-    required = EV.expected_inventory(rounds, artifact_profile)
+    required = EV.expected_inventory(
+        rounds, artifact_profile, compact_checkpoint_every
+    )
     for relative in required - {"recipe.json", "probe.jsonl"}:
         path = run / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -80,17 +88,24 @@ def _rate(count: int, n: int) -> dict:
     }
 
 
-def _metric_row(round_i: int, gamma: float | None, n: int) -> dict:
+def _metric_row(
+    round_i: int,
+    gamma: float | None,
+    n: int,
+    eval_profile: str = EV.DEFAULT_EVAL_PROFILE,
+) -> dict:
+    profile = EV.resolve_evaluation_profile(eval_profile)
     return {
-        "metric_version": EV.METRIC_VERSION,
-        "caption": EV.REPORT_CAPTION,
+        "metric_version": profile.metric_version,
+        "caption": profile.caption,
+        "evaluation_profile": profile.name,
         "mode": "raw",
         "method": "afe_rbf",
         "algorithm": "afe_rbf_low7_signed_execution_sweep_v1",
         "round": round_i,
         "scope": "pooled" if gamma is None else "gamma",
         "gamma": gamma,
-        "M_per_gamma": EV.M,
+        "M_per_gamma": profile.m,
         "n": n,
         "binary": {
             "SR": _rate(0, n),
@@ -110,6 +125,17 @@ def _metric_row(round_i: int, gamma: float | None, n: int) -> dict:
             "mean": None,
             "bootstrap95": [None, None],
             "values": [],
+        },
+        "route_modes": {
+            "early_first_10_steps": {
+                "balance": 0.0,
+            },
+            "closest_obstacle_approach": {
+                "balance": 0.0,
+            },
+            "closest_obstacle_approach_success_only": {
+                "coverage_weighted_balance": 0.0,
+            },
         },
     }
 
@@ -139,6 +165,23 @@ def test_variable_round_schedule_has_r0_every_ten_and_final():
         EV.evaluation_rounds(0)
 
 
+def test_v2_smoke_profile_uses_m10_and_every_stored_round():
+    profile = EV.resolve_evaluation_profile(EV.V2_SMOKE_EVAL_PROFILE)
+    assert profile.m == 10
+    assert profile.caption == (
+        "stored checkpoints re-evaluated on the same raw M=10/gamma seed bank"
+    )
+    assert EV.evaluation_rounds(10, profile) == tuple(range(11))
+    bank, metadata = EV.build_noise_bank(
+        "low7_radius1_canonical_v1", 2, profile
+    )
+    canonical, _ = EV.build_noise_bank("low7_radius1_canonical_v1", 2)
+    assert bank.shape == (len(EV.GAMMAS), 10, EV.T, 2)
+    assert np.array_equal(bank, canonical[:, :10])
+    assert metadata["evaluation_profile"] == profile.name
+    assert "canonical M=50" in metadata["cross_profile_pairing"]
+
+
 def test_completed_rbf_validator_authenticates_all_but_selects_schedule(tmp_path: Path):
     run = _fake_run(tmp_path)
     contract = EV.validate_completed_run(run, "low7_radius1_canonical_v1")
@@ -146,6 +189,18 @@ def test_completed_rbf_validator_authenticates_all_but_selects_schedule(tmp_path
     assert sorted(contract["selected_checkpoints"]) == [0, 10, 20, 23]
     assert contract["authenticated_artifact_count"] == len(EV.expected_inventory(23))
     assert contract["final_checkpoint_alias"]["path"].endswith("final.pt")
+
+
+def test_v2_smoke_validator_selects_every_authenticated_checkpoint(tmp_path: Path):
+    run = _fake_run(tmp_path, rounds=10)
+    contract = EV.validate_completed_run(
+        run,
+        "low7_radius1_canonical_v1",
+        EV.V2_SMOKE_EVAL_PROFILE,
+    )
+    assert contract["evaluation_profile"] == EV.V2_SMOKE_EVAL_PROFILE
+    assert contract["evaluation_rounds"] == list(range(11))
+    assert sorted(contract["selected_checkpoints"]) == list(range(11))
 
 
 def test_compact_sweep_inventory_keeps_video_rounds_and_omits_dstore(tmp_path: Path):
@@ -165,6 +220,26 @@ def test_compact_sweep_inventory_keeps_video_rounds_and_omits_dstore(tmp_path: P
     assert contract["authenticated_artifact_count"] == len(expected)
 
 
+def test_compact_v2_inventory_can_store_every_checkpoint_without_dstore(
+    tmp_path: Path,
+):
+    expected = EV.expected_inventory(10, "sweep_compact", compact_checkpoint_every=1)
+    assert "dstore.pt" not in expected
+    assert {f"ckpt_{round_i}.pt" for round_i in range(11)} <= expected
+    run = _fake_run(
+        tmp_path,
+        rounds=10,
+        artifact_profile="sweep_compact",
+        compact_checkpoint_every=1,
+    )
+    contract = EV.validate_completed_run(
+        run,
+        "low7_radius1_canonical_v1",
+        EV.V2_SMOKE_EVAL_PROFILE,
+    )
+    assert contract["evaluation_rounds"] == list(range(11))
+
+
 def test_missing_final_round_checkpoint_never_substitutes_final_pt(tmp_path: Path):
     run = _fake_run(tmp_path)
     (run / "ckpt_23.pt").unlink()
@@ -179,6 +254,9 @@ def test_noise_pairing_has_no_arm_or_round_key_and_is_reproducible():
     assert "round_i" not in parameters
     first = EV.paired_seed("low7_radius1_canonical_v1", 0.3, 7)
     assert first == EV.paired_seed("low7_radius1_canonical_v1", 0.3, 7)
+    assert first == EV.paired_seed(
+        "low7_radius1_canonical_v1", 0.3, 7, EV.V2_SMOKE_EVAL_PROFILE
+    )
     assert first != EV.paired_seed("low7_radius1_canonical_v1", 0.3, 8)
     bank_a, metadata_a = EV.build_noise_bank("low7_radius1_canonical_v1", 2)
     bank_b, metadata_b = EV.build_noise_bank("low7_radius1_canonical_v1", 2)
@@ -214,6 +292,24 @@ def test_raw_metric_grid_has_only_m50_gamma_and_pooled_rows():
         EV._authenticate_metric_grid(rows, rounds)
 
 
+def test_v2_smoke_metric_grid_authenticates_m10_every_round():
+    profile = EV.resolve_evaluation_profile(EV.V2_SMOKE_EVAL_PROFILE)
+    rounds = EV.evaluation_rounds(3, profile)
+    rows = []
+    for round_i in rounds:
+        rows.extend(
+            _metric_row(round_i, gamma, profile.m, profile.name)
+            for gamma in EV.GAMMAS
+        )
+        rows.append(
+            _metric_row(
+                round_i, None, profile.m * len(EV.GAMMAS), profile.name
+            )
+        )
+    EV._authenticate_metric_grid(rows, rounds, eval_profile=profile)
+    assert len(rows) == 4 * (len(EV.GAMMAS) + 1)
+
+
 def test_aggregate_reports_wilson_and_bootstrap_cis_from_raw_rows():
     raw = []
     for index in range(EV.M):
@@ -229,6 +325,8 @@ def test_aggregate_reports_wilson_and_bootstrap_cis_from_raw_rows():
                 "time_to_goal": 3.0 + index / 10 if success else None,
                 "v_safe": index % 2 == 0,
                 "v_full": index % 5 == 0,
+                "route_mode_early": 1 if index % 2 == 0 else -1,
+                "route_mode_closest": 1 if index % 2 == 0 else -1,
             }
         )
     row = EV.aggregate_metrics(
@@ -281,6 +379,47 @@ def test_true_eval_curve_renders_validity_with_other_metrics(tmp_path: Path):
     assert all(path.is_file() and path.stat().st_size > 0 for path in outputs)
 
 
+def test_v2_smoke_renders_a_fixed_index_gallery_for_every_round(tmp_path: Path):
+    profile = EV.resolve_evaluation_profile(EV.V2_SMOKE_EVAL_PROFILE)
+    rounds = (0, 1)
+    rows = []
+    cell_dir = tmp_path / "cells" / "raw" / "afe_rbf"
+    cell_dir.mkdir(parents=True)
+    path = np.stack(
+        (np.linspace(0.3, 4.0, 8), np.linspace(0.3, 4.0, 8)), axis=1
+    )
+    for round_i in rounds:
+        for gamma in EV.GAMMAS:
+            rows.append(_metric_row(round_i, gamma, profile.m, profile.name))
+            paths = np.empty(profile.m, dtype=object)
+            for index in range(profile.m):
+                paths[index] = path
+            np.savez_compressed(
+                cell_dir / f"r{round_i:03d}_g{gamma:.1f}.npz",
+                paths=paths,
+                status=np.asarray(["timeout"] * profile.m),
+                outcome=np.asarray(["timeout"] * profile.m),
+                rollout_index=np.arange(profile.m, dtype=np.int32),
+            )
+        rows.append(
+            _metric_row(
+                round_i, None, profile.m * len(EV.GAMMAS), profile.name
+            )
+        )
+    scene = SimpleNamespace(start=(0.3, 0.3), goal=(4.7, 4.7))
+    env = SimpleNamespace(obstacles=torch.empty((0, 3)), r_robot=0.1)
+    outputs, manifest_path = EV._render_galleries(
+        tmp_path, scene, env, rows, rounds, best_round=0, eval_profile=profile
+    )
+    assert (tmp_path / "round_galleries" / "raw_m10_round_000.png").is_file()
+    assert (tmp_path / "round_galleries" / "raw_m10_round_001.png").is_file()
+    assert all(path.is_file() and path.stat().st_size > 0 for path in outputs)
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["per_round"] == [0, 1]
+    assert manifest["M"] == 10
+    assert manifest["caption"] == profile.caption
+
+
 def test_required_report_caption_is_exact():
     assert EV.REPORT_CAPTION == (
         "stored checkpoints re-evaluated on the same raw M=50/gamma seed bank"
@@ -292,7 +431,11 @@ def test_required_report_caption_is_exact():
 
 
 def test_worker_validity_is_preserved_while_raw_outcomes_are_disjoint():
-    episode = {"status": "reached"}
+    episode = {
+        "status": "reached",
+        "route_mode_early": 1,
+        "route_mode_closest": -1,
+    }
     worker = {
         "status": "reached",
         "success": True,

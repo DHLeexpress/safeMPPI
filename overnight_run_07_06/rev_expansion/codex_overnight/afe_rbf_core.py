@@ -385,6 +385,84 @@ def recent_round_positive_ids(
     return sorted(selected)
 
 
+def recent_round_positive_ids_hierarchical(
+    store,
+    round_i: int,
+    replay_window: int,
+    cap: int,
+    seed: int,
+) -> list[int]:
+    """Without-replacement round/gamma/replica/context-balanced GP buffer.
+
+    This is an opt-in V2 selector.  Recursive round-robin interleaving prevents
+    a long replica or a context with several positive queries from dominating
+    the fixed-size RBF memory.  The legacy selectors above remain unchanged.
+    """
+
+    replay_window = int(replay_window)
+    cap = int(cap)
+    if replay_window < 1:
+        raise ValueError("GP replay window must be at least one round")
+    if cap < 1:
+        raise ValueError("GP buffer cap must be positive")
+    first_round = max(0, int(round_i) - replay_window + 1)
+    eligible = [
+        int(query_id)
+        for query_id in store.pos_ids
+        if first_round <= int(store.q_round[query_id]) <= int(round_i)
+    ]
+    if len(eligible) <= cap:
+        return sorted(eligible)
+    hierarchy = store.positive_replay_hierarchy(eligible_ids=eligible)
+    rng = np.random.default_rng(int(seed))
+
+    def shuffled(values):
+        ordered = sorted(values)
+        return [ordered[index] for index in rng.permutation(len(ordered))]
+
+    def interleave(generators):
+        active = [(key, generators[key]) for key in shuffled(generators)]
+        while active:
+            next_active = []
+            for key, generator in active:
+                try:
+                    yield next(generator)
+                    next_active.append((key, generator))
+                except StopIteration:
+                    pass
+            active = next_active
+
+    def query_generator(query_ids):
+        yield from shuffled(query_ids)
+
+    def context_generator(contexts):
+        yield from interleave({
+            context_id: query_generator(query_ids)
+            for context_id, query_ids in contexts.items()
+        })
+
+    def replica_generator(replicas):
+        yield from interleave({
+            replica: context_generator(contexts)
+            for replica, contexts in replicas.items()
+        })
+
+    def gamma_generator(gammas):
+        yield from interleave({
+            gamma: replica_generator(replicas)
+            for gamma, replicas in gammas.items()
+        })
+
+    order = interleave({
+        query_round: gamma_generator(gammas)
+        for query_round, gammas in hierarchy.items()
+    })
+    selected = [int(query_id) for _, query_id in zip(range(cap), order)]
+    if len(selected) != cap or len(set(selected)) != cap:
+        raise RuntimeError("failed to build hierarchical GP buffer without replacement")
+    return sorted(selected)
+
+
 _VERIFY_ENV = None
 _VERIFY_GOAL = None
 _VERIFY_REACH = None

@@ -1,9 +1,10 @@
-"""Raw-only M=50 checkpoint sweep for one completed AFE-RBF arm.
+"""Raw-only checkpoint sweep for one completed AFE-RBF arm.
 
 This evaluator is deliberately additive and evaluation-only.  It authenticates
-the completed trainer inventory, evaluates ckpt_0, every tenth checkpoint, and
-the final checkpoint with one common raw proposal-noise bank, and never loads
-or applies the RBF/GP acquisition rule or verifier controller.
+the completed trainer inventory and uses one common raw proposal-noise bank.  It
+never loads or applies the RBF/GP acquisition rule or verifier controller.  The
+default profile preserves the canonical M=50/every-tenth-checkpoint protocol;
+the explicit V2 smoke profile evaluates M=10 at every stored checkpoint.
 """
 from __future__ import annotations
 
@@ -38,6 +39,7 @@ import torch
 import _paths  # noqa: F401
 import afe_context as CX
 import afe_m20_eval as M20
+import afe_route_metrics as RM
 from afe2_scene_profiles import (
     SCENE_PROFILES,
     assert_scene_snapshot,
@@ -77,7 +79,63 @@ SUPPORTED_ALGORITHMS = {
     "afe_rbf_adaptive_ess_parallel_v4",
     "afe_uniform_parallel_v1",
     "afe_rbf_low7_signed_execution_sweep_v1",
+    "afe_rbf_low7_v2_smoke_v1",
 }
+
+
+@dataclass(frozen=True)
+class EvaluationProfile:
+    name: str
+    m: int
+    checkpoint_stride: int
+    metric_version: str
+    caption: str
+    filename_tag: str
+    summary_status: str
+    delivery_status: str
+
+    @property
+    def gallery_indices(self) -> tuple[int, ...]:
+        return tuple(range(min(10, self.m)))
+
+
+DEFAULT_EVAL_PROFILE = "canonical_m50_every10"
+V2_SMOKE_EVAL_PROFILE = "v2_smoke_m10_every_round"
+EVALUATION_PROFILES = {
+    DEFAULT_EVAL_PROFILE: EvaluationProfile(
+        name=DEFAULT_EVAL_PROFILE,
+        m=M,
+        checkpoint_stride=10,
+        metric_version=METRIC_VERSION,
+        caption=REPORT_CAPTION,
+        filename_tag="raw_m50",
+        summary_status="AFE_RBF_RAW_M50_SWEEP_COMPLETE",
+        delivery_status="AFE_RBF_RAW_M50_EVALUATION_DELIVERY_COMPLETE",
+    ),
+    V2_SMOKE_EVAL_PROFILE: EvaluationProfile(
+        name=V2_SMOKE_EVAL_PROFILE,
+        m=10,
+        checkpoint_stride=1,
+        metric_version="afe_rbf_raw_sweep_m10_every_round_v1",
+        caption=(
+            "stored checkpoints re-evaluated on the same raw M=10/gamma seed bank"
+        ),
+        filename_tag="raw_m10",
+        summary_status="AFE_RBF_RAW_M10_EVERY_ROUND_SWEEP_COMPLETE",
+        delivery_status="AFE_RBF_RAW_M10_EVERY_ROUND_EVALUATION_DELIVERY_COMPLETE",
+    ),
+}
+
+
+def resolve_evaluation_profile(
+    profile: str | EvaluationProfile = DEFAULT_EVAL_PROFILE,
+) -> EvaluationProfile:
+    if isinstance(profile, EvaluationProfile):
+        return profile
+    try:
+        return EVALUATION_PROFILES[str(profile)]
+    except KeyError as exc:
+        raise ValueError(f"unknown raw evaluation profile: {profile}") from exc
 
 
 @dataclass(frozen=True)
@@ -172,17 +230,32 @@ def require_clean_additive_source(expected_base: str) -> dict[str, Any]:
     return state
 
 
-def evaluation_rounds(final_round: int) -> tuple[int, ...]:
+def evaluation_rounds(
+    final_round: int,
+    eval_profile: str | EvaluationProfile = DEFAULT_EVAL_PROFILE,
+) -> tuple[int, ...]:
     final_round = int(final_round)
     if final_round < 1:
         raise ValueError("a completed RBF sweep must contain at least one expansion round")
-    selected = {0, final_round, *range(10, final_round + 1, 10)}
+    profile = resolve_evaluation_profile(eval_profile)
+    selected = {
+        0,
+        final_round,
+        *range(profile.checkpoint_stride, final_round + 1, profile.checkpoint_stride),
+    }
     return tuple(sorted(selected))
 
 
-def expected_inventory(rounds: int, artifact_profile: str = "full") -> set[str]:
+def expected_inventory(
+    rounds: int,
+    artifact_profile: str = "full",
+    compact_checkpoint_every: int = 10,
+) -> set[str]:
     if artifact_profile not in {"full", "sweep_compact"}:
         raise ValueError(f"unknown trainer artifact profile: {artifact_profile}")
+    compact_checkpoint_every = int(compact_checkpoint_every)
+    if compact_checkpoint_every < 1:
+        raise ValueError("compact checkpoint interval must be positive")
     viz_rounds = (
         range(1, int(rounds) + 1)
         if artifact_profile == "full"
@@ -203,7 +276,17 @@ def expected_inventory(rounds: int, artifact_profile: str = "full") -> set[str]:
             for round_i in (
                 range(int(rounds) + 1)
                 if artifact_profile == "full"
-                else sorted({0, int(rounds), *range(10, int(rounds) + 1, 10)})
+                else sorted(
+                    {
+                        0,
+                        int(rounds),
+                        *range(
+                            compact_checkpoint_every,
+                            int(rounds) + 1,
+                            compact_checkpoint_every,
+                        ),
+                    }
+                )
             )
         },
         *{f"viz_db/round{round_i}.pt" for round_i in viz_rounds},
@@ -225,7 +308,9 @@ def _validate_recipe_protocol(recipe: dict[str, Any]) -> None:
 
 
 def validate_completed_run(
-    run_root: str | os.PathLike[str], scene_profile: str
+    run_root: str | os.PathLike[str],
+    scene_profile: str,
+    eval_profile: str | EvaluationProfile = DEFAULT_EVAL_PROFILE,
 ) -> dict[str, Any]:
     """Authenticate one completed variable-length AFE-RBF trainer run."""
 
@@ -273,7 +358,10 @@ def validate_completed_run(
 
     inventory = complete.get("artifact_sha256", {})
     artifact_profile = str(recipe.get("artifact_profile", "full"))
-    required = expected_inventory(completed_round, artifact_profile)
+    compact_checkpoint_every = int(recipe.get("compact_checkpoint_every", 10))
+    required = expected_inventory(
+        completed_round, artifact_profile, compact_checkpoint_every
+    )
     if set(inventory) != required:
         missing = sorted(required - set(inventory))
         extra = sorted(set(inventory) - required)
@@ -287,8 +375,9 @@ def validate_completed_run(
         if sha256_file(path) != expected_hash:
             raise RuntimeError(f"inventoried RBF artifact hash mismatch: {relative}")
 
+    profile = resolve_evaluation_profile(eval_profile)
     selected_checkpoints = {}
-    for round_i in evaluation_rounds(completed_round):
+    for round_i in evaluation_rounds(completed_round, profile):
         relative = f"ckpt_{round_i}.pt"
         selected_checkpoints[round_i] = {
             "path": str(root / relative),
@@ -317,13 +406,20 @@ def validate_completed_run(
         },
         "authenticated_artifact_count": len(inventory),
         "completed_round": completed_round,
-        "evaluation_rounds": list(evaluation_rounds(completed_round)),
+        "evaluation_profile": profile.name,
+        "evaluation_rounds": list(evaluation_rounds(completed_round, profile)),
     }
 
 
-def paired_seed(scene_profile: str, gamma: float, rollout_index: int) -> int:
+def paired_seed(
+    scene_profile: str,
+    gamma: float,
+    rollout_index: int,
+    eval_profile: str | EvaluationProfile = DEFAULT_EVAL_PROFILE,
+) -> int:
     """Stable pairing identifier; intentionally has no arm or round argument."""
 
+    resolve_evaluation_profile(eval_profile)
     raw = "|".join(
         (
             METRIC_VERSION,
@@ -335,19 +431,27 @@ def paired_seed(scene_profile: str, gamma: float, rollout_index: int) -> int:
     return int.from_bytes(hashlib.sha256(raw).digest()[:8], "big") % (2**63 - 1)
 
 
-def noise_bank_seed(scene_profile: str) -> int:
+def noise_bank_seed(
+    scene_profile: str,
+    eval_profile: str | EvaluationProfile = DEFAULT_EVAL_PROFILE,
+) -> int:
+    resolve_evaluation_profile(eval_profile)
     raw = f"{METRIC_VERSION}|{scene_profile}|raw-temp1-noise-bank".encode()
     return int.from_bytes(hashlib.sha256(raw).digest()[:8], "big") % (2**63 - 1)
 
 
 def build_noise_bank(
-    scene_profile: str, policy_dim: int
+    scene_profile: str,
+    policy_dim: int,
+    eval_profile: str | EvaluationProfile = DEFAULT_EVAL_PROFILE,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    seed = noise_bank_seed(scene_profile)
+    profile = resolve_evaluation_profile(eval_profile)
+    seed = noise_bank_seed(scene_profile, profile)
     generator = np.random.default_rng(seed)
-    bank = generator.standard_normal(
+    canonical_bank = generator.standard_normal(
         (len(GAMMAS), M, T, int(policy_dim)), dtype=np.float32
     )
+    bank = canonical_bank[:, :profile.m].copy()
     metadata = {
         "seed": seed,
         "shape": list(bank.shape),
@@ -355,6 +459,10 @@ def build_noise_bank(
         "sha256": hashlib.sha256(bank.tobytes(order="C")).hexdigest(),
         "indexing": "[gamma_index, rollout_index, control_time, latent_dimension]",
         "independence": "scene-keyed; independent of RBF arm and checkpoint round",
+        "evaluation_profile": profile.name,
+        "cross_profile_pairing": (
+            f"first {profile.m} rollouts per gamma from the canonical M={M} bank"
+        ),
     }
     return bank, metadata
 
@@ -456,10 +564,12 @@ def run_raw_batch(
     cfg: RawEvalConfig,
     device: str,
     noise_bank: np.ndarray,
+    eval_profile: str | EvaluationProfile = DEFAULT_EVAL_PROFILE,
 ) -> list[dict[str, Any]]:
     """Batched raw H=10 receding-horizon policy; no GP, tilt, or verifier."""
 
-    expected_shape = (len(GAMMAS), M, T, int(policy.d))
+    profile = resolve_evaluation_profile(eval_profile)
+    expected_shape = (len(GAMMAS), profile.m, T, int(policy.d))
     if noise_bank.shape != expected_shape or noise_bank.dtype != np.float32:
         raise RuntimeError(
             f"raw noise bank {noise_bank.shape}/{noise_bank.dtype} != {expected_shape}/float32"
@@ -470,10 +580,10 @@ def run_raw_batch(
     robot_radius = float(env.r_robot)
     episodes: list[dict[str, Any]] = []
     for gamma_index, gamma in enumerate(cfg.gammas):
-        for rollout_index in range(M):
+        for rollout_index in range(profile.m):
             episodes.append(
                 {
-                    "episode_id": gamma_index * M + rollout_index,
+                    "episode_id": gamma_index * profile.m + rollout_index,
                     "gamma_index": gamma_index,
                     "rollout_index": rollout_index,
                     "gamma": float(gamma),
@@ -580,6 +690,8 @@ def normalize_trajectory_metrics(
             "collision": collision,
             "oob": oob,
             "time_to_goal": float(row["steps"] * dt) if success else None,
+            "route_mode_early": int(episode["route_mode_early"]),
+            "route_mode_closest": int(episode["route_mode_closest"]),
         }
     )
     return row
@@ -602,7 +714,9 @@ def aggregate_metrics(
     scope: str,
     scene_profile: str,
     algorithm: str,
+    eval_profile: str | EvaluationProfile = DEFAULT_EVAL_PROFILE,
 ) -> dict[str, Any]:
+    profile = resolve_evaluation_profile(eval_profile)
     n = len(rows)
     if n <= 0:
         raise ValueError("cannot aggregate an empty raw evaluation cell")
@@ -621,19 +735,31 @@ def aggregate_metrics(
         for row in rows
         if row["time_to_goal"] is not None
     ]
-    bootstrap_key = [METRIC_VERSION, scene_profile, scope, gamma, n]
+    bootstrap_key = [profile.metric_version, scene_profile, scope, gamma, n]
     clearance_ci = bootstrap95(clearances, [*bootstrap_key, "clearance"])
     time_ci = bootstrap95(success_times, [*bootstrap_key, "success_time"])
+    route_modes = {
+        "early_first_10_steps": RM.summarize_modes([
+            row["route_mode_early"] for row in rows
+        ]),
+        "closest_obstacle_approach": RM.summarize_modes([
+            row["route_mode_closest"] for row in rows
+        ]),
+        "closest_obstacle_approach_success_only": RM.summarize_modes([
+            row["route_mode_closest"] for row in rows if row["success"]
+        ]),
+    }
     return {
-        "metric_version": METRIC_VERSION,
-        "caption": REPORT_CAPTION,
+        "metric_version": profile.metric_version,
+        "caption": profile.caption,
+        "evaluation_profile": profile.name,
         "mode": "raw",
         "method": "afe_rbf",
         "algorithm": algorithm,
         "round": int(round_i),
         "scope": scope,
         "gamma": None if gamma is None else float(gamma),
-        "M_per_gamma": M,
+        "M_per_gamma": profile.m,
         "n": n,
         "binary": binary,
         "minimum_clearance": {
@@ -648,6 +774,8 @@ def aggregate_metrics(
             "bootstrap95": list(time_ci),
             "values": success_times,
         },
+        "route_modes": route_modes,
+        "route_mode_intervention": False,
         "ci_note": (
             "Wilson 95% intervals for SR/CR/timeout/V_safe/V_full; deterministic episode "
             "bootstrap 95% intervals for continuous means"
@@ -664,17 +792,19 @@ def _save_cell(
     metrics: list[dict[str, Any]],
     model_state_sha256: str,
     noise_metadata: dict[str, Any],
+    eval_profile: str | EvaluationProfile = DEFAULT_EVAL_PROFILE,
 ) -> tuple[dict[str, Any], dict[str, str]]:
+    profile = resolve_evaluation_profile(eval_profile)
     pairs = [
         (episode, metric)
         for episode, metric in zip(episodes, metrics)
         if episode["gamma"] == float(gamma)
     ]
-    if len(pairs) != M:
-        raise RuntimeError(f"raw/r{round_i}/g{gamma}: expected M={M}")
+    if len(pairs) != profile.m:
+        raise RuntimeError(f"raw/r{round_i}/g{gamma}: expected M={profile.m}")
     records = [pair[0] for pair in pairs]
     metric_rows = [pair[1] for pair in pairs]
-    if [record["rollout_index"] for record in records] != list(range(M)):
+    if [record["rollout_index"] for record in records] != list(range(profile.m)):
         raise RuntimeError("raw rollout records are not in fixed index order")
 
     cell_dir = outdir / "cells" / "raw" / "afe_rbf"
@@ -684,14 +814,14 @@ def _save_cell(
     provenance_path = cell_dir / f"{stem}.provenance.json"
     if archive_path.exists() or provenance_path.exists():
         raise FileExistsError(f"stale raw evaluation cell exists: {stem}")
-    paths = np.empty(M, dtype=object)
+    paths = np.empty(profile.m, dtype=object)
     for index, record in enumerate(records):
         paths[index] = record["path"]
     pairing_keys = [
         paired_seed(
-            contract["recipe"]["scene"]["profile"]["name"], gamma, index
+            contract["recipe"]["scene"]["profile"]["name"], gamma, index, profile
         )
-        for index in range(M)
+        for index in range(profile.m)
     ]
     np.savez_compressed(
         archive_path,
@@ -713,18 +843,19 @@ def _save_cell(
             ],
             dtype=np.float64,
         ),
-        rollout_index=np.arange(M, dtype=np.int32),
+        rollout_index=np.arange(profile.m, dtype=np.int32),
         pairing_keys=np.asarray(pairing_keys, dtype=np.int64),
     )
     checkpoint = contract["selected_checkpoints"][round_i]
     provenance = {
-        "metric_version": METRIC_VERSION,
-        "caption": REPORT_CAPTION,
+        "metric_version": profile.metric_version,
+        "caption": profile.caption,
+        "evaluation_profile": profile.name,
         "mode": "raw",
         "algorithm": contract["algorithm"],
         "round": int(round_i),
         "gamma": float(gamma),
-        "M": M,
+        "M": profile.m,
         "T": T,
         "reach": REACH,
         "nfe": NFE,
@@ -758,6 +889,7 @@ def _save_cell(
             scope="gamma",
             scene_profile=contract["recipe"]["scene"]["profile"]["name"],
             algorithm=contract["algorithm"],
+            eval_profile=profile,
         ),
         artifacts,
     )
@@ -780,14 +912,21 @@ def _authenticate_metric_grid(
     metric_rows: list[dict[str, Any]],
     rounds: tuple[int, ...] | list[int],
     outdir: Path | None = None,
+    eval_profile: str | EvaluationProfile = DEFAULT_EVAL_PROFILE,
 ) -> None:
+    profile = resolve_evaluation_profile(eval_profile)
     rounds = tuple(int(value) for value in rounds)
     gamma_rows = [row for row in metric_rows if row["scope"] == "gamma"]
     pooled_rows = [row for row in metric_rows if row["scope"] == "pooled"]
     if any(row.get("mode") != "raw" for row in metric_rows):
         raise RuntimeError("raw sweep contains a non-raw metric row")
-    if any(row.get("caption") != REPORT_CAPTION for row in metric_rows):
+    if any(row.get("caption") != profile.caption for row in metric_rows):
         raise RuntimeError("raw sweep metric caption changed")
+    if any(
+        row.get("evaluation_profile", DEFAULT_EVAL_PROFILE) != profile.name
+        for row in metric_rows
+    ):
+        raise RuntimeError("raw sweep evaluation profile changed")
     if len(gamma_rows) != len(rounds) * len(GAMMAS):
         raise RuntimeError("per-gamma raw metric grid is incomplete")
     if len(pooled_rows) != len(rounds):
@@ -801,20 +940,30 @@ def _authenticate_metric_grid(
     if {int(row["round"]) for row in pooled_rows} != set(rounds):
         raise RuntimeError("raw pooled metric keys are incomplete")
     for row in gamma_rows:
-        if int(row["n"]) != M:
-            raise RuntimeError("per-gamma raw metric row does not contain M=50")
+        if int(row["n"]) != profile.m:
+            raise RuntimeError(
+                f"per-gamma raw metric row does not contain M={profile.m}"
+            )
         if set(row["binary"]) != {"SR", "CR", "timeout", "V_safe", "V_full"}:
             raise RuntimeError("per-gamma raw binary metric set is incomplete")
-        if sum(row["binary"][key]["count"] for key in ("SR", "CR", "timeout")) != M:
-            raise RuntimeError("per-gamma terminal counts do not partition M=50")
+        if (
+            sum(
+                row["binary"][key]["count"]
+                for key in ("SR", "CR", "timeout")
+            )
+            != profile.m
+        ):
+            raise RuntimeError(
+                f"per-gamma terminal counts do not partition M={profile.m}"
+            )
     for row in pooled_rows:
-        if int(row["n"]) != M * len(GAMMAS):
+        if int(row["n"]) != profile.m * len(GAMMAS):
             raise RuntimeError("pooled raw metric row has the wrong sample count")
         if set(row["binary"]) != {"SR", "CR", "timeout", "V_safe", "V_full"}:
             raise RuntimeError("pooled raw binary metric set is incomplete")
         if sum(
             row["binary"][key]["count"] for key in ("SR", "CR", "timeout")
-        ) != M * len(GAMMAS):
+        ) != profile.m * len(GAMMAS):
             raise RuntimeError("pooled terminal counts do not partition the raw sweep")
     if outdir is not None:
         expected_cells = len(rounds) * len(GAMMAS)
@@ -896,6 +1045,12 @@ def _metric_series(
             else:
                 value = float(entry["mean"])
                 lo, hi = (float(item) for item in entry["bootstrap95"])
+        elif key == "route_balance":
+            value = float(
+                row["route_modes"]["closest_obstacle_approach_success_only"]
+                ["coverage_weighted_balance"]
+            )
+            lo = hi = value
         else:
             raise KeyError(key)
         values.append(value)
@@ -909,7 +1064,9 @@ def _render_curves(
     metric_rows: list[dict[str, Any]],
     rounds: tuple[int, ...],
     best_round: int,
+    eval_profile: str | EvaluationProfile = DEFAULT_EVAL_PROFILE,
 ) -> list[Path]:
+    profile = resolve_evaluation_profile(eval_profile)
     lookup = _row_lookup(metric_rows)
     specs = [
         ("SR", "success rate"),
@@ -919,13 +1076,14 @@ def _render_curves(
         ("V_full", "whole-trajectory V_full"),
         ("clearance", "mean minimum clearance [m]"),
         ("time", "successful time-to-goal [s]"),
+        ("route_balance", "Successful U/R diversity at central obstacle"),
     ]
     cmap = plt.get_cmap("plasma")
     colors = {
         gamma: cmap(0.08 + 0.84 * index / (len(GAMMAS) - 1))
         for index, gamma in enumerate(GAMMAS)
     }
-    fig, axes = plt.subplots(2, 4, figsize=(21, 9), squeeze=False)
+    fig, axes = plt.subplots(2, 5, figsize=(25, 9), squeeze=False)
     for ax, (key, title) in zip(axes.flat, specs):
         for gamma in GAMMAS:
             series = [lookup[(round_i, gamma)] for round_i in rounds]
@@ -940,12 +1098,14 @@ def _render_curves(
         ax.set_title(title)
         ax.set_xlabel("stored checkpoint round")
         ax.grid(alpha=0.25)
-        if key in ("SR", "CR", "timeout", "V_safe", "V_full"):
+        if key in ("SR", "CR", "timeout", "V_safe", "V_full", "route_balance"):
             ax.set_ylim(-0.03, 1.03)
         ax.legend(fontsize=7, loc="best")
-    axes[1, 3].axis("off")
+    for ax in axes.flat[len(specs):]:
+        ax.axis("off")
+    info_ax = axes.flat[len(specs)]
     selected = lookup[(best_round, None)]
-    axes[1, 3].text(
+    info_ax.text(
         0.03,
         0.95,
         "Post-hoc selected checkpoint\n"
@@ -956,6 +1116,8 @@ def _render_curves(
         f"pooled V_safe = {selected['binary']['V_safe']['estimate']:.3f}\n"
         f"pooled V_full = {selected['binary']['V_full']['estimate']:.3f}\n"
         f"mean clearance = {selected['minimum_clearance']['mean']:.3f} m\n\n"
+        "successful U/R diversity = "
+        f"{selected['route_modes']['closest_obstacle_approach_success_only']['coverage_weighted_balance']:.3f}\n\n"
         + BEST_SELECTION_RULE,
         va="top",
         ha="left",
@@ -967,11 +1129,11 @@ def _render_curves(
         for gamma in GAMMAS
     ]
     fig.legend(handles=handles, loc="upper center", ncol=7, fontsize=8, bbox_to_anchor=(0.5, 0.93))
-    fig.suptitle(f"Raw checkpoint sweep\n{REPORT_CAPTION}", fontsize=14)
+    fig.suptitle(f"Raw checkpoint sweep\n{profile.caption}", fontsize=14)
     fig.tight_layout(rect=(0, 0, 1, 0.89))
     outputs = []
     for suffix in ("png", "pdf"):
-        path = outdir / f"raw_m50_checkpoint_curves.{suffix}"
+        path = outdir / f"{profile.filename_tag}_checkpoint_curves.{suffix}"
         fig.savefig(path, dpi=160)
         outputs.append(path)
     plt.close(fig)
@@ -997,6 +1159,7 @@ def _draw_scene(
     gamma: float,
     title: str,
     outcomes: list[str],
+    gallery_indices: tuple[int, ...] = GALLERY_INDICES,
 ) -> None:
     obstacles = env.obstacles.detach().cpu().numpy()
     for obstacle in obstacles:
@@ -1006,7 +1169,7 @@ def _draw_scene(
     color = plt.get_cmap("plasma")(
         0.08 + 0.84 * GAMMAS.index(gamma) / (len(GAMMAS) - 1)
     )
-    for index in GALLERY_INDICES:
+    for index in gallery_indices:
         path = np.asarray(paths[index], dtype=float)
         ax.plot(path[:, 0], path[:, 1], color=color, lw=1.0, alpha=0.72, zorder=3)
         dots = path[::STATE_DOT_STRIDE]
@@ -1036,7 +1199,10 @@ def _render_galleries(
     metric_rows: list[dict[str, Any]],
     rounds: tuple[int, ...],
     best_round: int,
+    eval_profile: str | EvaluationProfile = DEFAULT_EVAL_PROFILE,
 ) -> tuple[list[Path], Path]:
+    eval_spec = resolve_evaluation_profile(eval_profile)
+    gallery_indices = eval_spec.gallery_indices
     lookup = _row_lookup(metric_rows)
     final_round = rounds[-1]
     roles = [
@@ -1049,7 +1215,7 @@ def _render_galleries(
         pooled = lookup[(round_i, None)]
         for gamma_index, gamma in enumerate(GAMMAS):
             paths, _, outcomes, indices = _load_cell(outdir, round_i, gamma)
-            if [int(value) for value in indices] != list(range(M)):
+            if [int(value) for value in indices] != list(range(eval_spec.m)):
                 raise RuntimeError("gallery source lost fixed rollout indices")
             gamma_row = lookup[(round_i, gamma)]
             title = (
@@ -1057,7 +1223,14 @@ def _render_galleries(
                 f"CR={gamma_row['binary']['CR']['estimate']:.2f}"
             )
             _draw_scene(
-                axes[row_index, gamma_index], profile, env, paths, gamma, title, outcomes
+                axes[row_index, gamma_index],
+                profile,
+                env,
+                paths,
+                gamma,
+                title,
+                outcomes,
+                gallery_indices,
             )
             if gamma_index == 0:
                 axes[row_index, gamma_index].set_ylabel(
@@ -1066,14 +1239,14 @@ def _render_galleries(
                     fontsize=10,
                 )
     fig.suptitle(
-        f"Fixed raw rollout indices {list(GALLERY_INDICES)}; state dots every "
-        f"{STATE_DOT_STRIDE} steps\n{REPORT_CAPTION}",
+        f"Fixed raw rollout indices {list(gallery_indices)}; state dots every "
+        f"{STATE_DOT_STRIDE} steps\n{eval_spec.caption}",
         fontsize=13,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.93))
     outputs = []
     for suffix in ("png", "pdf"):
-        path = outdir / f"raw_m50_r0_best_final_gallery.{suffix}"
+        path = outdir / f"{eval_spec.filename_tag}_r0_best_final_gallery.{suffix}"
         fig.savefig(path, dpi=160)
         outputs.append(path)
     plt.close(fig)
@@ -1085,7 +1258,7 @@ def _render_galleries(
         pooled = lookup[(round_i, None)]
         for gamma_index, gamma in enumerate(GAMMAS):
             paths, _, outcomes, indices = _load_cell(outdir, round_i, gamma)
-            if [int(value) for value in indices] != list(range(M)):
+            if [int(value) for value in indices] != list(range(eval_spec.m)):
                 raise RuntimeError("round gallery source lost fixed rollout indices")
             gamma_row = lookup[(round_i, gamma)]
             _draw_scene(
@@ -1099,14 +1272,15 @@ def _render_galleries(
                     f"CR={gamma_row['binary']['CR']['estimate']:.2f}"
                 ),
                 outcomes,
+                gallery_indices,
             )
         fig.suptitle(
             f"Raw checkpoint r{round_i}: pooled SR={pooled['binary']['SR']['estimate']:.3f}, "
-            f"CR={pooled['binary']['CR']['estimate']:.3f}\n{REPORT_CAPTION}",
+            f"CR={pooled['binary']['CR']['estimate']:.3f}\n{eval_spec.caption}",
             fontsize=12,
         )
         fig.tight_layout(rect=(0, 0, 1, 0.85))
-        path = round_dir / f"raw_m50_round_{round_i:03d}.png"
+        path = round_dir / f"{eval_spec.filename_tag}_round_{round_i:03d}.png"
         fig.savefig(path, dpi=150)
         outputs.append(path)
         plt.close(fig)
@@ -1115,16 +1289,17 @@ def _render_galleries(
     write_json(
         manifest_path,
         {
-            "caption": REPORT_CAPTION,
+            "caption": eval_spec.caption,
+            "evaluation_profile": eval_spec.name,
             "rule": "fixed archive indices; no outcome-based trajectory selection",
-            "indices": list(GALLERY_INDICES),
+            "indices": list(gallery_indices),
             "state_dot_stride": STATE_DOT_STRIDE,
             "roles": [
                 {"role": role, "round": round_i} for role, round_i in roles
             ],
             "per_round": list(rounds),
             "gammas": list(GAMMAS),
-            "M": M,
+            "M": eval_spec.m,
         },
     )
     return outputs, manifest_path
@@ -1140,12 +1315,17 @@ def _artifact_inventory(outdir: Path) -> dict[str, str]:
 
 
 def run_evaluation(args: argparse.Namespace) -> None:
+    eval_profile = resolve_evaluation_profile(
+        getattr(args, "eval_profile", DEFAULT_EVAL_PROFILE)
+    )
     started = time.perf_counter()
     started_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     outdir = Path(args.outdir).resolve()
     if outdir.exists():
         raise FileExistsError(f"evaluation output root must be absent/new: {outdir}")
-    contract = validate_completed_run(args.run_root, args.scene_profile)
+    contract = validate_completed_run(
+        args.run_root, args.scene_profile, eval_profile
+    )
     source_state = require_clean_additive_source(contract["source_git_commit"])
     gpu = _gpu_record()
     rounds = tuple(contract["evaluation_rounds"])
@@ -1155,7 +1335,9 @@ def run_evaluation(args: argparse.Namespace) -> None:
         raise RuntimeError("ckpt_0 model state does not equal the authenticated pretrained model")
     final_model_sha = _authenticate_final_alias(contract)
     policy_dim = int(policy0.d)
-    noise_bank, noise_metadata = build_noise_bank(args.scene_profile, policy_dim)
+    noise_bank, noise_metadata = build_noise_bank(
+        args.scene_profile, policy_dim, eval_profile
+    )
     del policy0
 
     profile = get_scene_profile(args.scene_profile)
@@ -1172,15 +1354,16 @@ def run_evaluation(args: argparse.Namespace) -> None:
     write_json(
         outdir / "evaluation_contract.json",
         {
-            "metric_version": METRIC_VERSION,
-            "caption": REPORT_CAPTION,
+            "metric_version": eval_profile.metric_version,
+            "caption": eval_profile.caption,
+            "evaluation_profile": eval_profile.name,
             "trainer_source_commit": contract["source_git_commit"],
             "evaluation_source": source_state,
             "gpu": gpu,
             "scene": snapshot,
             "rounds": list(rounds),
             "gammas": list(GAMMAS),
-            "M": M,
+            "M": eval_profile.m,
             "T": T,
             "reach": REACH,
             "nfe": NFE,
@@ -1205,13 +1388,15 @@ def run_evaluation(args: argparse.Namespace) -> None:
             ),
             "checkpoint_selection_rule": (
                 "authenticate all trainer checkpoints; evaluate ckpt_0.pt, each available "
-                "multiple of 10, and ckpt_<completed_round>.pt; never substitute final.pt"
+                f"multiple of {eval_profile.checkpoint_stride}, and "
+                "ckpt_<completed_round>.pt; never substitute final.pt"
             ),
             "final_alias_model_state_sha256": final_model_sha,
             "post_hoc_best_selection": BEST_SELECTION_RULE,
             "report_metric_source": (
                 "SR, CR, timeout, V_safe, V_full, clearance, and time are computed only "
-                "from the stored raw M=50/gamma evaluation trajectories; trainer probe "
+                f"from the stored raw M={eval_profile.m}/gamma evaluation trajectories; "
+                "trainer probe "
                 "metrics are not read"
             ),
             "completed_run": contract,
@@ -1233,7 +1418,48 @@ def run_evaluation(args: argparse.Namespace) -> None:
             policy, _, model_sha, conditioning = _load_policy(contract, round_i, device)
             if conditioning != conditioning0:
                 raise RuntimeError(f"checkpoint r{round_i} changed conditioning architecture")
-            episodes = run_raw_batch(policy, env, cfg, device, noise_bank)
+            episodes = run_raw_batch(
+                policy, env, cfg, device, noise_bank, eval_profile
+            )
+            obstacle_array = env.obstacles.detach().cpu().numpy()
+            if profile.center_replacement_radius is not None:
+                route_mask = np.linalg.norm(
+                    obstacle_array[:, :2] - np.asarray((2.5, 2.5)), axis=1
+                ) < 1.0e-6
+            else:
+                central_centers = np.asarray(
+                    ((2.0, 2.0), (2.0, 3.0), (3.0, 2.0), (3.0, 3.0))
+                )
+                route_mask = np.any(
+                    np.linalg.norm(
+                        obstacle_array[:, None, :2] - central_centers[None], axis=2
+                    ) < 1.0e-6,
+                    axis=1,
+                )
+            if not route_mask.any():
+                raise RuntimeError("raw U/R metric could not identify central obstacles")
+            obstacle_centers = obstacle_array[route_mask, :2]
+            obstacle_radii = (
+                obstacle_array[route_mask, 2] + float(env.r_robot)
+            )
+            for episode in episodes:
+                path = np.asarray(episode["path"], dtype=np.float64)
+                early_index = min(10, len(path) - 1)
+                episode["route_mode_early"] = int(
+                    RM.classify_plan_endpoints(
+                        path[early_index:early_index + 1],
+                        start=profile.start,
+                        goal=profile.goal,
+                    )[0]
+                )
+                closest_labels, _ = RM.classify_trajectories_at_closest_approach(
+                    path[None, :, :],
+                    start=profile.start,
+                    goal=profile.goal,
+                    obstacle_centers=obstacle_centers,
+                    obstacle_radii=obstacle_radii,
+                )
+                episode["route_mode_closest"] = int(closest_labels[0])
             tasks = [
                 (
                     episode["path"],
@@ -1262,6 +1488,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
                     metrics,
                     model_sha,
                     noise_metadata,
+                    eval_profile,
                 )
                 metric_rows.append(row)
                 pooled_metrics.extend(
@@ -1277,6 +1504,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
                     scope="pooled",
                     scene_profile=args.scene_profile,
                     algorithm=contract["algorithm"],
+                    eval_profile=eval_profile,
                 )
             )
             elapsed = time.perf_counter() - round_started
@@ -1284,16 +1512,19 @@ def run_evaluation(args: argparse.Namespace) -> None:
             del policy
             torch.cuda.empty_cache()
             print(
-                f"[raw M50 r{round_i:03d}] rollout+validity complete in {elapsed:.1f}s",
+                f"[raw M{eval_profile.m} r{round_i:03d}] rollout+validity complete "
+                f"in {elapsed:.1f}s",
                 flush=True,
             )
 
-    _authenticate_metric_grid(metric_rows, rounds, outdir)
+    _authenticate_metric_grid(metric_rows, rounds, outdir, eval_profile)
     metrics_path = _write_metrics(outdir, metric_rows)
     best_round, ranking = select_best_round(metric_rows)
-    curve_paths = _render_curves(outdir, metric_rows, rounds, best_round)
+    curve_paths = _render_curves(
+        outdir, metric_rows, rounds, best_round, eval_profile
+    )
     gallery_paths, gallery_manifest = _render_galleries(
-        outdir, profile, env, metric_rows, rounds, best_round
+        outdir, profile, env, metric_rows, rounds, best_round, eval_profile
     )
     elapsed = time.perf_counter() - started
     finished_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -1301,9 +1532,10 @@ def run_evaluation(args: argparse.Namespace) -> None:
     write_json(
         summary_path,
         {
-            "status": "AFE_RBF_RAW_M50_SWEEP_COMPLETE",
-            "metric_version": METRIC_VERSION,
-            "caption": REPORT_CAPTION,
+            "status": eval_profile.summary_status,
+            "metric_version": eval_profile.metric_version,
+            "caption": eval_profile.caption,
+            "evaluation_profile": eval_profile.name,
             "started_utc": started_utc,
             "finished_utc": finished_utc,
             "elapsed_seconds": elapsed,
@@ -1314,7 +1546,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
             "post_hoc_selection_rule": BEST_SELECTION_RULE,
             "post_hoc_ranking": ranking,
             "gammas": list(GAMMAS),
-            "M": M,
+            "M": eval_profile.m,
             "verifier_workers": int(args.verifier_workers),
             "cell_count": len(rounds) * len(GAMMAS),
             "metric_row_count": len(metric_rows),
@@ -1333,9 +1565,10 @@ def run_evaluation(args: argparse.Namespace) -> None:
     write_json(
         outdir / "EVALUATION_COMPLETE.json",
         {
-            "status": "AFE_RBF_RAW_M50_EVALUATION_DELIVERY_COMPLETE",
-            "metric_version": METRIC_VERSION,
-            "caption": REPORT_CAPTION,
+            "status": eval_profile.delivery_status,
+            "metric_version": eval_profile.metric_version,
+            "caption": eval_profile.caption,
+            "evaluation_profile": eval_profile.name,
             "trainer_source_commit": contract["source_git_commit"],
             "evaluation_source_commit": source_state["commit"],
             "scene_sha256": snapshot["sha256"],
@@ -1343,7 +1576,9 @@ def run_evaluation(args: argparse.Namespace) -> None:
             "artifact_sha256": inventory,
         },
     )
-    print(f"AFE RBF RAW M50 SWEEP COMPLETE: {outdir}", flush=True)
+    print(
+        f"AFE RBF RAW M{eval_profile.m} SWEEP COMPLETE: {outdir}", flush=True
+    )
 
 
 def validate_output(outdir: str | os.PathLike[str]) -> dict[str, Any]:
@@ -1352,10 +1587,13 @@ def validate_output(outdir: str | os.PathLike[str]) -> dict[str, Any]:
     if not complete_path.is_file():
         raise FileNotFoundError(f"evaluation completion manifest is missing: {complete_path}")
     complete = load_json(complete_path)
-    if complete.get("status") != "AFE_RBF_RAW_M50_EVALUATION_DELIVERY_COMPLETE":
-        raise RuntimeError("raw M50 evaluation completion status is invalid")
-    if complete.get("caption") != REPORT_CAPTION:
-        raise RuntimeError("raw M50 completion caption changed")
+    profile = resolve_evaluation_profile(
+        complete.get("evaluation_profile", DEFAULT_EVAL_PROFILE)
+    )
+    if complete.get("status") != profile.delivery_status:
+        raise RuntimeError(f"raw M={profile.m} evaluation completion status is invalid")
+    if complete.get("caption") != profile.caption:
+        raise RuntimeError(f"raw M={profile.m} completion caption changed")
     inventory = complete.get("artifact_sha256", {})
     actual_files = {
         str(path.relative_to(root))
@@ -1366,17 +1604,19 @@ def validate_output(outdir: str | os.PathLike[str]) -> dict[str, Any]:
         raise RuntimeError("raw M50 delivery inventory does not match output files")
     for relative, expected in inventory.items():
         if sha256_file(root / relative) != expected:
-            raise RuntimeError(f"raw M50 output hash mismatch: {relative}")
+            raise RuntimeError(f"raw M={profile.m} output hash mismatch: {relative}")
     contract = load_json(root / "evaluation_contract.json")
-    if contract.get("caption") != REPORT_CAPTION:
-        raise RuntimeError("raw M50 evaluation contract caption changed")
+    if contract.get("evaluation_profile", DEFAULT_EVAL_PROFILE) != profile.name:
+        raise RuntimeError("raw evaluation profile disagrees across manifests")
+    if contract.get("caption") != profile.caption:
+        raise RuntimeError(f"raw M={profile.m} evaluation contract caption changed")
     rounds = tuple(int(value) for value in contract["rounds"])
     rows = [
         json.loads(line)
         for line in (root / "metrics.jsonl").read_text().splitlines()
         if line
     ]
-    _authenticate_metric_grid(rows, rounds, root)
+    _authenticate_metric_grid(rows, rounds, root, profile)
     summary = load_json(root / "evaluation_summary.json")
     best_round, ranking = select_best_round(rows)
     if int(summary.get("post_hoc_best_round", -1)) != best_round:
@@ -1391,12 +1631,17 @@ def main() -> None:
     parser.add_argument("--run-root")
     parser.add_argument("--scene-profile", choices=sorted(SCENE_PROFILES))
     parser.add_argument("--outdir", required=True)
+    parser.add_argument(
+        "--eval-profile",
+        choices=sorted(EVALUATION_PROFILES),
+        default=DEFAULT_EVAL_PROFILE,
+    )
     parser.add_argument("--verifier-workers", type=int, default=16)
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args()
     if args.validate_only:
         validate_output(args.outdir)
-        print(f"AFE RBF RAW M50 OUTPUT VALID: {Path(args.outdir).resolve()}")
+        print(f"AFE RBF RAW OUTPUT VALID: {Path(args.outdir).resolve()}")
         return
     if not args.run_root or not args.scene_profile:
         parser.error("--run-root and --scene-profile are required unless --validate-only is used")

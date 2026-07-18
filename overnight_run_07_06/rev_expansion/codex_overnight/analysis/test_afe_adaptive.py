@@ -69,3 +69,87 @@ def test_rbf_counterfactual_sweep_is_read_only_and_complete() -> None:
     assert all(row["achieved"]["ess_med"] == pytest.approx(0.5, abs=1.0e-4)
                for row in rows)
     assert torch.equal(buffer, before)
+
+
+def _context_store(rows):
+    store = AC.DStore()
+    for round_i, gamma, episode_id, control_t in rows:
+        store.ctx_meta.append((round_i, episode_id, control_t))
+        store.ctx_low5.append(np.asarray((0.0, 0.0, 0.0, 0.0, gamma), np.float32))
+    return store
+
+
+def test_adaptive_context_cap_is_round_gamma_episode_balanced_and_deterministic() -> None:
+    rows = []
+    for gamma_index, gamma in enumerate((0.1, 0.5)):
+        for replica, count in enumerate((20, 5, 2)):
+            episode_id = gamma_index * 3 + replica
+            rows.extend((4, gamma, episode_id, step) for step in range(count))
+    rows.extend((3, 0.1, 99, step) for step in range(20))
+    store = _context_store(rows)
+
+    selected = AD.round_gamma_episode_balanced_context_ids(
+        store, 4, (0.1, 0.5), cap_per_gamma=12, seed=910
+    )
+    repeated = AD.round_gamma_episode_balanced_context_ids(
+        store, 4, (0.1, 0.5), cap_per_gamma=12, seed=910
+    )
+
+    assert selected == repeated
+    assert len(selected) == len(set(selected)) == 24
+    assert all(store.ctx_meta[context_id][0] == 4 for context_id in selected)
+    for gamma in (0.1, 0.5):
+        gamma_ids = [
+            context_id for context_id in selected
+            if float(store.ctx_low5[context_id][-1]) == pytest.approx(gamma)
+        ]
+        assert len(gamma_ids) == 12
+        counts = {}
+        for context_id in gamma_ids:
+            episode_id = store.ctx_meta[context_id][1]
+            counts[episode_id] = counts.get(episode_id, 0) + 1
+        # The two short replicas are exhausted; the remaining quota comes from
+        # the long replica without dropping either short trajectory.
+        assert sorted(counts.values()) == [2, 5, 5]
+
+
+def test_adaptive_context_cap_keeps_underfilled_gamma_cells() -> None:
+    store = _context_store([
+        (2, 0.1, 0, 0),
+        (2, 0.1, 1, 0),
+        (2, 0.5, 2, 0),
+    ])
+
+    selected = AD.round_gamma_episode_balanced_context_ids(
+        store, 2, (0.1, 0.5), cap_per_gamma=8, seed=5
+    )
+
+    assert selected == [0, 1, 2]
+
+
+def test_adaptive_context_cap_can_equalize_to_the_hardest_gamma() -> None:
+    store = _context_store([
+        *((2, 0.1, 0, step) for step in range(8)),
+        *((2, 0.5, 1, step) for step in range(3)),
+    ])
+
+    selected = AD.round_gamma_episode_balanced_context_ids(
+        store,
+        2,
+        (0.1, 0.5),
+        cap_per_gamma=8,
+        seed=5,
+        equalize_gammas=True,
+    )
+
+    assert len(selected) == 6
+    assert sum(store.ctx_low5[index][-1] == pytest.approx(0.1) for index in selected) == 3
+    assert sum(store.ctx_low5[index][-1] == pytest.approx(0.5) for index in selected) == 3
+
+
+def test_adaptive_context_cap_rejects_undeclared_gamma() -> None:
+    store = _context_store([(1, 0.7, 0, 0)])
+    with pytest.raises(ValueError, match="undeclared conditioning gamma"):
+        AD.round_gamma_episode_balanced_context_ids(
+            store, 1, (0.1, 0.5), cap_per_gamma=2, seed=1
+        )

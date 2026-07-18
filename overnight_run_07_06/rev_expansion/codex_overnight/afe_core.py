@@ -390,12 +390,93 @@ class DStore:
             if first_round <= int(self.q_round[query_id]) <= int(round_i)
         ]
 
-    def sample_pos(self, nb, rng, *, eligible_ids=None):
-        """Uniform-with-replacement draw over an explicit positive replay population."""
+    def positive_replay_hierarchy(self, *, eligible_ids=None):
+        """Index positives by round, gamma, replica, context for balanced replay."""
+
+        population = self.pos_ids if eligible_ids is None else eligible_ids
+        if not population:
+            return {}
+        hierarchy = {}
+        for query_id in population:
+            query_id = int(query_id)
+            context_id = int(self.q_sid[query_id])
+            if not 0 <= context_id < len(self.ctx_meta):
+                raise IndexError(f"positive query has invalid context id: {context_id}")
+            meta = self.ctx_meta[context_id]
+            if len(meta) != 3:
+                raise RuntimeError(f"stored context metadata is malformed: {meta}")
+            query_round = int(self.q_round[query_id])
+            if int(meta[0]) != query_round:
+                raise RuntimeError(
+                    f"query/context round mismatch: query={query_round}, context={meta[0]}"
+                )
+            gamma = round(float(self.q_gamma[query_id]), 8)
+            replica = int(meta[1])
+            hierarchy.setdefault(query_round, {}).setdefault(gamma, {}).setdefault(
+                replica, {}
+            ).setdefault(context_id, []).append(query_id)
+        return hierarchy
+
+    def sample_positive_ids(
+        self,
+        nb,
+        rng,
+        *,
+        eligible_ids=None,
+        sampling="query_uniform",
+        hierarchy=None,
+    ):
+        """Draw positive query ids using the declared replay population measure."""
+
         population = self.pos_ids if eligible_ids is None else eligible_ids
         if not population:
             return None
-        ids = [population[i] for i in rng.integers(0, len(population), nb)]
+        if sampling == "query_uniform":
+            return [population[i] for i in rng.integers(0, len(population), nb)]
+        if sampling != "round_gamma_replica_context":
+            raise ValueError(f"unknown positive replay sampling rule: {sampling}")
+        hierarchy = (
+            self.positive_replay_hierarchy(eligible_ids=population)
+            if hierarchy is None
+            else hierarchy
+        )
+        if not hierarchy:
+            return None
+
+        def choose(values):
+            ordered = sorted(values)
+            return ordered[int(rng.integers(0, len(ordered)))]
+
+        ids = []
+        for _ in range(int(nb)):
+            query_round = choose(hierarchy)
+            gamma = choose(hierarchy[query_round])
+            replica = choose(hierarchy[query_round][gamma])
+            context_id = choose(hierarchy[query_round][gamma][replica])
+            queries = hierarchy[query_round][gamma][replica][context_id]
+            ids.append(int(queries[int(rng.integers(0, len(queries)))]))
+        return ids
+
+    def sample_pos(
+        self,
+        nb,
+        rng,
+        *,
+        eligible_ids=None,
+        sampling="query_uniform",
+        hierarchy=None,
+    ):
+        """Reconstruct a batch drawn from the declared positive replay measure."""
+
+        ids = self.sample_positive_ids(
+            nb,
+            rng,
+            eligible_ids=eligible_ids,
+            sampling=sampling,
+            hierarchy=hierarchy,
+        )
+        if ids is None:
+            return None
         sids = [self.q_sid[q] for q in ids]
         G = self.grid3_of(sids)
         L = torch.stack([torch.from_numpy(self.ctx_low5[s]) for s in sids])

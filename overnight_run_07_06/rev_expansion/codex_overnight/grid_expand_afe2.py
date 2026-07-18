@@ -767,6 +767,16 @@ def update_round(policy, opt, store, cfg, device, rng, round_i=None):
     )
     if not eligible_ids:
         return None
+    replay_sampling = getattr(
+        cfg,
+        "replay_sampling",
+        getattr(cfg, "positive_replay_sampling", "query_uniform"),
+    )
+    replay_hierarchy = (
+        store.positive_replay_hierarchy(eligible_ids=eligible_ids)
+        if replay_sampling == "round_gamma_replica_context"
+        else None
+    )
     policy.train()
     groups = {k: list(m.parameters()) for k, m in policy.module_groups().items()}
     g_before = {k: torch.sqrt(sum((p.detach() ** 2).sum() for p in ps)).item()
@@ -781,9 +791,18 @@ def update_round(policy, opt, store, cfg, device, rng, round_i=None):
     gnorm = {k: [] for k in groups}
     stop = "all_steps"
     for k_step in range(n_steps):
-        G, L, Hh, U, ids = store.sample_pos(
-            cfg.batch, rng, eligible_ids=eligible_ids
+        positive_batch = (
+            store.sample_pos(cfg.batch, rng, eligible_ids=eligible_ids)
+            if replay_sampling == "query_uniform"
+            else store.sample_pos(
+                cfg.batch,
+                rng,
+                eligible_ids=eligible_ids,
+                sampling=replay_sampling,
+                hierarchy=replay_hierarchy,
+            )
         )
+        G, L, Hh, U, ids = positive_batch
         for q in ids:
             drawn_ids[q] = drawn_ids.get(q, 0) + 1
         G, L, Hh, U = G.to(device), L.to(device), Hh.to(device), U.to(device)
@@ -843,6 +862,7 @@ def update_round(policy, opt, store, cfg, device, rng, round_i=None):
                 grad_norm={k: float(np.mean(v)) for k, v in gnorm.items()},
                 rel_param_change=rel_dp, drawn_ids=drawn_ids, n_distinct=len(drawn_ids),
                 replay_window=replay_window, replay_eligible=len(eligible_ids),
+                replay_sampling=replay_sampling,
                 replay_fresh_draws=int(fresh_draws),
                 replay_fresh_distinct=int(fresh_distinct),
                 replay_eligible_round_counts=replay_eligible_round_counts,

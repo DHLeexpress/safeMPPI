@@ -161,3 +161,56 @@ def test_recent_round_buffer_is_deterministic_capped_and_cell_balanced() -> None
         cell = (store.q_round[query_id], store.q_gamma[query_id])
         counts[cell] = counts.get(cell, 0) + 1
     assert counts == {(3, 0.1): 2, (3, 0.5): 2, (4, 0.1): 2, (4, 0.5): 2}
+
+
+class _HierarchicalStore:
+    def __init__(self):
+        self.pos_ids = []
+        self.q_round = []
+        self.q_gamma = []
+        self.q_sid = []
+        self.ctx_meta = []
+        for round_i in (1, 2):
+            for gamma_index, gamma in enumerate((0.1, 0.5)):
+                for replica, context_count in enumerate((8, 2)):
+                    episode = gamma_index * 2 + replica
+                    for control_t in range(context_count):
+                        context_id = len(self.ctx_meta)
+                        self.ctx_meta.append((round_i, episode, control_t))
+                        for _ in range(2):
+                            query_id = len(self.pos_ids)
+                            self.pos_ids.append(query_id)
+                            self.q_round.append(round_i)
+                            self.q_gamma.append(gamma)
+                            self.q_sid.append(context_id)
+
+    def positive_replay_hierarchy(self, *, eligible_ids=None):
+        import afe_core as AC
+
+        proxy = AC.DStore()
+        proxy.pos_ids = list(self.pos_ids)
+        proxy.q_round = list(self.q_round)
+        proxy.q_gamma = list(self.q_gamma)
+        proxy.q_sid = list(self.q_sid)
+        proxy.ctx_meta = list(self.ctx_meta)
+        return proxy.positive_replay_hierarchy(eligible_ids=eligible_ids)
+
+
+def test_hierarchical_recent_gp_buffer_balances_replicas_without_replacement() -> None:
+    store = _HierarchicalStore()
+    selected = RC.recent_round_positive_ids_hierarchical(
+        store, round_i=2, replay_window=2, cap=16, seed=31
+    )
+    repeated = RC.recent_round_positive_ids_hierarchical(
+        store, round_i=2, replay_window=2, cap=16, seed=31
+    )
+
+    assert selected == repeated
+    assert len(selected) == len(set(selected)) == 16
+    cell_counts = {}
+    for query_id in selected:
+        context_id = store.q_sid[query_id]
+        round_i, episode, _ = store.ctx_meta[context_id]
+        key = (round_i, store.q_gamma[query_id], episode)
+        cell_counts[key] = cell_counts.get(key, 0) + 1
+    assert set(cell_counts.values()) == {2}

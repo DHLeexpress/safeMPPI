@@ -22,6 +22,7 @@ import grid_scene as GS
 NOMINAL_HP_TOLERANCE = 1.0e-8
 MAX_STEP_PROGRESS = "nominal_hp_max_step_progress"
 MAX_STEP_MARGIN = "nominal_hp_max_step_margin"
+MAX_STEP_MARGIN_ONLY = "nominal_hp_max_step_margin_only"
 
 
 def _numpy(value) -> np.ndarray:
@@ -30,7 +31,7 @@ def _numpy(value) -> np.ndarray:
     return np.asarray(value)
 
 
-def _selection_key(row: dict, selector: str) -> tuple[float, float, int]:
+def _selection_key(row: dict, selector: str) -> tuple[float | int, ...]:
     progress = float(row["step_progress"])
     margin = float(row["nominal_hp_step_margin"])
     candidate_id = int(row["candidate_id"])
@@ -38,6 +39,8 @@ def _selection_key(row: dict, selector: str) -> tuple[float, float, int]:
         return progress, margin, -candidate_id
     if selector == MAX_STEP_MARGIN:
         return margin, progress, -candidate_id
+    if selector == MAX_STEP_MARGIN_ONLY:
+        return margin, -candidate_id
     raise ValueError(f"unknown execution selector: {selector}")
 
 
@@ -67,7 +70,7 @@ def select_nominal_hp_execution(
     gamma_value = float(gamma)
     if not np.isfinite(gamma_value) or not 0.0 <= gamma_value <= 1.0:
         raise ValueError("gamma must be finite and in [0, 1]")
-    if selector not in (MAX_STEP_PROGRESS, MAX_STEP_MARGIN):
+    if selector not in (MAX_STEP_PROGRESS, MAX_STEP_MARGIN, MAX_STEP_MARGIN_ONLY):
         raise ValueError(f"unknown execution selector: {selector}")
 
     controls = _numpy(candidates)
@@ -206,4 +209,28 @@ def nominal_hp_max_step_margin(
         segments=segments,
         candidate_ids=candidate_ids,
         selector=MAX_STEP_MARGIN,
+    )
+
+
+def nominal_hp_max_step_margin_only(
+    current_state,
+    candidates,
+    verifier_results: Sequence[dict],
+    gamma: float,
+    env,
+    *,
+    segments=None,
+    candidate_ids: Sequence[int] | None = None,
+) -> dict:
+    """Choose only by H_P margin; candidate id resolves an exact tie."""
+
+    return select_nominal_hp_execution(
+        current_state,
+        candidates,
+        verifier_results,
+        gamma,
+        env,
+        segments=segments,
+        candidate_ids=candidate_ids,
+        selector=MAX_STEP_MARGIN_ONLY,
     )
