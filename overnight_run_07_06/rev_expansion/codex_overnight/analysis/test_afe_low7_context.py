@@ -58,6 +58,16 @@ def _cfg(**overrides):
     return SimpleNamespace(**values)
 
 
+def test_gamma_wire_mapping_preserves_declared_keys_and_rejects_collisions() -> None:
+    mapping = CX.declared_gamma_storage_map((0.3, 0.4, 0.7))
+
+    assert CX.canonical_declared_gamma(np.float32(0.3), mapping) == 0.3
+    assert CX.canonical_declared_gamma(np.float32(0.4), mapping) == 0.4
+    assert CX.canonical_declared_gamma(np.float32(0.7), mapping) == 0.7
+    with pytest.raises(ValueError, match="not unique"):
+        CX.declared_gamma_storage_map((0.3, np.float32(0.3)))
+
+
 def test_giant_scene_and_boundary_vector_orientation() -> None:
     env = _env()
     snapshot = scene_snapshot(env, get_scene_profile("low7_radius1_canonical_v1"))

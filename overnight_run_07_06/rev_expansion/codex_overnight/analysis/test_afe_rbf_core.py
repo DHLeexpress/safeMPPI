@@ -111,6 +111,21 @@ def test_previous_round_buffer_is_capped_balanced_and_round_local() -> None:
     assert selected_gamma.count(0.5) == 5
 
 
+def test_previous_round_buffer_balances_float32_conditioning_gammas() -> None:
+    store = _Store()
+    store.pos_ids = list(range(20))
+    store.q_round = [1] * 20
+    store.q_gamma = [np.float32(0.3)] * 10 + [np.float32(0.7)] * 10
+
+    selected = RC.previous_round_positive_ids(
+        store, round_i=1, cap=8, gammas=(0.3, 0.7), seed=7
+    )
+
+    assert len(selected) == len(set(selected)) == 8
+    assert sum(np.isclose(store.q_gamma[index], 0.3) for index in selected) == 4
+    assert sum(np.isclose(store.q_gamma[index], 0.7) for index in selected) == 4
+
+
 def test_one_round_recent_buffer_preserves_previous_round_selection() -> None:
     store = _Store()
     expected = RC.previous_round_positive_ids(

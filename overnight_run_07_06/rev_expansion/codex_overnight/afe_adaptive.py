@@ -9,6 +9,7 @@ import torch
 
 import afe2_calibration as BC
 import afe_core as AC
+import afe_context as CX
 import afe_rbf_core as RC
 import grid_expand_afe2 as AFE2
 
@@ -46,18 +47,21 @@ def round_gamma_episode_balanced_context_ids(
     if cap_per_gamma < 1:
         raise ValueError("adaptive-beta context cap per gamma must be positive")
 
-    gamma_keys = [round(float(gamma), 8) for gamma in gammas]
+    gamma_storage_map = CX.declared_gamma_storage_map(gammas)
+    gamma_keys = list(gamma_storage_map.values())
     grouped: dict[float, dict[int, list[int]]] = {
         gamma: defaultdict(list) for gamma in gamma_keys
     }
     for context_id, meta in enumerate(store.ctx_meta):
         if int(meta[0]) != int(round_i):
             continue
-        gamma = round(float(store.ctx_low5[context_id][-1]), 8)
-        if gamma not in grouped:
+        raw_gamma = float(store.ctx_low5[context_id][-1])
+        try:
+            gamma = CX.canonical_declared_gamma(raw_gamma, gamma_storage_map)
+        except ValueError as exc:
             raise ValueError(
-                f"round {round_i} contains undeclared conditioning gamma {gamma}"
-            )
+                f"round {round_i} contains undeclared conditioning gamma {raw_gamma}"
+            ) from exc
         grouped[gamma][int(meta[1])].append(int(context_id))
 
     available_by_gamma = {

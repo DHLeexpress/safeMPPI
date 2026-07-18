@@ -19,6 +19,8 @@ import math
 import numpy as np
 import torch
 
+import afe_context as CX
+
 
 def l2_normalize(values: torch.Tensor, eps: float = 1.0e-9) -> torch.Tensor:
     return values / values.norm(dim=-1, keepdim=True).clamp_min(eps)
@@ -285,16 +287,20 @@ def previous_round_positive_ids(store, round_i: int, cap: int, gammas, seed: int
 
     if cap <= 0:
         raise ValueError("GP buffer cap must be positive")
+    gamma_storage_map = CX.declared_gamma_storage_map(gammas)
     groups: dict[float, list[int]] = defaultdict(list)
     for query_id in store.pos_ids:
         if int(store.q_round[query_id]) == int(round_i):
-            groups[round(float(store.q_gamma[query_id]), 8)].append(int(query_id))
+            gamma = CX.canonical_declared_gamma(
+                store.q_gamma[query_id], gamma_storage_map
+            )
+            groups[gamma].append(int(query_id))
     all_ids = [query_id for values in groups.values() for query_id in values]
     if len(all_ids) <= cap:
         return sorted(all_ids)
 
     rng = np.random.default_rng(int(seed))
-    gamma_keys = [round(float(gamma), 8) for gamma in gammas]
+    gamma_keys = list(gamma_storage_map.values())
     quota, extra = divmod(cap, len(gamma_keys))
     selected: list[int] = []
     selected_set: set[int] = set()
@@ -342,18 +348,22 @@ def recent_round_positive_ids(
 
     last_round = int(round_i)
     first_round = last_round - replay_window + 1
+    gamma_storage_map = CX.declared_gamma_storage_map(gammas)
     groups: dict[tuple[int, float], list[int]] = defaultdict(list)
     all_ids: list[int] = []
     for query_id in store.pos_ids:
         query_round = int(store.q_round[query_id])
         if first_round <= query_round <= last_round:
             query_id = int(query_id)
-            groups[(query_round, round(float(store.q_gamma[query_id]), 8))].append(query_id)
+            gamma = CX.canonical_declared_gamma(
+                store.q_gamma[query_id], gamma_storage_map
+            )
+            groups[(query_round, gamma)].append(query_id)
             all_ids.append(query_id)
     if len(all_ids) <= cap:
         return sorted(all_ids)
 
-    gamma_keys = [round(float(gamma), 8) for gamma in gammas]
+    gamma_keys = list(gamma_storage_map.values())
     cell_keys = [
         (query_round, gamma)
         for query_round in range(first_round, last_round + 1)

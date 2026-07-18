@@ -35,6 +35,34 @@ LOW7_SCHEMA = "low7_closest_boundary"
 SCHEMA_DIMS = {LOW5_SCHEMA: 5, LOW7_SCHEMA: 7}
 
 
+def declared_gamma_storage_map(gammas) -> dict[float, float]:
+    """Map float32 conditioning-wire values to original declared gamma keys."""
+
+    mapping: dict[float, float] = {}
+    declared_keys: set[float] = set()
+    for gamma in gammas:
+        declared = round(float(gamma), 8)
+        storage = float(np.float32(gamma))
+        if not np.isfinite(declared) or not np.isfinite(storage):
+            raise ValueError("declared gammas must be finite")
+        if storage in mapping or declared in declared_keys:
+            raise ValueError("declared gammas are not unique at conditioning precision")
+        mapping[storage] = declared
+        declared_keys.add(declared)
+    if not mapping:
+        raise ValueError("at least one gamma must be declared")
+    return mapping
+
+
+def canonical_declared_gamma(value, storage_map: dict[float, float]) -> float:
+    """Recover a declared gamma after the conditioning vector's float32 cast."""
+
+    storage = float(np.float32(value))
+    if not np.isfinite(storage) or storage not in storage_map:
+        raise ValueError(f"gamma {value!r} is not declared")
+    return storage_map[storage]
+
+
 @dataclass(frozen=True)
 class ConditioningContract:
     schema: str

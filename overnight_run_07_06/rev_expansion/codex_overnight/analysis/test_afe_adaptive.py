@@ -127,6 +127,24 @@ def test_adaptive_context_cap_keeps_underfilled_gamma_cells() -> None:
     assert selected == [0, 1, 2]
 
 
+def test_adaptive_context_cap_accepts_all_declared_float32_gammas() -> None:
+    gammas = (0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0)
+    store = _context_store([
+        (0, gamma, index, 0) for index, gamma in enumerate(gammas)
+    ])
+
+    selected = AD.round_gamma_episode_balanced_context_ids(
+        store,
+        0,
+        gammas,
+        cap_per_gamma=1,
+        seed=910,
+        equalize_gammas=True,
+    )
+
+    assert selected == list(range(len(gammas)))
+
+
 def test_adaptive_context_cap_can_equalize_to_the_hardest_gamma() -> None:
     store = _context_store([
         *((2, 0.1, 0, step) for step in range(8)),
@@ -148,8 +166,16 @@ def test_adaptive_context_cap_can_equalize_to_the_hardest_gamma() -> None:
 
 
 def test_adaptive_context_cap_rejects_undeclared_gamma() -> None:
-    store = _context_store([(1, 0.7, 0, 0)])
+    store = _context_store([(1, 0.6, 0, 0)])
     with pytest.raises(ValueError, match="undeclared conditioning gamma"):
         AD.round_gamma_episode_balanced_context_ids(
-            store, 1, (0.1, 0.5), cap_per_gamma=2, seed=1
+            store, 1, (0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0), cap_per_gamma=2, seed=1
+        )
+
+
+def test_adaptive_context_cap_rejects_nearby_undeclared_gamma() -> None:
+    store = _context_store([(1, 0.3001, 0, 0)])
+    with pytest.raises(ValueError, match="undeclared conditioning gamma"):
+        AD.round_gamma_episode_balanced_context_ids(
+            store, 1, (0.3,), cap_per_gamma=2, seed=1
         )

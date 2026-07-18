@@ -108,10 +108,12 @@ def _new_estimator(cfg, device):
 
 def _label_counts(store, cfg):
     output = {}
+    gamma_storage_map = CX.declared_gamma_storage_map(cfg.gammas)
     for gamma in cfg.gammas:
+        gamma_key = CX.canonical_declared_gamma(gamma, gamma_storage_map)
         ids = [
             index for index, value in enumerate(store.q_gamma)
-            if round(float(value), 8) == round(float(gamma), 8)
+            if CX.canonical_declared_gamma(value, gamma_storage_map) == gamma_key
         ]
         positives = int(sum(store.q_y[index] for index in ids))
         output[str(gamma)] = {
