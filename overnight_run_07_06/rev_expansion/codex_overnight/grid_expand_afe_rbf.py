@@ -4,7 +4,7 @@ This is a task-specific AFE adaptation, not a claim that the main AFE theorem
 requires an RBF kernel.  It follows the peptide experiment's RBF choices while
 making the control-specific memory semantics explicit:
 
-* exact RBF-GP on at most 512 full-H positives from the previous round;
+* exact RBF-GP on at most 512 recent full-H positives;
 * append-only D+ with cumulative replay by default and an opt-in round window;
 * multiple closed-loop replicas gathered synchronously; the GP is frozen for
   the whole round, so replicas do not depend on an arbitrary execution order;
@@ -49,6 +49,8 @@ import afe_context as CX
 import afe_adaptive as AD
 import afe2_calibration as BC
 import afe_rbf_core as RC
+import afe_execution as EX
+import afe_signed_update as SU
 import grid_expand_afe2 as AFE2
 from afe2_scene_profiles import (
     SCENE_PROFILES,
@@ -70,7 +72,45 @@ class AFERBFConfig(AFE2.AFE2Config):
     acquisition_mode: str = "sequential"
     adaptive_ess_target: float | None = None
     replay_window: int | None = None
+    gp_replay_window: int = 1
+    lengthscale_multiplier: float = 1.0
+    negative_alpha: float = 0.0
+    execution_rule: str = "legacy_max_horizon_progress"
+    training_probes: bool = True
+    calibration_replicas: int | None = None
+    calibration_control_steps: int | None = None
+    sweep_compact_artifacts: bool = False
     rbf_offline_sweep: bool = False
+
+
+def configure_policy_trainability(policy, freeze_visual_encoder: bool) -> dict:
+    """Freeze exactly the visual grid encoder when requested."""
+
+    for parameter in policy.parameters():
+        parameter.requires_grad_(True)
+    if freeze_visual_encoder:
+        for parameter in policy.enc_grid.parameters():
+            parameter.requires_grad_(False)
+    frozen = {
+        name for name, parameter in policy.named_parameters()
+        if not parameter.requires_grad
+    }
+    expected = {
+        f"enc_grid.{name}" for name, _ in policy.enc_grid.named_parameters()
+    } if freeze_visual_encoder else set()
+    if frozen != expected:
+        raise RuntimeError(
+            f"unexpected frozen parameters: got {sorted(frozen)}, expected {sorted(expected)}"
+        )
+    trainable = [
+        name for name, parameter in policy.named_parameters()
+        if parameter.requires_grad
+    ]
+    if not any(name.startswith("trunk.") for name in trainable):
+        raise RuntimeError("flow trunk is not trainable")
+    if not any(name.startswith("head.") for name in trainable):
+        raise RuntimeError("flow output head is not trainable")
+    return {"frozen": sorted(frozen), "trainable": trainable}
 
 
 def _episode(state, gamma, replica, episode_id, env, cfg):
@@ -240,6 +280,7 @@ def run_parallel_episodes(
     viz,
     purpose,
     acquisition_mode="sequential",
+    max_control_steps=None,
 ):
     """Advance all gamma x replica episodes in lockstep with batched GPU proposals."""
 
@@ -254,7 +295,10 @@ def run_parallel_episodes(
     obstacles = env.obstacles.detach().cpu().numpy()
     robot_radius = float(env.r_robot)
 
-    for control_t in range(cfg.T):
+    control_horizon = cfg.T if max_control_steps is None else min(
+        cfg.T, int(max_control_steps)
+    )
+    for control_t in range(control_horizon):
         active = [episode for episode in episodes if episode["status"] is None]
         if not active:
             break
@@ -372,6 +416,7 @@ def run_parallel_episodes(
                 for row in traces[local_index]
             }
             best = None
+            execution_selection = None
             query_rows = []
             verifier_cpu_seconds = 0.0
             for candidate_id, result in episode_results:
@@ -390,10 +435,37 @@ def run_parallel_episodes(
                         segment,
                     )
                 query_rows.append((candidate_id, query_id, result))
-                if result["exec_y"] and (
+                if cfg.execution_rule == "legacy_max_horizon_progress" and result["exec_y"] and (
                     best is None or result["exec_prog"] > best[0]
                 ):
                     best = (float(result["exec_prog"]), query_id, controls, candidate_id, result)
+
+            if cfg.execution_rule != "legacy_max_horizon_progress":
+                queried_ids = [row[0] for row in query_rows]
+                queried_controls = np.stack([
+                    candidate_cpu[local_index, candidate_id]
+                    for candidate_id in queried_ids
+                ])
+                execution_selection = EX.select_nominal_hp_execution(
+                    episode["state"],
+                    queried_controls,
+                    [row[2] for row in query_rows],
+                    episode["gamma"],
+                    env,
+                    candidate_ids=queried_ids,
+                    selector=cfg.execution_rule,
+                )
+                chosen = execution_selection["chosen"]
+                if chosen is not None:
+                    local_choice = int(chosen["local_index"])
+                    candidate_id, query_id, result = query_rows[local_choice]
+                    controls = candidate_cpu[local_index, candidate_id]
+                    primary = (
+                        chosen["step_progress"]
+                        if cfg.execution_rule == EX.MAX_STEP_PROGRESS
+                        else chosen["nominal_hp_step_margin"]
+                    )
+                    best = (float(primary), query_id, controls, candidate_id, result)
 
             drawn = selected[local_index]
             stats = _acquisition_stats(
@@ -416,6 +488,16 @@ def run_parallel_episodes(
                 ),
                 n_pos=sum(row[2]["y"] == 1 for row in query_rows),
                 n_exec_pos=sum(row[2]["exec_y"] == 1 for row in query_rows),
+                n_full_socp_positive=sum(row[2]["y"] == 1 for row in query_rows),
+                n_exec_verified_hp_positive=(
+                    None if execution_selection is None
+                    else execution_selection["counts"]["nominal_hp_eligible"]
+                ),
+                execution_failure=(
+                    None if execution_selection is None
+                    else execution_selection["failure"]
+                ),
+                execution_rule=cfg.execution_rule,
                 n_terminal_rescue=sum(bool(row[2]["terminal_rescue"]) for row in query_rows),
                 n_terminal_reverify=sum(bool(row[2]["terminal_reverify"]) for row in query_rows),
                 selected_terminal_rescue=selected_rescue,
@@ -441,6 +523,28 @@ def run_parallel_episodes(
                     "y": [(-1 if row[2]["reason"] == "socp_error" else row[2]["y"])
                           for row in query_rows],
                     "exec_y": [row[2]["exec_y"] for row in query_rows],
+                    "exec_verified_hp_y": (
+                        None if execution_selection is None
+                        else [
+                            int(row["eligible"])
+                            for row in execution_selection["per_candidate"]
+                        ]
+                    ),
+                    "step_progress": (
+                        None if execution_selection is None
+                        else [
+                            float(row["step_progress"])
+                            for row in execution_selection["per_candidate"]
+                        ]
+                    ),
+                    "nominal_hp_step_margin": (
+                        None if execution_selection is None
+                        else [
+                            float(row["nominal_hp_step_margin"])
+                            for row in execution_selection["per_candidate"]
+                        ]
+                    ),
+                    "execution_rule": cfg.execution_rule,
                     "terminal_rescue": [bool(row[2]["terminal_rescue"]) for row in query_rows],
                     "terminal_tau": [row[2]["terminal_tau"] for row in query_rows],
                     "n_socp_solve": stats["n_socp_solve"],
@@ -454,7 +558,14 @@ def run_parallel_episodes(
                 })
 
             if best is None:
+                if collect:
+                    store.mark_nvp_negative(row[1] for row in query_rows)
                 episode["status"] = "nvp"
+                episode["nvp_reason"] = (
+                    execution_selection["failure"]
+                    if execution_selection is not None
+                    else "no_verified_execution_candidate"
+                )
                 episode["term_t"] = control_t
                 continue
             if collect and best[1] >= 0:
@@ -498,6 +609,7 @@ def run_parallel_episodes(
             "clear_min": episode["clear_min"],
             "collision": episode["collision"],
             "oob": episode["oob"],
+            "nvp_reason": episode.get("nvp_reason"),
             "step_stats": episode["step_stats"],
         })
     return output, timings
@@ -526,6 +638,12 @@ def _per_gamma_episode_stats(episodes, cfg):
             "n_q": int(sum(item["n_drawn"] for item in steps)),
             "n_pos": int(sum(item["n_pos"] for item in steps)),
             "n_exec_pos": int(sum(item["n_exec_pos"] for item in steps)),
+            "n_full_socp_positive": int(sum(
+                item["n_full_socp_positive"] for item in steps
+            )),
+            "n_exec_verified_hp_positive": int(sum(
+                item["n_exec_verified_hp_positive"] or 0 for item in steps
+            )),
             "n_socp_solve": int(sum(item["n_socp_solve"] for item in steps)),
             "verifier_cpu_seconds": float(sum(item["verifier_seconds"] for item in steps)),
             "n_err": int(sum(item["n_err"] for item in steps)),
@@ -651,7 +769,8 @@ def calibrate_rbf(policy, env, cfg, device, executor):
         features = RC.l2_normalize(
             policy.phi_s(controls, context[context_index], s=cfg.s)
         )
-    lengthscale = RC.mean_pairwise_lengthscale(features)
+    base_lengthscale = RC.mean_pairwise_lengthscale(features)
+    lengthscale = float(base_lengthscale * cfg.lengthscale_multiplier)
 
     # A beta calibrated on the 50-sample length-scale seed is not operational:
     # the expansion GP has `gp_cap` points and sees rollout contexts.  Build a
@@ -662,10 +781,12 @@ def calibrate_rbf(policy, env, cfg, device, executor):
         conditioning_schema=cfg.conditioning_schema,
         condition_dim=cfg.raw_condition_dim,
     )
+    calibration_replicas = cfg.calibration_replicas or cfg.replicas
     seed_episodes, seed_timing = run_parallel_episodes(
-        policy, empty_gp, env, cfg, seed_store, 0, cfg.replicas,
+        policy, empty_gp, env, cfg, seed_store, 0, calibration_replicas,
         device, executor, collect=True, viz=None,
         purpose="rbf_operational_seed", acquisition_mode="uniform",
+        max_control_steps=cfg.calibration_control_steps,
     )
     seed_ids = RC.previous_round_positive_ids(
         seed_store, 0, cfg.gp_cap, cfg.gammas,
@@ -689,9 +810,10 @@ def calibrate_rbf(policy, env, cfg, device, executor):
         condition_dim=cfg.raw_condition_dim,
     )
     beta_episodes, beta_timing = run_parallel_episodes(
-        policy, gp, env, cfg, beta_store, 0, cfg.replicas,
+        policy, gp, env, cfg, beta_store, 0, calibration_replicas,
         device, executor, collect=True, viz=None,
         purpose="rbf_operational_beta_contexts", acquisition_mode="uniform",
+        max_control_steps=cfg.calibration_control_steps,
     )
     score_vector_start = time.perf_counter()
     score_vectors, context_gamma_counts, feature_pools = _calibration_score_vectors(
@@ -741,8 +863,12 @@ def calibrate_rbf(policy, env, cfg, device, executor):
         "enters_round1_GP": "exactly the declared operational_gp_size seed positives",
     }
     return {
+        "base_lengthscale": float(base_lengthscale),
+        "lengthscale_multiplier": float(cfg.lengthscale_multiplier),
         "lengthscale": float(lengthscale),
         "lengthscale_samples": cfg.lengthscale_samples,
+        "calibration_replicas": int(calibration_replicas),
+        "calibration_control_steps": cfg.calibration_control_steps,
         "operational_gp_size": gp.n,
         "operational_seed_queries": len(seed_store),
         "operational_seed_positives": seed_store.n_pos(),
@@ -833,12 +959,18 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
         conditioning_schema=cfg.conditioning_schema,
         condition_dim=cfg.raw_condition_dim,
     )
-    optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.afe_lr)
-    audit_contexts = AC.build_audit_contexts(
-        env,
-        cfg.gammas,
-        n_pos=cfg.audit_pos,
-        conditioning_schema=cfg.conditioning_schema,
+    optimizer = torch.optim.Adam(
+        [parameter for parameter in policy.parameters() if parameter.requires_grad],
+        lr=cfg.afe_lr,
+    )
+    audit_contexts = (
+        AC.build_audit_contexts(
+            env,
+            cfg.gammas,
+            n_pos=cfg.audit_pos,
+            conditioning_schema=cfg.conditioning_schema,
+        )
+        if cfg.training_probes else None
     )
     representation_probe = AFE2.rep_probe_build(policy, env, cfg, device)
     goal = env.goal.detach().cpu().numpy()
@@ -861,7 +993,8 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             "status": "CALIBRATED_AFE_RBF_SEQUENTIAL_OPERATIONAL_V3",
             "kernel": "RBF on L2-normalized phi_s",
             "lengthscale_rule": (
-                "mean pairwise embedding distance of exactly 50 samples from the pretrained model"
+                "declared multiplier times the mean pairwise embedding distance of exactly "
+                "50 samples from the pretrained model"
             ),
             "gp_buffer_label": "full-H verifier positive only",
             "acquisition_statistic": (
@@ -878,7 +1011,9 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             json.dump(calibration_public, stream, indent=2, sort_keys=True, allow_nan=False)
             stream.write("\n")
 
-        if cfg.acquisition_mode == "uniform":
+        if cfg.execution_rule != "legacy_max_horizon_progress":
+            algorithm = "afe_rbf_low7_signed_execution_sweep_v1"
+        elif cfg.acquisition_mode == "uniform":
             algorithm = "afe_uniform_parallel_v1"
         elif cfg.adaptive_ess_target is not None:
             algorithm = "afe_rbf_adaptive_ess_parallel_v4"
@@ -912,6 +1047,8 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             "arm": "afe",
             "single_arm": True,
             "kernel": "RBF",
+            "base_lengthscale": calibration["base_lengthscale"],
+            "lengthscale_multiplier": cfg.lengthscale_multiplier,
             "lengthscale": calibration["lengthscale"],
             "lengthscale_protocol": calibration_public["lengthscale_rule"],
             "beta": cfg.beta,
@@ -920,10 +1057,13 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             "acquisition_mode": cfg.acquisition_mode,
             "acquisition_memory": (
                 "round 1: verified-positive pretrained calibration seed; later rounds: at most "
-                f"{cfg.gp_cap} full-H positives from immediately preceding round, gamma-balanced "
-                "random without replacement; re-embedded with current phi; frozen within round"
+                f"{cfg.gp_cap} full-H positives from the current and previous "
+                f"{cfg.gp_replay_window - 1} rounds, round/gamma-balanced random without "
+                "replacement; re-embedded with current phi; frozen within round"
             ),
             "calibration_budget": calibration_public["calibration_budget"],
+            "calibration_replicas": calibration["calibration_replicas"],
+            "calibration_control_steps": calibration["calibration_control_steps"],
             "calibration_scope": (
                 "round-0 acquisition-only verifier budget; the seed archive supplies the "
                 "declared round-1 GP but neither archive enters cumulative training D+ or audit"
@@ -934,6 +1074,7 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             ),
             "learning_memory": learning_memory,
             "replay_window": cfg.replay_window,
+            "gp_replay_window": cfg.gp_replay_window,
             "rbf_offline_sweep": (
                 "one pretrained-policy counterfactual sweep stored in rbf_calibration.json"
                 if cfg.rbf_offline_sweep else False
@@ -949,10 +1090,14 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                 "verifier workers; no within-round GP update"
             ),
             "execution": (
-                "maximum-progress terminal-aware verified plan; execute first action; absorbing "
-                "goal prefix allowed only for execution; NVP terminates; no expert/fallback"
+                f"{cfg.execution_rule}; execution-verified (full-H or certified goal prefix) "
+                "and, for nominal_hp rules, the first executed state satisfies the nominal "
+                "SafeMPPI DTCBF level-set condition; NVP terminates; no expert/fallback"
             ),
-            "update": f"CFM lr {cfg.afe_lr:g}, batch {cfg.batch}, {cfg.afe_steps} steps, no prox",
+            "update": (
+                f"signed CFM lr {cfg.afe_lr:g}, separate batch {cfg.batch}, "
+                f"{cfg.afe_steps} steps, alpha {cfg.negative_alpha:g}, no prox"
+            ),
             "rounds": cfg.rounds,
             "rollout_replicas": cfg.replicas,
             "T": cfg.T,
@@ -961,11 +1106,35 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             "batch": cfg.batch,
             "afe_lr": cfg.afe_lr,
             "afe_steps": cfg.afe_steps,
+            "negative_alpha": cfg.negative_alpha,
+            "negative_alpha_semantics": (
+                "paper gradient-norm target: g = g_pos - rho*g_neg, "
+                "rho=alpha*||g_pos||/||g_neg||; alpha=0 is exact positive-only update"
+            ),
+            "negative_population": (
+                "all successfully observed B queries at a terminal NVP context from the same "
+                "replay window; this task-specific closed-loop viability signal may overlap "
+                "full-H D+ and excludes SOCP errors"
+            ),
+            "artifact_profile": (
+                "sweep_compact" if cfg.sweep_compact_artifacts else "full"
+            ),
+            "artifact_profile_description": (
+                "omit final DStore; retain checkpoints r0/every10/final and training-viz "
+                "rounds 1..10/every10; probe, calibration, and completion hashes remain complete"
+                if cfg.sweep_compact_artifacts
+                else "retain complete DStore, every checkpoint, and every training-viz round"
+            ),
             "gp_cap": cfg.gp_cap,
             "gp_lam": cfg.gp_lam,
             "s": cfg.s,
             "nfe": cfg.nfe,
             "M_eval": cfg.M_eval,
+            "training_probes": cfg.training_probes,
+            "outcome_evaluation": (
+                "not produced by the trainer; stored checkpoints require a separate raw, "
+                "untilted temperature-1 evaluation"
+            ),
             "gammas": list(cfg.gammas),
             "reach": cfg.reach,
             "seed": cfg.seed,
@@ -989,6 +1158,9 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             "no_anchor": True,
             "no_prox": True,
             "no_fallback": True,
+            "conditioning_schema": cfg.conditioning_schema,
+            "raw_condition_dim": cfg.raw_condition_dim,
+            "freeze_visual_encoder": cfg.freeze_visual_encoder,
         }
         recipe_path = os.path.join(outdir, "recipe.json")
         with open(recipe_path, "w") as stream:
@@ -1003,19 +1175,29 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
 
         bootstrap_gp = RC.RBFGPSigma(calibration["lengthscale"], cfg.gp_lam)
         bootstrap_gp.set_buffer(calibration["bootstrap_features"].to(device))
-        audit0 = AC.run_audit(
-            policy, audit_contexts, env, goal, device,
-            n_plans=cfg.audit_plans, nfe=cfg.nfe, n_theta=cfg.n_theta,
-            seed=AFE2.named_seed(cfg.seed, "audit"),
-        )
-        eval0, eval0_timing = run_parallel_episodes(
-            policy, bootstrap_gp, env, cfg, store, 0, cfg.M_eval, device, executor,
-            collect=False, viz=None, purpose="controller_eval",
-        )
-        rows0, pooled0 = _controller_summary(eval0, cfg, env)
+        if cfg.training_probes:
+            audit0 = AC.run_audit(
+                policy, audit_contexts, env, goal, device,
+                n_plans=cfg.audit_plans, nfe=cfg.nfe, n_theta=cfg.n_theta,
+                seed=AFE2.named_seed(cfg.seed, "audit"),
+            )
+            eval0, eval0_timing = run_parallel_episodes(
+                policy, bootstrap_gp, env, cfg, store, 0, cfg.M_eval, device, executor,
+                collect=False, viz=None, purpose="controller_eval",
+            )
+            rows0, pooled0 = _controller_summary(eval0, cfg, env)
+        else:
+            audit0 = {
+                "V": None, "V_safe": None, "V_full": None,
+                "V_gamma": {}, "V_safe_gamma": {}, "V_full_gamma": {},
+            }
+            rows0, pooled0 = {}, {"SR": None, "CR": None, "NVP": None}
+            eval0_timing = None
         write_probe({
             "round": 0,
             "arm": "afe",
+            "negative_alpha": cfg.negative_alpha,
+            "execution_rule": cfg.execution_rule,
             "acquisition_mode": cfg.acquisition_mode,
             "beta_used": cfg.beta,
             "beta_next": cfg.beta,
@@ -1029,6 +1211,8 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             "ctrl_pooled": pooled0,
             "n_D": 0,
             "n_Dpos": 0,
+            "n_Dneg": 0,
+            "n_Dneutral": 0,
             "gp_buffer": bootstrap_gp.diagnostics(),
             "calibration_budget": calibration_public["calibration_budget"],
             "rbf_offline_sweep": calibration_public["offline_sweep"],
@@ -1039,11 +1223,19 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             policy, os.path.join(outdir, "ckpt_0.pt"),
             extra={"iter": 0, "recipe": recipe, "resumable": False},
         )
-        print(
-            f"[afe-rbf] r000 V {audit0['V']:.3f} ctrl SR {pooled0['SR']:.2f} "
-            f"NVP {pooled0['NVP']:.2f} ell {cfg.beta:.4g}/{calibration['lengthscale']:.4g}",
-            flush=True,
-        )
+        if cfg.training_probes:
+            print(
+                f"[afe-rbf] r000 V {audit0['V']:.3f} ctrl SR {pooled0['SR']:.2f} "
+                f"NVP {pooled0['NVP']:.2f} beta/ell "
+                f"{cfg.beta:.4g}/{calibration['lengthscale']:.4g}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[afe-rbf] r000 training probes skipped; beta/ell "
+                f"{cfg.beta:.4g}/{calibration['lengthscale']:.4g}",
+                flush=True,
+            )
 
         gp_for_gather = bootstrap_gp
         gp_start_diagnostics = bootstrap_gp.diagnostics()
@@ -1064,14 +1256,15 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             update_start = time.perf_counter()
             replay_rng = np.random.default_rng(AFE2.named_seed(cfg.seed, "replay", round_i))
             with AC.isolated_random_state(AFE2.named_seed(cfg.seed, "update", round_i)):
-                update = AFE2.update_round(
-                    policy, optimizer, store, cfg, device, replay_rng, round_i
+                update = SU.update_round_signed(
+                    policy, optimizer, store, cfg, device, replay_rng, round_i,
+                    alpha=cfg.negative_alpha,
                 )
             update_seconds = time.perf_counter() - update_start
             policy.eval()
 
-            query_ids = RC.previous_round_positive_ids(
-                store, round_i, cfg.gp_cap, cfg.gammas,
+            query_ids = RC.recent_round_positive_ids(
+                store, round_i, cfg.gp_replay_window, cfg.gp_cap, cfg.gammas,
                 AFE2.named_seed(cfg.seed, "gp_buffer", round_i),
             )
             gp_post, gp_post_diagnostics = _gp_from_query_ids(
@@ -1093,17 +1286,26 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                 adaptive_calibration["context_gamma_counts"] = calibration_gamma_counts
                 beta_next = float(adaptive_calibration["beta"])
                 cfg.beta = beta_next
-            audit = AC.run_audit(
-                policy, audit_contexts, env, goal, device,
-                n_plans=cfg.audit_plans, nfe=cfg.nfe, n_theta=cfg.n_theta,
-                seed=AFE2.named_seed(cfg.seed, "audit"),
-            )
-            evaluation, evaluation_timing = run_parallel_episodes(
-                policy, gp_post, env, cfg, store, round_i, cfg.M_eval,
-                device, executor, collect=False, viz=None, purpose="controller_eval",
-                acquisition_mode=cfg.acquisition_mode,
-            )
-            rows, pooled = _controller_summary(evaluation, cfg, env)
+            if cfg.training_probes:
+                audit = AC.run_audit(
+                    policy, audit_contexts, env, goal, device,
+                    n_plans=cfg.audit_plans, nfe=cfg.nfe, n_theta=cfg.n_theta,
+                    seed=AFE2.named_seed(cfg.seed, "audit"),
+                )
+                evaluation, evaluation_timing = run_parallel_episodes(
+                    policy, gp_post, env, cfg, store, round_i, cfg.M_eval,
+                    device, executor, collect=False, viz=None, purpose="controller_eval",
+                    acquisition_mode=cfg.acquisition_mode,
+                )
+                rows, pooled = _controller_summary(evaluation, cfg, env)
+            else:
+                audit = {
+                    "V": None, "V_safe": None, "V_full": None,
+                    "V_gamma": {}, "V_safe_gamma": {}, "V_full_gamma": {},
+                    "counts_gamma": {},
+                }
+                rows, pooled = {}, {"SR": None, "CR": None, "NVP": None}
+                evaluation_timing = None
             drawn = (update or {}).get("drawn_ids", {})
             trained_gamma = {}
             distinct_gamma = {}
@@ -1114,6 +1316,8 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             record = {
                 "round": round_i,
                 "arm": "afe",
+                "negative_alpha": cfg.negative_alpha,
+                "execution_rule": cfg.execution_rule,
                 "acquisition_mode": cfg.acquisition_mode,
                 "beta_used": beta_used,
                 "beta_next": beta_next,
@@ -1121,6 +1325,21 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                 "rbf_offline_sweep": None,
                 "n_D": len(store),
                 "n_Dpos": store.n_pos(),
+                "n_Dneg": int(sum(int(value) == 1 for value in store.q_nvp_negative)),
+                "n_Doverlap": int(sum(
+                    int(y) == 1 and int(nvp_negative) == 1
+                    for y, nvp_negative in zip(store.q_y, store.q_nvp_negative)
+                )),
+                "n_Dneutral": int(sum(
+                    int(y) == 0 and int(nvp_negative) == 0
+                    for y, nvp_negative in zip(store.q_y, store.q_nvp_negative)
+                )),
+                "n_Dterminal_rescue_neutral": int(sum(
+                    int(y) == 0 and int(exec_y) == 1 and int(nvp_negative) == 0
+                    for y, exec_y, nvp_negative in zip(
+                        store.q_y, store.q_exec_y, store.q_nvp_negative
+                    )
+                )),
                 "per_gamma": per_gamma,
                 **acquisition,
                 "gp_round_start": gp_start_diagnostics,
@@ -1145,49 +1364,53 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             }
             if update is not None:
                 record.update({
-                    "steps": update["steps"],
-                    "stop": update["stop"],
-                    "cfm": update["cfm"],
-                    "cfm_first": update["cfm_first"],
-                    "cfm_last": update["cfm_last"],
-                    "fstep_final": update["fstep_final"],
-                    "fstep_max": update["fstep_max"],
-                    "grad_norm": update["grad_norm"],
-                    "rel_param_change": update["rel_param_change"],
-                    "replay_window": update["replay_window"],
-                    "replay_eligible": update["replay_eligible"],
-                    "replay_fresh_draws": update["replay_fresh_draws"],
-                    "replay_fresh_distinct": update["replay_fresh_distinct"],
+                    key: value for key, value in update.items()
+                    if key not in {"drawn_ids", "negative_drawn_ids"}
                 })
             write_probe(record)
-            torch.save({
-                "round": round_i,
-                "viz": viz,
-                "eps": [
-                    {key: value for key, value in episode.items() if key != "step_stats"}
-                    for episode in episodes
-                ],
-                "gp_buffer_query_ids": np.asarray(query_ids, dtype=np.int64),
-                "gp_diagnostics": gp_post_diagnostics,
-                "scene": scene,
-                "audit": audit,
-                "train_ids": np.asarray(sorted(drawn), dtype=np.int64),
-                "train_counts": np.asarray(
-                    [drawn[key] for key in sorted(drawn)], dtype=np.int64
-                ),
-                "goal": goal,
-                "x0": env.x0.detach().cpu().numpy(),
-            }, os.path.join(outdir, "viz_db", f"round{round_i}.pt"))
-            HT._save_hp_atomic(
-                policy, os.path.join(outdir, f"ckpt_{round_i}.pt"),
-                extra={"iter": round_i, "recipe": recipe, "resumable": False},
+            keep_viz = (
+                not cfg.sweep_compact_artifacts
+                or round_i <= 10
+                or round_i % 10 == 0
+            )
+            if keep_viz:
+                torch.save({
+                    "round": round_i,
+                    "viz": viz,
+                    "eps": [
+                        {key: value for key, value in episode.items() if key != "step_stats"}
+                        for episode in episodes
+                    ],
+                    "gp_buffer_query_ids": np.asarray(query_ids, dtype=np.int64),
+                    "gp_diagnostics": gp_post_diagnostics,
+                    "scene": scene,
+                    "audit": audit,
+                    "train_ids": np.asarray(sorted(drawn), dtype=np.int64),
+                    "train_counts": np.asarray(
+                        [drawn[key] for key in sorted(drawn)], dtype=np.int64
+                    ),
+                    "goal": goal,
+                    "x0": env.x0.detach().cpu().numpy(),
+                }, os.path.join(outdir, "viz_db", f"round{round_i}.pt"))
+            keep_checkpoint = (
+                not cfg.sweep_compact_artifacts
+                or round_i % 10 == 0
+                or round_i == cfg.rounds
+            )
+            if keep_checkpoint:
+                HT._save_hp_atomic(
+                    policy, os.path.join(outdir, f"ckpt_{round_i}.pt"),
+                    extra={"iter": round_i, "recipe": recipe, "resumable": False},
+                )
+            outcome = (
+                f"V {audit['V']:.3f} SR {pooled['SR']:.2f} NVP {pooled['NVP']:.2f}"
+                if cfg.training_probes else "training probes skipped"
             )
             print(
                 f"[afe-rbf] r{round_i:03d} D {len(store)} D+ {store.n_pos()} "
                 f"GP {gp_post.n}/{cfg.gp_cap} ESS/M {record.get('ess_med', float('nan')):.3f} "
                 f"beta {beta_used:.4g}->{beta_next:.4g} "
-                f"uplift {record.get('uplift_med', float('nan')):.4f} V {audit['V']:.3f} "
-                f"SR {pooled['SR']:.2f} NVP {pooled['NVP']:.2f} "
+                f"uplift {record.get('uplift_med', float('nan')):.4f} {outcome} "
                 f"gather {gather_seconds:.1f}s update {update_seconds:.1f}s",
                 flush=True,
             )
@@ -1200,15 +1423,65 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
         policy, final_path,
         extra={"iter": cfg.rounds, "recipe": recipe, "resumable": False},
     )
-    store.save(store_path)
+    if not cfg.sweep_compact_artifacts:
+        store.save(store_path)
+    else:
+        negative_ids = np.flatnonzero(
+            np.asarray(store.q_nvp_negative, dtype=np.int8)
+        ).astype(np.int64)
+        np.savez_compressed(
+            os.path.join(outdir, "nvp_negative_archive.npz"),
+            query_id=negative_ids,
+            step_context_id=np.asarray(
+                [store.q_sid[index] for index in negative_ids], dtype=np.int64
+            ),
+            round=np.asarray(
+                [store.q_round[index] for index in negative_ids], dtype=np.int32
+            ),
+            gamma=np.asarray(
+                [store.q_gamma[index] for index in negative_ids], dtype=np.float32
+            ),
+            full_y=np.asarray(
+                [store.q_y[index] for index in negative_ids], dtype=np.int8
+            ),
+            terminal_exec_y=np.asarray(
+                [store.q_exec_y[index] for index in negative_ids], dtype=np.int8
+            ),
+            controls=(
+                np.stack([store.q_U[index] for index in negative_ids])
+                if len(negative_ids)
+                else np.zeros((0, GF.H_PRED, 2), dtype=np.float32)
+            ),
+            state=(
+                np.stack([
+                    store.ctx_state[store.q_sid[index]] for index in negative_ids
+                ])
+                if len(negative_ids)
+                else np.zeros((0, 4), dtype=np.float32)
+            ),
+        )
+    viz_rounds = (
+        list(range(1, cfg.rounds + 1))
+        if not cfg.sweep_compact_artifacts
+        else [
+            index for index in range(1, cfg.rounds + 1)
+            if index <= 10 or index % 10 == 0
+        ]
+    )
+    checkpoint_rounds = (
+        list(range(cfg.rounds + 1))
+        if not cfg.sweep_compact_artifacts
+        else sorted({0, cfg.rounds, *range(10, cfg.rounds + 1, 10)})
+    )
     required = [
         "recipe.json",
         "rbf_calibration.json",
         "probe.jsonl",
         "final.pt",
-        "dstore.pt",
-        *[f"ckpt_{index}.pt" for index in range(cfg.rounds + 1)],
-        *[f"viz_db/round{index}.pt" for index in range(1, cfg.rounds + 1)],
+        *([] if cfg.sweep_compact_artifacts else ["dstore.pt"]),
+        *(["nvp_negative_archive.npz"] if cfg.sweep_compact_artifacts else []),
+        *[f"ckpt_{index}.pt" for index in checkpoint_rounds],
+        *[f"viz_db/round{index}.pt" for index in viz_rounds],
     ]
     inventory = {}
     for relative in required:
@@ -1257,16 +1530,40 @@ def main():
     )
     parser.add_argument("--adaptive-ess-target", type=float, default=None)
     parser.add_argument("--replay-window", type=int, default=None)
+    parser.add_argument("--gp-replay-window", type=int, default=1)
+    parser.add_argument("--lengthscale-multiplier", type=float, default=1.0)
+    parser.add_argument("--negative-alpha", type=float, default=0.0)
+    parser.add_argument(
+        "--execution-rule",
+        choices=(
+            "legacy_max_horizon_progress",
+            "nominal_hp_max_step_progress",
+            "nominal_hp_max_step_margin",
+        ),
+        default="legacy_max_horizon_progress",
+    )
+    parser.add_argument(
+        "--conditioning-schema",
+        choices=(CX.LOW5_SCHEMA, CX.LOW7_SCHEMA),
+        default=CX.LOW5_SCHEMA,
+    )
+    parser.add_argument("--freeze-visual-encoder", action="store_true")
+    parser.add_argument("--skip-training-probes", action="store_true")
+    parser.add_argument("--calibration-replicas", type=int, default=None)
+    parser.add_argument("--calibration-control-steps", type=int, default=None)
+    parser.add_argument("--sweep-compact-artifacts", action="store_true")
     parser.add_argument("--rbf-offline-sweep", action="store_true")
     parser.add_argument("--verifier-workers", type=int, default=16)
     parser.add_argument("--seed", type=int, default=910)
     args = parser.parse_args()
     if args.K != 64 or args.B != 8 or args.batch != 128:
         raise ValueError("the first RBF study holds K=64, B=8, and batch=128 fixed")
-    if args.afe_steps != 250 or args.afe_lr != 1.0e-4:
-        raise ValueError("the first RBF study holds the AFE update at 250 steps and lr=1e-4")
-    if args.rounds < 1 or args.rollout_replicas < 1 or args.M_eval < 1:
-        raise ValueError("rounds, rollout replicas, and M-eval must be positive")
+    if args.afe_steps < 1 or args.afe_lr <= 0.0:
+        raise ValueError("AFE steps and learning rate must be positive")
+    if args.rounds < 1 or args.rollout_replicas < 1 or args.M_eval < 0:
+        raise ValueError("rounds and rollout replicas must be positive; M-eval cannot be negative")
+    if not args.skip_training_probes and args.M_eval < 1:
+        raise ValueError("M-eval must be positive unless training probes are skipped")
     if args.verifier_workers < 1:
         raise ValueError("verifier worker count must be positive")
     if args.adaptive_ess_target is not None and not 0.0 < args.adaptive_ess_target < 1.0:
@@ -1275,6 +1572,16 @@ def main():
         raise ValueError("uniform acquisition does not use adaptive beta")
     if args.replay_window is not None and args.replay_window < 1:
         raise ValueError("replay window must be at least one round")
+    if args.gp_replay_window < 1:
+        raise ValueError("GP replay window must be at least one round")
+    if not np.isfinite(args.lengthscale_multiplier) or args.lengthscale_multiplier <= 0.0:
+        raise ValueError("length-scale multiplier must be finite and positive")
+    if not np.isfinite(args.negative_alpha) or args.negative_alpha < 0.0:
+        raise ValueError("negative alpha must be finite and nonnegative")
+    if args.calibration_replicas is not None and args.calibration_replicas < 1:
+        raise ValueError("calibration replicas must be positive")
+    if args.calibration_control_steps is not None and args.calibration_control_steps < 1:
+        raise ValueError("calibration control steps must be positive")
 
     np.random.seed(args.seed)
     random.seed(args.seed)
@@ -1293,8 +1600,23 @@ def main():
             profile.name, policy, checkpoint, checkpoint_sha256
         )
     )
-    if any(not parameter.requires_grad for parameter in policy.parameters()):
-        raise ValueError("all encoder, trunk, and head parameters must remain trainable")
+    policy_contract = CX.require_declared_contract(
+        policy,
+        args.conditioning_schema,
+        7 if args.conditioning_schema == CX.LOW7_SCHEMA else 5,
+    )
+    if profile.name in {
+        "low7_radius1_canonical_v1",
+        "low7_radius03_canonical_v1",
+    }:
+        if args.conditioning_schema != CX.LOW7_SCHEMA or not args.freeze_visual_encoder:
+            raise ValueError(
+                "low7 OOD expansion requires low7 closest-boundary conditioning "
+                "and a frozen visual encoder"
+            )
+    elif args.conditioning_schema != CX.LOW5_SCHEMA or args.freeze_visual_encoder:
+        raise ValueError("legacy scenes retain low5 conditioning and a trainable encoder")
+    trainability = configure_policy_trainability(policy, args.freeze_visual_encoder)
     source_git_state = AFE2._git_state()
     if (
         source_git_state["commit"] is None
@@ -1329,13 +1651,27 @@ def main():
         acquisition_mode=args.acquisition_mode,
         adaptive_ess_target=args.adaptive_ess_target,
         replay_window=args.replay_window,
+        gp_replay_window=args.gp_replay_window,
+        lengthscale_multiplier=args.lengthscale_multiplier,
+        negative_alpha=args.negative_alpha,
+        execution_rule=args.execution_rule,
+        training_probes=not args.skip_training_probes,
+        calibration_replicas=args.calibration_replicas,
+        calibration_control_steps=args.calibration_control_steps,
+        sweep_compact_artifacts=args.sweep_compact_artifacts,
         rbf_offline_sweep=args.rbf_offline_sweep,
+        conditioning_schema=policy_contract.schema,
+        raw_condition_dim=policy_contract.raw_condition_dim,
+        freeze_visual_encoder=args.freeze_visual_encoder,
     )
     print(
         f"[afe-rbf] scene={profile.name} rounds={cfg.rounds} replicas/gamma={cfg.replicas} "
         f"K={cfg.K} B={cfg.B} GPcap={cfg.gp_cap} workers={cfg.verifier_workers} "
         f"acquisition={cfg.acquisition_mode} adaptive_ESS={cfg.adaptive_ess_target} "
-        f"replay_W={cfg.replay_window}",
+        f"replay_W={cfg.replay_window} gp_W={cfg.gp_replay_window} "
+        f"ell_mult={cfg.lengthscale_multiplier:g} alpha={cfg.negative_alpha:g} "
+        f"steps={cfg.afe_steps} exec={cfg.execution_rule} "
+        f"frozen={len(trainability['frozen'])}",
         flush=True,
     )
     run(

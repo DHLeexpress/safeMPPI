@@ -255,6 +255,7 @@ class DStore:
         self.q_exec_y = []       # execution admissibility (full-H or certified terminal prefix)
         self.q_exec_prog = []
         self.q_exec_margin = []
+        self.q_nvp_negative = [] # 1 only for queries at a terminal NVP context
         self.q_terminal_hit = []
         self.q_terminal_rescue = []
         self.q_terminal_tau = []
@@ -295,6 +296,7 @@ class DStore:
         self.q_exec_y.append(int(v.get("exec_y", v["y"])))
         self.q_exec_prog.append(float(v.get("exec_prog", v["prog"])))
         self.q_exec_margin.append(float(v.get("exec_margin", v["margin"])))
+        self.q_nvp_negative.append(0)
         self.q_terminal_hit.append(int(bool(v.get("terminal_hit", False))))
         self.q_terminal_rescue.append(int(bool(v.get("terminal_rescue", False))))
         self.q_terminal_tau.append(int(v.get("terminal_tau") or -1))
@@ -324,6 +326,24 @@ class DStore:
         if not (full_witness or prefix_witness):
             raise RuntimeError("executed query has no persisted full-H or terminal-prefix certificate")
         self.q_exec[qid] = 1
+
+    def mark_nvp_negative(self, query_ids):
+        """Persist the queried plans that jointly produced a terminal NVP.
+
+        The marker is deliberately independent of the full-window verifier label:
+        a plan may remain in ``D+`` because it is SOCP-positive while also carrying
+        evidence against closed-loop viability at the terminal NVP context.
+        """
+
+        for query_id in query_ids:
+            query_id = int(query_id)
+            if query_id < 0:
+                continue
+            if query_id >= len(self.q_nvp_negative):
+                raise IndexError(f"NVP-negative query id is out of range: {query_id}")
+            if self.q_exec[query_id]:
+                raise RuntimeError("an executed query cannot be marked as terminal-NVP negative")
+            self.q_nvp_negative[query_id] = 1
 
     def validate_execution_witnesses(self):
         for qid, executed in enumerate(self.q_exec):
@@ -410,6 +430,7 @@ class DStore:
             q_exec_y=np.asarray(self.q_exec_y, np.int8),
             q_exec_prog=np.asarray(self.q_exec_prog, np.float32),
             q_exec_margin=np.asarray(self.q_exec_margin, np.float32),
+            q_nvp_negative=np.asarray(self.q_nvp_negative, np.int8),
             q_terminal_hit=np.asarray(self.q_terminal_hit, np.int8),
             q_terminal_rescue=np.asarray(self.q_terminal_rescue, np.int8),
             q_terminal_tau=np.asarray(self.q_terminal_tau, np.int16),

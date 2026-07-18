@@ -109,3 +109,55 @@ def test_previous_round_buffer_is_capped_balanced_and_round_local() -> None:
     assert all(store.q_round[index] == 1 for index in selected)
     assert selected_gamma.count(0.1) == 5
     assert selected_gamma.count(0.5) == 5
+
+
+def test_one_round_recent_buffer_preserves_previous_round_selection() -> None:
+    store = _Store()
+    expected = RC.previous_round_positive_ids(
+        store, round_i=1, cap=10, gammas=(0.1, 0.5), seed=17
+    )
+    actual = RC.recent_round_positive_ids(
+        store,
+        round_i=1,
+        replay_window=1,
+        cap=10,
+        gammas=(0.1, 0.5),
+        seed=17,
+    )
+
+    assert actual == expected
+
+
+class _RecentStore:
+    def __init__(self):
+        self.pos_ids = list(range(32))
+        self.q_round = [round_i for round_i in range(1, 5) for _ in range(8)]
+        self.q_gamma = [gamma for _ in range(4) for gamma in (0.1, 0.5) for _ in range(4)]
+
+
+def test_recent_round_buffer_is_deterministic_capped_and_cell_balanced() -> None:
+    store = _RecentStore()
+    selected = RC.recent_round_positive_ids(
+        store,
+        round_i=4,
+        replay_window=2,
+        cap=8,
+        gammas=(0.1, 0.5),
+        seed=23,
+    )
+    repeated = RC.recent_round_positive_ids(
+        store,
+        round_i=4,
+        replay_window=2,
+        cap=8,
+        gammas=(0.1, 0.5),
+        seed=23,
+    )
+
+    assert selected == repeated
+    assert len(selected) == len(set(selected)) == 8
+    counts = {}
+    for query_id in selected:
+        cell = (store.q_round[query_id], store.q_gamma[query_id])
+        counts[cell] = counts.get(cell, 0) + 1
+    assert counts == {(3, 0.1): 2, (3, 0.5): 2, (4, 0.1): 2, (4, 0.5): 2}

@@ -34,6 +34,15 @@ def test_short_video_schedule_keeps_every_round() -> None:
     ) == [1, 2, 3, 4, 5]
 
 
+def test_compact_sweep_viz_inventory_matches_the_19_frame_schedule() -> None:
+    module = _video_module()
+    rounds = module.expected_viz_rounds({
+        "rounds": 100,
+        "artifact_profile": "sweep_compact",
+    })
+    assert rounds == [*range(1, 11), *range(20, 101, 10)]
+
+
 def test_video_schedule_rejects_half_specified_arguments() -> None:
     module = _video_module()
     with pytest.raises(ValueError, match="supplied together"):

@@ -328,7 +328,10 @@ def validate_checkpoint_contract(profile_name, policy, checkpoint, checkpoint_sh
             "best_val": float(checkpoint["best_val"]),
             "config_sha256": _canonical_json_sha256(config),
         }
-    elif profile_name == "low7_radius1_canonical_v1":
+    elif profile_name in {
+        "low7_radius1_canonical_v1",
+        "low7_radius03_canonical_v1",
+    }:
         if not low7_architecture:
             raise RuntimeError(
                 "low7 expansion requires ctx=39, trunk input=91, and 70,308 parameters"

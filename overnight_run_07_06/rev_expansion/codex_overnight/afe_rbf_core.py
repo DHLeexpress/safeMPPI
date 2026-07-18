@@ -4,12 +4,12 @@ The acquisition buffer and the CFM replay store deliberately have different
 semantics:
 
 * ``D+`` remains cumulative and contains every full-window verifier positive.
-* the exact GP contains at most ``cap`` positives from the immediately preceding
-  round, selected without replacement and balanced across gamma values.
+* the exact GP contains at most ``cap`` positives from a declared recent-round
+  window, selected without replacement and balanced across round/gamma cells.
 
 The GP is frozen while a round's closed-loop replicas are gathered.  This makes
 parallel replicas order-independent and defines sigma as *novelty relative to the
-previous round*, not as a calibrated probability of validity.
+declared recent-round buffer*, not as a calibrated probability of validity.
 """
 from __future__ import annotations
 
@@ -305,6 +305,73 @@ def previous_round_positive_ids(store, round_i: int, cap: int, gammas, seed: int
             chosen = rng.choice(candidates, size=take, replace=False).tolist()
             selected.extend(int(value) for value in chosen)
             selected_set.update(int(value) for value in chosen)
+    if len(selected) < cap:
+        remaining = np.asarray(
+            [query_id for query_id in all_ids if query_id not in selected_set],
+            dtype=np.int64,
+        )
+        take = min(cap - len(selected), len(remaining))
+        if take:
+            selected.extend(int(value) for value in rng.choice(remaining, size=take, replace=False))
+    if len(selected) != cap or len(set(selected)) != cap:
+        raise RuntimeError("failed to construct the declared without-replacement GP buffer")
+    return sorted(selected)
+
+
+def recent_round_positive_ids(
+    store,
+    round_i: int,
+    replay_window: int,
+    cap: int,
+    gammas,
+    seed: int,
+) -> list[int]:
+    """Compress recent positives, balanced across non-empty round/gamma cells.
+
+    ``replay_window=1`` deliberately delegates to the original selector so the
+    established previous-round buffer is bit-for-bit unchanged.
+    """
+
+    replay_window = int(replay_window)
+    if replay_window < 1:
+        raise ValueError("GP replay window must be at least one round")
+    if replay_window == 1:
+        return previous_round_positive_ids(store, round_i, cap, gammas, seed)
+    if cap <= 0:
+        raise ValueError("GP buffer cap must be positive")
+
+    last_round = int(round_i)
+    first_round = last_round - replay_window + 1
+    groups: dict[tuple[int, float], list[int]] = defaultdict(list)
+    all_ids: list[int] = []
+    for query_id in store.pos_ids:
+        query_round = int(store.q_round[query_id])
+        if first_round <= query_round <= last_round:
+            query_id = int(query_id)
+            groups[(query_round, round(float(store.q_gamma[query_id]), 8))].append(query_id)
+            all_ids.append(query_id)
+    if len(all_ids) <= cap:
+        return sorted(all_ids)
+
+    gamma_keys = [round(float(gamma), 8) for gamma in gammas]
+    cell_keys = [
+        (query_round, gamma)
+        for query_round in range(first_round, last_round + 1)
+        for gamma in gamma_keys
+        if groups.get((query_round, gamma))
+    ]
+    rng = np.random.default_rng(int(seed))
+    selected: list[int] = []
+    selected_set: set[int] = set()
+    if cell_keys:
+        quota, extra = divmod(cap, len(cell_keys))
+        for index, cell in enumerate(cell_keys):
+            candidates = np.asarray(groups[cell], dtype=np.int64)
+            take = min(len(candidates), quota + int(index < extra))
+            if take:
+                chosen = rng.choice(candidates, size=take, replace=False).tolist()
+                selected.extend(int(value) for value in chosen)
+                selected_set.update(int(value) for value in chosen)
     if len(selected) < cap:
         remaining = np.asarray(
             [query_id for query_id in all_ids if query_id not in selected_set],

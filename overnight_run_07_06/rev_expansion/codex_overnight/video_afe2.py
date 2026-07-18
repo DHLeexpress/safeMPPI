@@ -69,6 +69,19 @@ def select_video_rounds(rounds, dense_until=None, every_after=None):
     return selected
 
 
+def expected_viz_rounds(recipe):
+    """Return the authenticated viz inventory declared by the trainer recipe."""
+
+    first_round = 0 if recipe.get("video_include_round0") else 1
+    values = range(first_round, int(recipe["rounds"]) + 1)
+    profile = recipe.get("artifact_profile", "full")
+    if profile == "full":
+        return list(values)
+    if profile == "sweep_compact":
+        return [round_i for round_i in values if round_i <= 10 or round_i % 10 == 0]
+    raise ValueError(f"unknown trainer artifact profile: {profile}")
+
+
 def sha256_file(path):
     digest = hashlib.sha256()
     with open(path, "rb") as stream:
@@ -118,7 +131,7 @@ def render_round(db, out_png, arm, allow_legacy_claude=False):
         draw_scene(ax, scene, goal, x0)
         steps = by_g[g]
         gamma_episodes = ep_by_g.get(g, [])
-        nquery_tot = npos_tot = nexec_tot = nrescue_tot = nsolve_tot = 0
+        nquery_tot = npos_tot = nexec_tot = nhp_tot = nrescue_tot = nsolve_tot = 0
         min_marg = np.inf
         for v in steps:
             segs = np.asarray(v["segsK"], np.float32)
@@ -156,6 +169,9 @@ def render_round(db, out_png, arm, allow_legacy_claude=False):
             npos_tot += int(np.sum(np.asarray(v["y"]) == 1))
             nquery_tot += len(v["drawn"])
             nexec_tot += int(np.sum(np.asarray(v.get("exec_y", v["y"])) == 1))
+            hp_labels = v.get("exec_verified_hp_y")
+            if hp_labels is not None:
+                nhp_tot += int(np.sum(np.asarray(hp_labels) == 1))
             nrescue_tot += int(np.sum(np.asarray(v.get("terminal_rescue", []), dtype=bool)))
             nsolve_tot += int(v.get("n_socp_solve", 0))
             if np.isfinite(v.get("min_margin", np.nan)):
@@ -178,14 +194,19 @@ def render_round(db, out_png, arm, allow_legacy_claude=False):
             f"{name}:{count}" for name, count in status_counts.items() if count
         ) or "-"
         nvp_times = [ep.get("term_t") for ep in gamma_episodes if ep["status"] == "nvp"]
+        nvp_reasons = sorted({
+            str(ep.get("nvp_reason", "unspecified"))
+            for ep in gamma_episodes if ep["status"] == "nvp"
+        })
         ax.set_title(f"γ={g}", fontsize=13)
         margin_text = f"{min_marg:.3f}" if np.isfinite(min_marg) else "—"
         ax.text(0.02, 0.98,
                 f"query objects {nquery_tot} / SOCP solves {nsolve_tot}\n"
-                f"full+ {npos_tot} / exec+ {nexec_tot} / rescue {nrescue_tot}\n"
+                f"full+ {npos_tot} / prefix+ {nexec_tot} / nominal-step+ {nhp_tot}\n"
+                f"terminal rescue {nrescue_tot}\n"
                 f"min execution-certificate m {margin_text}\n"
                 f"V̂_H full {float(vg.get(str(g), np.nan)):.2f}\n{stat}"
-                + (f" NVP t={nvp_times}" if nvp_times else ""),
+                + (f" NVP t={nvp_times} reason={nvp_reasons}" if nvp_times else ""),
                 transform=ax.transAxes, va="top", fontsize=9,
                 bbox=dict(fc="white", ec="0.6", alpha=0.85))
     axL = axes.flat[7]
@@ -200,7 +221,7 @@ def render_round(db, out_png, arm, allow_legacy_claude=False):
                label="selected certified plan/prefix (red dashed = unverified suffix)"),
         Line2D([], [], color="#0b3d91", lw=2.6, label="executed path"),
         Line2D([], [], color="k", marker="x", ls="", mew=3, ms=10,
-               label="NO_VERIFIED_POSITIVE (terminate; no expert, no fallback)"),
+               label="NO_EXECUTION_ELIGIBLE / NVP (terminate; no fallback)"),
     ], loc="center", fontsize=10.5, frameon=False)
     scene_name = scene.get("profile", {}).get("name", "unknown_scene")
     if "ensemble_diagnostics" in db:
@@ -249,10 +270,7 @@ def main():
     if os.path.isfile(recipe_path):
         with open(recipe_path) as stream:
             recipe = json.load(stream)
-        expected = list(range(
-            0 if recipe.get("video_include_round0") else 1,
-            int(recipe["rounds"]) + 1,
-        ))
+        expected = expected_viz_rounds(recipe)
         observed = [int(re.findall(r"round(\d+)\.pt", path)[0]) for path in dbs]
         if observed != expected:
             raise RuntimeError(f"viz rounds are {observed}; expected {expected}")
