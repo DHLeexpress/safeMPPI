@@ -351,6 +351,8 @@ def test_support_profile_locks_only_declared_optimizer_and_demo_matrix():
             RBF.validate_protocol_args(support_args(
                 optimizer_steps_per_round=steps, demo_frac=demo_frac
             ))
+    source = inspect.getsource(RBF.run)
+    assert '"execution_rule": cfg.execution_rule' in source
     for name, value in (
         ("optimizer_steps_per_round", 24),
         ("demo_frac", 0.2),

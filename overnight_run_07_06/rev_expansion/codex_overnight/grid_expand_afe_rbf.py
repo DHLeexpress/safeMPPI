@@ -1505,6 +1505,7 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                 "and, for nominal_hp rules, the first executed state satisfies the nominal "
                 "SafeMPPI DTCBF level-set condition; NVP terminates; no expert/fallback"
             ),
+            "execution_rule": cfg.execution_rule,
             "nvp_all_k_audit": (
                 "at the unchanged NVP context only, verify unselected K-B candidates and "
                 "classify acquisition miss versus nominal-Hp gate versus finite-K failure; "
