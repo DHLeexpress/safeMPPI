@@ -52,6 +52,7 @@ import afe_rbf_core as RC
 import afe_route_metrics as RM
 import afe_execution as EX
 import afe_signed_update as SU
+import afe_demo_support as DS
 import grid_expand_afe2 as AFE2
 from afe2_scene_profiles import (
     SCENE_PROFILES,
@@ -93,6 +94,8 @@ class AFERBFConfig(AFE2.AFE2Config):
     route_ambiguity_band: float = RM.DEFAULT_AMBIGUITY_BAND
     rbf_offline_sweep: bool = False
     nvp_audit_all_k: bool = False
+    optimizer_steps_per_round: int = 0
+    demo_frac: float = 0.0
 
 
 def configure_policy_trainability(policy, freeze_visual_encoder: bool) -> dict:
@@ -179,6 +182,86 @@ def classify_nvp_all_k(all_k_counts: dict, socp_errors: int) -> str:
     if int(all_k_counts["execution_verifier_positive"]) > 0:
         return "all_K_nominal_hp_gate_failure"
     return "finite_K_no_execution_candidate"
+
+
+def run_all_k_nvp_audit_only(
+    executor,
+    *,
+    episode_id,
+    state,
+    candidate_controls,
+    gamma,
+    query_rows,
+    execution_selection,
+    execution_rule,
+    env,
+):
+    """Verify unselected K-B plans without access to training or RNG objects.
+
+    The deliberately narrow signature is the isolation contract: policy, GP,
+    beta, D/D+, optimizer, acquisition RNG and execution state are not mutable
+    inputs.  The returned dictionary is observational metadata only.
+    """
+
+    selected_ids = {int(row[0]) for row in query_rows}
+    audit_ids = [
+        candidate_id for candidate_id in range(len(candidate_controls))
+        if candidate_id not in selected_ids
+    ]
+    tasks = [
+        (episode_id, candidate_id, state, candidate_controls[candidate_id], gamma)
+        for candidate_id in audit_ids
+    ]
+    audit_start = time.perf_counter()
+    audit_results = list(executor.map(RC.verify_in_worker, tasks, chunksize=1))
+    audit_wall = time.perf_counter() - audit_start
+    result_by_id = {
+        int(candidate_id): result for candidate_id, _, result in query_rows
+    }
+    for _, candidate_id, result in audit_results:
+        result_by_id[int(candidate_id)] = result
+    if set(result_by_id) != set(range(len(candidate_controls))):
+        raise RuntimeError("all-K NVP audit did not cover every candidate")
+    all_k_results = [
+        result_by_id[candidate_id] for candidate_id in range(len(candidate_controls))
+    ]
+    all_k_selection = EX.select_nominal_hp_execution(
+        state,
+        candidate_controls,
+        all_k_results,
+        gamma,
+        env,
+        candidate_ids=list(range(len(candidate_controls))),
+        selector=execution_rule,
+    )
+    all_k_errors = int(sum(query_has_socp_error(result) for result in all_k_results))
+    result = {
+        "status": "audit_only_no_execution_no_storage",
+        "classification": classify_nvp_all_k(
+            all_k_selection["counts"], all_k_errors
+        ),
+        "selected_B_counts": execution_selection["counts"],
+        "selected_B_socp_errors": int(sum(
+            query_has_socp_error(row[2]) for row in query_rows
+        )),
+        "all_K_counts": all_k_selection["counts"],
+        "all_K_socp_errors": all_k_errors,
+        "audit_extra_verifications": len(audit_results),
+        "audit_socp_solves": int(sum(
+            int(item[2]["n_socp_solve"]) for item in audit_results
+        )),
+        "audit_verifier_seconds": float(sum(
+            float(item[2]["verifier_seconds"]) for item in audit_results
+        )),
+        "audit_wall_seconds": audit_wall,
+    }
+    if result["classification"] == "selected_B_acquisition_miss":
+        if int(execution_selection["counts"]["nominal_hp_eligible"]) != 0:
+            raise RuntimeError("acquisition-miss audit contradicts selected-B NVP")
+        chosen_id = int(all_k_selection["chosen"]["candidate_id"])
+        if chosen_id in selected_ids:
+            raise RuntimeError("acquisition-miss witness was already in selected B")
+    return result, audit_wall
 
 
 def _proposal_noise(policy, active, cfg, purpose, round_i, control_t, device):
@@ -562,79 +645,19 @@ def run_parallel_episodes(
             ):
                 if execution_selection is None:
                     raise RuntimeError("all-K NVP audit requires nominal-Hp execution")
-                selected_ids = {int(row[0]) for row in query_rows}
-                audit_ids = [
-                    candidate_id for candidate_id in range(cfg.K)
-                    if candidate_id not in selected_ids
-                ]
-                audit_tasks = [
-                    (
-                        episode["episode_id"],
-                        candidate_id,
-                        episode["state"],
-                        candidate_cpu[local_index, candidate_id],
-                        episode["gamma"],
-                    )
-                    for candidate_id in audit_ids
-                ]
-                audit_start = time.perf_counter()
-                audit_results = list(
-                    executor.map(RC.verify_in_worker, audit_tasks, chunksize=1)
+                nvp_audit, audit_wall = run_all_k_nvp_audit_only(
+                    executor,
+                    episode_id=episode["episode_id"],
+                    state=episode["state"],
+                    candidate_controls=candidate_cpu[local_index],
+                    gamma=episode["gamma"],
+                    query_rows=query_rows,
+                    execution_selection=execution_selection,
+                    execution_rule=cfg.execution_rule,
+                    env=env,
                 )
-                audit_wall = time.perf_counter() - audit_start
                 audit_wall_this_step += audit_wall
                 timings["nvp_audit_verifier_wall"] += audit_wall
-                result_by_id = {
-                    int(candidate_id): result
-                    for candidate_id, _, result in query_rows
-                }
-                for _, candidate_id, result in audit_results:
-                    result_by_id[int(candidate_id)] = result
-                if set(result_by_id) != set(range(cfg.K)):
-                    raise RuntimeError("all-K NVP audit did not cover every candidate")
-                all_k_results = [
-                    result_by_id[candidate_id] for candidate_id in range(cfg.K)
-                ]
-                all_k_selection = EX.select_nominal_hp_execution(
-                    episode["state"],
-                    candidate_cpu[local_index],
-                    all_k_results,
-                    episode["gamma"],
-                    env,
-                    candidate_ids=list(range(cfg.K)),
-                    selector=cfg.execution_rule,
-                )
-                all_k_errors = int(sum(
-                    query_has_socp_error(result) for result in all_k_results
-                ))
-                nvp_audit = {
-                    "status": "audit_only_no_execution_no_storage",
-                    "classification": classify_nvp_all_k(
-                        all_k_selection["counts"], all_k_errors
-                    ),
-                    "selected_B_counts": execution_selection["counts"],
-                    "selected_B_socp_errors": int(sum(
-                        query_has_socp_error(row[2]) for row in query_rows
-                    )),
-                    "all_K_counts": all_k_selection["counts"],
-                    "all_K_socp_errors": all_k_errors,
-                    "audit_extra_verifications": len(audit_results),
-                    "audit_socp_solves": int(sum(
-                        int(result["n_socp_solve"])
-                        for _, _, result in audit_results
-                    )),
-                    "audit_verifier_seconds": float(sum(
-                        float(result["verifier_seconds"])
-                        for _, _, result in audit_results
-                    )),
-                    "audit_wall_seconds": audit_wall,
-                }
-                if nvp_audit["classification"] == "selected_B_acquisition_miss":
-                    if int(execution_selection["counts"]["nominal_hp_eligible"]) != 0:
-                        raise RuntimeError("acquisition-miss audit contradicts selected-B NVP")
-                    chosen_id = int(all_k_selection["chosen"]["candidate_id"])
-                    if chosen_id in selected_ids:
-                        raise RuntimeError("acquisition-miss witness was already in selected B")
                 stats["nvp_audit"] = nvp_audit
                 episode["nvp_audit"] = nvp_audit
             if route_metric_steps > 0 and control_t < route_metric_steps:
@@ -1250,6 +1273,14 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
     profile = get_scene_profile(cfg.scene_profile)
     scene = scene_snapshot(env, profile)
     assert_scene_snapshot(scene)
+    demo_reference = None
+    demo_provenance = None
+    if cfg.protocol_profile in {"v3_support_sweep", "v3_support_preflight"}:
+        demo_reference, demo_provenance = DS.load_authenticated_demo_reference(
+            checkpoint_path,
+            checkpoint_sha256,
+            load_tensors=cfg.demo_frac > 0.0,
+        )
     store = AC.DStore(
         conditioning_schema=cfg.conditioning_schema,
         condition_dim=cfg.raw_condition_dim,
@@ -1306,7 +1337,9 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             json.dump(calibration_public, stream, indent=2, sort_keys=True, allow_nan=False)
             stream.write("\n")
 
-        if cfg.protocol_profile == "v2_lineage_mass_smoke":
+        if cfg.protocol_profile in {"v3_support_sweep", "v3_support_preflight"}:
+            algorithm = "afe_rbf_low7_v3_optimizer_demo_support_v1"
+        elif cfg.protocol_profile == "v2_lineage_mass_smoke":
             algorithm = "afe_rbf_low7_v2_lineage_mass_smoke_v1"
         elif cfg.protocol_profile == "v2_smoke":
             algorithm = "afe_rbf_low7_v2_sample_complete_smoke_v2"
@@ -1349,7 +1382,20 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                 f"{replay_population}"
             )
         )
-        if cfg.replay_update_mode == "one_epoch_without_replacement":
+        if cfg.replay_update_mode == "fixed_macro_steps_exact_epoch":
+            update_description = (
+                f"positive-only gamma/episode/context/query equal-mass CFM lr "
+                f"{cfg.afe_lr:g}; one exact W2 D+ epoch partitioned into exactly "
+                f"{cfg.optimizer_steps_per_round} mass-balanced macro Adam updates; "
+                f"demo objective mass {cfg.demo_frac:g}; alpha 0, no prox"
+            )
+            optimizer_draws_per_round = None
+            optimizer_draw_interpretation = (
+                "exactly |eligible D+| unique positive draws; all positives appear once; "
+                "macro-batches are balanced by hierarchical loss mass and each macro-batch "
+                "causes exactly one Adam update"
+            )
+        elif cfg.replay_update_mode == "one_epoch_without_replacement":
             weighting_text = (
                 "gamma/episode/context/query equal-mass weighted"
                 if cfg.replay_loss_weighting
@@ -1433,7 +1479,9 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                 else None
             ),
             "replay_epochs": (
-                1 if cfg.replay_update_mode == "one_epoch_without_replacement" else None
+                1 if cfg.replay_update_mode in {
+                    "one_epoch_without_replacement", "fixed_macro_steps_exact_epoch"
+                } else None
             ),
             "gp_replay_window": cfg.gp_replay_window,
             "gp_replay_sampling": cfg.gp_replay_sampling,
@@ -1451,6 +1499,7 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                 f"proposal batch per control tick; {cfg.verifier_workers} persistent spawned CPU "
                 "verifier workers; no within-round GP update"
             ),
+            "verifier_workers": cfg.verifier_workers,
             "execution": (
                 f"{cfg.execution_rule}; execution-verified (full-H or certified goal prefix) "
                 "and, for nominal_hp rules, the first executed state satisfies the nominal "
@@ -1468,7 +1517,9 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
                 "|eligible D+|" if optimizer_draws_per_round is None else None
             ),
             "optimizer_steps_formula": (
-                "ceil(|eligible D+|/batch)"
+                str(cfg.optimizer_steps_per_round)
+                if cfg.replay_update_mode == "fixed_macro_steps_exact_epoch"
+                else "ceil(|eligible D+|/batch)"
                 if cfg.replay_update_mode == "one_epoch_without_replacement"
                 else str(cfg.afe_steps)
             ),
@@ -1481,6 +1532,21 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             "batch": cfg.batch,
             "afe_lr": cfg.afe_lr,
             "afe_steps": cfg.afe_steps,
+            "optimizer_steps_per_round": cfg.optimizer_steps_per_round,
+            "demo_frac": cfg.demo_frac,
+            "demo_objective_semantics": (
+                "L=(1-demo_frac)*L_pos + demo_frac*L_demo; both source losses "
+                "independently normalized; no update when W2 D+ is empty"
+                if demo_provenance is not None else None
+            ),
+            "demo_reference": (
+                demo_provenance.record() if demo_provenance is not None else None
+            ),
+            "demo_buffer_isolation": (
+                "authenticated TRAIN reference never enters D/D+, RBF GP, beta, "
+                "acquisition, verifier counts, execution, or raw evaluation"
+                if demo_provenance is not None else None
+            ),
             "grad_clip": cfg.grad_clip,
             "gradient_clip_semantics": (
                 "the declared replay measure defines the pre-clip objective; existing global "
@@ -1650,10 +1716,16 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
             update_start = time.perf_counter()
             replay_rng = np.random.default_rng(AFE2.named_seed(cfg.seed, "replay", round_i))
             with AC.isolated_random_state(AFE2.named_seed(cfg.seed, "update", round_i)):
-                update = SU.update_round_signed(
-                    policy, optimizer, store, cfg, device, replay_rng, round_i,
-                    alpha=cfg.negative_alpha,
-                )
+                if cfg.protocol_profile in {"v3_support_sweep", "v3_support_preflight"}:
+                    update = DS.update_round_support(
+                        policy, optimizer, store, cfg, device, replay_rng, round_i,
+                        demo_reference,
+                    )
+                else:
+                    update = SU.update_round_signed(
+                        policy, optimizer, store, cfg, device, replay_rng, round_i,
+                        alpha=cfg.negative_alpha,
+                    )
             update_seconds = time.perf_counter() - update_start
             policy.eval()
 
@@ -1930,12 +2002,22 @@ def validate_protocol_args(args) -> None:
         if args.K != 64 or args.B != 8 or args.batch != 128:
             raise ValueError("the first RBF study holds K=64, B=8, and batch=128 fixed")
         return
-    if args.protocol_profile not in {"v2_smoke", "v2_lineage_mass_smoke"}:
+    support_profile = args.protocol_profile in {
+        "v3_support_sweep", "v3_support_preflight"
+    }
+    if args.protocol_profile not in {
+        "v2_smoke", "v2_lineage_mass_smoke",
+        "v3_support_sweep", "v3_support_preflight",
+    }:
         raise ValueError(f"unknown RBF protocol profile: {args.protocol_profile}")
 
     exact = {
         "scene_profile": "low7_radius1_canonical_v1",
-        "rounds": 10,
+        "rounds": (
+            1 if args.protocol_profile == "v3_support_preflight"
+            else 100 if args.protocol_profile == "v3_support_sweep"
+            else 10
+        ),
         "rollout_replicas": 8,
         "K": 16,
         "B": 4,
@@ -1952,10 +2034,15 @@ def validate_protocol_args(args) -> None:
         "adaptive_beta_equalize_gammas": True,
         "replay_window": 2,
         "replay_sampling": "round_gamma_replica_context",
-        "replay_update_mode": "one_epoch_without_replacement",
+        "replay_update_mode": (
+            "fixed_macro_steps_exact_epoch"
+            if support_profile else "one_epoch_without_replacement"
+        ),
         "replay_loss_weighting": (
             "gamma_episode_context_query_equal_mass"
-            if args.protocol_profile == "v2_lineage_mass_smoke"
+            if args.protocol_profile in {
+                "v2_lineage_mass_smoke", "v3_support_sweep", "v3_support_preflight"
+            }
             else "query_uniform"
         ),
         "gp_replay_window": 2,
@@ -1964,7 +2051,9 @@ def validate_protocol_args(args) -> None:
         "negative_alpha": 0.0,
         "execution_rule": (
             "nominal_hp_max_step_margin"
-            if args.protocol_profile == "v2_lineage_mass_smoke"
+            if args.protocol_profile in {
+                "v2_lineage_mass_smoke", "v3_support_sweep", "v3_support_preflight"
+            }
             else "nominal_hp_max_step_margin_only"
         ),
         "conditioning_schema": CX.LOW7_SCHEMA,
@@ -1978,6 +2067,16 @@ def validate_protocol_args(args) -> None:
         "route_ambiguity_band": RM.DEFAULT_AMBIGUITY_BAND,
         "nvp_audit_all_k": args.protocol_profile == "v2_lineage_mass_smoke",
     }
+    if support_profile:
+        if getattr(args, "optimizer_steps_per_round", 0) not in {16, 32}:
+            raise ValueError("V3 support optimizer dose must be 16 or 32")
+        if getattr(args, "demo_frac", 0.0) not in {0.0, 0.125, 0.25}:
+            raise ValueError("V3 support demo objective mass must be 0, 0.125, or 0.25")
+    elif (
+        getattr(args, "optimizer_steps_per_round", 0) != 0
+        or getattr(args, "demo_frac", 0.0) != 0.0
+    ):
+        raise ValueError("optimizer-dose/demo options are exclusive to V3 support profiles")
     mismatches = []
     for name, expected in exact.items():
         actual = getattr(args, name)
@@ -1995,7 +2094,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--protocol-profile",
-        choices=("v1", "v2_smoke", "v2_lineage_mass_smoke"),
+        choices=(
+            "v1", "v2_smoke", "v2_lineage_mass_smoke",
+            "v3_support_sweep", "v3_support_preflight",
+        ),
         default="v1",
     )
     parser.add_argument("--ckpt", required=True)
@@ -2029,7 +2131,10 @@ def main():
     )
     parser.add_argument(
         "--replay-update-mode",
-        choices=("fixed_steps_with_replacement", "one_epoch_without_replacement"),
+        choices=(
+            "fixed_steps_with_replacement", "one_epoch_without_replacement",
+            "fixed_macro_steps_exact_epoch",
+        ),
         default="fixed_steps_with_replacement",
     )
     parser.add_argument(
@@ -2074,6 +2179,8 @@ def main():
     )
     parser.add_argument("--rbf-offline-sweep", action="store_true")
     parser.add_argument("--nvp-audit-all-k", action="store_true")
+    parser.add_argument("--optimizer-steps-per-round", type=int, default=0)
+    parser.add_argument("--demo-frac", type=float, default=0.0)
     parser.add_argument("--verifier-workers", type=int, default=16)
     parser.add_argument("--seed", type=int, default=910)
     args = parser.parse_args()
@@ -2085,10 +2192,14 @@ def main():
             raise ValueError("fixed-step replay requires positive AFE steps")
     elif args.afe_steps != 0:
         raise ValueError("exact-epoch replay requires --afe-steps 0 as a non-operative sentinel")
-    if args.replay_update_mode == "one_epoch_without_replacement" and args.negative_alpha != 0.0:
+    if args.replay_update_mode in {
+        "one_epoch_without_replacement", "fixed_macro_steps_exact_epoch"
+    } and args.negative_alpha != 0.0:
         raise ValueError("exact positive replay epoch currently requires negative alpha zero")
     if args.replay_loss_weighting != "query_uniform" and (
-        args.replay_update_mode != "one_epoch_without_replacement"
+        args.replay_update_mode not in {
+            "one_epoch_without_replacement", "fixed_macro_steps_exact_epoch"
+        }
         or args.replay_sampling != "round_gamma_replica_context"
         or args.negative_alpha != 0.0
     ):
@@ -2224,6 +2335,8 @@ def main():
         route_ambiguity_band=args.route_ambiguity_band,
         rbf_offline_sweep=args.rbf_offline_sweep,
         nvp_audit_all_k=args.nvp_audit_all_k,
+        optimizer_steps_per_round=args.optimizer_steps_per_round,
+        demo_frac=args.demo_frac,
         conditioning_schema=policy_contract.schema,
         raw_condition_dim=policy_contract.raw_condition_dim,
         freeze_visual_encoder=args.freeze_visual_encoder,
@@ -2236,7 +2349,7 @@ def main():
         f"replay_weighting={cfg.replay_loss_weighting} "
         f"gp_W={cfg.gp_replay_window} "
         f"ell_mult={cfg.lengthscale_multiplier:g} alpha={cfg.negative_alpha:g} "
-        f"steps={'dynamic' if cfg.afe_steps == 0 else cfg.afe_steps} "
+        f"steps={cfg.optimizer_steps_per_round if cfg.optimizer_steps_per_round else ('dynamic' if cfg.afe_steps == 0 else cfg.afe_steps)} "
         f"exec={cfg.execution_rule} nvp_allK_audit={cfg.nvp_audit_all_k} "
         f"frozen={len(trainability['frozen'])}",
         flush=True,
