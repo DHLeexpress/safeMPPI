@@ -136,12 +136,69 @@ def test_hierarchical_positive_replay_rejects_query_context_round_mismatch() -> 
         store.positive_replay_hierarchy(eligible_ids=store.pos_ids)
 
 
+def test_hierarchical_equal_mass_uses_every_query_and_equalizes_nested_cells() -> None:
+    store = _imbalanced_store()
+    # Add a second context with two positives to the already dominant
+    # (round 1, episode 0) lineage. This exercises both the context and query
+    # levels, not just gamma/episode balancing.
+    second_context = len(store.ctx_meta)
+    store.ctx_meta.append((1, 0, 1))
+    second_context_ids = []
+    for _ in range(2):
+        query_id = len(store.q_sid)
+        store.q_sid.append(second_context)
+        store.q_round.append(1)
+        store.q_gamma.append(0.1)
+        store.pos_ids.append(query_id)
+        second_context_ids.append(query_id)
+    mass, diagnostics = store.positive_hierarchy_equal_mass(
+        (0.1, 0.5),
+        eligible_ids=store.pos_ids
+    )
+
+    assert set(mass) == set(store.pos_ids)
+    assert sum(mass.values()) == pytest.approx(1.0)
+    assert diagnostics["missing_declared_gammas"] == []
+    assert diagnostics["mass_by_gamma"] == pytest.approx({"0.1": 0.5, "0.5": 0.5})
+    # Gamma .1 has three active episode instances, so each episode receives
+    # 1/6 total mass. The first episode has two contexts, hence 1/12 each,
+    # regardless of their 100-versus-2 positive query counts.
+    dominant = sum(mass[query_id] for query_id in range(100))
+    second = sum(mass[query_id] for query_id in second_context_ids)
+    singleton = mass[100]
+    assert dominant == pytest.approx(second)
+    assert dominant == pytest.approx(1.0 / 12.0)
+    assert singleton == pytest.approx(1.0 / 6.0)
+    assert mass[second_context_ids[0]] == pytest.approx(
+        mass[second_context_ids[1]]
+    )
+    assert diagnostics["episode_mass_max_error"] == pytest.approx(0.0)
+    assert diagnostics["context_mass_max_error"] == pytest.approx(0.0)
+    assert diagnostics["within_context_query_mass_max_error"] == pytest.approx(0.0)
+
+
+def test_hierarchical_equal_mass_canonicalizes_float32_gamma_and_reports_empty() -> None:
+    store = _imbalanced_store()
+    store.q_gamma[0] = float(np.float32(0.1))
+    mass, diagnostics = store.positive_hierarchy_equal_mass(
+        (0.1, 0.5, 0.7), eligible_ids=store.pos_ids
+    )
+    assert sum(mass.values()) == pytest.approx(1.0)
+    assert diagnostics["missing_declared_gammas"] == [0.7]
+    store.q_gamma[0] = 0.6
+    with pytest.raises(ValueError, match="not declared"):
+        store.positive_hierarchy_equal_mass(
+            (0.1, 0.5, 0.7), eligible_ids=store.pos_ids
+        )
+
+
 class _TinyPolicy(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.zeros(2))
         self.u_max = 1.0
         self.d = 2
+        self.seen_weight_batches = []
 
     def module_groups(self):
         return {"trunk": self}
@@ -158,9 +215,15 @@ class _TinyPolicy(torch.nn.Module):
         del time
         return values + self.weight + context
 
-    def cfm_loss(self, controls, context):
+    def cfm_loss(self, controls, context, weights=None):
         target = controls.mean(dim=1)
-        return (self.weight + context - target).square().mean()
+        per = (self.weight + context - target).square().mean(dim=1)
+        if weights is not None:
+            self.seen_weight_batches.append(
+                [float(value) for value in weights.detach()]
+            )
+            per = per * weights
+        return per.mean()
 
 
 def _trainable_store() -> AC.DStore:
@@ -255,3 +318,99 @@ def test_update_round_exact_epoch_has_dynamic_tail_and_full_unique_coverage(monk
     assert result["replay_epoch_coverage"] == 1.0
     assert result["replay_batch_sizes"] == [2, 1]
     assert set(result["drawn_ids"]) == set(store.pos_ids)
+
+
+def test_update_round_exact_epoch_applies_hierarchical_equal_mass_weights() -> None:
+    store = _trainable_store()
+    # Add nine extra positives to the first context so query-uniform replay
+    # would give that single lineage ten times the loss mass.
+    first_context = store.q_sid[0]
+    for _ in range(9):
+        query_id = len(store.q_sid)
+        store.q_sid.append(first_context)
+        store.q_round.append(1)
+        store.q_gamma.append(0.1)
+        store.q_U.append(np.asarray([[1.0, 0.0]], np.float32))
+        store.pos_ids.append(query_id)
+    policy = _TinyPolicy()
+    optimizer = torch.optim.SGD(policy.parameters(), lr=0.01)
+    cfg = SimpleNamespace(
+        arm="afe",
+        replay_window=2,
+        replay_sampling="round_gamma_replica_context",
+        replay_update_mode="one_epoch_without_replacement",
+        replay_loss_weighting="gamma_episode_context_query_equal_mass",
+        gammas=(0.1, 0.5),
+        batch=4,
+        afe_steps=0,
+        grad_clip=0.0,
+    )
+
+    result = AFE2.update_round(
+        policy,
+        optimizer,
+        store,
+        cfg,
+        torch.device("cpu"),
+        np.random.default_rng(5),
+        round_i=2,
+    )
+
+    assert result["replay_epoch_coverage"] == 1.0
+    assert result["replay_loss_weighting"] == (
+        "gamma_episode_context_query_equal_mass"
+    )
+    assert sum(len(batch) for batch in policy.seen_weight_batches) == len(store.pos_ids)
+    assert result["replay_population_weight_max"] > (
+        result["replay_population_weight_min"]
+    )
+    assert result["replay_applied_weight_max"] > result["replay_applied_weight_min"]
+    assert 0.0 < result["replay_weight_ess_fraction"] < 1.0
+
+
+def test_equal_mass_batch_weights_preserve_global_coefficients_with_tail(
+    monkeypatch,
+) -> None:
+    store = _trainable_store()
+    policy = _TinyPolicy()
+    optimizer = torch.optim.SGD(policy.parameters(), lr=0.01)
+    cfg = SimpleNamespace(
+        arm="afe",
+        replay_window=2,
+        replay_sampling="round_gamma_replica_context",
+        replay_update_mode="one_epoch_without_replacement",
+        replay_loss_weighting="gamma_episode_context_query_equal_mass",
+        gammas=(0.1, 0.5),
+        batch=2,
+        afe_steps=0,
+        grad_clip=0.0,
+    )
+    mass, _ = store.positive_hierarchy_equal_mass(
+        cfg.gammas, eligible_ids=store.pos_ids
+    )
+    batch_ids = []
+    original = store.positive_batch
+
+    def batch_spy(query_ids):
+        batch_ids.append(list(query_ids))
+        return original(query_ids)
+
+    monkeypatch.setattr(store, "positive_batch", batch_spy)
+    AFE2.update_round(
+        policy,
+        optimizer,
+        store,
+        cfg,
+        torch.device("cpu"),
+        np.random.default_rng(3),
+        round_i=2,
+    )
+
+    assert [len(ids) for ids in batch_ids] == [2, 1]
+    steps = len(batch_ids)
+    for ids, weights in zip(batch_ids, policy.seen_weight_batches):
+        batch_size = len(ids)
+        for query_id, weight in zip(ids, weights):
+            assert weight / batch_size == pytest.approx(
+                steps * mass[query_id]
+            )

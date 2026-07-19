@@ -20,6 +20,8 @@ DIAGNOSTICS = ROOT / "analysis" / "afe_rbf_sweep_diagnostics.py"
 VIDEO = ROOT / "video_afe2.py"
 SCENE = "low7_radius1_canonical_v1"
 EVAL_PROFILE = "v2_smoke_m10_every_round"
+BASELINE_STUDY = "baseline"
+LINEAGE_MASS_STUDY = "lineage_mass"
 
 
 def sha256_file(path: Path) -> str:
@@ -31,10 +33,26 @@ def sha256_file(path: Path) -> str:
 
 
 def trainer_command(args, run_dir: Path) -> list[str]:
-    return [
+    study_profile = args.study_profile
+    if study_profile not in {BASELINE_STUDY, LINEAGE_MASS_STUDY}:
+        raise ValueError(f"unknown V2 study profile: {study_profile}")
+    protocol_profile = (
+        "v2_lineage_mass_smoke"
+        if study_profile == LINEAGE_MASS_STUDY else "v2_smoke"
+    )
+    execution_rule = (
+        "nominal_hp_max_step_margin"
+        if study_profile == LINEAGE_MASS_STUDY
+        else "nominal_hp_max_step_margin_only"
+    )
+    replay_loss_weighting = (
+        "gamma_episode_context_query_equal_mass"
+        if study_profile == LINEAGE_MASS_STUDY else "query_uniform"
+    )
+    command = [
         args.python,
         str(TRAINER),
-        "--protocol-profile", "v2_smoke",
+        "--protocol-profile", protocol_profile,
         "--ckpt", str(args.ckpt),
         "--expected-ckpt-sha256", args.expected_ckpt_sha256,
         "--scene-profile", SCENE,
@@ -57,11 +75,12 @@ def trainer_command(args, run_dir: Path) -> list[str]:
         "--replay-window", "2",
         "--replay-sampling", "round_gamma_replica_context",
         "--replay-update-mode", "one_epoch_without_replacement",
+        "--replay-loss-weighting", replay_loss_weighting,
         "--gp-replay-window", "2",
         "--gp-replay-sampling", "round_gamma_replica_context",
         "--lengthscale-multiplier", "1.0",
         "--negative-alpha", "0",
-        "--execution-rule", "nominal_hp_max_step_margin_only",
+        "--execution-rule", execution_rule,
         "--conditioning-schema", "low7_closest_boundary",
         "--freeze-visual-encoder",
         "--skip-training-probes",
@@ -73,6 +92,9 @@ def trainer_command(args, run_dir: Path) -> list[str]:
         "--verifier-workers", str(args.verifier_workers),
         "--seed", "910",
     ]
+    if study_profile == LINEAGE_MASS_STUDY:
+        command.append("--nvp-audit-all-k")
+    return command
 
 
 def _run(command: list[str], log_path: Path) -> None:
@@ -121,6 +143,11 @@ def main() -> None:
     parser.add_argument("--expected-ckpt-sha256", required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--verifier-workers", type=int, default=64)
+    parser.add_argument(
+        "--study-profile",
+        choices=(BASELINE_STUDY, LINEAGE_MASS_STUDY),
+        required=True,
+    )
     parser.add_argument(
         "--python",
         default="/home/dohyun/miniforge3/envs/cfm_mppi/bin/python",
@@ -212,6 +239,16 @@ def main() -> None:
                 "bytes": destination.stat().st_size,
             }
         )
+    gallery_source = evaluation_dir / "raw_m10_r0_best_final_gallery.png"
+    gallery_path = args.out / "gallery.png"
+    if not gallery_source.is_file() or gallery_source.stat().st_size == 0:
+        raise RuntimeError(f"V2 true-evaluation gallery is missing: {gallery_source}")
+    shutil.copy2(gallery_source, gallery_path)
+    gallery_record = {
+        "path": str(gallery_path),
+        "sha256": sha256_file(gallery_path),
+        "bytes": gallery_path.stat().st_size,
+    }
     _run(diagnostics, args.out / "diagnostic.log")
     _run(video, args.out / "video.log")
     completion = _load_json(evaluation_dir / "EVALUATION_COMPLETE.json")
@@ -224,17 +261,26 @@ def main() -> None:
     video_record = _video_record(video_path, expected_frames=10)
 
     manifest = {
-        "status": "LOW7_RBF_V2_SMOKE_DELIVERY_COMPLETE",
+        "status": (
+            "LOW7_RBF_V2_LINEAGE_MASS_SMOKE_DELIVERY_COMPLETE"
+            if args.study_profile == LINEAGE_MASS_STUDY
+            else "LOW7_RBF_V2_SMOKE_DELIVERY_COMPLETE"
+        ),
         "source_git_commit": source_commit,
         "scene_profile": SCENE,
         "checkpoint": str(args.ckpt),
         "checkpoint_sha256": args.expected_ckpt_sha256,
         "elapsed_seconds": time.time() - started,
-        "protocol": "v2_smoke",
+        "protocol": (
+            "v2_lineage_mass_smoke"
+            if args.study_profile == LINEAGE_MASS_STUDY else "v2_smoke"
+        ),
+        "study_profile": args.study_profile,
         "evaluation_profile": EVAL_PROFILE,
         "run": str(run_dir),
         "evaluation": str(evaluation_dir),
         "true_evaluation_reports": report_records,
+        "true_evaluation_gallery": gallery_record,
         "presentation": str(presentation_dir),
         "training_diagnostic": str(diagnostic_path),
         "training_video": video_record,
@@ -250,7 +296,10 @@ def main() -> None:
     with (args.out / "DELIVERY_COMPLETE.json").open("x") as stream:
         json.dump(manifest, stream, indent=2, sort_keys=True, allow_nan=False)
         stream.write("\n")
-    print(f"LOW7 RBF V2 SMOKE COMPLETE: {args.out}", flush=True)
+    print(
+        f"LOW7 RBF V2 {args.study_profile.upper()} SMOKE COMPLETE: {args.out}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

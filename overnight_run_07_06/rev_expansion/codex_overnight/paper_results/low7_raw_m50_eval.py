@@ -82,6 +82,7 @@ SUPPORTED_ALGORITHMS = {
     "afe_rbf_low7_signed_execution_sweep_v1",
     "afe_rbf_low7_v2_smoke_v1",
     "afe_rbf_low7_v2_sample_complete_smoke_v2",
+    "afe_rbf_low7_v2_lineage_mass_smoke_v1",
 }
 
 

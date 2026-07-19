@@ -775,10 +775,22 @@ def update_round(policy, opt, store, cfg, device, rng, round_i=None):
     replay_update_mode = getattr(
         cfg, "replay_update_mode", "fixed_steps_with_replacement"
     )
+    replay_loss_weighting = getattr(cfg, "replay_loss_weighting", "query_uniform")
     if replay_update_mode not in {
         "fixed_steps_with_replacement", "one_epoch_without_replacement"
     }:
         raise ValueError(f"unknown replay update mode: {replay_update_mode}")
+    if replay_loss_weighting not in {
+        "query_uniform", "gamma_episode_context_query_equal_mass"
+    }:
+        raise ValueError(f"unknown replay loss weighting: {replay_loss_weighting}")
+    if replay_loss_weighting != "query_uniform" and (
+        replay_update_mode != "one_epoch_without_replacement"
+        or replay_sampling != "round_gamma_replica_context"
+    ):
+        raise ValueError(
+            "hierarchical equal-mass loss requires hierarchical exact-epoch replay"
+        )
     if cfg.arm == "prox" and replay_update_mode != "fixed_steps_with_replacement":
         raise ValueError("prox update does not support exact-epoch replay")
     if int(cfg.batch) < 1:
@@ -799,6 +811,8 @@ def update_round(policy, opt, store, cfg, device, rng, round_i=None):
     trainable = [p for p in policy.parameters() if p.requires_grad]
     refs = [p.detach().clone() for p in trainable] if cfg.arm == "prox" else None
     epoch_batches = None
+    weight_by_id = None
+    replay_mass_diagnostics = None
     if replay_update_mode == "one_epoch_without_replacement":
         epoch_ids = store.positive_epoch_ids(
             rng,
@@ -815,12 +829,22 @@ def update_round(policy, opt, store, cfg, device, rng, round_i=None):
             offset += size
         if offset != len(epoch_ids):
             raise RuntimeError("failed to partition the exact positive replay epoch")
+        if replay_loss_weighting == "gamma_episode_context_query_equal_mass":
+            weight_by_id, replay_mass_diagnostics = (
+                store.positive_hierarchy_equal_mass(
+                    cfg.gammas,
+                    eligible_ids=eligible_ids,
+                )
+            )
     else:
         n_steps = cfg.prox_max_inner if cfg.arm == "prox" else cfg.afe_steps
     probe = v_before = None
     drawn_ids = {}
     cfm_hist, fstep_hist = [], []
     gnorm = {k: [] for k in groups}
+    preclip_norm_hist = []
+    applied_weight_hist = []
+    clipped_steps = 0
     stop = "all_steps"
     for k_step in range(n_steps):
         if epoch_batches is not None:
@@ -849,7 +873,28 @@ def update_round(policy, opt, store, cfg, device, rng, round_i=None):
             with torch.no_grad():
                 v_before = policy.forward(xa, ta, policy._expand_ctx(ctxa, na)).detach()
             probe = (xa, ta, ctxa, na)
-        cfm = policy.cfm_loss(U, policy.ctx_from(G, L, Hh))
+        cfm_weights = (
+            None
+            if weight_by_id is None
+            else torch.as_tensor(
+                [
+                    len(ids) * n_steps * weight_by_id[int(query_id)]
+                    for query_id in ids
+                ],
+                dtype=U.dtype,
+                device=device,
+            )
+        )
+        applied_weight_hist.extend(
+            [1.0] * len(ids)
+            if cfm_weights is None
+            else [float(value) for value in cfm_weights.detach().cpu()]
+        )
+        cfm = policy.cfm_loss(
+            U,
+            policy.ctx_from(G, L, Hh),
+            **({} if cfm_weights is None else {"weights": cfm_weights}),
+        )
         loss = cfm
         if cfg.arm == "prox":
             loss = loss + sum(((p - r) ** 2).sum() for p, r in zip(trainable, refs)) / (2.0 * cfg.prox_eta)
@@ -858,7 +903,9 @@ def update_round(policy, opt, store, cfg, device, rng, round_i=None):
         for kg, ps in groups.items():
             gnorm[kg].append(float(sum((p.grad ** 2).sum() for p in ps if p.grad is not None)) ** 0.5)
         if cfg.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(trainable, cfg.grad_clip)
+            preclip_norm = float(torch.nn.utils.clip_grad_norm_(trainable, cfg.grad_clip))
+            preclip_norm_hist.append(preclip_norm)
+            clipped_steps += int(preclip_norm > float(cfg.grad_clip))
         opt.step()
         cfm_hist.append(float(cfm.detach()))
         xa, ta, ctxa, na = probe
@@ -899,6 +946,17 @@ def update_round(policy, opt, store, cfg, device, rng, round_i=None):
         if duplicate_draws != 0 or len(drawn_ids) != len(eligible_ids):
             raise RuntimeError("exact replay epoch did not use every eligible positive once")
         stop = "one_epoch_complete"
+    replay_mass = (
+        np.full(len(eligible_ids), 1.0 / len(eligible_ids), dtype=np.float64)
+        if weight_by_id is None
+        else np.asarray(
+            [weight_by_id[int(query_id)] for query_id in eligible_ids],
+            dtype=np.float64,
+        )
+    )
+    replay_weight_ess = float(
+        replay_mass.sum() ** 2 / np.square(replay_mass).sum()
+    )
     return dict(steps=len(cfm_hist), stop=stop, cfm=float(np.mean(cfm_hist)),
                 cfm_first=cfm_hist[0], cfm_last=cfm_hist[-1],
                 fstep_final=fstep_hist[-1], fstep_max=max(fstep_hist),
@@ -907,6 +965,32 @@ def update_round(policy, opt, store, cfg, device, rng, round_i=None):
                 replay_window=replay_window, replay_eligible=len(eligible_ids),
                 replay_sampling=replay_sampling,
                 replay_update_mode=replay_update_mode,
+                replay_loss_weighting=replay_loss_weighting,
+                replay_raw_mass_sum=float(replay_mass.sum()),
+                replay_population_weight_min=float(
+                    len(replay_mass) * replay_mass.min()
+                ),
+                replay_population_weight_max=float(
+                    len(replay_mass) * replay_mass.max()
+                ),
+                replay_population_weight_mean=float(
+                    len(replay_mass) * replay_mass.mean()
+                ),
+                replay_applied_weight_min=float(min(applied_weight_hist)),
+                replay_applied_weight_max=float(max(applied_weight_hist)),
+                replay_applied_weight_mean=float(np.mean(applied_weight_hist)),
+                replay_weight_ess=replay_weight_ess,
+                replay_weight_ess_fraction=float(
+                    replay_weight_ess / len(replay_mass)
+                ),
+                replay_mass_diagnostics=replay_mass_diagnostics,
+                preclip_grad_norm_mean=(
+                    float(np.mean(preclip_norm_hist)) if preclip_norm_hist else None
+                ),
+                grad_clipped_steps=int(clipped_steps),
+                grad_clipped_fraction=(
+                    float(clipped_steps / len(cfm_hist)) if cfm_hist else 0.0
+                ),
                 optimizer_draws=total_draws,
                 replay_duplicate_draws=int(duplicate_draws),
                 replay_epoch_coverage=epoch_coverage,

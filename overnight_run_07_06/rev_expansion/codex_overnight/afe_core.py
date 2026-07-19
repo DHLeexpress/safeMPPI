@@ -417,6 +417,125 @@ class DStore:
             ).setdefault(context_id, []).append(query_id)
         return hierarchy
 
+    def positive_hierarchy_equal_mass(self, declared_gammas, *, eligible_ids=None):
+        """Return gamma/episode/context/query-equal mass on positive support.
+
+        Episode instances are keyed by ``(round, stored episode id)`` because
+        episode ids repeat across expansion rounds.  Empty groups cannot carry
+        positive CFM mass and are reported rather than invented.
+        """
+
+        population = [
+            int(query_id)
+            for query_id in (self.pos_ids if eligible_ids is None else eligible_ids)
+        ]
+        if not population:
+            return {}, {
+                "declared_gammas": [round(float(value), 8) for value in declared_gammas],
+                "active_gammas": [],
+                "missing_declared_gammas": [
+                    round(float(value), 8) for value in declared_gammas
+                ],
+                "raw_mass_sum": 0.0,
+                "episode_mass_max_error": None,
+                "context_mass_max_error": None,
+                "within_context_query_mass_max_error": None,
+            }
+        if len(set(population)) != len(population):
+            raise ValueError("positive replay mass population contains duplicate query ids")
+        storage_map = CX.declared_gamma_storage_map(declared_gammas)
+        declared = sorted(storage_map.values())
+        groups = {}
+        for query_id in population:
+            context_id = int(self.q_sid[query_id])
+            if not 0 <= context_id < len(self.ctx_meta):
+                raise IndexError(f"positive query has invalid context id: {context_id}")
+            meta = self.ctx_meta[context_id]
+            if len(meta) != 3:
+                raise RuntimeError(f"stored context metadata is malformed: {meta}")
+            query_round = int(self.q_round[query_id])
+            if int(meta[0]) != query_round:
+                raise RuntimeError(
+                    f"query/context round mismatch: query={query_round}, context={meta[0]}"
+                )
+            gamma = CX.canonical_declared_gamma(
+                self.q_gamma[query_id], storage_map
+            )
+            episode_instance = (query_round, int(meta[1]))
+            groups.setdefault(gamma, {}).setdefault(episode_instance, {}).setdefault(
+                context_id, []
+            ).append(query_id)
+
+        mass = {}
+        gamma_mass = 1.0 / len(groups)
+        for episode_map in groups.values():
+            episode_mass = gamma_mass / len(episode_map)
+            for context_map in episode_map.values():
+                context_mass = episode_mass / len(context_map)
+                for query_ids in context_map.values():
+                    query_mass = context_mass / len(query_ids)
+                    for query_id in query_ids:
+                        mass[query_id] = float(query_mass)
+        if set(mass) != set(population):
+            raise RuntimeError("hierarchical replay mass does not cover the population")
+        total = float(sum(mass.values()))
+        if not np.isclose(total, 1.0, rtol=0.0, atol=1.0e-10):
+            raise RuntimeError(f"hierarchical replay mass sums to {total}, not one")
+        active = sorted(groups)
+        episode_mass_errors = []
+        context_mass_errors = []
+        within_context_query_mass_errors = []
+        for gamma, episode_map in groups.items():
+            target_episode_mass = gamma_mass / len(episode_map)
+            for context_map in episode_map.values():
+                observed_episode_mass = sum(
+                    mass[query_id]
+                    for query_ids in context_map.values()
+                    for query_id in query_ids
+                )
+                episode_mass_errors.append(
+                    abs(observed_episode_mass - target_episode_mass)
+                )
+                target_context_mass = target_episode_mass / len(context_map)
+                for query_ids in context_map.values():
+                    observed_context_mass = sum(mass[query_id] for query_id in query_ids)
+                    context_mass_errors.append(
+                        abs(observed_context_mass - target_context_mass)
+                    )
+                    target_query_mass = target_context_mass / len(query_ids)
+                    within_context_query_mass_errors.extend(
+                        abs(mass[query_id] - target_query_mass)
+                        for query_id in query_ids
+                    )
+        return mass, {
+            "declared_gammas": declared,
+            "active_gammas": active,
+            "missing_declared_gammas": [
+                gamma for gamma in declared if gamma not in groups
+            ],
+            "positive_episode_instances": int(sum(len(value) for value in groups.values())),
+            "positive_contexts": int(sum(
+                len(context_map)
+                for episode_map in groups.values()
+                for context_map in episode_map.values()
+            )),
+            "mass_by_gamma": {
+                str(gamma): float(sum(
+                    mass[query_id]
+                    for context_map in groups[gamma].values()
+                    for query_ids in context_map.values()
+                    for query_id in query_ids
+                ))
+                for gamma in active
+            },
+            "raw_mass_sum": total,
+            "episode_mass_max_error": float(max(episode_mass_errors, default=0.0)),
+            "context_mass_max_error": float(max(context_mass_errors, default=0.0)),
+            "within_context_query_mass_max_error": float(max(
+                within_context_query_mass_errors, default=0.0
+            )),
+        }
+
     def sample_positive_ids(
         self,
         nb,

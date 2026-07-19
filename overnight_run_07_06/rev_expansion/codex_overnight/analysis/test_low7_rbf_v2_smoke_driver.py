@@ -17,6 +17,7 @@ def test_v2_driver_pins_the_qualification_recipe(tmp_path: Path) -> None:
         ckpt=tmp_path / "checkpoint.pt",
         expected_ckpt_sha256="a" * 64,
         verifier_workers=32,
+        study_profile=DR.BASELINE_STUDY,
     )
     command = DR.trainer_command(args, tmp_path / "run")
 
@@ -35,6 +36,7 @@ def test_v2_driver_pins_the_qualification_recipe(tmp_path: Path) -> None:
     assert value("--replay-window") == "2"
     assert value("--replay-sampling") == "round_gamma_replica_context"
     assert value("--replay-update-mode") == "one_epoch_without_replacement"
+    assert value("--replay-loss-weighting") == "query_uniform"
     assert value("--gp-replay-window") == "2"
     assert value("--gp-replay-sampling") == "round_gamma_replica_context"
     assert value("--lengthscale-multiplier") == "1.0"
@@ -45,6 +47,28 @@ def test_v2_driver_pins_the_qualification_recipe(tmp_path: Path) -> None:
     assert value("--route-metric-steps") == "10"
     assert "--skip-training-probes" in command
     assert "--freeze-visual-encoder" in command
+    assert "--nvp-audit-all-k" not in command
+
+
+def test_v2_lineage_mass_driver_pins_the_structural_smoke(tmp_path: Path) -> None:
+    args = SimpleNamespace(
+        python="python",
+        ckpt=tmp_path / "checkpoint.pt",
+        expected_ckpt_sha256="a" * 64,
+        verifier_workers=64,
+        study_profile=DR.LINEAGE_MASS_STUDY,
+    )
+    command = DR.trainer_command(args, tmp_path / "run")
+
+    def value(flag: str) -> str:
+        return command[command.index(flag) + 1]
+
+    assert value("--protocol-profile") == "v2_lineage_mass_smoke"
+    assert value("--replay-loss-weighting") == (
+        "gamma_episode_context_query_equal_mass"
+    )
+    assert value("--execution-rule") == "nominal_hp_max_step_margin"
+    assert "--nvp-audit-all-k" in command
 
 
 def test_v2_wrapper_enforces_exclusive_gpu_and_single_driver() -> None:
@@ -52,6 +76,9 @@ def test_v2_wrapper_enforces_exclusive_gpu_and_single_driver() -> None:
     assert "CUDA_VISIBLE_DEVICES=$PHYSICAL_INDEX" in wrapper
     assert "query-compute-apps=pid" in wrapper
     assert "low7_rbf_v2_smoke_driver.py" in wrapper
+    assert "STUDY_PROFILE" in wrapper
+    assert '${STUDY_PROFILE:-baseline}' not in wrapper
+    assert 'set STUDY_PROFILE explicitly' in wrapper
     assert (ROOT / "video_afe2.py").is_file()
 
 

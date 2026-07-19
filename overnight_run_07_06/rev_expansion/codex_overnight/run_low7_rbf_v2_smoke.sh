@@ -13,6 +13,7 @@ PHYSICAL_INDEX=$4
 EXPECTED_UUID=$5
 PYTHON_BIN=${PYTHON:-/home/dohyun/miniforge3/envs/cfm_mppi/bin/python}
 VERIFIER_WORKERS=${VERIFIER_WORKERS:-64}
+: "${STUDY_PROFILE:?set STUDY_PROFILE explicitly to baseline or lineage_mass}"
 HERE=$(cd "$(dirname "$0")" && pwd)
 
 if [[ ! -f "$CKPT" || ! "$EXPECTED_SHA" =~ ^[0-9a-f]{64}$ ]]; then
@@ -25,6 +26,10 @@ if [[ ! "$PHYSICAL_INDEX" =~ ^[0-9]+$ || ! "$EXPECTED_UUID" == GPU-* ]]; then
 fi
 if [[ ! "$VERIFIER_WORKERS" =~ ^[1-9][0-9]*$ ]]; then
   echo "VERIFIER_WORKERS must be a positive integer" >&2
+  exit 2
+fi
+if [[ "$STUDY_PROFILE" != "baseline" && "$STUDY_PROFILE" != "lineage_mass" ]]; then
+  echo "STUDY_PROFILE must be baseline or lineage_mass" >&2
   exit 2
 fi
 if [[ -e "$OUT" ]]; then
@@ -63,4 +68,5 @@ exec "$PYTHON_BIN" analysis/low7_rbf_v2_smoke_driver.py \
   --expected-ckpt-sha256 "$EXPECTED_SHA" \
   --out "$OUT" \
   --verifier-workers "$VERIFIER_WORKERS" \
+  --study-profile "$STUDY_PROFILE" \
   --python "$PYTHON_BIN"

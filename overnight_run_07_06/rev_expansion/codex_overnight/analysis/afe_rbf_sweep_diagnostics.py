@@ -115,8 +115,14 @@ def render(run: Path, output: Path) -> None:
     coverage = _series(rows, "replay_epoch_coverage")
     if np.isfinite(coverage).any():
         ax.plot(rounds, coverage, marker=".", label="eligible unique coverage")
+    weight_ess = _series(rows, "replay_weight_ess_fraction")
+    if np.isfinite(weight_ess).any():
+        ax.plot(rounds, weight_ess, marker=".", label="positive-weight ESS")
+    clipped = _series(rows, "grad_clipped_fraction")
+    if np.isfinite(clipped).any():
+        ax.plot(rounds, clipped, marker=".", label="clipped optimizer steps")
     ax.set(
-        title="Replay recency and coverage",
+        title="Replay measure diagnostics",
         xlabel="round",
         ylabel="fraction",
     )

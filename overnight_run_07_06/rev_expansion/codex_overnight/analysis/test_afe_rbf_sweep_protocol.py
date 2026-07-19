@@ -205,7 +205,16 @@ def _result(*, y, exec_y=None, exec_prog=0.0, terminal_rescue=False):
     }
 
 
-def _run_one_step(monkeypatch, candidates, results, execution_rule, hp):
+def _run_one_step(
+    monkeypatch,
+    candidates,
+    results,
+    execution_rule,
+    hp,
+    *,
+    query_budget=None,
+    nvp_audit_all_k=False,
+):
     count = len(candidates)
     env = SimpleNamespace(
         x0=torch.tensor((0.0, 0.0, 0.0, 0.0)),
@@ -219,7 +228,7 @@ def _run_one_step(monkeypatch, candidates, results, execution_rule, hp):
         taskspace_epsilon=2.0,
         conditioning_schema=CX.LOW5_SCHEMA,
         K=count,
-        B=count,
+        B=count if query_budget is None else int(query_budget),
         T=1,
         reach=0.01,
         seed=910,
@@ -228,6 +237,7 @@ def _run_one_step(monkeypatch, candidates, results, execution_rule, hp):
         s=0.9,
         beta=0.1,
         execution_rule=execution_rule,
+        nvp_audit_all_k=bool(nvp_audit_all_k),
     )
     store = AC.DStore(conditioning_schema=CX.LOW5_SCHEMA, condition_dim=5)
     viz = []
@@ -265,7 +275,7 @@ def _run_one_step(monkeypatch, candidates, results, execution_rule, hp):
         lambda *_args, **_kwargs: (hp, (None, None, None)),
     )
 
-    episodes, _ = R.run_parallel_episodes(
+    episodes, timings = R.run_parallel_episodes(
         _Policy(candidates),
         _GP(),
         env,
@@ -279,7 +289,7 @@ def _run_one_step(monkeypatch, candidates, results, execution_rule, hp):
         viz=viz,
         purpose="gather",
     )
-    return episodes[0], store, viz[0]
+    return episodes[0], store, viz[0], timings
 
 
 def test_legacy_selector_keeps_terminal_prefix_max_horizon_behavior(monkeypatch) -> None:
@@ -299,7 +309,7 @@ def test_legacy_selector_keeps_terminal_prefix_max_horizon_behavior(monkeypatch)
         lambda *_args, **_kwargs: pytest.fail("legacy execution called the H_P helper"),
     )
 
-    episode, store, frame = _run_one_step(
+    episode, store, frame, _ = _run_one_step(
         monkeypatch,
         candidates,
         results,
@@ -327,7 +337,7 @@ def test_nominal_selector_maps_exec_y_hp_gate_without_relabeling_dplus(monkeypat
         _result(y=1, exec_y=1, exec_prog=1.0),
     ]
 
-    episode, store, frame = _run_one_step(
+    episode, store, frame, _ = _run_one_step(
         monkeypatch,
         candidates,
         results,
@@ -356,7 +366,7 @@ def test_nominal_selector_nvp_is_fail_closed_and_keeps_full_labels(monkeypatch) 
     ], dtype=np.float32)
     results = [_result(y=1, exec_y=1), _result(y=1, exec_y=1)]
 
-    episode, store, frame = _run_one_step(
+    episode, store, frame, _ = _run_one_step(
         monkeypatch,
         candidates,
         results,
@@ -374,3 +384,77 @@ def test_nominal_selector_nvp_is_fail_closed_and_keeps_full_labels(monkeypatch) 
     assert store.q_nvp_negative == [1, 1]
     assert frame["sel"] == -1
     assert frame["exec_verified_hp_y"] == [0, 0]
+
+
+def test_all_k_nvp_audit_is_observation_only(monkeypatch) -> None:
+    candidates = np.asarray([
+        [[0.4, 0.0]],
+        [[0.8, 0.0]],
+        [[-0.2, 0.0]],  # eligible, but outside the selected first B
+        [[1.2, 0.0]],
+    ], dtype=np.float32)
+    results = [_result(y=1, exec_y=1) for _ in candidates]
+
+    def hp(points):
+        x = np.asarray(points)[:, 0]
+        return np.where(x < 0.0, 1.0, np.where(np.isclose(x, 0.0), 1.0, 0.0))
+
+    without, store_without, frame_without, timing_without = _run_one_step(
+        monkeypatch,
+        candidates,
+        results,
+        R.EX.MAX_STEP_MARGIN,
+        hp,
+        query_budget=2,
+        nvp_audit_all_k=False,
+    )
+    with_audit, store_with, frame_with, timing_with = _run_one_step(
+        monkeypatch,
+        candidates,
+        results,
+        R.EX.MAX_STEP_MARGIN,
+        hp,
+        query_budget=2,
+        nvp_audit_all_k=True,
+    )
+
+    assert without["status"] == with_audit["status"] == "nvp"
+    assert without["term_t"] == with_audit["term_t"] == 0
+    np.testing.assert_array_equal(without["path"], with_audit["path"])
+    assert store_without.q_sid == store_with.q_sid == [0, 0]
+    assert store_without.pos_ids == store_with.pos_ids == [0, 1]
+    assert store_without.q_exec == store_with.q_exec == [0, 0]
+    assert store_without.q_nvp_negative == store_with.q_nvp_negative == [1, 1]
+    assert frame_without["drawn"] == frame_with["drawn"] == [0, 1]
+    assert frame_without["sel"] == frame_with["sel"] == -1
+    assert frame_without["nvp_audit"] is None
+    assert frame_with["nvp_audit"]["classification"] == (
+        "selected_B_acquisition_miss"
+    )
+    assert frame_with["nvp_audit"]["audit_extra_verifications"] == 2
+    assert timing_without["nvp_audit_verifier_wall"] == 0.0
+    assert timing_with["nvp_audit_verifier_wall"] >= 0.0
+
+
+def test_all_k_nvp_audit_does_not_run_after_selected_b_success(monkeypatch) -> None:
+    candidates = np.asarray([
+        [[-0.2, 0.0]],
+        [[0.8, 0.0]],
+        [[1.2, 0.0]],
+    ], dtype=np.float32)
+    results = [_result(y=1, exec_y=1) for _ in candidates]
+
+    episode, store, frame, timings = _run_one_step(
+        monkeypatch,
+        candidates,
+        results,
+        R.EX.MAX_STEP_MARGIN,
+        lambda points: np.ones(len(points)),
+        query_budget=1,
+        nvp_audit_all_k=True,
+    )
+
+    assert episode["status"] != "nvp"
+    assert len(store.q_sid) == 1
+    assert frame["nvp_audit"] is None
+    assert timings["nvp_audit_verifier_wall"] == 0.0
