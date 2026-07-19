@@ -17,6 +17,7 @@ import math
 import multiprocessing as mp
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -1070,68 +1071,56 @@ def _render_curves(
     profile = resolve_evaluation_profile(eval_profile)
     lookup = _row_lookup(metric_rows)
     specs = [
-        ("SR", "success rate"),
-        ("CR", "collision / OOB rate"),
-        ("timeout", "timeout rate"),
-        ("V_safe", "whole-trajectory V_safe"),
-        ("V_full", "whole-trajectory V_full"),
-        ("clearance", "mean minimum clearance [m]"),
-        ("time", "successful time-to-goal [s]"),
-        ("route_balance", "Successful U/R diversity at central obstacle"),
+        ("SR", "SR"),
+        ("CR", "CR / OOB"),
+        ("timeout", "Timeout"),
+        ("V_safe", r"$V_{safe}$"),
+        ("V_full", r"$V_{full}$"),
+        ("clearance", "Min. clearance [m]"),
+        ("time", "Time-to-goal [s]"),
+        ("route_balance", "U/R balance"),
     ]
     cmap = plt.get_cmap("plasma")
     colors = {
         gamma: cmap(0.08 + 0.84 * index / (len(GAMMAS) - 1))
         for index, gamma in enumerate(GAMMAS)
     }
-    fig, axes = plt.subplots(2, 5, figsize=(25, 9), squeeze=False)
-    for ax, (key, title) in zip(axes.flat, specs):
+    fig, axes = plt.subplots(2, 4, figsize=(17, 8), squeeze=False)
+    for plot_index, (ax, (key, title)) in enumerate(zip(axes.flat, specs)):
         for gamma in GAMMAS:
             series = [lookup[(round_i, gamma)] for round_i in rounds]
             values, _, _ = _metric_series(series, key)
             ax.plot(rounds, values, color=colors[gamma], lw=1.1, alpha=0.68)
         pooled = [lookup[(round_i, None)] for round_i in rounds]
         values, lower, upper = _metric_series(pooled, key)
-        ax.plot(rounds, values, color="black", lw=2.6, label="pooled")
+        ax.plot(rounds, values, color="black", lw=2.6)
         ax.fill_between(rounds, lower, upper, color="black", alpha=0.12, lw=0)
-        ax.axvline(best_round, color="#0072b2", ls="--", lw=1.2, label="post-hoc best")
-        ax.axvline(rounds[-1], color="0.4", ls=":", lw=1.1, label="final")
+        ax.axvline(best_round, color="#0072b2", ls="--", lw=1.2)
+        ax.axvline(rounds[-1], color="0.4", ls=":", lw=1.1)
         ax.set_title(title)
-        ax.set_xlabel("stored checkpoint round")
+        if plot_index >= 4:
+            ax.set_xlabel("round")
         ax.grid(alpha=0.25)
         if key in ("SR", "CR", "timeout", "V_safe", "V_full", "route_balance"):
             ax.set_ylim(-0.03, 1.03)
-        ax.legend(fontsize=7, loc="best")
-    for ax in axes.flat[len(specs):]:
-        ax.axis("off")
-    info_ax = axes.flat[len(specs)]
-    selected = lookup[(best_round, None)]
-    info_ax.text(
-        0.03,
-        0.95,
-        "Post-hoc selected checkpoint\n"
-        f"r{best_round}\n\n"
-        f"pooled SR = {selected['binary']['SR']['estimate']:.3f}\n"
-        f"pooled CR = {selected['binary']['CR']['estimate']:.3f}\n"
-        f"pooled timeout = {selected['binary']['timeout']['estimate']:.3f}\n"
-        f"pooled V_safe = {selected['binary']['V_safe']['estimate']:.3f}\n"
-        f"pooled V_full = {selected['binary']['V_full']['estimate']:.3f}\n"
-        f"mean clearance = {selected['minimum_clearance']['mean']:.3f} m\n\n"
-        "successful U/R diversity = "
-        f"{selected['route_modes']['closest_obstacle_approach_success_only']['coverage_weighted_balance']:.3f}\n\n"
-        + BEST_SELECTION_RULE,
-        va="top",
-        ha="left",
-        wrap=True,
-        fontsize=10,
-    )
     handles = [
-        plt.Line2D([0], [0], color=colors[gamma], lw=2, label=f"gamma={gamma}")
+        plt.Line2D([0], [0], color=colors[gamma], lw=2, label=rf"$\gamma={gamma}$")
         for gamma in GAMMAS
     ]
-    fig.legend(handles=handles, loc="upper center", ncol=7, fontsize=8, bbox_to_anchor=(0.5, 0.93))
-    fig.suptitle(f"Raw checkpoint sweep\n{profile.caption}", fontsize=14)
-    fig.tight_layout(rect=(0, 0, 1, 0.89))
+    handles.append(plt.Line2D([0], [0], color="black", lw=2.6, label="pooled"))
+    fig.legend(
+        handles=handles,
+        loc="upper center",
+        ncol=8,
+        fontsize=8,
+        bbox_to_anchor=(0.5, 0.94),
+    )
+    fig.suptitle(
+        f"Raw M={profile.m}/$\\gamma$ checkpoint evaluation | "
+        f"best r{best_round} | final r{rounds[-1]}",
+        fontsize=14,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.90))
     outputs = []
     for suffix in ("png", "pdf"):
         path = outdir / f"{profile.filename_tag}_checkpoint_curves.{suffix}"
@@ -1139,6 +1128,69 @@ def _render_curves(
         outputs.append(path)
     plt.close(fig)
     return outputs
+
+
+def render_existing_evaluation(
+    evaluation_dir: str | os.PathLike[str],
+    presentation_dir: str | os.PathLike[str],
+) -> dict[str, Any]:
+    """Render a compact report without changing an authenticated evaluation tree."""
+    evaluation_root = Path(evaluation_dir).resolve()
+    presentation_root = Path(presentation_dir).resolve()
+    if presentation_root.exists():
+        raise FileExistsError(
+            f"presentation output root must be absent/new: {presentation_root}"
+        )
+    complete = validate_output(evaluation_root)
+    contract = load_json(evaluation_root / "evaluation_contract.json")
+    profile = resolve_evaluation_profile(
+        contract.get("evaluation_profile", DEFAULT_EVAL_PROFILE)
+    )
+    rounds = tuple(int(value) for value in contract["rounds"])
+    metric_rows = [
+        json.loads(line)
+        for line in (evaluation_root / "metrics.jsonl").read_text().splitlines()
+        if line
+    ]
+    best_round, _ = select_best_round(metric_rows)
+    renderer_source = git_state()
+    if (
+        renderer_source["tracked_dirty"]
+        or renderer_source["untracked_runtime_sources"]
+    ):
+        raise RuntimeError("presentation rendering requires committed clean source")
+
+    presentation_root.mkdir(parents=True)
+    curve_paths = _render_curves(
+        presentation_root, metric_rows, rounds, best_round, profile
+    )
+    report_paths = []
+    for source in curve_paths:
+        destination = presentation_root / f"report{source.suffix}"
+        shutil.copy2(source, destination)
+        report_paths.append(destination)
+    source_manifest = evaluation_root / "EVALUATION_COMPLETE.json"
+    payload = {
+        "status": "RAW_EVALUATION_PRESENTATION_COMPLETE",
+        "evaluation_profile": profile.name,
+        "source_evaluation": str(evaluation_root),
+        "source_evaluation_manifest_sha256": sha256_file(source_manifest),
+        "source_metrics_sha256": sha256_file(evaluation_root / "metrics.jsonl"),
+        "post_hoc_best_round": best_round,
+        "rounds": list(rounds),
+        "renderer_source": renderer_source,
+        "reports": [
+            {
+                "path": str(path),
+                "sha256": sha256_file(path),
+                "bytes": path.stat().st_size,
+            }
+            for path in report_paths
+        ],
+        "source_delivery_status": complete["status"],
+    }
+    write_json(presentation_root / "PRESENTATION_COMPLETE.json", payload)
+    return payload
 
 
 def _load_cell(outdir: Path, round_i: int, gamma: float):
@@ -1639,13 +1691,31 @@ def main() -> None:
     )
     parser.add_argument("--verifier-workers", type=int, default=16)
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--render-only", action="store_true")
+    parser.add_argument("--presentation-outdir")
     args = parser.parse_args()
+    if args.validate_only and args.render_only:
+        parser.error("--validate-only and --render-only are mutually exclusive")
     if args.validate_only:
         validate_output(args.outdir)
         print(f"AFE RBF RAW OUTPUT VALID: {Path(args.outdir).resolve()}")
         return
+    if args.render_only:
+        if not args.presentation_outdir:
+            parser.error("--presentation-outdir is required with --render-only")
+        payload = render_existing_evaluation(args.outdir, args.presentation_outdir)
+        print(
+            "AFE RBF RAW PRESENTATION COMPLETE: "
+            f"{Path(args.presentation_outdir).resolve()} "
+            f"(best r{payload['post_hoc_best_round']})"
+        )
+        return
+    if args.presentation_outdir:
+        parser.error("--presentation-outdir is only valid with --render-only")
     if not args.run_root or not args.scene_profile:
-        parser.error("--run-root and --scene-profile are required unless --validate-only is used")
+        parser.error(
+            "--run-root and --scene-profile are required unless a read-only mode is used"
+        )
     if args.verifier_workers < 1:
         parser.error("--verifier-workers must be positive")
     run_evaluation(args)

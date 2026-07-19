@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import time
 
@@ -150,6 +151,7 @@ def main() -> None:
     args.out.mkdir(parents=True)
     run_dir = args.out / "run"
     evaluation_dir = args.out / "evaluation"
+    presentation_dir = args.out / "presentation"
     diagnostic_path = args.out / "training_diagnostic.png"
     video_path = args.out / "training_expansion.mp4"
     started = time.time()
@@ -168,6 +170,13 @@ def main() -> None:
         str(EVALUATOR),
         "--outdir", str(evaluation_dir),
         "--validate-only",
+    ]
+    render = [
+        args.python,
+        str(EVALUATOR),
+        "--outdir", str(evaluation_dir),
+        "--render-only",
+        "--presentation-outdir", str(presentation_dir),
     ]
     diagnostics = [
         args.python,
@@ -188,6 +197,21 @@ def main() -> None:
         raise RuntimeError("V2 trainer did not deliver COMPLETE")
     _run(evaluate, args.out / "evaluation.log")
     _run(validate, args.out / "validation.log")
+    _run(render, args.out / "presentation.log")
+    report_records = []
+    for suffix in ("png", "pdf"):
+        source = presentation_dir / f"report.{suffix}"
+        destination = args.out / f"report.{suffix}"
+        if not source.is_file() or source.stat().st_size == 0:
+            raise RuntimeError(f"V2 true-evaluation report is missing: {source}")
+        shutil.copy2(source, destination)
+        report_records.append(
+            {
+                "path": str(destination),
+                "sha256": sha256_file(destination),
+                "bytes": destination.stat().st_size,
+            }
+        )
     _run(diagnostics, args.out / "diagnostic.log")
     _run(video, args.out / "video.log")
     completion = _load_json(evaluation_dir / "EVALUATION_COMPLETE.json")
@@ -210,12 +234,15 @@ def main() -> None:
         "evaluation_profile": EVAL_PROFILE,
         "run": str(run_dir),
         "evaluation": str(evaluation_dir),
+        "true_evaluation_reports": report_records,
+        "presentation": str(presentation_dir),
         "training_diagnostic": str(diagnostic_path),
         "training_video": video_record,
         "commands": {
             "train": train,
             "evaluate": evaluate,
             "validate": validate,
+            "render": render,
             "diagnostics": diagnostics,
             "video": video,
         },

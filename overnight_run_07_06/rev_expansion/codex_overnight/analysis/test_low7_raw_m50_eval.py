@@ -379,6 +379,70 @@ def test_true_eval_curve_renders_validity_with_other_metrics(tmp_path: Path):
     assert all(path.is_file() and path.stat().st_size > 0 for path in outputs)
 
 
+def test_render_existing_evaluation_is_additive_and_writes_report_aliases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    evaluation = tmp_path / "evaluation"
+    presentation = tmp_path / "presentation"
+    evaluation.mkdir()
+    rounds = (0, 1)
+    rows = []
+    for round_i in rounds:
+        rows.extend(
+            _metric_row(
+                round_i,
+                gamma,
+                EV.resolve_evaluation_profile(EV.V2_SMOKE_EVAL_PROFILE).m,
+                EV.V2_SMOKE_EVAL_PROFILE,
+            )
+            for gamma in EV.GAMMAS
+        )
+        rows.append(
+            _metric_row(
+                round_i,
+                None,
+                EV.resolve_evaluation_profile(EV.V2_SMOKE_EVAL_PROFILE).m
+                * len(EV.GAMMAS),
+                EV.V2_SMOKE_EVAL_PROFILE,
+            )
+        )
+    (evaluation / "metrics.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows)
+    )
+    (evaluation / "evaluation_contract.json").write_text(
+        json.dumps(
+            {
+                "evaluation_profile": EV.V2_SMOKE_EVAL_PROFILE,
+                "rounds": list(rounds),
+            }
+        )
+    )
+    manifest = evaluation / "EVALUATION_COMPLETE.json"
+    manifest.write_text(json.dumps({"status": "AUTHENTICATED_TEST_DELIVERY"}))
+    before = {path.name: _sha(path) for path in evaluation.iterdir()}
+    monkeypatch.setattr(
+        EV,
+        "validate_output",
+        lambda root: {"status": "AUTHENTICATED_TEST_DELIVERY"},
+    )
+    monkeypatch.setattr(
+        EV,
+        "git_state",
+        lambda: {
+            "commit": "f" * 40,
+            "parent": "e" * 40,
+            "tracked_dirty": False,
+            "untracked_runtime_sources": [],
+        },
+    )
+    payload = EV.render_existing_evaluation(evaluation, presentation)
+    assert payload["post_hoc_best_round"] == 0
+    assert (presentation / "report.png").stat().st_size > 0
+    assert (presentation / "report.pdf").stat().st_size > 0
+    assert (presentation / "PRESENTATION_COMPLETE.json").is_file()
+    assert before == {path.name: _sha(path) for path in evaluation.iterdir()}
+
+
 def test_v2_smoke_renders_a_fixed_index_gallery_for_every_round(tmp_path: Path):
     profile = EV.resolve_evaluation_profile(EV.V2_SMOKE_EVAL_PROFILE)
     rounds = (0, 1)

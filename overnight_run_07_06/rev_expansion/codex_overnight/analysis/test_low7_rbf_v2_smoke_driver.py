@@ -53,3 +53,11 @@ def test_v2_wrapper_enforces_exclusive_gpu_and_single_driver() -> None:
     assert "query-compute-apps=pid" in wrapper
     assert "low7_rbf_v2_smoke_driver.py" in wrapper
     assert (ROOT / "video_afe2.py").is_file()
+
+
+def test_v2_driver_delivers_true_evaluation_report() -> None:
+    source = (ROOT / "analysis" / "low7_rbf_v2_smoke_driver.py").read_text()
+    assert '"--render-only"' in source
+    assert '"--presentation-outdir"' in source
+    assert 'destination = args.out / f"report.{suffix}"' in source
+    assert '"true_evaluation_reports": report_records' in source
