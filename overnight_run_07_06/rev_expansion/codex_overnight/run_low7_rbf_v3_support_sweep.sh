@@ -17,7 +17,9 @@ PYTHON=${PYTHON:-/home/dohyun/miniforge3/envs/cfm_mppi/bin/python}
 command -v nvidia-smi >/dev/null
 command -v ffmpeg >/dev/null
 command -v ffprobe >/dev/null
-ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libx264
+# Do not use grep -q under pipefail: an early grep exit can SIGPIPE ffmpeg and
+# falsely fail the launch gate even when libx264 is present.
+ffmpeg -hide_banner -encoders 2>/dev/null | grep libx264 >/dev/null
 
 CPU_COUNT=$(getconf _NPROCESSORS_ONLN)
 (( CPU_COUNT > 1 && CPU_COUNT % 2 == 0 )) || {

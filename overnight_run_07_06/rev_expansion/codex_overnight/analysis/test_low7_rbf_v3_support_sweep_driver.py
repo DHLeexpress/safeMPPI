@@ -109,3 +109,5 @@ def test_launcher_allocates_exactly_half_the_online_cpu_count():
     assert "CPU_COUNT=$(getconf _NPROCESSORS_ONLN)" in launcher
     assert "WORKERS=$((CPU_COUNT / 2))" in launcher
     assert "check_gpu 1" in launcher and "check_gpu 3" in launcher
+    assert "grep -q libx264" not in launcher
+    assert "grep libx264 >/dev/null" in launcher
