@@ -184,6 +184,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         all_routes["u_fraction_wilson95"] = _wilson(
             int(all_routes["u_count"]), resolved
         )
+        successful_routes["u_fraction_wilson95"] = _wilson(
+            int(successful_routes["u_count"]),
+            int(successful_routes["resolved_count"]),
+        )
         success_count = sum(bool(row["metrics"]["success"]) for row in cell)
         collision_count = sum(bool(row["metrics"]["collision"]) for row in cell)
         entry = {
