@@ -71,3 +71,28 @@ def test_signed_visits_every_eligible_negative_once(tmp_path):
     assert len(report["negative_visited"]) == report["negative_eligible"]
     assert len(set(report["negative_visited"])) == report["negative_eligible"]
     assert abs(report["negative_mass"]["total"] - 1) < 1e-12
+
+
+def test_signed_negative_only_still_visits_all_without_changing_policy(tmp_path):
+    recent = S.RecentRounds(tmp_path)
+    shard = S.RoundShard(1)
+    cid = shard.add_context(
+        scenario_id=10, gamma=.5, step=0, state=np.zeros(4),
+        hp10=np.random.randn(10, 16, 12), low5=np.random.randn(5),
+        hist=np.random.randn(16, 2), ped_xy=np.zeros((1, 2)), ped_vel=np.zeros((1, 2)),
+    )
+    for query in range(3):
+        shard.add_resolved_query(
+            cid, query, np.random.randn(10, 2), .2, _result(0), acquisition_step=query,
+        )
+    recent.append_and_save(shard)
+    policy = GPS.build_sfm_policy(width=24, res_dropout=0.0)
+    S.configure_expansion_trainability(policy)
+    before = copy.deepcopy(policy.state_dict())
+    optimizer = torch.optim.Adam([p for p in policy.parameters() if p.requires_grad], lr=1e-5)
+    report = S.signed_update(policy, optimizer, recent, alpha=.01, batch=2, seed=3)
+    assert report["path"] == "signed_no_positive"
+    assert set(report["negative_visited"]) == {(1, 0), (1, 1), (1, 2)}
+    assert report["negative_eligible"] == 3 and report["optimizer_steps"] == 0
+    for name, value in policy.state_dict().items():
+        assert torch.equal(value, before[name])

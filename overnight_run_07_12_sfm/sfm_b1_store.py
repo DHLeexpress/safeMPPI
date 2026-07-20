@@ -338,8 +338,23 @@ def signed_update(policy, optimizer, recent, *, alpha, batch=128, device="cpu", 
     neg_order = hierarchical_order(negatives, seed + 1)
     pos_mass, pos_accounting = hierarchy_mass(pos_order)
     neg_mass, neg_accounting = hierarchy_mass(neg_order)
-    if not pos_order or not neg_order:
+    if not neg_order:
         return positive_only_update(policy, optimizer, recent, batch=batch, device=device, seed=seed)
+    if not pos_order:
+        # The signed scale is exactly zero without g_pos, but alpha>0 still requires
+        # deterministic, once-only accounting of every eligible verifier negative.
+        optimizer.zero_grad(set_to_none=True)
+        neg_loss, neg_visited = _accumulate_objective(policy, neg_order, neg_mass, batch, device)
+        negative_gradient = _gradient_snapshot(policy)
+        negative_norm = _gradient_norm(negative_gradient)
+        optimizer.zero_grad(set_to_none=True)
+        return dict(
+            path="signed_no_positive", alpha=float(alpha), rho=0.0, positive_norm=0.0,
+            negative_norm=negative_norm, positive_loss=0.0, negative_loss=neg_loss,
+            positive_eligible=0, negative_eligible=len(neg_order),
+            positive_visited=[], negative_visited=neg_visited,
+            positive_mass=pos_accounting, negative_mass=neg_accounting, optimizer_steps=0,
+        )
     optimizer.zero_grad(set_to_none=True)
     pos_loss, pos_visited = _accumulate_objective(policy, pos_order, pos_mass, batch, device)
     positive_gradient = _gradient_snapshot(policy)

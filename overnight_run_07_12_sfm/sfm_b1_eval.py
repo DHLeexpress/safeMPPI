@@ -195,7 +195,7 @@ def selection_key(summary):
     support = summary["pooled"]["support"]
     noncollapsed = min((support.get(mode, 0) for mode in ("left", "right", "yield")), default=0)
     return (
-        0 if worst_cr < 0.05 else 1, worst_cr, summary["pooled"]["CR"],
+        0 if worst_cr < 0.05 else 1, summary["pooled"]["CR"],
         -worst_sr, -summary["pooled"]["SR"],
         -(clearance if clearance is not None else -float("inf")),
         time if time is not None else float("inf"), -noncollapsed,

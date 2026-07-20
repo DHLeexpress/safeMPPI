@@ -71,3 +71,24 @@ def test_forecast_boundary_is_json_native_for_numpy_timing():
     assert type(forecast) is float
     assert type(authorized) is bool
     json.dumps(dict(maximum_round=maximum_round, forecast=forecast, authorized=authorized))
+
+
+def _selection_summary(*, pooled_cr, worst_cr, pooled_sr=.8, worst_sr=.7):
+    pooled = dict(
+        CR=pooled_cr, SR=pooled_sr,
+        successful_clearance=dict(mean=.2), successful_time_to_goal=dict(mean=6.0),
+        support={"left": 10, "right": 10, "yield": 10},
+    )
+    return dict(pooled=pooled, per_gamma={
+        "low": dict(CR=worst_cr, SR=worst_sr),
+        "high": dict(CR=min(pooled_cr, worst_cr), SR=pooled_sr),
+    })
+
+
+def test_selection_is_threshold_then_pooled_cr_not_continuous_worst_cr():
+    lower_pooled = _selection_summary(pooled_cr=.05, worst_cr=.20)
+    lower_worst = _selection_summary(pooled_cr=.08, worst_cr=.10)
+    assert E.selection_key(lower_pooled) < E.selection_key(lower_worst)
+    threshold_pass = _selection_summary(pooled_cr=.04, worst_cr=.04)
+    threshold_fail = _selection_summary(pooled_cr=0.0, worst_cr=.05)
+    assert E.selection_key(threshold_pass) < E.selection_key(threshold_fail)
