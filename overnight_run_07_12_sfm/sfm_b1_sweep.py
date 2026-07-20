@@ -121,10 +121,13 @@ def seed_bank_manifest(outdir, rounds=20):
         kazuki_confirmation={key: list(value) for key, value in SP.raw_bank(SP.KAZUKI_CONFIRM_EP0, 100).items()},
         deployment_id={key: list(value) for key, value in SP.raw_bank(SP.DEPLOY_ID_EP0, 100).items()},
         deployment_requested_ood={key: list(value) for key, value in SP.raw_bank(SP.DEPLOY_OOD_EP0, 100).items()},
+        deployment_density_ood={
+            key: list(value) for key, value in SP.raw_bank(SP.DEPLOY_DENSITY_OOD_EP0, 100).items()
+        },
         query_diagnostic_scenarios=list(range(SP.QUERY_DIAGNOSTIC_EP0, SP.QUERY_DIAGNOSTIC_EP0 + 3)),
         environment_contracts={
             name: SS.scene_profile(name)
-            for name in ("training", "id", "legacy_velocity_ood", "requested_ood")
+            for name in ("training", "id", "legacy_velocity_ood", "requested_ood", "density_ood")
         },
     )
     path = os.path.join(outdir, "seed_banks.json")
@@ -581,7 +584,10 @@ def main():
     smoke_parser.add_argument("--checkpoint", required=True)
     smoke_parser.add_argument("--preflight", required=True)
     smoke_parser.add_argument("--outdir", required=True)
-    smoke_parser.add_argument("--scene-profile", required=True, choices=("legacy_velocity_ood", "requested_ood"))
+    smoke_parser.add_argument(
+        "--scene-profile", required=True,
+        choices=("legacy_velocity_ood", "requested_ood", "density_ood"),
+    )
     kazuki = sub.add_parser("kazuki-eval")
     kazuki.add_argument("--checkpoint", required=True)
     kazuki.add_argument("--ep0", type=int, required=True)

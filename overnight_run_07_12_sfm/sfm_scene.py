@@ -42,6 +42,12 @@ SCENE_PROFILES = {
         role="requested_density_and_velocity_ood_benchmark",
         shift_from_training="higher pedestrian count (30 versus 20) and speed range 1.0-1.5 versus 0.5-1.0 m/s",
     ),
+    "density_ood": dict(
+        n_ped=50,
+        ped_speed_range=ID_PED_SPEED_RANGE,
+        role="requested_density_only_ood_benchmark",
+        shift_from_training="higher pedestrian count (50 versus 20); speed range unchanged",
+    ),
     "legacy_velocity_ood": dict(
         n_ped=20,
         ped_speed_range=OOD_PED_SPEED_RANGE,
@@ -49,7 +55,7 @@ SCENE_PROFILES = {
         shift_from_training="pedestrian count unchanged; speed range 1.0-1.5 versus 0.5-1.0 m/s",
     ),
 }
-SCIENTIFIC_EVAL_PROFILES = ("id", "requested_ood", "legacy_velocity_ood")
+SCIENTIFIC_EVAL_PROFILES = ("id", "density_ood", "requested_ood", "legacy_velocity_ood")
 
 
 def scene_profile(name):

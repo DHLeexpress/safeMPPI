@@ -71,14 +71,18 @@ def test_raw_support_is_counted_without_render_trace(monkeypatch):
 def test_scene_profiles_make_training_shift_explicit():
     training = SS.scene_profile("training")
     requested_id = SS.scene_profile("id")
+    density_ood = SS.scene_profile("density_ood")
     requested_ood = SS.scene_profile("requested_ood")
     legacy = SS.scene_profile("legacy_velocity_ood")
     assert (training["n_ped"], training["ped_speed_range"]) == (20, [.5, 1.0])
     assert (requested_id["n_ped"], requested_id["ped_speed_range"]) == (10, [.5, 1.0])
+    assert (density_ood["n_ped"], density_ood["ped_speed_range"]) == (50, [.5, 1.0])
     assert (requested_ood["n_ped"], requested_ood["ped_speed_range"]) == (30, [1.0, 1.5])
     assert (legacy["n_ped"], legacy["ped_speed_range"]) == (20, [1.0, 1.5])
     assert requested_id["training_reference"] == training["training_reference"]
+    assert density_ood["training_reference"] == training["training_reference"]
     assert "10 versus 20" in requested_id["shift_from_training"]
+    assert "50 versus 20" in density_ood["shift_from_training"]
 
 
 def test_scientific_eval_cli_requires_scene_profile():
@@ -107,6 +111,39 @@ def test_evaluate_policy_passes_explicit_scene_contract(monkeypatch):
     assert len(calls) == len(SS.GAMMAS)
     assert all(call["n_ped"] == 30 for call in calls)
     assert all(call["ped_speed_range"] == (1.0, 1.5) for call in calls)
+
+
+def test_evaluate_policy_passes_density_only_ood_contract(monkeypatch):
+    calls = []
+
+    def fake_rollout(policy, episode, gamma, **kwargs):
+        calls.append(kwargs)
+        return dict(
+            gamma=gamma, success=False, collision=False, successful_clearance=None,
+            time_to_goal=None, min_clearance=1.0, mode_counts={},
+        )
+
+    monkeypatch.setattr(E, "raw_rollout", fake_rollout)
+    bank = {str(gamma): [1] for gamma in SS.GAMMAS}
+    E.evaluate_policy(object(), bank, device="cpu", scene_profile="density_ood")
+    assert len(calls) == len(SS.GAMMAS)
+    assert all(call["n_ped"] == 50 for call in calls)
+    assert all(call["ped_speed_range"] == (0.5, 1.0) for call in calls)
+
+
+def test_density_only_ood_is_accepted_by_expansion_contract():
+    config = X.ArmConfig(
+        name="A", selector="margin", alpha=0.0, scene_profile="density_ood",
+    ).validate()
+    assert config.scene_profile == "density_ood"
+
+
+def test_density_only_deployment_bank_is_declared(tmp_path):
+    payload = SW.seed_bank_manifest(tmp_path)["payload"]
+    bank = payload["deployment_density_ood"]
+    assert bank["0.1"][0] == 210_000
+    assert len(bank["0.1"]) == 100
+    assert payload["environment_contracts"]["density_ood"]["n_ped"] == 50
 
 
 def test_paired_query_snapshot_rule_is_shared_and_not_visual_curation():

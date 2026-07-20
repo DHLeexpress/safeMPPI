@@ -16,8 +16,14 @@ Every new command is fail-closed on an explicit scene profile:
 | `id` | 10 | 0.5--1.0 | requested easier benchmark; lower density than training |
 | `legacy_velocity_ood` | 20 | 1.0--1.5 | exact `103476d` environment |
 | `requested_ood` | 30 | 1.0--1.5 | density-plus-velocity OOD |
+| `density_ood` | 50 | 0.5--1.0 | density-only OOD at the training velocity range |
 
 This distinction is stored in every new metrics JSON.
+
+The current density-only study uses `density_ood`: it changes only pedestrian
+count from the demonstration distribution (20 to 50) while holding the sampled
+speed range fixed at 0.5--1.0 m/s. Its fixed M100/gamma deployment bank begins
+at scenario 210000 and is declared before observing outcomes.
 
 ## Model and expansion semantics
 

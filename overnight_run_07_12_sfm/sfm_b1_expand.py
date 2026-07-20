@@ -58,7 +58,7 @@ class ArmConfig:
             raise ValueError("scientific B1 knobs differ from the frozen protocol")
         if self.selector not in ("margin", "safemppi_cost"):
             raise ValueError("invalid arm selector")
-        if self.scene_profile not in ("legacy_velocity_ood", "requested_ood"):
+        if self.scene_profile not in ("legacy_velocity_ood", "requested_ood", "density_ood"):
             raise ValueError("expansion requires an explicit OOD scene profile")
         if self.name == "A" and (self.selector != "margin" or self.alpha != 0.0):
             raise ValueError("arm A must be margin/alpha=0")
@@ -486,8 +486,10 @@ def main():
     parser.add_argument("--seed", type=int, default=20260720)
     parser.add_argument("--verifier-workers", type=int, default=32)
     parser.add_argument(
-        "--scene-profile", required=True, choices=("legacy_velocity_ood", "requested_ood"),
-        help="Explicit expansion environment; legacy reproduces 103476d, requested_ood uses n_ped=30.",
+        "--scene-profile", required=True,
+        choices=("legacy_velocity_ood", "requested_ood", "density_ood"),
+        help=("Explicit expansion environment: legacy reproduces 103476d, "
+              "requested_ood shifts density and speed, and density_ood uses n_ped=50 at training speeds."),
     )
     args = parser.parse_args()
     arm = ARMS[args.arm]

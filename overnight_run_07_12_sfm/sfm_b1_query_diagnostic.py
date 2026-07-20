@@ -119,8 +119,8 @@ def _run_selector(checkpoint, recent_dir, round_i, scenarios, *, selector, ell, 
 
 def run(checkpoint, recent_dir, round_i, *, scenarios, ell, cap, scene_profile,
         device, verifier_workers, seed, outdir):
-    if scene_profile != "requested_ood":
-        raise ValueError("paired query diagnostic is intentionally restricted to requested_ood")
+    if scene_profile not in ("requested_ood", "density_ood"):
+        raise ValueError("paired query diagnostic requires an explicit supported OOD profile")
     if len(tuple(scenarios)) != 3 or len(set(map(int, scenarios))) != 3:
         raise ValueError("exactly three distinct diagnostic scenarios are required")
     os.makedirs(outdir, exist_ok=True)
@@ -167,7 +167,7 @@ def main(argv=None):
     parser.add_argument("--round", type=int, required=True)
     parser.add_argument("--scenarios", type=int, nargs=3, required=True)
     parser.add_argument("--ell", type=float, required=True); parser.add_argument("--cap", type=int, required=True)
-    parser.add_argument("--scene-profile", required=True, choices=("requested_ood",))
+    parser.add_argument("--scene-profile", required=True, choices=("requested_ood", "density_ood"))
     parser.add_argument("--device", default="cuda"); parser.add_argument("--verifier-workers", type=int, default=32)
     parser.add_argument("--seed", type=int, default=20260720); parser.add_argument("--outdir", required=True)
     args = parser.parse_args(argv)

@@ -20,6 +20,7 @@ N_PED = 20
 # constant; scientific evaluation selects one of the named profiles instead.
 TRAINING_ENVIRONMENT = SS.scene_profile("training")
 ID_ENVIRONMENT = SS.scene_profile("id")
+DENSITY_OOD_ENVIRONMENT = SS.scene_profile("density_ood")
 REQUESTED_OOD_ENVIRONMENT = SS.scene_profile("requested_ood")
 LEGACY_VELOCITY_OOD_ENVIRONMENT = SS.scene_profile("legacy_velocity_ood")
 
@@ -34,6 +35,7 @@ SMOKE_EVAL_EP0 = 130_000
 DEPLOY_ID_EP0 = 150_000
 DEPLOY_OOD_EP0 = 170_000
 QUERY_DIAGNOSTIC_EP0 = 190_000
+DEPLOY_DENSITY_OOD_EP0 = 210_000
 
 
 def expansion_scenarios(round_i, *, smoke=False):
