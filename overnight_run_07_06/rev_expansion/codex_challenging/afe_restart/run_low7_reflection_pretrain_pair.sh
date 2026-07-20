@@ -95,6 +95,7 @@ run_candidate() {
     --device cuda:0 \
     --M "$M_SELECT" \
     --seed-bank low7-balanced-r0-selection-v1 \
+    --reflection-antithetic \
     --minimum-successes 5 \
     --report-only \
     >"$root/qualification_select.log" 2>&1
@@ -127,6 +128,7 @@ CUDA_VISIBLE_DEVICES="$GPU_A" "$PYTHON" \
   --device cuda:0 \
   --M "$M_CONFIRM" \
   --seed-bank low7-balanced-r0-disjoint-confirmation-v1 \
+  --reflection-antithetic \
   >"$OUTPUT_ROOT/confirmation.log" 2>&1
 
 "$PYTHON" - "$OUTPUT_ROOT" <<'PY'

@@ -403,10 +403,19 @@ def run_raw_rollouts(
     nfe: int = NFE,
     device: str | torch.device = "cpu",
     seed_bank: str = METRIC_VERSION,
+    reflection_antithetic: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Generate raw receding-horizon trajectories without any verifier call."""
 
     device = torch.device(device)
+    if reflection_antithetic:
+        if m % 2:
+            raise ValueError("reflection-antithetic raw evaluation requires even M")
+        if not bool(getattr(policy, "reflection_group_average", False)):
+            raise ValueError(
+                "reflection-antithetic raw evaluation requires an exactly "
+                "reflection-group-averaged policy"
+            )
     start = env.x0.detach().cpu().numpy().astype(np.float64)
     goal = env.goal.detach().cpu().numpy().astype(np.float64)
     obstacles = env.obstacles.detach().cpu().numpy().astype(np.float64)
@@ -452,14 +461,23 @@ def run_raw_rollouts(
             histories.append(
                 GF.hist_pad(recent if recent.size else np.zeros((0, 2)), GF.K_HIST)
             )
+            pair_size = m // 2 if reflection_antithetic else m
+            base_rollout_index = (
+                episode["rollout_index"] % pair_size
+                if reflection_antithetic
+                else episode["rollout_index"]
+            )
             seed = raw_noise_seed(
                 episode["gamma"],
-                episode["rollout_index"],
+                base_rollout_index,
                 control_t,
                 seed_bank=seed_bank,
             )
             generator = torch.Generator(device=device).manual_seed(seed)
-            noises.append(torch.randn(policy.d, generator=generator, device=device))
+            noise = torch.randn(policy.d, generator=generator, device=device)
+            if reflection_antithetic and episode["rollout_index"] >= pair_size:
+                noise = noise.reshape(-1, 2).flip(-1).reshape_as(noise)
+            noises.append(noise)
         grid_tensor = torch.as_tensor(np.asarray(grids), device=device)
         condition_tensor = torch.as_tensor(np.asarray(conditions), device=device)
         history_tensor = torch.as_tensor(np.asarray(histories), device=device)
@@ -473,9 +491,15 @@ def run_raw_rollouts(
         ).detach().cpu().numpy()
         for episode, window in zip(active, windows):
             state_before = episode["state"].copy()
+            pair_size = m // 2 if reflection_antithetic else m
+            base_rollout_index = (
+                episode["rollout_index"] % pair_size
+                if reflection_antithetic
+                else episode["rollout_index"]
+            )
             seed = raw_noise_seed(
                 episode["gamma"],
-                episode["rollout_index"],
+                base_rollout_index,
                 control_t,
                 seed_bank=seed_bank,
             )
@@ -486,6 +510,8 @@ def run_raw_rollouts(
                     "rollout_index": int(episode["rollout_index"]),
                     "control_t": int(control_t),
                     "seed": int(seed),
+                    "reflection_antithetic": bool(reflection_antithetic),
+                    "reflection_pair_index": int(base_rollout_index),
                     "state": state_before,
                     "plan": np.asarray(window, dtype=np.float32),
                 }

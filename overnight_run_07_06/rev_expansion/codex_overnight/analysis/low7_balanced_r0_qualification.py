@@ -168,6 +168,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         nfe=args.nfe,
         device=device,
         seed_bank=args.seed_bank,
+        reflection_antithetic=args.reflection_antithetic,
     )
     summaries: dict[str, dict[str, Any]] = {}
     for episode in episodes:
@@ -255,6 +256,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "passed": passed,
         "failures": failures,
         "scientific_mode": "raw untilted temperature-1 generator; no verifier/acquisition/expert",
+        "raw_noise_design": (
+            "reflection-antithetic common-random-number pairs"
+            if args.reflection_antithetic
+            else "iid common-random-number bank"
+        ),
         "selection_warning": (
             "this seed bank may be used for qualification but a selected model requires a disjoint confirmation bank"
         ),
@@ -315,6 +321,14 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--horizon", type=int, default=300)
     parser.add_argument("--gallery-count", type=int, default=20)
     parser.add_argument("--seed-bank", default="low7-balanced-r0-qualification-v1")
+    parser.add_argument(
+        "--reflection-antithetic",
+        action="store_true",
+        help=(
+            "evaluate each raw temperature-1 noise path together with its x/y "
+            "reflection; requires an exactly group-averaged policy and even M"
+        ),
+    )
     parser.add_argument("--minimum-balance", type=float, default=0.8)
     parser.add_argument("--minimum-success-balance", type=float, default=0.8)
     parser.add_argument("--minimum-successes", type=int, default=10)
@@ -327,6 +341,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = make_parser().parse_args(argv)
     if min(args.m, args.nfe, args.horizon, args.gallery_count) <= 0:
         raise ValueError("M, nfe, horizon, and gallery-count must be positive")
+    if args.reflection_antithetic and args.m % 2:
+        raise ValueError("reflection-antithetic qualification requires even M")
     if not 0.0 <= args.minimum_balance <= 1.0:
         raise ValueError("minimum-balance must lie in [0,1]")
     if not 0.0 <= args.minimum_success_balance <= 1.0:

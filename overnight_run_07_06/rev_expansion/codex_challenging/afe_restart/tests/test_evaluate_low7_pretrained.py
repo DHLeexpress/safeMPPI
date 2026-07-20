@@ -195,9 +195,11 @@ def test_declared_scenes_have_canonical_endpoints_and_exact_ood_geometry() -> No
 
 class _ZeroPolicy:
     d = 20
+    reflection_group_average = False
 
     def __init__(self) -> None:
         self.conditions: list[torch.Tensor] = []
+        self.noises: list[torch.Tensor] = []
 
     def ctx_from(
         self, grid: torch.Tensor, condition: torch.Tensor, history: torch.Tensor
@@ -221,6 +223,7 @@ class _ZeroPolicy:
     ) -> torch.Tensor:
         assert context.shape == (n, 39)
         assert initial_noise.shape == (n, 20)
+        self.noises.append(initial_noise.detach().cpu().clone())
         return torch.zeros(n, 10, 2, device=context.device)
 
 
@@ -255,6 +258,61 @@ def test_raw_rollout_uses_low7_gamma_last_and_never_calls_verifier(
             conditions[:, -1], torch.tensor((0.1, 0.1, 0.7, 0.7))
         )
     assert plans[0]["seed"] == evaluation.raw_noise_seed(0.1, 0, 0)
+
+
+def test_reflection_antithetic_raw_noise_pairs_without_changing_temperature() -> None:
+    class GroupAveragedZeroPolicy(_ZeroPolicy):
+        reflection_group_average = True
+
+    env = evaluation.build_scene(
+        evaluation.get_scene_profile("low7_radius1_canonical_v1")
+    )
+    policy = GroupAveragedZeroPolicy()
+
+    episodes, plans = evaluation.run_raw_rollouts(
+        policy,
+        env,
+        "low7_radius1_canonical_v1",
+        m=4,
+        gammas=(0.1,),
+        horizon=1,
+        device="cpu",
+        reflection_antithetic=True,
+    )
+
+    assert len(episodes) == 4
+    noise = policy.noises[0]
+    torch.testing.assert_close(noise[2], noise[0].reshape(-1, 2).flip(-1).reshape(-1))
+    torch.testing.assert_close(noise[3], noise[1].reshape(-1, 2).flip(-1).reshape(-1))
+    assert plans[0]["seed"] == plans[2]["seed"]
+    assert plans[1]["seed"] == plans[3]["seed"]
+    assert plans[2]["reflection_pair_index"] == 0
+
+
+def test_reflection_antithetic_raw_noise_rejects_invalid_contracts() -> None:
+    env = evaluation.build_scene(
+        evaluation.get_scene_profile("low7_radius1_canonical_v1")
+    )
+    with pytest.raises(ValueError, match="even M"):
+        evaluation.run_raw_rollouts(
+            _ZeroPolicy(),
+            env,
+            "low7_radius1_canonical_v1",
+            m=3,
+            gammas=(0.1,),
+            horizon=1,
+            reflection_antithetic=True,
+        )
+    with pytest.raises(ValueError, match="group-averaged"):
+        evaluation.run_raw_rollouts(
+            _ZeroPolicy(),
+            env,
+            "low7_radius1_canonical_v1",
+            m=2,
+            gammas=(0.1,),
+            horizon=1,
+            reflection_antithetic=True,
+        )
 
 
 def test_seed_stream_is_fixed_and_plan_validity_matches_existing_progress_bar() -> None:
