@@ -173,29 +173,45 @@ def _render_curve(records, environment, M, output):
     plt.close(figure)
 
 
-def run_curve(checkpoint_dir, *, scene_profile, ep0, M, rounds, device, outdir):
+def curve_cell(checkpoint_dir, *, scene_profile, ep0, M, round_i, device, outdir):
     environment = SS.scene_profile(scene_profile)
     bank = SP.raw_bank(ep0, M)
     os.makedirs(outdir, exist_ok=True)
+    checkpoint = os.path.join(checkpoint_dir, f"round_{int(round_i):02d}.pt")
+    result_path = os.path.join(outdir, f"round_{int(round_i):02d}.json")
+    expected_sha = BE.sha256_file(checkpoint)
+    if os.path.exists(result_path):
+        with open(result_path) as stream:
+            record = json.load(stream)
+        if (record.get("checkpoint_sha256") != expected_sha
+                or record.get("environment") != environment
+                or record.get("bank") != {key: list(value) for key, value in bank.items()}):
+            raise RuntimeError(f"stale curve cell: {result_path}")
+        return record
+    value = evaluate_raw(checkpoint, bank, scene_profile=scene_profile, device=device)
+    record = dict(
+        round=int(round_i), environment=environment,
+        bank={key: list(value) for key, value in bank.items()}, **value,
+    )
+    _write_json(result_path, record)
+    return record
+
+
+def aggregate_curve(checkpoint_dir, *, scene_profile, ep0, M, rounds, outdir):
+    environment = SS.scene_profile(scene_profile)
+    bank = {key: list(value) for key, value in SP.raw_bank(ep0, M).items()}
     records = []
     for round_i in rounds:
-        checkpoint = os.path.join(checkpoint_dir, f"round_{round_i:02d}.pt")
-        result_path = os.path.join(outdir, f"round_{round_i:02d}.json")
-        expected_sha = BE.sha256_file(checkpoint)
-        if os.path.exists(result_path):
-            with open(result_path) as stream:
-                record = json.load(stream)
-            if (record.get("checkpoint_sha256") != expected_sha
-                    or record.get("environment") != environment
-                    or record.get("bank") != {key: list(value) for key, value in bank.items()}):
-                raise RuntimeError(f"stale curve cell: {result_path}")
-        else:
-            value = evaluate_raw(checkpoint, bank, scene_profile=scene_profile, device=device)
-            record = dict(
-                round=int(round_i), environment=environment,
-                bank={key: list(value) for key, value in bank.items()}, **value,
-            )
-            _write_json(result_path, record)
+        checkpoint = os.path.join(checkpoint_dir, f"round_{int(round_i):02d}.pt")
+        result_path = os.path.join(outdir, f"round_{int(round_i):02d}.json")
+        if not os.path.exists(result_path):
+            raise FileNotFoundError(f"missing curve cell: {result_path}")
+        with open(result_path) as stream:
+            record = json.load(stream)
+        if (record.get("round") != int(round_i)
+                or record.get("checkpoint_sha256") != BE.sha256_file(checkpoint)
+                or record.get("environment") != environment or record.get("bank") != bank):
+            raise RuntimeError(f"invalid curve cell: {result_path}")
         records.append(record)
     with open(os.path.join(outdir, "metrics.jsonl"), "w") as stream:
         for record in records:
@@ -206,6 +222,18 @@ def run_curve(checkpoint_dir, *, scene_profile, ep0, M, rounds, device, outdir):
         M_per_gamma=int(M), ep0=int(ep0), rounds=list(map(int, rounds)),
         checkpoint_dir=os.path.abspath(checkpoint_dir),
     ))
+
+
+def run_curve(checkpoint_dir, *, scene_profile, ep0, M, rounds, device, outdir):
+    for round_i in rounds:
+        curve_cell(
+            checkpoint_dir, scene_profile=scene_profile, ep0=ep0, M=M,
+            round_i=round_i, device=device, outdir=outdir,
+        )
+    aggregate_curve(
+        checkpoint_dir, scene_profile=scene_profile, ep0=ep0, M=M,
+        rounds=rounds, outdir=outdir,
+    )
 
 
 def _rounds(value):
@@ -229,16 +257,37 @@ def main(argv=None):
     curve.add_argument("--ep0", type=int, required=True); curve.add_argument("--M", type=int, default=50)
     curve.add_argument("--rounds", default="0:20"); curve.add_argument("--device", default="cuda")
     curve.add_argument("--outdir", required=True)
+    cell = sub.add_parser("curve-cell")
+    cell.add_argument("--checkpoint-dir", required=True)
+    cell.add_argument("--scene-profile", required=True, choices=("id", "requested_ood"))
+    cell.add_argument("--ep0", type=int, required=True); cell.add_argument("--M", type=int, default=50)
+    cell.add_argument("--round", type=int, required=True); cell.add_argument("--device", default="cuda")
+    cell.add_argument("--outdir", required=True)
+    aggregate = sub.add_parser("curve-aggregate")
+    aggregate.add_argument("--checkpoint-dir", required=True)
+    aggregate.add_argument("--scene-profile", required=True, choices=("id", "requested_ood"))
+    aggregate.add_argument("--ep0", type=int, required=True); aggregate.add_argument("--M", type=int, default=50)
+    aggregate.add_argument("--rounds", default="0:20"); aggregate.add_argument("--outdir", required=True)
     args = parser.parse_args(argv)
     if args.command == "benchmark":
         run_benchmark(
             args.r0, args.selected, scene_profile=args.scene_profile, ep0=args.ep0,
             M=args.M, device=args.device, outdir=args.outdir,
         )
-    else:
+    elif args.command == "curve":
         run_curve(
             args.checkpoint_dir, scene_profile=args.scene_profile, ep0=args.ep0,
             M=args.M, rounds=_rounds(args.rounds), device=args.device, outdir=args.outdir,
+        )
+    elif args.command == "curve-cell":
+        curve_cell(
+            args.checkpoint_dir, scene_profile=args.scene_profile, ep0=args.ep0,
+            M=args.M, round_i=args.round, device=args.device, outdir=args.outdir,
+        )
+    else:
+        aggregate_curve(
+            args.checkpoint_dir, scene_profile=args.scene_profile, ep0=args.ep0,
+            M=args.M, rounds=_rounds(args.rounds), outdir=args.outdir,
         )
 
 
