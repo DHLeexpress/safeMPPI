@@ -135,6 +135,7 @@ def validate_balanced_r0_delivery(path, checkpoint_path, checkpoint_sha256) -> d
             or float(routes.get("resolved_fraction", -1.0)) < 0.95
             or int(row.get("success_count", -1)) < 10
             or float(successful_routes.get("balance", -1.0)) < 0.8
+            or float(successful_routes.get("resolved_fraction", -1.0)) < 0.95
         ):
             raise RuntimeError(f"balanced-r0 confirmation failed at gamma={gamma}")
     return {

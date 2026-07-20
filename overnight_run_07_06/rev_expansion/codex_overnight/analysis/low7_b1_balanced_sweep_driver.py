@@ -176,6 +176,10 @@ def qualified_checkpoint(delivery_path: Path) -> tuple[Path, str, dict]:
             raise RuntimeError(
                 f"balanced-r0 gamma {gamma} failed successful-route balance"
             )
+        if float(successful_routes.get("resolved_fraction", -1.0)) < 0.95:
+            raise RuntimeError(
+                f"balanced-r0 gamma {gamma} failed successful-route resolution"
+            )
     return checkpoint, expected, {
         "delivery": str(delivery_path),
         "delivery_sha256": sha256_file(delivery_path),

@@ -210,6 +210,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 f"gamma={gamma:g} successful_balance={successful_routes['balance']:.4f} "
                 f"< {args.minimum_success_balance:.4f}"
             )
+        if (
+            success_count >= args.minimum_successes
+            and float(successful_routes["resolved_fraction"])
+            < args.minimum_resolved_fraction
+        ):
+            failures.append(
+                f"gamma={gamma:g} successful_resolved="
+                f"{successful_routes['resolved_fraction']:.4f} "
+                f"< {args.minimum_resolved_fraction:.4f}"
+            )
         if float(all_routes["resolved_fraction"]) < args.minimum_resolved_fraction:
             failures.append(
                 f"gamma={gamma:g} resolved={all_routes['resolved_fraction']:.4f} "
