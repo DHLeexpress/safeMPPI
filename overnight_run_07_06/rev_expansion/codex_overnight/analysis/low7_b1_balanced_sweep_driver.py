@@ -257,7 +257,7 @@ def trainer_command(args, arm: Arm, run_dir: Path, *, preflight: bool) -> list[s
         "--lengthscale-multiplier", "1.0",
         "--negative-alpha", f"{arm.alpha:g}",
         "--execution-rule", arm.execution_rule,
-        "--conditioning-schema", "low7_closest_boundary",
+        "--conditioning-schema", "low7_closest_boundary_tie_mean",
         "--freeze-visual-encoder", "--skip-training-probes",
         "--calibration-replicas", "8", "--calibration-control-steps", "4",
         "--sweep-compact-artifacts", "--compact-checkpoint-every", "1",

@@ -80,6 +80,7 @@ class GridHPFlowPolicy(GP2.GridGRUFlowPolicy2):
         if (self.raw_condition_dim, self.conditioning_schema) not in {
             (5, "low5"),
             (7, "low7_closest_boundary"),
+            (7, "low7_closest_boundary_tie_mean"),
         }:
             raise ValueError(
                 "conditioning dimension and schema must declare low5 or "
@@ -87,12 +88,12 @@ class GridHPFlowPolicy(GP2.GridGRUFlowPolicy2):
             )
         self.reflection_group_average = bool(reflection_group_average)
         if self.reflection_group_average and (
-            self.conditioning_schema != "low7_closest_boundary"
+            self.conditioning_schema != "low7_closest_boundary_tie_mean"
             or use_gru
             or boundary_adapter
         ):
             raise ValueError(
-                "reflection group averaging requires low7_closest_boundary "
+                "reflection group averaging requires tie-mean low7 conditioning "
                 "conditioning without a GRU or boundary adapter"
             )
         self.low_raw_dim = self.raw_condition_dim + (self.gru_dim if use_gru else 0)
@@ -327,7 +328,9 @@ class GridHPFlowPolicy(GP2.GridGRUFlowPolicy2):
         return {
             "arch": "hp-repr" if self.repr_dim is not None else "hp-reduced-32",
             "schema_version": (
-                "w8sg-hp-v3-low7-closest-boundary"
+                "w8sg-hp-v4-low7-closest-boundary-tie-mean"
+                if self.conditioning_schema == "low7_closest_boundary_tie_mean"
+                else "w8sg-hp-v3-low7-closest-boundary"
                 if self.conditioning_schema == "low7_closest_boundary"
                 else "w8sg-hp-v2-low5-only"
             ),

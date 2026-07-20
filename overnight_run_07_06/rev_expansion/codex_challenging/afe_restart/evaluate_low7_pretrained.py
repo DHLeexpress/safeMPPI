@@ -91,6 +91,9 @@ GROUP_AVERAGED_CHECKPOINT_STAGE_SCHEMA = (
     "afe_fresh_pretrain_v5_low7_reflection_group_average"
 )
 MODEL_SCHEMA = "w8sg-hp-v3-low7-closest-boundary"
+GROUP_AVERAGED_MODEL_SCHEMA = "w8sg-hp-v4-low7-closest-boundary-tie-mean"
+LOW7_SCHEMA = "low7_closest_boundary"
+LOW7_TIE_SCHEMA = "low7_closest_boundary_tie_mean"
 T = 300
 REACH = 0.15
 NFE = 12
@@ -190,9 +193,13 @@ def load_low7_candidate(
     config = payload.get("config")
     if not isinstance(config, Mapping):
         raise CheckpointContractError("checkpoint has no model config")
+    stage_schema = payload.get("stage_schema")
+    group_averaged = stage_schema == GROUP_AVERAGED_CHECKPOINT_STAGE_SCHEMA
     exact_fields = {
         "arch": "hp-repr",
-        "schema_version": MODEL_SCHEMA,
+        "schema_version": (
+            GROUP_AVERAGED_MODEL_SCHEMA if group_averaged else MODEL_SCHEMA
+        ),
         "raw_start_goal": False,
         "H_pred": 10,
         "grid_shape": (1, 32, 32),
@@ -202,7 +209,7 @@ def load_low7_candidate(
         "u_max": 1.0,
         "ctx_dim": 39,
         "raw_condition_dim": 7,
-        "conditioning_schema": "low7_closest_boundary",
+        "conditioning_schema": LOW7_TIE_SCHEMA if group_averaged else LOW7_SCHEMA,
         "use_gru": False,
         "repr_dim": 32,
         "grid_hw": (32, 32),
@@ -212,7 +219,6 @@ def load_low7_candidate(
     }
     for field, expected_value in exact_fields.items():
         _require_exact(config, field, expected_value)
-    stage_schema = payload.get("stage_schema")
     if stage_schema not in {
         CHECKPOINT_STAGE_SCHEMA,
         REFLECTION_CHECKPOINT_STAGE_SCHEMA,
@@ -255,6 +261,13 @@ def load_low7_candidate(
         if config.get("reflection_group_average") is not True:
             raise CheckpointContractError(
                 "group-averaged checkpoint does not reconstruct the symmetric model"
+            )
+        transform = payload.get("conditioning_transform")
+        if not isinstance(transform, Mapping) or transform.get("name") != (
+            "equal-nearest-boundary-vector-mean-v1"
+        ):
+            raise CheckpointContractError(
+                "group-averaged checkpoint lacks its tie-mean conditioning transform"
             )
     fixed_goal_grid = payload.get("fixed_goal") is not None
     if fixed_goal_grid:
@@ -299,6 +312,7 @@ def load_low7_candidate(
         "reflection_group_average": bool(
             payload.get("reflection_group_average", False)
         ),
+        "conditioning_transform": payload.get("conditioning_transform"),
         "source_manifest": payload["source_manifest"],
         "source_query_hash_digest": payload["source_query_hash_digest"],
         "best_epoch": int(payload["best_epoch"]),
@@ -422,7 +436,17 @@ def run_raw_rollouts(
             state = episode["state"]
             grids.append(GF.axis_grid(state[:2], obstacles, robot_radius))
             conditions.append(
-                GF.low7(state, goal, episode["gamma"], obstacles, robot_radius)
+                GF.low7(
+                    state,
+                    goal,
+                    episode["gamma"],
+                    obstacles,
+                    robot_radius,
+                    tie_average=(
+                        getattr(policy, "conditioning_schema", LOW7_SCHEMA)
+                        == LOW7_TIE_SCHEMA
+                    ),
+                )
             )
             recent = np.asarray(episode["history"][-GF.K_HIST :], dtype=np.float32)
             histories.append(

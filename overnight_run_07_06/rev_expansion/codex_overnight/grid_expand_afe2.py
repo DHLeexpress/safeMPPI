@@ -247,9 +247,15 @@ def validate_checkpoint_contract(profile_name, policy, checkpoint, checkpoint_sh
         and tuple(getattr(policy, "grid_shape", ())) == (1, 32, 32)
         and getattr(policy, "boundary_adapter", None) is False
     )
+    low7_schema = config.get("conditioning_schema")
+    low7_model_schema = {
+        CX.LOW7_SCHEMA: "w8sg-hp-v3-low7-closest-boundary",
+        CX.LOW7_TIE_SCHEMA: "w8sg-hp-v4-low7-closest-boundary-tie-mean",
+    }.get(low7_schema)
     low7_architecture = (
         config.get("arch") == "hp-repr"
-        and config.get("schema_version") == "w8sg-hp-v3-low7-closest-boundary"
+        and low7_model_schema is not None
+        and config.get("schema_version") == low7_model_schema
         and int(config.get("H_pred", -1)) == 10
         and tuple(config.get("grid_shape", ())) == (1, 32, 32)
         and int(config.get("K_hist", -1)) == 16
@@ -258,11 +264,11 @@ def validate_checkpoint_contract(profile_name, policy, checkpoint, checkpoint_sh
         and config.get("boundary_adapter", False) is False
         and int(config.get("repr_dim", -1)) == 32
         and int(config.get("raw_condition_dim", -1)) == 7
-        and config.get("conditioning_schema") == CX.LOW7_SCHEMA
+        and config.get("conditioning_schema") == low7_schema
         and int(config.get("ctx_dim", -1)) == 39
         and int(getattr(policy, "repr_dim", -1)) == 32
         and int(getattr(policy, "raw_condition_dim", -1)) == 7
-        and getattr(policy, "conditioning_schema", None) == CX.LOW7_SCHEMA
+        and getattr(policy, "conditioning_schema", None) == low7_schema
         and int(getattr(policy, "ctx_dim", -1)) == 39
         and int(getattr(policy, "H_pred", -1)) == 10
         and tuple(getattr(policy, "grid_shape", ())) == (1, 32, 32)
@@ -369,6 +375,10 @@ def validate_checkpoint_contract(profile_name, policy, checkpoint, checkpoint_sh
                 and (
                     checkpoint.get("reflection_group_average") is not True
                     or config.get("reflection_group_average") is not True
+                    or low7_schema != CX.LOW7_TIE_SCHEMA
+                    or not isinstance(checkpoint.get("conditioning_transform"), dict)
+                    or checkpoint["conditioning_transform"].get("name")
+                    != "equal-nearest-boundary-vector-mean-v1"
                 )
             ):
                 raise RuntimeError(
@@ -418,7 +428,7 @@ def validate_checkpoint_contract(profile_name, policy, checkpoint, checkpoint_sh
             "expansion_promotion": checkpoint["expansion_promotion"],
             "source_manifest": checkpoint.get("source_manifest"),
             "source_query_hash_digest": source_digest,
-            "conditioning_schema": CX.LOW7_SCHEMA,
+            "conditioning_schema": low7_schema,
             "raw_condition_dim": 7,
             "ctx_dim": 39,
             "trunk_input_dim": 91,

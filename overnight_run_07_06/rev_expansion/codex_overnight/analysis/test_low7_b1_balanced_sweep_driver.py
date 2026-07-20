@@ -57,6 +57,9 @@ def test_b1_command_preserves_sample_complete_b1_and_qualification(tmp_path) -> 
         "gamma_episode_context_query_equal_mass"
     )
     assert value(command, "--lengthscale-multiplier") == "1.0"
+    assert value(command, "--conditioning-schema") == (
+        "low7_closest_boundary_tie_mean"
+    )
     assert value(command, "--balanced-r0-delivery") == str(delivery.resolve())
     assert "--nvp-audit-all-k" in command
     assert "--freeze-visual-encoder" in command

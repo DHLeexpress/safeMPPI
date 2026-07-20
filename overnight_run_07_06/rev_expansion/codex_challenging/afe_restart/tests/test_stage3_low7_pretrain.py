@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import torch
 import grid_hp_expt as HP
 
@@ -12,6 +13,7 @@ from afe_restart.stage3_low7_pretrain import (
     polar_reflection_indices,
     reflection_paired_cfm_terms,
     reflect_low7_batch,
+    _tie_mean_boundary_vectors,
 )
 
 
@@ -162,7 +164,7 @@ def test_group_averaged_policy_is_exactly_reflection_equivariant() -> None:
         trunk_hidden=(32,),
         enc_depth=1,
         raw_condition_dim=7,
-        conditioning_schema="low7_closest_boundary",
+        conditioning_schema="low7_closest_boundary_tie_mean",
         reflection_group_average=True,
     ).eval()
     grid = torch.randn(3, 3, 32, 32)
@@ -191,3 +193,13 @@ def test_group_averaged_policy_is_exactly_reflection_equivariant() -> None:
     features = policy.phi_s(controls, context)
     reflected_features = policy.phi_s(reflected[3], reflected_context)
     torch.testing.assert_close(features, reflected_features, rtol=1e-5, atol=1e-6)
+
+
+def test_tie_mean_batch_transform_is_permutation_and_reflection_equivariant() -> None:
+    positions = torch.tensor(((0.0, 0.0, 0.0, 0.0),), dtype=torch.float32)
+    obstacles = np.asarray(((1.0, 0.0, 0.2), (0.0, 1.0, 0.2)))
+    vector = _tie_mean_boundary_vectors(positions, obstacles, 0.1)
+    reordered = _tie_mean_boundary_vectors(positions, obstacles[::-1].copy(), 0.1)
+
+    torch.testing.assert_close(vector, reordered)
+    torch.testing.assert_close(vector[:, (1, 0)], vector)

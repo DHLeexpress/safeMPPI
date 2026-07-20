@@ -29,11 +29,14 @@ import numpy as np
 import torch
 
 import grid_hp_expt as HP
+import grid_feats as GF
 
 from .deps import sha256_file, write_dependency_manifest
 from .policy import model_state_hash
 from .schemas import QueryContext, query_content_hash
 from .stage3_pretrain import seeded_cfm_loss
+from .scene import make_id_scene
+from .stage2_low7_randomized import _scene_geometry_sha256
 
 
 DATA_SCHEMA = "afe_planned_demo_v3_low7_uniform_pairs"
@@ -227,7 +230,39 @@ def _tensor(payload: Mapping[str, Any], key: str, shape_tail: tuple[int, ...]) -
     return value.contiguous()
 
 
-def load_pool(manifest_path: Path) -> Low7Pool:
+def _tie_mean_boundary_vectors(
+    positions: torch.Tensor,
+    obstacles: np.ndarray,
+    robot_radius: float,
+    *,
+    chunk_size: int = 8192,
+) -> torch.Tensor:
+    output = np.empty((len(positions), 2), dtype=np.float32)
+    obstacle_array = np.asarray(obstacles, dtype=np.float64)
+    for begin in range(0, len(positions), chunk_size):
+        points = positions[begin : begin + chunk_size].double().numpy()[:, :2]
+        delta = obstacle_array[None, :, :2] - points[:, None, :]
+        distance = np.linalg.norm(delta, axis=2)
+        clearance = distance - obstacle_array[None, :, 2] - float(robot_radius)
+        minimum = clearance.min(axis=1)
+        tolerance = 1.0e-12 * np.maximum(1.0, np.abs(minimum))
+        tied = np.abs(clearance - minimum[:, None]) <= tolerance[:, None]
+        direction = np.divide(
+            delta,
+            distance[:, :, None],
+            out=np.zeros_like(delta),
+            where=distance[:, :, None] > 1.0e-12,
+        )
+        vectors = direction * clearance[:, :, None] / float(GF.SENSING)
+        averaged = (vectors * tied[:, :, None]).sum(axis=1) / tied.sum(
+            axis=1, keepdims=True
+        )
+        averaged[minimum > float(GF.SENSING)] = 0.0
+        output[begin : begin + len(points)] = averaged.astype(np.float32)
+    return torch.from_numpy(output)
+
+
+def load_pool(manifest_path: Path, *, tie_average_boundary: bool = False) -> Low7Pool:
     manifest_path = manifest_path.resolve()
     manifest = json.loads(manifest_path.read_text())
     if manifest.get("schema_version") != DATA_SCHEMA:
@@ -306,6 +341,30 @@ def load_pool(manifest_path: Path) -> Low7Pool:
     if sha256_file(endpoint_path) != str(manifest["endpoint_manifest_sha256"]):
         raise RuntimeError("low7 endpoint-manifest checksum mismatch")
     endpoint_payload = json.loads(endpoint_path.read_text())
+    boundary_transform = None
+    if tie_average_boundary:
+        if (
+            endpoint_payload.get("schema_version")
+            != "afe_low7_fixed_goal_full_grid_endpoint_manifest_v1"
+        ):
+            raise RuntimeError("tie-mean low7 pretraining requires the fixed-goal grid bank")
+        env = make_id_scene(goal=np.asarray((4.7, 4.7), dtype=np.float32))
+        if manifest.get("scene", {}).get("geometry_sha256") != _scene_geometry_sha256(env):
+            raise RuntimeError("tie-mean transform scene differs from the source dataset")
+        transformed = low7.clone()
+        transformed[:, 4:6] = _tie_mean_boundary_vectors(
+            states,
+            env.obstacles.detach().cpu().numpy(),
+            float(env.r_robot),
+        )
+        low7 = transformed
+        boundary_transform = {
+            "name": "equal-nearest-boundary-vector-mean-v1",
+            "source_low7_authenticated_before_transform": True,
+            "transformed_low7_sha256": hashlib.sha256(
+                low7.numpy().tobytes(order="C")
+            ).hexdigest(),
+        }
     return Low7Pool(
         grid=grid,
         low7=low7,
@@ -326,6 +385,7 @@ def load_pool(manifest_path: Path) -> Low7Pool:
             "endpoint_manifest_sha256": str(manifest["endpoint_manifest_sha256"]),
             "endpoint_schema": str(endpoint_payload.get("schema_version")),
             "endpoint_sampling": dict(endpoint_payload.get("sampling", {})),
+            "conditioning_transform": boundary_transform,
         },
     )
 
@@ -499,7 +559,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
     dependencies = write_dependency_manifest(outdir / "logs/dependencies.json")
-    pool = load_pool(args.manifest)
+    pool = load_pool(
+        args.manifest,
+        tie_average_boundary=args.reflection_group_average,
+    )
     train_rows, validation_rows, split_audit = paired_split(
         pool, validation_pairs=args.validation_pairs, seed=args.split_seed
     )
@@ -512,7 +575,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         trunk_hidden=tuple(args.trunk_hidden),
         enc_depth=args.enc_depth,
         raw_condition_dim=7,
-        conditioning_schema="low7_closest_boundary",
+        conditioning_schema=(
+            "low7_closest_boundary_tie_mean"
+            if args.reflection_group_average
+            else "low7_closest_boundary"
+        ),
         reflection_group_average=args.reflection_group_average,
     ).to(device)
     config = model.config()
@@ -677,6 +744,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "diagonal_start_exclusion": False,
         "source_manifest": str(args.manifest.resolve()),
         "source_query_hash_digest": query_digest,
+        "conditioning_transform": pool.source.get("conditioning_transform"),
         "model_state_sha256": state_sha,
         "best_epoch": best_epoch,
         "best_validation_objective": best_loss,
@@ -750,6 +818,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "pair_leakage": 0,
             "absolute_start_goal_inputs": False,
             "closest_boundary_vector_inputs": True,
+            "equal_nearest_boundary_tie_mean": bool(
+                pool.source.get("conditioning_transform")
+            ),
             "gamma_last": True,
             "encoder_frozen_during_pretraining": False,
             "exact_xy_reflection_pairs": bool(args.reflection_paired_pretraining),

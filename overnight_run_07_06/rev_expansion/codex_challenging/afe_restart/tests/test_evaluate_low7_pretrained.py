@@ -19,13 +19,18 @@ def _candidate_checkpoint(
     equivariance_weight: float = 0.0,
     reflection_group_average: bool = False,
 ) -> str:
+    conditioning_schema = (
+        evaluation.LOW7_TIE_SCHEMA
+        if reflection_group_average
+        else evaluation.LOW7_SCHEMA
+    )
     policy = evaluation.HP.GridHPFlowPolicy(
         repr_dim=32,
         grid_hw=(32, 32),
         trunk_hidden=(160, 96),
         enc_depth=3,
         raw_condition_dim=7,
-        conditioning_schema="low7_closest_boundary",
+        conditioning_schema=conditioning_schema,
         reflection_group_average=reflection_group_average,
     )
     evaluation.HP.save_hp(
@@ -57,6 +62,15 @@ def _candidate_checkpoint(
             "reflection_paired_pretraining": reflection_paired,
             "equivariance_weight": equivariance_weight,
             "reflection_group_average": reflection_group_average,
+            "conditioning_transform": (
+                {
+                    "name": "equal-nearest-boundary-vector-mean-v1",
+                    "source_low7_authenticated_before_transform": True,
+                    "transformed_low7_sha256": "b" * 64,
+                }
+                if reflection_group_average
+                else None
+            ),
         },
     )
     return evaluation.sha256_file(path)

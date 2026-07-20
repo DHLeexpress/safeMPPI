@@ -417,7 +417,7 @@ def test_reflection_paired_low7_contract_requires_embedded_model_provenance(
         trunk_hidden=(160, 96),
         enc_depth=3,
         raw_condition_dim=7,
-        conditioning_schema=AFE2.CX.LOW7_SCHEMA,
+        conditioning_schema=AFE2.CX.LOW7_TIE_SCHEMA,
         reflection_group_average=True,
     )
     group_averaged = {
@@ -425,6 +425,11 @@ def test_reflection_paired_low7_contract_requires_embedded_model_provenance(
         "config": group_policy.config(),
         "stage_schema": "afe_fresh_pretrain_v5_low7_reflection_group_average",
         "reflection_group_average": True,
+        "conditioning_transform": {
+            "name": "equal-nearest-boundary-vector-mean-v1",
+            "source_low7_authenticated_before_transform": True,
+            "transformed_low7_sha256": "b" * 64,
+        },
         "model_state_sha256": model_state_hash(group_policy),
     }
     _model_hash, group_contract, _digest = AFE2.validate_checkpoint_contract(

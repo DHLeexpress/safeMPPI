@@ -2145,7 +2145,9 @@ def validate_protocol_args(args) -> None:
             else args.execution_rule if b1_balanced_sweep
             else "nominal_hp_max_step_margin_only"
         ),
-        "conditioning_schema": CX.LOW7_SCHEMA,
+        "conditioning_schema": (
+            CX.LOW7_TIE_SCHEMA if b1_balanced_sweep else CX.LOW7_SCHEMA
+        ),
         "freeze_visual_encoder": True,
         "skip_training_probes": True,
         "calibration_replicas": 8,
@@ -2277,7 +2279,7 @@ def main():
     )
     parser.add_argument(
         "--conditioning-schema",
-        choices=(CX.LOW5_SCHEMA, CX.LOW7_SCHEMA),
+        choices=(CX.LOW5_SCHEMA, *CX.LOW7_SCHEMAS),
         default=CX.LOW5_SCHEMA,
     )
     parser.add_argument("--freeze-visual-encoder", action="store_true")
@@ -2400,15 +2402,25 @@ def main():
     policy_contract = CX.require_declared_contract(
         policy,
         args.conditioning_schema,
-        7 if args.conditioning_schema == CX.LOW7_SCHEMA else 5,
+        7 if args.conditioning_schema in CX.LOW7_SCHEMAS else 5,
     )
     if profile.name in {
         "low7_radius1_canonical_v1",
         "low7_radius03_canonical_v1",
     }:
-        if args.conditioning_schema != CX.LOW7_SCHEMA or not args.freeze_visual_encoder:
+        expected_low7_schema = (
+            CX.LOW7_TIE_SCHEMA
+            if args.protocol_profile in {
+                "b1_balanced_r0_sweep", "b1_balanced_r0_preflight"
+            }
+            else CX.LOW7_SCHEMA
+        )
+        if (
+            args.conditioning_schema != expected_low7_schema
+            or not args.freeze_visual_encoder
+        ):
             raise ValueError(
-                "low7 OOD expansion requires low7 closest-boundary conditioning "
+                "low7 OOD expansion requires the profile-declared low7 conditioning "
                 "and a frozen visual encoder"
             )
     elif args.conditioning_schema != CX.LOW5_SCHEMA or args.freeze_visual_encoder:
