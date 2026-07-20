@@ -119,6 +119,28 @@ def raw_cell(confirmation: Path, round_i: int, gamma: float) -> tuple[list[np.nd
     return [paths[index] for index in FIXED_INDICES], [outcomes[index] for index in FIXED_INDICES]
 
 
+def load_reused_expert(root: Path) -> dict[float, tuple[list[np.ndarray], list[str]]]:
+    path = root / "expert.npz"
+    cells: dict[float, tuple[list[np.ndarray], list[str]]] = {}
+    with np.load(path, allow_pickle=True) as archive:
+        for gamma in GAMMAS:
+            suffix = f"g{gamma:g}"
+            cells[gamma] = (
+                [np.asarray(value, dtype=np.float32) for value in archive[f"paths_{suffix}"]],
+                [str(value) for value in archive[f"outcomes_{suffix}"]],
+            )
+    return cells
+
+
+def load_reused_kazuki(root: Path, coefficient: float) -> tuple[list[np.ndarray], list[str]]:
+    path = root / f"kazuki_ws_{coefficient:g}.npz"
+    with np.load(path, allow_pickle=True) as archive:
+        return (
+            [np.asarray(value, dtype=np.float32) for value in archive["paths"]],
+            [str(value) for value in archive["outcomes"]],
+        )
+
+
 def run_expert(env: Any, gamma: float, m: int, t_cap: int, reach: float) -> tuple[list[np.ndarray], list[str]]:
     from cfm_mppi.safegpc_adapter.safemppi import SafeMPPIAdapter
     from di_grid_viz import di_step
@@ -230,6 +252,10 @@ def main() -> int:
     parser.add_argument("--T", type=int, default=300)
     parser.add_argument("--reach", type=float, default=0.15)
     parser.add_argument(
+        "--reuse-rollouts", type=Path, default=None,
+        help="reuse an authenticated diagnostic directory; render only, no new expert/Kazuki rollout",
+    )
+    parser.add_argument(
         "--safe-coef-candidates", type=float, nargs="+",
         default=[0.0, 0.1, 0.9],
     )
@@ -246,16 +272,22 @@ def main() -> int:
     policy, _ = load_hp(str(args.pretrained_ckpt), device="cpu")
     policy = policy.to(args.device).eval()
 
-    expert: dict[float, tuple[list[np.ndarray], list[str]]] = {}
-    for gamma in GAMMAS:
-        expert[gamma] = run_expert(env, gamma, args.m, args.T, args.reach)
+    if args.reuse_rollouts is None:
+        expert: dict[float, tuple[list[np.ndarray], list[str]]] = {}
+        for gamma in GAMMAS:
+            expert[gamma] = run_expert(env, gamma, args.m, args.T, args.reach)
+    else:
+        expert = load_reused_expert(args.reuse_rollouts)
 
     kazuki: dict[float, tuple[list[np.ndarray], list[str]]] = {}
     summaries: dict[float, dict[str, float | int]] = {}
     for coefficient in args.safe_coef_candidates:
-        paths, outcomes = run_kazuki(
-            policy, env, coefficient, args.m, args.T, args.reach, args.device,
-        )
+        if args.reuse_rollouts is None:
+            paths, outcomes = run_kazuki(
+                policy, env, coefficient, args.m, args.T, args.reach, args.device,
+            )
+        else:
+            paths, outcomes = load_reused_kazuki(args.reuse_rollouts, coefficient)
         kazuki[coefficient] = (paths, outcomes)
         summary = route_summary(paths)
         summary.update({
@@ -338,6 +370,21 @@ def main() -> int:
         "pretrained_checkpoint": str(args.pretrained_ckpt),
         "pretrained_checkpoint_sha256": sha256_file(args.pretrained_ckpt),
         "confirmation": str(args.confirmation),
+        "rollout_source": (
+            "new named fixed seeds" if args.reuse_rollouts is None
+            else f"reused without regeneration from {args.reuse_rollouts}"
+        ),
+        "reused_rollout_sha256": (
+            None if args.reuse_rollouts is None else {
+                "expert.npz": sha256_file(args.reuse_rollouts / "expert.npz"),
+                **{
+                    f"kazuki_ws_{coefficient:g}.npz": sha256_file(
+                        args.reuse_rollouts / f"kazuki_ws_{coefficient:g}.npz"
+                    )
+                    for coefficient in args.safe_coef_candidates
+                },
+            }
+        ),
         "outputs": outputs,
     }
     manifest_path = args.outdir / "gallery_manifest.json"

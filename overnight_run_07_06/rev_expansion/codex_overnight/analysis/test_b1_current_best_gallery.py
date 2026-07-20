@@ -59,3 +59,16 @@ def test_kazuki_adapter_exposes_additive_conditioning_schema():
         "conditioning_schema"
     ]
     assert parameter.default is None
+
+
+def test_reused_kazuki_round_trip(tmp_path):
+    paths = np.empty(2, dtype=object)
+    paths[0] = np.asarray([[0.3, 0.3], [1.0, 1.2]], dtype=np.float32)
+    paths[1] = np.asarray([[0.3, 0.3], [1.2, 1.0]], dtype=np.float32)
+    np.savez_compressed(
+        tmp_path / "kazuki_ws_0.1.npz", paths=paths,
+        outcomes=np.asarray(["TO", "CR"]),
+    )
+    loaded_paths, outcomes = MODULE.load_reused_kazuki(tmp_path, 0.1)
+    assert outcomes == ["TO", "CR"]
+    assert np.array_equal(loaded_paths[0], paths[0])

@@ -211,9 +211,9 @@ def kazuki_deploy(policy, env, safe_coefs, gamma_ctx=0.5, T=250, reach=0.1,
             record = CX.build_context(
                 st, goal, gamma_ctx, hist, env, conditioning_schema
             )
-            gT = torch.as_tensor(record.grid, device=device)
-            lT = torch.as_tensor(record.low5, device=device)
-            hT = torch.as_tensor(record.hist, device=device)
+            gT = torch.tensor(np.array(record.grid, copy=True), device=device)
+            lT = torch.tensor(np.array(record.low5, copy=True), device=device)
+            hT = torch.tensor(np.array(record.hist, copy=True), device=device)
         ctx = policy.ctx_from(gT[None], lT[None], hT[None]).squeeze(0)   # 1-D so _expand_ctx broadcasts
         if prev_z is None:
             z = torch.randn(N_SAMPLE, d, device=device); taus = ODE_TIMES_FULL
