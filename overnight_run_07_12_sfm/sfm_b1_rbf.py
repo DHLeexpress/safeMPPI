@@ -1,0 +1,260 @@
+"""Tested exact RBF-GP and pending-conditioned B1 acquisition primitives."""
+from __future__ import annotations
+
+import math
+from collections import defaultdict
+import numpy as np
+import torch
+
+
+def l2_normalize(values, eps=1.0e-9):
+    values = torch.as_tensor(values)
+    return values / values.norm(dim=-1, keepdim=True).clamp_min(float(eps))
+
+
+def balanced_exact50(records, *, gamma_key="gamma", scenario_key="scenario_id"):
+    """Round-robin exactly 50 records with marginal cell counts differing by at most one."""
+    groups = {}
+    for record in records:
+        key = (round(float(record[gamma_key]), 8), int(record[scenario_key]))
+        groups.setdefault(key, []).append(record)
+    if not groups:
+        raise ValueError("no pretrained embedding records")
+    by_gamma = {}
+    for key in sorted(groups):
+        by_gamma.setdefault(key[0], []).append(key)
+    gamma_keys = sorted(by_gamma)
+    keys = []
+    scenario_index = 0
+    while len(keys) < 50:
+        progressed = False
+        for gamma in gamma_keys:
+            candidates = by_gamma[gamma]
+            if scenario_index < len(candidates):
+                keys.append(candidates[scenario_index])
+                progressed = True
+                if len(keys) == 50:
+                    break
+        if not progressed:
+            break
+        scenario_index += 1
+    if len(keys) < 50:
+        # Revisit cells only after every available gamma/scenario cell got one slot.
+        keys = [key for index in range(50) for key in sorted(groups)
+                if index < len(groups[key])][:50]
+    chosen = []
+    cell_visits = defaultdict(int)
+    for key in keys:
+        index = cell_visits[key]
+        if index >= len(groups[key]):
+            raise ValueError("fewer than 50 balanced pretrained embeddings")
+        chosen.append(groups[key][index])
+        cell_visits[key] += 1
+    if len({id(value) for value in chosen}) != 50:
+        raise RuntimeError("lengthscale sample contains duplicates")
+    return chosen
+
+
+def mean_pairwise_lengthscale(features):
+    values = l2_normalize(torch.as_tensor(features).detach().to(torch.float64))
+    if values.ndim != 2 or values.shape[0] != 50:
+        raise ValueError("ell0 requires exactly 50 pretrained embeddings")
+    lengthscale = float(torch.pdist(values, p=2).mean())
+    if not math.isfinite(lengthscale) or lengthscale <= 0.0:
+        raise ValueError("invalid pretrained mean pairwise distance")
+    return lengthscale
+
+
+class RBFGP:
+    def __init__(self, lengthscale, lam=1.0e-2):
+        if not math.isfinite(float(lengthscale)) or float(lengthscale) <= 0.0:
+            raise ValueError("lengthscale must be finite and positive")
+        if not math.isfinite(float(lam)) or float(lam) <= 0.0:
+            raise ValueError("lambda must be finite and positive")
+        self.ell = float(lengthscale)
+        self.lam = float(lam)
+        self.X = None
+        self.L = None
+        self.jitter = None
+
+    @staticmethod
+    def _sqdist(left, right):
+        return ((left * left).sum(1, keepdim=True) + (right * right).sum(1)[None]
+                - 2.0 * left @ right.T).clamp_min(0.0)
+
+    def _kernel(self, left, right):
+        return torch.exp(-self._sqdist(left, right) / (2.0 * self.ell ** 2))
+
+    @torch.no_grad()
+    def set_buffer(self, features):
+        if features is None or len(features) == 0:
+            self.X = self.L = None
+            self.jitter = None
+            return
+        self.X = l2_normalize(torch.as_tensor(features).detach())
+        kernel = self._kernel(self.X, self.X).to(torch.float64)
+        eye = torch.eye(len(kernel), dtype=kernel.dtype, device=kernel.device)
+        jitter = self.lam
+        last_error = None
+        for _ in range(6):
+            try:
+                self.L = torch.linalg.cholesky(kernel + jitter * eye)
+                self.jitter = float(jitter)
+                return
+            except RuntimeError as error:
+                last_error = error
+                jitter *= 10.0
+        raise RuntimeError("RBF-GP Cholesky failed") from last_error
+
+    @torch.no_grad()
+    def posterior_covariance(self, features, include_observation_noise=True):
+        query = l2_normalize(torch.as_tensor(features).detach())
+        covariance = self._kernel(query, query)
+        if self.X is not None:
+            cross = self._kernel(query, self.X)
+            solved = torch.cholesky_solve(cross.T.to(torch.float64), self.L)
+            covariance = covariance - cross @ solved.to(cross.dtype)
+        covariance = 0.5 * (covariance + covariance.T)
+        if include_observation_noise:
+            covariance = covariance + self.lam * torch.eye(
+                len(query), dtype=query.dtype, device=query.device
+            )
+        return covariance
+
+    @torch.no_grad()
+    def sigma(self, features):
+        covariance = self.posterior_covariance(features, include_observation_noise=False)
+        return torch.diagonal(covariance).clamp_min(0.0).sqrt()
+
+    @staticmethod
+    def _condition(covariance, remaining, chosen_local):
+        keep = torch.ones(len(covariance), dtype=torch.bool, device=covariance.device)
+        keep[int(chosen_local)] = False
+        if not keep.any():
+            return covariance.new_zeros((0, 0)), remaining[keep]
+        cross = covariance[keep, int(chosen_local)]
+        denominator = covariance[int(chosen_local), int(chosen_local)].clamp_min(1.0e-12)
+        updated = covariance[keep][:, keep] - torch.outer(cross, cross) / denominator
+        return 0.5 * (updated + updated.T), remaining[keep]
+
+    @torch.no_grad()
+    def sequential_score_vectors(self, features, order, steps):
+        features = torch.as_tensor(features)
+        order = torch.as_tensor(order, dtype=torch.long, device=features.device)
+        if sorted(order.tolist()) != list(range(len(features))):
+            raise ValueError("order must be a permutation")
+        covariance = self.posterior_covariance(features)
+        remaining = torch.arange(len(features), device=features.device)
+        vectors = []
+        for step in range(int(steps)):
+            scores = (torch.diagonal(covariance) / (1.0 + self.lam)).clamp(0.0, 1.0)
+            vectors.append(scores)
+            location = torch.nonzero(remaining == order[step], as_tuple=False).flatten()
+            covariance, remaining = self._condition(covariance, remaining, int(location[0]))
+        return vectors
+
+    @torch.no_grad()
+    def sequential_acquire(self, features, steps, beta, *, generator=None):
+        if not math.isfinite(float(beta)) or float(beta) <= 0.0:
+            raise ValueError("beta must be finite and positive")
+        features = torch.as_tensor(features)
+        covariance = self.posterior_covariance(features)
+        remaining = torch.arange(len(features), device=features.device)
+        selected, trace = [], []
+        for _ in range(int(steps)):
+            scores = (torch.diagonal(covariance) / (1.0 + self.lam)).clamp(0.0, 1.0)
+            weights = torch.exp(((scores - scores.max()) / float(beta)).clamp(-30.0, 30.0))
+            probability = weights / weights.sum()
+            local = int(torch.multinomial(probability, 1, generator=generator).item())
+            chosen = int(remaining[local])
+            ess = float(1.0 / (probability.to(torch.float64).square().sum() * len(probability)))
+            trace.append(dict(
+                remaining=remaining.detach().cpu(), scores=scores.detach().cpu(),
+                probability=probability.detach().cpu(), chosen=chosen,
+                chosen_sigma=float(scores[local].sqrt()), ess_norm=ess,
+            ))
+            selected.append(chosen)
+            covariance, remaining = self._condition(covariance, remaining, local)
+        return selected, trace
+
+    @torch.no_grad()
+    def diagnostics(self):
+        if self.X is None:
+            return dict(n=0, kernel_condition=1.0, kernel_effective_rank=0.0, jitter=None)
+        kernel = self._kernel(self.X, self.X).to(torch.float64)
+        eigenvalues = torch.linalg.eigvalsh(kernel).clamp_min(0.0)
+        condition = float((eigenvalues.max() + self.lam) / (eigenvalues.min() + self.lam))
+        effective_rank = float(eigenvalues.sum().square() / eigenvalues.square().sum().clamp_min(1.0e-12))
+        return dict(
+            n=len(self.X), kernel_condition=condition,
+            kernel_effective_rank=effective_rank, jitter=self.jitter,
+        )
+
+
+def normalized_ess(scores, beta):
+    scores = torch.as_tensor(scores, dtype=torch.float64)
+    probability = torch.softmax((scores - scores.max()) / float(beta), dim=0)
+    return float(1.0 / (probability.square().sum() * len(probability)))
+
+
+def solve_beta(score_vectors, target=0.5, *, lower=1.0e-6, upper=10.0, iterations=80):
+    vectors = [torch.as_tensor(value, dtype=torch.float64) for value in score_vectors if len(value)]
+    if not vectors:
+        raise ValueError("beta calibration has no score vectors")
+    def objective(beta):
+        return float(np.mean([normalized_ess(value, beta) for value in vectors]))
+    low_value, high_value = objective(lower), objective(upper)
+    if not (low_value <= float(target) <= high_value):
+        raise ValueError(f"ESS target {target} not bracketed by [{low_value}, {high_value}]")
+    low, high = float(lower), float(upper)
+    for _ in range(int(iterations)):
+        middle = math.sqrt(low * high)
+        if objective(middle) < float(target):
+            low = middle
+        else:
+            high = middle
+    beta = math.sqrt(low * high)
+    return beta, objective(beta)
+
+
+def calibrate_beta(gp, feature_batches, *, B=4, target=0.5, seed=0):
+    generator = torch.Generator(device=torch.as_tensor(feature_batches[0]).device).manual_seed(int(seed))
+    vectors = []
+    for features in feature_batches:
+        order = torch.randperm(len(features), generator=generator, device=torch.as_tensor(features).device)
+        vectors.extend(gp.sequential_score_vectors(features, order, B))
+    return solve_beta(vectors, target)
+
+
+def quantiles(values):
+    values = np.asarray(values, float)
+    if not len(values):
+        return {key: None for key in ("q0", "q25", "q50", "q75", "q100")}
+    return dict(zip(("q0", "q25", "q50", "q75", "q100"),
+                    map(float, np.quantile(values, [0, .25, .5, .75, 1]))))
+
+
+def acquisition_diagnostics(all_sigma, selected_sigma):
+    all_sigma = np.asarray(all_sigma, float)
+    selected_sigma = np.asarray(selected_sigma, float)
+    uplift = float(np.median(selected_sigma) - np.median(all_sigma))
+    return dict(all_K_sigma=quantiles(all_sigma), selected_B_sigma=quantiles(selected_sigma), uplift=uplift)
+
+
+def choose_preflight(rows):
+    """Choose maximum uplift, then the smallest cap retaining >=90% of cap-512 uplift."""
+    stable = [row for row in rows if row.get("ess_solved") and row.get("stable_conditioning")]
+    if not stable:
+        raise RuntimeError("no solvable/stable RBF preflight candidate")
+    by_ell = {}
+    for row in stable:
+        by_ell.setdefault(float(row["ell_multiplier"]), []).append(row)
+    ell_scores = {ell: float(np.median([item["uplift"] for item in values]))
+                  for ell, values in by_ell.items()}
+    selected_ell = max(sorted(ell_scores), key=lambda ell: ell_scores[ell])
+    candidates = by_ell[selected_ell]
+    cap512 = next(item for item in candidates if int(item["cap"]) == 512)
+    threshold = 0.9 * float(cap512["uplift"])
+    retained = [item for item in candidates if float(item["uplift"]) >= threshold]
+    selected = min(retained, key=lambda item: int(item["cap"]))
+    return dict(selected=selected, ell_median_uplift=ell_scores, cap512_threshold=threshold)
