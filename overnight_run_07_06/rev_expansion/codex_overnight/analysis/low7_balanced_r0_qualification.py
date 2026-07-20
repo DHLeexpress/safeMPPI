@@ -4,8 +4,10 @@
 This evaluator never uses RBF acquisition, a verifier, SafeMPPI, or route labels
 to choose an action.  It first generates one fixed raw temperature-1 rollout
 bank and only then labels each trajectory by its closest approach to the giant
-obstacle.  The default gate requires at least 80% U/R balance and 95% resolved
-route labels independently at every declared gamma.
+obstacle.  The default gate requires at least 80% U/R balance for both all
+trajectories and successful trajectories, plus 95% resolved route labels,
+independently at every declared gamma.  Gating successful routes is essential:
+the expansion studies measure route coverage among successful raw rollouts.
 """
 from __future__ import annotations
 
@@ -112,9 +114,11 @@ def _render_gallery(
                 axis.plot(path[-1, 0], path[-1, 1], "x", color="#cc3311", ms=4, zorder=5)
         entry = summaries[f"{gamma:g}"]
         route = entry["all_routes"]
+        success_route = entry["successful_routes"]
         axis.set_title(
             rf"$\gamma={gamma:g}$  U/R={route['u_count']}/{route['r_count']}"
-            + f"\nSR={entry['SR']:.2f}, bal={route['balance']:.2f}",
+            + f"\nsuccess U/R={success_route['u_count']}/{success_route['r_count']}"
+            + f"\nSR={entry['SR']:.2f}, bal={success_route['balance']:.2f}",
             fontsize=9,
         )
         axis.plot(*env.x0[:2].detach().cpu().numpy(), "ks", ms=3.5, zorder=6)
@@ -197,6 +201,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             failures.append(
                 f"gamma={gamma:g} balance={all_routes['balance']:.4f} < {args.minimum_balance:.4f}"
             )
+        if success_count < args.minimum_successes:
+            failures.append(
+                f"gamma={gamma:g} successes={success_count} < {args.minimum_successes}"
+            )
+        elif float(successful_routes["balance"]) < args.minimum_success_balance:
+            failures.append(
+                f"gamma={gamma:g} successful_balance={successful_routes['balance']:.4f} "
+                f"< {args.minimum_success_balance:.4f}"
+            )
         if float(all_routes["resolved_fraction"]) < args.minimum_resolved_fraction:
             failures.append(
                 f"gamma={gamma:g} resolved={all_routes['resolved_fraction']:.4f} "
@@ -220,6 +233,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "horizon": args.horizon,
         "gate": {
             "minimum_balance_every_gamma": args.minimum_balance,
+            "minimum_success_balance_every_gamma": args.minimum_success_balance,
+            "minimum_successes_every_gamma": args.minimum_successes,
             "minimum_resolved_fraction_every_gamma": args.minimum_resolved_fraction,
         },
         "per_gamma": summaries,
@@ -267,6 +282,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gallery-count", type=int, default=20)
     parser.add_argument("--seed-bank", default="low7-balanced-r0-qualification-v1")
     parser.add_argument("--minimum-balance", type=float, default=0.8)
+    parser.add_argument("--minimum-success-balance", type=float, default=0.8)
+    parser.add_argument("--minimum-successes", type=int, default=10)
     parser.add_argument("--minimum-resolved-fraction", type=float, default=0.95)
     parser.add_argument("--report-only", action="store_true")
     return parser
@@ -278,6 +295,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise ValueError("M, nfe, horizon, and gallery-count must be positive")
     if not 0.0 <= args.minimum_balance <= 1.0:
         raise ValueError("minimum-balance must lie in [0,1]")
+    if not 0.0 <= args.minimum_success_balance <= 1.0:
+        raise ValueError("minimum-success-balance must lie in [0,1]")
+    if args.minimum_successes < 1:
+        raise ValueError("minimum-successes must be positive")
     if not 0.0 <= args.minimum_resolved_fraction <= 1.0:
         raise ValueError("minimum-resolved-fraction must lie in [0,1]")
     result = run(args)

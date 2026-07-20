@@ -29,6 +29,10 @@ def candidate_record(directory: Path) -> dict:
         float(entry["all_routes"]["balance"])
         for entry in qualification["per_gamma"].values()
     ]
+    success_balances = [
+        float(entry["successful_routes"]["balance"])
+        for entry in qualification["per_gamma"].values()
+    ]
     successes = sum(
         int(entry["success_count"]) for entry in qualification["per_gamma"].values()
     )
@@ -43,6 +47,8 @@ def candidate_record(directory: Path) -> dict:
         "passed": bool(qualification["passed"]),
         "minimum_per_gamma_balance": min(balances),
         "mean_per_gamma_balance": sum(balances) / len(balances),
+        "minimum_per_gamma_success_balance": min(success_balances),
+        "mean_per_gamma_success_balance": sum(success_balances) / len(success_balances),
         "raw_SR": successes / attempts,
     }
 
@@ -58,7 +64,9 @@ def run(args: argparse.Namespace) -> dict:
     selected = max(
         eligible,
         key=lambda item: (
+            item["minimum_per_gamma_success_balance"],
             item["minimum_per_gamma_balance"],
+            item["mean_per_gamma_success_balance"],
             item["mean_per_gamma_balance"],
             item["raw_SR"],
             item["name"],
@@ -68,8 +76,9 @@ def run(args: argparse.Namespace) -> dict:
         "status": "LOW7_BALANCED_R0_SELECTION_COMPLETE",
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "selection_rule": (
-            "pass every-gamma balance/resolution gate; maximize minimum per-gamma "
-            "balance, then mean balance, then raw SR, then deterministic seed name"
+            "pass every-gamma all-route and successful-route balance/resolution gate; "
+            "maximize minimum successful-route balance, then minimum all-route balance, "
+            "then their means, raw SR, and deterministic seed name"
         ),
         "confirmation_required": True,
         "candidates": candidates,

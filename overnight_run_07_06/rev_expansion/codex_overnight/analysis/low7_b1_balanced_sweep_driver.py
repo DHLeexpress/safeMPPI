@@ -165,10 +165,17 @@ def qualified_checkpoint(delivery_path: Path) -> tuple[Path, str, dict]:
         raise RuntimeError("balanced-r0 confirmation lacks seven gamma cells")
     for gamma, row in per_gamma.items():
         routes = row.get("all_routes", {})
+        successful_routes = row.get("successful_routes", {})
         if float(routes.get("balance", -1.0)) < 0.8:
             raise RuntimeError(f"balanced-r0 gamma {gamma} failed route balance")
         if float(routes.get("resolved_fraction", -1.0)) < 0.95:
             raise RuntimeError(f"balanced-r0 gamma {gamma} failed route resolution")
+        if int(row.get("success_count", -1)) < 10:
+            raise RuntimeError(f"balanced-r0 gamma {gamma} has too few successes")
+        if float(successful_routes.get("balance", -1.0)) < 0.8:
+            raise RuntimeError(
+                f"balanced-r0 gamma {gamma} failed successful-route balance"
+            )
     return checkpoint, expected, {
         "delivery": str(delivery_path),
         "delivery_sha256": sha256_file(delivery_path),

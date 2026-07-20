@@ -79,6 +79,7 @@ run_candidate() {
     --device cuda:0 \
     --M "$M_SELECT" \
     --seed-bank low7-balanced-r0-selection-v1 \
+    --minimum-successes 5 \
     --report-only \
     >"$root/qualification_select.log" 2>&1
 }

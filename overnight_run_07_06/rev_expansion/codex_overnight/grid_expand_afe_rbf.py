@@ -129,9 +129,12 @@ def validate_balanced_r0_delivery(path, checkpoint_path, checkpoint_sha256) -> d
         raise RuntimeError("balanced-r0 confirmation lacks seven gamma cells")
     for gamma, row in per_gamma.items():
         routes = row.get("all_routes", {})
+        successful_routes = row.get("successful_routes", {})
         if (
             float(routes.get("balance", -1.0)) < 0.8
             or float(routes.get("resolved_fraction", -1.0)) < 0.95
+            or int(row.get("success_count", -1)) < 10
+            or float(successful_routes.get("balance", -1.0)) < 0.8
         ):
             raise RuntimeError(f"balanced-r0 confirmation failed at gamma={gamma}")
     return {
@@ -141,6 +144,8 @@ def validate_balanced_r0_delivery(path, checkpoint_path, checkpoint_sha256) -> d
         "confirmation_sha256": AFE2._sha256_file(confirmation_path),
         "M_per_gamma": 100,
         "minimum_balance": 0.8,
+        "minimum_success_balance": 0.8,
+        "minimum_successes": 10,
         "minimum_resolved_fraction": 0.95,
         "checkpoint_sha256": checkpoint_sha256.lower(),
     }

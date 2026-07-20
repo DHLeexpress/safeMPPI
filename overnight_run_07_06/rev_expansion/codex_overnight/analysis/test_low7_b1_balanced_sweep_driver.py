@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import hashlib
+import json
 import sys
 
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "analysis"))
@@ -72,3 +75,37 @@ def test_global_selection_prioritizes_balanced_success_coverage() -> None:
                  "minimum_clearance": 0.1, "round": 5},
     }
     assert min((better_sr, better_coverage), key=DRIVER.global_key) is better_coverage
+
+
+def test_balanced_r0_gate_rejects_successful_route_bias(tmp_path) -> None:
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"model")
+    checksum = hashlib.sha256(b"model").hexdigest()
+    confirmation = tmp_path / "qualification.json"
+    per_gamma = {
+        f"{gamma:g}": {
+            "success_count": 20,
+            "all_routes": {"balance": 1.0, "resolved_fraction": 1.0},
+            "successful_routes": {"balance": 0.5},
+        }
+        for gamma in (0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0)
+    }
+    confirmation.write_text(json.dumps({
+        "passed": True,
+        "M_per_gamma": 100,
+        "checkpoint": {"file_sha256": checksum},
+        "per_gamma": per_gamma,
+    }))
+    delivery = tmp_path / "DELIVERY_COMPLETE.json"
+    delivery.write_text(json.dumps({
+        "status": "LOW7_BALANCED_R0_DELIVERY_COMPLETE",
+        "confirmation_passed": True,
+        "selected": {
+            "checkpoint": str(checkpoint.resolve()),
+            "checkpoint_sha256": checksum,
+        },
+        "confirmation": str(confirmation.resolve()),
+    }))
+
+    with pytest.raises(RuntimeError, match="successful-route balance"):
+        DRIVER.qualified_checkpoint(delivery)
