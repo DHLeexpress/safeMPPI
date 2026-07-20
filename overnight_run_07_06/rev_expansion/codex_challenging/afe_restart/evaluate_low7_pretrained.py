@@ -83,6 +83,7 @@ SCENE_LABELS = {
 }
 METRIC_VERSION = "low7_pretrained_raw_v1"
 CHECKPOINT_STAGE_SCHEMA = "afe_fresh_pretrain_v2_low7_uniform_pairs"
+REFLECTION_CHECKPOINT_STAGE_SCHEMA = "afe_fresh_pretrain_v3_low7_reflection_paired"
 MODEL_SCHEMA = "w8sg-hp-v3-low7-closest-boundary"
 T = 300
 REACH = 0.15
@@ -205,8 +206,15 @@ def load_low7_candidate(
     }
     for field, expected_value in exact_fields.items():
         _require_exact(config, field, expected_value)
+    stage_schema = payload.get("stage_schema")
+    if stage_schema not in {
+        CHECKPOINT_STAGE_SCHEMA,
+        REFLECTION_CHECKPOINT_STAGE_SCHEMA,
+    }:
+        raise CheckpointContractError(
+            f"checkpoint payload stage_schema={stage_schema!r} is not supported"
+        )
     required_payload = {
-        "stage_schema": CHECKPOINT_STAGE_SCHEMA,
         "fresh_from_scratch": True,
         "endpoint_free": True,
         "encoder_trainable_during_pretraining": True,
@@ -216,6 +224,11 @@ def load_low7_candidate(
         if payload.get(field) != expected_value:
             raise CheckpointContractError(
                 f"checkpoint payload {field}={payload.get(field)!r}, expected {expected_value!r}"
+            )
+    if stage_schema == REFLECTION_CHECKPOINT_STAGE_SCHEMA:
+        if payload.get("reflection_paired_pretraining") is not True:
+            raise CheckpointContractError(
+                "reflection-paired checkpoint lost its pretraining contract"
             )
     fixed_goal_grid = payload.get("fixed_goal") is not None
     if fixed_goal_grid:
@@ -252,7 +265,10 @@ def load_low7_candidate(
         "caller_hash_verified": True,
         "model_state_sha256": actual_state_hash,
         "config": dict(config),
-        "stage_schema": payload["stage_schema"],
+        "stage_schema": stage_schema,
+        "reflection_paired_pretraining": bool(
+            payload.get("reflection_paired_pretraining", False)
+        ),
         "source_manifest": payload["source_manifest"],
         "source_query_hash_digest": payload["source_query_hash_digest"],
         "best_epoch": int(payload["best_epoch"]),
@@ -314,11 +330,17 @@ def validate_scene_contract(name: str, env: Any) -> dict[str, Any]:
     return snapshot
 
 
-def raw_noise_seed(gamma: float, rollout_index: int, control_t: int) -> int:
+def raw_noise_seed(
+    gamma: float,
+    rollout_index: int,
+    control_t: int,
+    *,
+    seed_bank: str = METRIC_VERSION,
+) -> int:
     """Common-random-number seed; deliberately independent of scene geometry."""
 
     key = (
-        f"{METRIC_VERSION}|raw|gamma={float(gamma):.1f}|"
+        f"{seed_bank}|raw|gamma={float(gamma):.1f}|"
         f"index={int(rollout_index)}|t={int(control_t)}"
     ).encode()
     return int.from_bytes(hashlib.sha256(key).digest()[:8], "big") % (2**63 - 1)
@@ -336,6 +358,7 @@ def run_raw_rollouts(
     reach: float = REACH,
     nfe: int = NFE,
     device: str | torch.device = "cpu",
+    seed_bank: str = METRIC_VERSION,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Generate raw receding-horizon trajectories without any verifier call."""
 
@@ -376,7 +399,10 @@ def run_raw_rollouts(
                 GF.hist_pad(recent if recent.size else np.zeros((0, 2)), GF.K_HIST)
             )
             seed = raw_noise_seed(
-                episode["gamma"], episode["rollout_index"], control_t
+                episode["gamma"],
+                episode["rollout_index"],
+                control_t,
+                seed_bank=seed_bank,
             )
             generator = torch.Generator(device=device).manual_seed(seed)
             noises.append(torch.randn(policy.d, generator=generator, device=device))
@@ -394,7 +420,10 @@ def run_raw_rollouts(
         for episode, window in zip(active, windows):
             state_before = episode["state"].copy()
             seed = raw_noise_seed(
-                episode["gamma"], episode["rollout_index"], control_t
+                episode["gamma"],
+                episode["rollout_index"],
+                control_t,
+                seed_bank=seed_bank,
             )
             sampled_plans.append(
                 {

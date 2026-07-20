@@ -8,6 +8,8 @@ from afe_restart.stage3_low7_pretrain import (
     _canonical_gamma,
     _objective_weights,
     paired_split,
+    polar_reflection_indices,
+    reflect_low7_batch,
 )
 
 
@@ -88,3 +90,23 @@ def test_pair_split_uses_bank_before_success_missingness() -> None:
     assert set(audit["train_pairs_without_targets"]) | set(
         audit["validation_pairs_without_targets"]
     ) == {4, 5}
+
+
+def test_low7_reflection_is_an_involution_and_preserves_gamma() -> None:
+    grid = torch.arange(2 * 3 * 32 * 32, dtype=torch.float32).reshape(
+        2, 3, 32, 32
+    )
+    low7 = torch.tensor(
+        ((1, 2, 3, 4, 5, 6, 0.1), (7, 8, 9, 10, 11, 12, 1.0)),
+        dtype=torch.float32,
+    )
+    hist = torch.arange(2 * 16 * 2, dtype=torch.float32).reshape(2, 16, 2)
+    plans = torch.arange(2 * 10 * 2, dtype=torch.float32).reshape(2, 10, 2)
+
+    reflected = reflect_low7_batch(grid, low7, hist, plans)
+    restored = reflect_low7_batch(*reflected)
+
+    for actual, expected in zip(restored, (grid, low7, hist, plans)):
+        torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(reflected[1][:, -1], low7[:, -1])
+    assert sorted(polar_reflection_indices().tolist()) == list(range(32))

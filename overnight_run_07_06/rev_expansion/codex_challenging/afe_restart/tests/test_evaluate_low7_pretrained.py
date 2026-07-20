@@ -11,7 +11,12 @@ from afe_restart import evaluate_low7_pretrained as evaluation
 from afe_restart.policy import model_state_hash
 
 
-def _candidate_checkpoint(path: Path, *, fixed_goal_grid: bool = False) -> str:
+def _candidate_checkpoint(
+    path: Path,
+    *,
+    fixed_goal_grid: bool = False,
+    reflection_paired: bool = False,
+) -> str:
     policy = evaluation.HP.GridHPFlowPolicy(
         repr_dim=32,
         grid_hw=(32, 32),
@@ -24,7 +29,11 @@ def _candidate_checkpoint(path: Path, *, fixed_goal_grid: bool = False) -> str:
         policy,
         path,
         extra={
-            "stage_schema": evaluation.CHECKPOINT_STAGE_SCHEMA,
+            "stage_schema": (
+                evaluation.REFLECTION_CHECKPOINT_STAGE_SCHEMA
+                if reflection_paired
+                else evaluation.CHECKPOINT_STAGE_SCHEMA
+            ),
             "fresh_from_scratch": True,
             "endpoint_free": True,
             "domain_randomized_start_goal": not fixed_goal_grid,
@@ -39,6 +48,7 @@ def _candidate_checkpoint(path: Path, *, fixed_goal_grid: bool = False) -> str:
             "model_state_sha256": model_state_hash(policy),
             "best_epoch": 12,
             "best_validation_cfm": 0.25,
+            "reflection_paired_pretraining": reflection_paired,
         },
     )
     return evaluation.sha256_file(path)
@@ -71,6 +81,20 @@ def test_candidate_loader_accepts_fixed_goal_full_grid_provenance(
     _policy, contract = evaluation.load_low7_candidate(checkpoint, checksum, "cpu")
 
     assert contract["fixed_goal_grid"] is True
+
+
+def test_candidate_loader_accepts_reflection_paired_pretraining(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "reflection_candidate.pt"
+    checksum = _candidate_checkpoint(
+        checkpoint, fixed_goal_grid=True, reflection_paired=True
+    )
+
+    _policy, contract = evaluation.load_low7_candidate(checkpoint, checksum, "cpu")
+
+    assert contract["reflection_paired_pretraining"] is True
+    assert contract["stage_schema"] == evaluation.REFLECTION_CHECKPOINT_STAGE_SCHEMA
 
 
 @pytest.mark.parametrize(

@@ -38,6 +38,7 @@ from .stage3_pretrain import seeded_cfm_loss
 
 DATA_SCHEMA = "afe_planned_demo_v3_low7_uniform_pairs"
 TRAIN_SCHEMA = "afe_fresh_pretrain_v2_low7_uniform_pairs"
+REFLECTION_TRAIN_SCHEMA = "afe_fresh_pretrain_v3_low7_reflection_paired"
 GAMMAS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0)
 
 
@@ -46,6 +47,95 @@ def _canonical_gamma(value: float) -> float:
     if len(matches) != 1:
         raise ValueError(f"gamma={value!r} is not a declared conditioning level")
     return float(matches[0])
+
+
+def polar_reflection_indices(n_theta: int = 32) -> torch.Tensor:
+    """Return the exact polar-ray permutation induced by ``x <-> y``."""
+
+    if n_theta <= 0:
+        raise ValueError("n_theta must be positive")
+    theta = -np.pi + (np.arange(n_theta) + 0.5) * 2.0 * np.pi / n_theta
+    reflected_source = np.mod(np.pi / 2.0 - theta + np.pi, 2.0 * np.pi) - np.pi
+    distance = np.abs(
+        np.angle(np.exp(1j * (theta[None, :] - reflected_source[:, None])))
+    )
+    indices = np.argmin(distance, axis=1)
+    if len(set(int(value) for value in indices)) != n_theta:
+        raise RuntimeError("x/y polar reflection is not a permutation")
+    return torch.as_tensor(indices, dtype=torch.long)
+
+
+def reflect_low7_batch(
+    grid: torch.Tensor,
+    low7: torch.Tensor,
+    hist: torch.Tensor,
+    plans: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reflect one low7 batch across the world-frame diagonal ``x=y``."""
+
+    if tuple(grid.shape[1:]) != (3, 32, 32):
+        raise ValueError(f"grid must have shape [B,3,32,32], got {tuple(grid.shape)}")
+    if tuple(low7.shape[1:]) != (7,):
+        raise ValueError(f"low7 must have shape [B,7], got {tuple(low7.shape)}")
+    if tuple(hist.shape[1:]) != (16, 2) or tuple(plans.shape[1:]) != (10, 2):
+        raise ValueError("history/plan shapes must be [B,16,2] and [B,10,2]")
+    if len({len(grid), len(low7), len(hist), len(plans)}) != 1:
+        raise ValueError("reflection inputs must have the same batch length")
+    indices = polar_reflection_indices(grid.shape[-2]).to(grid.device)
+    reflected_grid = grid.index_select(-2, indices)
+    reflected_low7 = low7[:, (1, 0, 3, 2, 5, 4, 6)]
+    return reflected_grid, reflected_low7, hist.flip(-1), plans.flip(-1)
+
+
+def reflection_paired_cfm_loss(
+    policy: torch.nn.Module,
+    grid: torch.Tensor,
+    low7: torch.Tensor,
+    hist: torch.Tensor,
+    plans: torch.Tensor,
+    *,
+    generator: torch.Generator,
+    sample_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """CFM loss over exact original/reflection pairs with paired ``x0,tau``."""
+
+    reflected = reflect_low7_batch(grid, low7, hist, plans)
+
+    def interleave(original: torch.Tensor, mirror: torch.Tensor) -> torch.Tensor:
+        return torch.stack((original, mirror), dim=1).flatten(0, 1)
+
+    paired_grid = interleave(grid, reflected[0])
+    paired_low7 = interleave(low7, reflected[1])
+    paired_hist = interleave(hist, reflected[2])
+    paired_plans = interleave(plans, reflected[3])
+    pair_count = len(plans)
+    x1 = (paired_plans / float(policy.u_max)).reshape(2 * pair_count, int(policy.d))
+    x0_original = torch.randn(
+        (pair_count, int(policy.d)),
+        device=x1.device,
+        dtype=x1.dtype,
+        generator=generator,
+    )
+    x0_reflected = x0_original.reshape(pair_count, -1, 2).flip(-1).reshape_as(
+        x0_original
+    )
+    x0 = interleave(x0_original, x0_reflected)
+    tau_original = torch.rand(
+        pair_count, device=x1.device, dtype=x1.dtype, generator=generator
+    ).clamp_(1.0e-4, 1.0)
+    tau = torch.repeat_interleave(tau_original, 2)
+    x_tau = (1.0 - tau)[:, None] * x0 + tau[:, None] * x1
+    context = policy.ctx_from(paired_grid, paired_low7, paired_hist)
+    prediction = policy(x_tau, tau, context)
+    per_sample = ((prediction - (x1 - x0)) ** 2).mean(dim=1)
+    if sample_weight is None:
+        return per_sample.mean()
+    weights = torch.repeat_interleave(
+        sample_weight.to(device=per_sample.device, dtype=per_sample.dtype), 2
+    )
+    if weights.shape != per_sample.shape or bool((weights <= 0.0).any()):
+        raise ValueError("sample_weight must be one positive scalar per source row")
+    return (per_sample * weights).sum() / weights.sum()
 
 
 @dataclass(frozen=True)
@@ -274,6 +364,7 @@ def _cfm_eval(
     batch: int,
     seed: int,
     amp: bool,
+    reflection_paired: bool = False,
 ) -> float:
     model.eval()
     generator = torch.Generator(device=device).manual_seed(seed)
@@ -288,8 +379,19 @@ def _cfm_eval(
             plans = pool.plans[index].to(device)
             weight = weights[index].to(device)
             with _amp(device, amp):
-                loss = seeded_cfm_loss(
-                    model, grid, low, hist, plans, generator=generator, sample_weight=weight
+                objective = (
+                    reflection_paired_cfm_loss
+                    if reflection_paired
+                    else seeded_cfm_loss
+                )
+                loss = objective(
+                    model,
+                    grid,
+                    low,
+                    hist,
+                    plans,
+                    generator=generator,
+                    sample_weight=weight,
                 )
             batch_mass = float(weight.sum())
             total += float(loss) * batch_mass
@@ -387,8 +489,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             weight = train_weight[index].to(device)
             optimizer.zero_grad(set_to_none=True)
             with _amp(device, args.amp):
-                loss = seeded_cfm_loss(
-                    model, grid, low, hist, plans, generator=cfm_rng, sample_weight=weight
+                objective = (
+                    reflection_paired_cfm_loss
+                    if args.reflection_paired_pretraining
+                    else seeded_cfm_loss
+                )
+                loss = objective(
+                    model,
+                    grid,
+                    low,
+                    hist,
+                    plans,
+                    generator=cfm_rng,
+                    sample_weight=weight,
                 )
             batch_mass = float(weight.sum())
             (loss * (batch_mass / target_mass)).backward()
@@ -413,6 +526,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             batch=args.validation_batch_size,
             seed=args.seed + 10_000,
             amp=args.amp,
+            reflection_paired=args.reflection_paired_pretraining,
         )
         if validation < best_loss:
             best_loss = validation
@@ -448,7 +562,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         == "afe_low7_fixed_goal_full_grid_endpoint_manifest_v1"
     )
     extra = {
-        "stage_schema": TRAIN_SCHEMA,
+        "stage_schema": (
+            REFLECTION_TRAIN_SCHEMA
+            if args.reflection_paired_pretraining
+            else TRAIN_SCHEMA
+        ),
         "fresh_from_scratch": True,
         "endpoint_free": True,
         "domain_randomized_start_goal": not fixed_goal_grid,
@@ -462,6 +580,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "best_epoch": best_epoch,
         "best_validation_cfm": best_loss,
         "encoder_trainable_during_pretraining": True,
+        "reflection_paired_pretraining": bool(args.reflection_paired_pretraining),
+        "reflection_pair_contract": (
+            "each source row and its exact x/y reflection share tau and reflected x0; "
+            "the pair retains the source row's gamma/trajectory objective mass"
+            if args.reflection_paired_pretraining
+            else None
+        ),
         "expansion_promotion": False,
         "promotion_reason": "awaiting user review of nominal and two OOD pretrained evaluations",
     }
@@ -475,7 +600,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     _plot_history(history, outdir / "viz/training_history.png")
     summary = {
-        "schema_version": TRAIN_SCHEMA,
+        "schema_version": extra["stage_schema"],
         "status": "LOW7_PRETRAINED_AWAITING_OOD_REVIEW",
         "finished_at_utc": _utc_now(),
         "wall_seconds": time.perf_counter() - started,
@@ -500,6 +625,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "learning_rate": args.learning_rate,
             "best_epoch": best_epoch,
             "best_validation_cfm": best_loss,
+            "reflection_paired_pretraining": bool(
+                args.reflection_paired_pretraining
+            ),
+            "effective_examples_per_source_window": (
+                2 if args.reflection_paired_pretraining else 1
+            ),
         },
         "contract": {
             "exact_verified_planned_H10_targets": True,
@@ -512,6 +643,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "closest_boundary_vector_inputs": True,
             "gamma_last": True,
             "encoder_frozen_during_pretraining": False,
+            "exact_xy_reflection_pairs": bool(args.reflection_paired_pretraining),
+            "paired_cfm_source_noise_and_time": bool(
+                args.reflection_paired_pretraining
+            ),
             "expansion_started": False,
         },
         "artifacts": {
@@ -544,6 +679,15 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=20_260_717)
     parser.add_argument("--split-seed", type=int, default=31_711)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--reflection-paired-pretraining",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "train on every verified source row and its exact x/y reflection, "
+            "with paired CFM source noise and time"
+        ),
+    )
     return parser
 
 
