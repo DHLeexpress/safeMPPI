@@ -40,6 +40,7 @@ DATA_SCHEMA = "afe_planned_demo_v3_low7_uniform_pairs"
 TRAIN_SCHEMA = "afe_fresh_pretrain_v2_low7_uniform_pairs"
 REFLECTION_TRAIN_SCHEMA = "afe_fresh_pretrain_v3_low7_reflection_paired"
 EQUIVARIANT_TRAIN_SCHEMA = "afe_fresh_pretrain_v4_low7_reflection_equivariant"
+GROUP_AVERAGED_TRAIN_SCHEMA = "afe_fresh_pretrain_v5_low7_reflection_group_average"
 GAMMAS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0)
 
 
@@ -512,6 +513,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         enc_depth=args.enc_depth,
         raw_condition_dim=7,
         conditioning_schema="low7_closest_boundary",
+        reflection_group_average=args.reflection_group_average,
     ).to(device)
     config = model.config()
     if model.ctx_dim != 39 or model.trunk[0].in_features != 91:
@@ -659,7 +661,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     extra = {
         "stage_schema": (
-            EQUIVARIANT_TRAIN_SCHEMA
+            GROUP_AVERAGED_TRAIN_SCHEMA
+            if args.reflection_group_average
+            else EQUIVARIANT_TRAIN_SCHEMA
             if args.equivariance_weight > 0.0
             else REFLECTION_TRAIN_SCHEMA if args.reflection_paired_pretraining
             else TRAIN_SCHEMA
@@ -681,6 +685,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "equivariance_weight": args.equivariance_weight,
         "encoder_trainable_during_pretraining": True,
         "reflection_paired_pretraining": bool(args.reflection_paired_pretraining),
+        "reflection_group_average": bool(args.reflection_group_average),
         "reflection_pair_contract": (
             "each source row and its exact x/y reflection share tau and reflected x0; "
             "the pair retains the source row's gamma/trajectory objective mass"
@@ -731,6 +736,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "reflection_paired_pretraining": bool(
                 args.reflection_paired_pretraining
             ),
+            "reflection_group_average": bool(args.reflection_group_average),
             "effective_examples_per_source_window": (
                 2 if args.reflection_paired_pretraining else 1
             ),
@@ -752,6 +758,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "explicit_velocity_equivariance_loss": bool(
                 args.equivariance_weight > 0.0
+            ),
+            "exact_reflection_group_averaged_velocity": bool(
+                args.reflection_group_average
             ),
             "expansion_started": False,
         },
@@ -800,6 +809,15 @@ def make_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="weight on direct v(Rx,Rc)=R v(x,c) consistency; requires reflection pairs",
     )
+    parser.add_argument(
+        "--reflection-group-average",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "use the exact x/y group-averaged velocity field; requires "
+            "reflection-paired pretraining"
+        ),
+    )
     return parser
 
 
@@ -811,6 +829,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise ValueError("equivariance-weight must be finite and non-negative")
     if args.equivariance_weight > 0.0 and not args.reflection_paired_pretraining:
         raise ValueError("equivariance-weight requires reflection-paired-pretraining")
+    if args.reflection_group_average and not args.reflection_paired_pretraining:
+        raise ValueError("reflection-group-average requires reflection-paired-pretraining")
     summary = run(args)
     print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
 

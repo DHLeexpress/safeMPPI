@@ -411,6 +411,27 @@ def test_reflection_paired_low7_contract_requires_embedded_model_provenance(
     )
     assert eq_contract["equivariance_weight"] == 10.0
 
+    group_policy = AFE2.HP.GridHPFlowPolicy(
+        repr_dim=32,
+        grid_hw=(32, 32),
+        trunk_hidden=(160, 96),
+        enc_depth=3,
+        raw_condition_dim=7,
+        conditioning_schema=AFE2.CX.LOW7_SCHEMA,
+        reflection_group_average=True,
+    )
+    group_averaged = {
+        **checkpoint,
+        "config": group_policy.config(),
+        "stage_schema": "afe_fresh_pretrain_v5_low7_reflection_group_average",
+        "reflection_group_average": True,
+        "model_state_sha256": model_state_hash(group_policy),
+    }
+    _model_hash, group_contract, _digest = AFE2.validate_checkpoint_contract(
+        "low7_radius1_canonical_v1", group_policy, group_averaged, "f" * 64
+    )
+    assert group_contract["reflection_group_average"] is True
+
 
 def test_query_context_archive_preserves_embedding_inputs_in_float32(afe2_modules) -> None:
     AC, _ = afe2_modules

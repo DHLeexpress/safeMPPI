@@ -55,6 +55,7 @@ class GridHPFlowPolicy(GP2.GridGRUFlowPolicy2):
         boundary_adapter_hidden: int = 0,
         boundary_origin_gate: tuple[float, float, float, float] = (1.25, 0.65, 0.50, 0.47),
         boundary_goal_gate: tuple[float, float, float, float] = (3.95, 4.05, 0.55, 0.55),
+        reflection_group_average: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(
@@ -83,6 +84,16 @@ class GridHPFlowPolicy(GP2.GridGRUFlowPolicy2):
             raise ValueError(
                 "conditioning dimension and schema must declare low5 or "
                 "low7_closest_boundary"
+            )
+        self.reflection_group_average = bool(reflection_group_average)
+        if self.reflection_group_average and (
+            self.conditioning_schema != "low7_closest_boundary"
+            or use_gru
+            or boundary_adapter
+        ):
+            raise ValueError(
+                "reflection group averaging requires low7_closest_boundary "
+                "conditioning without a GRU or boundary adapter"
             )
         self.low_raw_dim = self.raw_condition_dim + (self.gru_dim if use_gru else 0)
 
@@ -164,9 +175,32 @@ class GridHPFlowPolicy(GP2.GridGRUFlowPolicy2):
         hist: torch.Tensor,
     ) -> torch.Tensor:
         """Build the declared raw-condition + ``E(H_P)`` context."""
-        low_raw = self._low_raw(low5, hist)
-        hp = self.hp_token(grid)
-        return torch.cat((low_raw, hp), dim=1)
+        context = torch.cat((self._low_raw(low5, hist), self.hp_token(grid)), dim=1)
+        if not self.reflection_group_average:
+            return context
+        if grid.ndim == 3:
+            grid = grid.unsqueeze(0)
+        if low5.ndim == 1:
+            low5 = low5.unsqueeze(0)
+        if hist.ndim == 2:
+            hist = hist.unsqueeze(0)
+        n_theta = int(grid.shape[-2])
+        if n_theta % 4:
+            raise ValueError("x/y reflection requires a polar grid divisible by four")
+        indices = torch.remainder(
+            n_theta // 4 - torch.arange(n_theta, device=grid.device) - 1,
+            n_theta,
+        )
+        reflected_grid = grid.index_select(-2, indices)
+        reflected_low = low5[:, (1, 0, 3, 2, 5, 4, 6)]
+        reflected_context = torch.cat(
+            (
+                self._low_raw(reflected_low, hist.flip(-1)),
+                self.hp_token(reflected_grid),
+            ),
+            dim=1,
+        )
+        return torch.cat((context, reflected_context), dim=1)
 
     @torch.no_grad()
     def sample_window(
@@ -232,6 +266,24 @@ class GridHPFlowPolicy(GP2.GridGRUFlowPolicy2):
         return origin, goal_gate
 
     def forward(self, x, tau, ctx, return_features: bool = False):
+        if self.reflection_group_average:
+            if ctx.ndim != 2 or ctx.shape[1] != 2 * self.ctx_dim:
+                raise ValueError(
+                    "group-averaged context must contain original and reflected branches"
+                )
+            original_context, reflected_context = ctx.split(self.ctx_dim, dim=1)
+            reflected_x = x.reshape(len(x), self.T, 2).flip(-1).reshape_as(x)
+            original_features = self.features(x, tau, original_context)
+            reflected_features = self.features(
+                reflected_x, tau, reflected_context
+            )
+            original_velocity = self.head(original_features)
+            reflected_velocity = self.head(reflected_features).reshape(
+                len(x), self.T, 2
+            ).flip(-1).reshape_as(original_velocity)
+            velocity = 0.5 * (original_velocity + reflected_velocity)
+            features = 0.5 * (original_features + reflected_features)
+            return (velocity, features) if return_features else velocity
         features = self.features(x, tau, ctx)
         velocity = self.head(features)
         if self.boundary_adapter:
@@ -242,6 +294,32 @@ class GridHPFlowPolicy(GP2.GridGRUFlowPolicy2):
                 + goal_gate[:, None] * self.adapter_goal(features)
             )
         return (velocity, features) if return_features else velocity
+
+    @torch.no_grad()
+    def phi_s(self, controls: torch.Tensor, ctx: torch.Tensor, s: float = 0.9) -> torch.Tensor:
+        if not self.reflection_group_average:
+            return super().phi_s(controls, ctx, s=s)
+        batch = controls.shape[0]
+        x1 = (controls / self.u_max).reshape(batch, self.d)
+        ctx = self._expand_ctx(ctx, batch)
+        if len(self.noise_templates) % 2:
+            raise RuntimeError("group-averaged feature templates must have even size")
+        base_templates = self.noise_templates[: len(self.noise_templates) // 2]
+        templates = torch.cat(
+            (
+                base_templates,
+                base_templates.reshape(-1, self.T, 2).flip(-1).reshape(
+                    -1, self.d
+                ),
+            ),
+            dim=0,
+        )
+        features = []
+        for template in templates:
+            x_s = (1.0 - s) * template[None] + s * x1
+            tau = torch.full((batch,), s, device=x1.device, dtype=x1.dtype)
+            features.append(self.forward(x_s, tau, ctx, return_features=True)[1])
+        return torch.stack(features, dim=0).mean(dim=0)
 
     def config(self) -> dict:
         return {
@@ -270,6 +348,7 @@ class GridHPFlowPolicy(GP2.GridGRUFlowPolicy2):
             "boundary_adapter_hidden": self.boundary_adapter_hidden,
             "boundary_origin_gate": list(self.boundary_origin_gate),
             "boundary_goal_gate": list(self.boundary_goal_gate),
+            "reflection_group_average": self.reflection_group_average,
         }
 
 
@@ -300,6 +379,7 @@ def load_hp(path: str | Path, device: str | torch.device = "cpu"):
         boundary_adapter_hidden=config.get("boundary_adapter_hidden", 0),
         boundary_origin_gate=tuple(config.get("boundary_origin_gate", (1.25, 0.65, 0.50, 0.47))),
         boundary_goal_gate=tuple(config.get("boundary_goal_gate", (3.95, 4.05, 0.55, 0.55))),
+        reflection_group_average=config.get("reflection_group_average", False),
     )
     policy.load_state_dict(checkpoint["state_dict"])
     return policy.to(device).eval(), checkpoint

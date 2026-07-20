@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import grid_hp_expt as HP
 
 from afe_restart.stage3_low7_pretrain import (
     GAMMAS,
@@ -152,3 +153,41 @@ def test_direct_equivariance_term_detects_coordinate_bias() -> None:
 
     torch.testing.assert_close(symmetric, torch.zeros_like(symmetric))
     assert float(biased) > 0.5
+
+
+def test_group_averaged_policy_is_exactly_reflection_equivariant() -> None:
+    policy = HP.GridHPFlowPolicy(
+        repr_dim=32,
+        grid_hw=(32, 32),
+        trunk_hidden=(32,),
+        enc_depth=1,
+        raw_condition_dim=7,
+        conditioning_schema="low7_closest_boundary",
+        reflection_group_average=True,
+    ).eval()
+    grid = torch.randn(3, 3, 32, 32)
+    low7 = torch.randn(3, 7)
+    low7[:, -1] = torch.tensor((0.1, 0.5, 1.0))
+    hist = torch.randn(3, 16, 2)
+    controls = torch.randn(3, 10, 2)
+    reflected = reflect_low7_batch(grid, low7, hist, controls)
+    context = policy.ctx_from(grid, low7, hist)
+    reflected_context = policy.ctx_from(*reflected[:3])
+    torch.testing.assert_close(
+        reflected_context,
+        torch.cat((context[:, policy.ctx_dim :], context[:, : policy.ctx_dim]), dim=1),
+    )
+
+    x = torch.randn(3, 20)
+    tau = torch.tensor((0.2, 0.5, 0.9))
+    reflected_x = x.reshape(3, 10, 2).flip(-1).reshape_as(x)
+    velocity = policy(x, tau, context)
+    reflected_velocity = policy(reflected_x, tau, reflected_context)
+    torch.testing.assert_close(
+        reflected_velocity,
+        velocity.reshape(3, 10, 2).flip(-1).reshape_as(velocity),
+    )
+
+    features = policy.phi_s(controls, context)
+    reflected_features = policy.phi_s(reflected[3], reflected_context)
+    torch.testing.assert_close(features, reflected_features, rtol=1e-5, atol=1e-6)

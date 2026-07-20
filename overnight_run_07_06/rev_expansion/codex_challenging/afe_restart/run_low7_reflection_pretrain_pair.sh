@@ -15,6 +15,8 @@ SEED_A=${SEED_A:-20260717}
 SEED_B=${SEED_B:-20260718}
 EQ_WEIGHT_A=${EQ_WEIGHT_A:-0}
 EQ_WEIGHT_B=${EQ_WEIGHT_B:-0}
+GROUP_AVERAGE_A=${GROUP_AVERAGE_A:-0}
+GROUP_AVERAGE_B=${GROUP_AVERAGE_B:-0}
 M_SELECT=${M_SELECT:-50}
 M_CONFIRM=${M_CONFIRM:-100}
 
@@ -56,10 +58,18 @@ run_candidate() {
   local gpu=$1
   local seed=$2
   local equivariance_weight=$3
+  local group_average=$4
   local eq_tag=${equivariance_weight//./p}
-  local name="seed_${seed}_eq_${eq_tag}"
+  local name="seed_${seed}_eq_${eq_tag}_ga_${group_average}"
   local root="$OUTPUT_ROOT/$name"
   mkdir -p "$root"
+  local group_args=()
+  if [[ "$group_average" == 1 ]]; then
+    group_args+=(--reflection-group-average)
+  elif [[ "$group_average" != 0 ]]; then
+    echo "GROUP_AVERAGE must be 0 or 1" >&2
+    return 2
+  fi
   CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON" -m afe_restart.stage3_low7_pretrain \
     --manifest "$DATA_MANIFEST" \
     --outdir "$root/pretrain" \
@@ -72,6 +82,7 @@ run_candidate() {
     --split-seed 31711 \
     --reflection-paired-pretraining \
     --equivariance-weight "$equivariance_weight" \
+    "${group_args[@]}" \
     >"$root/pretrain.log" 2>&1
   local checkpoint="$root/pretrain/data/checkpoint_candidate.pt"
   local checksum
@@ -89,9 +100,9 @@ run_candidate() {
     >"$root/qualification_select.log" 2>&1
 }
 
-run_candidate "$GPU_A" "$SEED_A" "$EQ_WEIGHT_A" &
+run_candidate "$GPU_A" "$SEED_A" "$EQ_WEIGHT_A" "$GROUP_AVERAGE_A" &
 PID_A=$!
-run_candidate "$GPU_B" "$SEED_B" "$EQ_WEIGHT_B" &
+run_candidate "$GPU_B" "$SEED_B" "$EQ_WEIGHT_B" "$GROUP_AVERAGE_B" &
 PID_B=$!
 wait "$PID_A"
 wait "$PID_B"

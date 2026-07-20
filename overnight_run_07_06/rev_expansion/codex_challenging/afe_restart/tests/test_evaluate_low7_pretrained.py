@@ -17,6 +17,7 @@ def _candidate_checkpoint(
     fixed_goal_grid: bool = False,
     reflection_paired: bool = False,
     equivariance_weight: float = 0.0,
+    reflection_group_average: bool = False,
 ) -> str:
     policy = evaluation.HP.GridHPFlowPolicy(
         repr_dim=32,
@@ -25,13 +26,16 @@ def _candidate_checkpoint(
         enc_depth=3,
         raw_condition_dim=7,
         conditioning_schema="low7_closest_boundary",
+        reflection_group_average=reflection_group_average,
     )
     evaluation.HP.save_hp(
         policy,
         path,
         extra={
             "stage_schema": (
-                evaluation.EQUIVARIANT_CHECKPOINT_STAGE_SCHEMA
+                evaluation.GROUP_AVERAGED_CHECKPOINT_STAGE_SCHEMA
+                if reflection_group_average
+                else evaluation.EQUIVARIANT_CHECKPOINT_STAGE_SCHEMA
                 if equivariance_weight > 0.0
                 else evaluation.REFLECTION_CHECKPOINT_STAGE_SCHEMA if reflection_paired
                 else evaluation.CHECKPOINT_STAGE_SCHEMA
@@ -52,6 +56,7 @@ def _candidate_checkpoint(
             "best_validation_cfm": 0.25,
             "reflection_paired_pretraining": reflection_paired,
             "equivariance_weight": equivariance_weight,
+            "reflection_group_average": reflection_group_average,
         },
     )
     return evaluation.sha256_file(path)
@@ -115,6 +120,24 @@ def test_candidate_loader_accepts_explicit_equivariance_pretraining(
 
     assert contract["stage_schema"] == evaluation.EQUIVARIANT_CHECKPOINT_STAGE_SCHEMA
     assert contract["equivariance_weight"] == 10.0
+
+
+def test_candidate_loader_accepts_exact_group_averaged_pretraining(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "group_averaged_candidate.pt"
+    checksum = _candidate_checkpoint(
+        checkpoint,
+        fixed_goal_grid=True,
+        reflection_paired=True,
+        reflection_group_average=True,
+    )
+
+    policy, contract = evaluation.load_low7_candidate(checkpoint, checksum, "cpu")
+
+    assert policy.reflection_group_average is True
+    assert contract["stage_schema"] == evaluation.GROUP_AVERAGED_CHECKPOINT_STAGE_SCHEMA
+    assert contract["reflection_group_average"] is True
 
 
 @pytest.mark.parametrize(

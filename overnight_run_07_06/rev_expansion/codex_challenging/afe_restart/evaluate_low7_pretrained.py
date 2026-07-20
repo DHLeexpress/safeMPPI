@@ -87,6 +87,9 @@ REFLECTION_CHECKPOINT_STAGE_SCHEMA = "afe_fresh_pretrain_v3_low7_reflection_pair
 EQUIVARIANT_CHECKPOINT_STAGE_SCHEMA = (
     "afe_fresh_pretrain_v4_low7_reflection_equivariant"
 )
+GROUP_AVERAGED_CHECKPOINT_STAGE_SCHEMA = (
+    "afe_fresh_pretrain_v5_low7_reflection_group_average"
+)
 MODEL_SCHEMA = "w8sg-hp-v3-low7-closest-boundary"
 T = 300
 REACH = 0.15
@@ -214,6 +217,7 @@ def load_low7_candidate(
         CHECKPOINT_STAGE_SCHEMA,
         REFLECTION_CHECKPOINT_STAGE_SCHEMA,
         EQUIVARIANT_CHECKPOINT_STAGE_SCHEMA,
+        GROUP_AVERAGED_CHECKPOINT_STAGE_SCHEMA,
     }:
         raise CheckpointContractError(
             f"checkpoint payload stage_schema={stage_schema!r} is not supported"
@@ -232,6 +236,7 @@ def load_low7_candidate(
     if stage_schema in {
         REFLECTION_CHECKPOINT_STAGE_SCHEMA,
         EQUIVARIANT_CHECKPOINT_STAGE_SCHEMA,
+        GROUP_AVERAGED_CHECKPOINT_STAGE_SCHEMA,
     }:
         if payload.get("reflection_paired_pretraining") is not True:
             raise CheckpointContractError(
@@ -241,6 +246,15 @@ def load_low7_candidate(
         if not float(payload.get("equivariance_weight", 0.0)) > 0.0:
             raise CheckpointContractError(
                 "equivariant checkpoint lacks a positive consistency weight"
+            )
+    if stage_schema == GROUP_AVERAGED_CHECKPOINT_STAGE_SCHEMA:
+        if payload.get("reflection_group_average") is not True:
+            raise CheckpointContractError(
+                "group-averaged checkpoint lost its exact symmetry contract"
+            )
+        if config.get("reflection_group_average") is not True:
+            raise CheckpointContractError(
+                "group-averaged checkpoint does not reconstruct the symmetric model"
             )
     fixed_goal_grid = payload.get("fixed_goal") is not None
     if fixed_goal_grid:
@@ -282,6 +296,9 @@ def load_low7_candidate(
             payload.get("reflection_paired_pretraining", False)
         ),
         "equivariance_weight": float(payload.get("equivariance_weight", 0.0)),
+        "reflection_group_average": bool(
+            payload.get("reflection_group_average", False)
+        ),
         "source_manifest": payload["source_manifest"],
         "source_query_hash_digest": payload["source_query_hash_digest"],
         "best_epoch": int(payload["best_epoch"]),

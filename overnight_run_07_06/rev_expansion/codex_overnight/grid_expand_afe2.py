@@ -339,6 +339,7 @@ def validate_checkpoint_contract(profile_name, policy, checkpoint, checkpoint_sh
         reflection_schemas = {
             "afe_fresh_pretrain_v3_low7_reflection_paired",
             "afe_fresh_pretrain_v4_low7_reflection_equivariant",
+            "afe_fresh_pretrain_v5_low7_reflection_group_average",
         }
         reflection_paired = checkpoint.get("stage_schema") in reflection_schemas
         if reflection_paired:
@@ -361,6 +362,17 @@ def validate_checkpoint_contract(profile_name, policy, checkpoint, checkpoint_sh
             ):
                 raise RuntimeError(
                     "equivariant low7 checkpoint lacks a positive consistency weight"
+                )
+            if (
+                checkpoint.get("stage_schema")
+                == "afe_fresh_pretrain_v5_low7_reflection_group_average"
+                and (
+                    checkpoint.get("reflection_group_average") is not True
+                    or config.get("reflection_group_average") is not True
+                )
+            ):
+                raise RuntimeError(
+                    "group-averaged low7 checkpoint lacks its exact symmetry contract"
                 )
         else:
             if checkpoint_sha256 != LOW7_CANDIDATE_CHECKPOINT_SHA256:
@@ -414,6 +426,9 @@ def validate_checkpoint_contract(profile_name, policy, checkpoint, checkpoint_sh
             "reflection_paired_pretraining": reflection_paired,
             "equivariance_weight": float(
                 checkpoint.get("equivariance_weight", 0.0)
+            ),
+            "reflection_group_average": bool(
+                checkpoint.get("reflection_group_average", False)
             ),
         }
     else:
