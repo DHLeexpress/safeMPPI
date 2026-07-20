@@ -105,28 +105,7 @@ def choose_low_high(summaries: dict[float, dict[str, float | int]]) -> tuple[flo
     positive = sorted(coef for coef in summaries if coef > 0.0)
     if len(positive) < 2:
         raise ValueError("at least two positive safety coefficients are required")
-    split = max(1, len(positive) // 2)
-    low_pool = positive[:split]
-    low = max(
-        low_pool,
-        key=lambda coef: (
-            float(summaries[coef]["balance"]),
-            float(summaries[coef]["route_value_std"]),
-            -coef,
-        ),
-    )
-    high_pool = [coef for coef in positive[split:] if coef > low]
-    if not high_pool:
-        high_pool = [coef for coef in positive if coef > low]
-    high = min(
-        high_pool,
-        key=lambda coef: (
-            float(summaries[coef]["balance"]),
-            float(summaries[coef]["route_value_std"]),
-            -coef,
-        ),
-    )
-    return low, high
+    return positive[0], positive[-1]
 
 
 def raw_cell(confirmation: Path, round_i: int, gamma: float) -> tuple[list[np.ndarray], list[str]]:
@@ -252,7 +231,7 @@ def main() -> int:
     parser.add_argument("--reach", type=float, default=0.15)
     parser.add_argument(
         "--safe-coef-candidates", type=float, nargs="+",
-        default=[0.0, 0.03, 0.1, 0.3, 0.9, 2.0],
+        default=[0.0, 0.1, 0.9],
     )
     args = parser.parse_args()
     if args.m != len(FIXED_INDICES):
@@ -347,8 +326,8 @@ def main() -> int:
             "selected_low": low_coef,
             "selected_high": high_coef,
             "selection_rule": (
-                "low: best closest-obstacle U/R balance then dispersion in lower positive half; "
-                "high: lowest balance then dispersion among larger coefficients"
+                "predeclared original Kazuki safety-grid endpoints: minimum and maximum "
+                "positive candidate; summaries are diagnostic and never select the rows"
             ),
             "important_control_note": (
                 "goal_coef=safe_coef=0 is not raw pretrained: FlowMPPI elite selection, "

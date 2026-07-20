@@ -15,7 +15,7 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)
 
 
-def test_route_summary_and_selection_are_deterministic():
+def test_low_high_are_predeclared_endpoints_not_metric_selected():
     summaries = {
         0.03: {"balance": 1.0, "route_value_std": 0.4},
         0.1: {"balance": 0.8, "route_value_std": 0.3},
