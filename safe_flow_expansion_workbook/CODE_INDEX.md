@@ -48,6 +48,7 @@ All paths below are relative to `source_snapshot/overnight_run_07_06/rev_expansi
 | `grid_hp_expt.py` | Nominal-Hp grid/policy helpers. | Shares historical experiment assumptions and absolute import roots. |
 | `grid_metrics2.py` | Additional rollout and validity metrics. | Metric names need evaluation-mode context. |
 | `paper_results/afe_m20_eval.py` | Portable raw/verified endpoint evaluation utilities. | Some “verified” modes use a controller; only raw mode is the Phase C scientific outcome. |
+| `analysis/validate_afe2_pair.py`, `run_afe2_pair.sh` | Historical AFE2 artifact-test fixtures retained so the inherited integrity suite is self-contained. | These launch/validate the superseded dual-arm AFE2 protocol and are not Phase C runtime. |
 
 ## 3. Shared flow policy and rollout stack
 

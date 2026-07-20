@@ -6,9 +6,9 @@
       "sha256": "ec140d9156a3504c176885ef08d195c0bf59400d748c77f6793226e06f072615"
     },
     {
-      "bytes": 16560,
+      "bytes": 16810,
       "path": "CODE_INDEX.md",
-      "sha256": "cf695999ac6f13d0fb6a0b031d681786eed465df5c8e0eb2b83b3efac471e399"
+      "sha256": "83aa127608e990faee526aad574f18db118f297e6df7f9f3a5407ada938b5fd5"
     },
     {
       "bytes": 475,
@@ -1681,6 +1681,11 @@
       "sha256": "1f90e846846ea06360f52a59bac1425cc8f6702563465eae16ea313a559fed20"
     },
     {
+      "bytes": 20024,
+      "path": "source_snapshot/overnight_run_07_06/rev_expansion/codex_overnight/analysis/validate_afe2_pair.py",
+      "sha256": "f28efbd9011e019234de2bb70e325a307854093cf314ac80ab66afb4c41f9c85"
+    },
+    {
       "bytes": 80330,
       "path": "source_snapshot/overnight_run_07_06/rev_expansion/codex_overnight/grid_expand_afe2.py",
       "sha256": "5219bae66d795c37fa6f135840fa33d36bb9cf70c1e0eaae7a525bbd711961bd"
@@ -1724,6 +1729,11 @@
       "bytes": 26742,
       "path": "source_snapshot/overnight_run_07_06/rev_expansion/codex_overnight/paper_results/low7_support_sweep_eval.py",
       "sha256": "c7754a4145f8daa9cefe316bc76c9fe9d4314a5d08942d54ea626597d8101144"
+    },
+    {
+      "bytes": 4771,
+      "path": "source_snapshot/overnight_run_07_06/rev_expansion/codex_overnight/run_afe2_pair.sh",
+      "sha256": "5ac0e783abcfb20d2e923b55c0364f181c8371e4d36d9b31add822f440efd239"
     },
     {
       "bytes": 1734,
