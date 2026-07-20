@@ -16,6 +16,7 @@ def _candidate_checkpoint(
     *,
     fixed_goal_grid: bool = False,
     reflection_paired: bool = False,
+    equivariance_weight: float = 0.0,
 ) -> str:
     policy = evaluation.HP.GridHPFlowPolicy(
         repr_dim=32,
@@ -30,8 +31,9 @@ def _candidate_checkpoint(
         path,
         extra={
             "stage_schema": (
-                evaluation.REFLECTION_CHECKPOINT_STAGE_SCHEMA
-                if reflection_paired
+                evaluation.EQUIVARIANT_CHECKPOINT_STAGE_SCHEMA
+                if equivariance_weight > 0.0
+                else evaluation.REFLECTION_CHECKPOINT_STAGE_SCHEMA if reflection_paired
                 else evaluation.CHECKPOINT_STAGE_SCHEMA
             ),
             "fresh_from_scratch": True,
@@ -49,6 +51,7 @@ def _candidate_checkpoint(
             "best_epoch": 12,
             "best_validation_cfm": 0.25,
             "reflection_paired_pretraining": reflection_paired,
+            "equivariance_weight": equivariance_weight,
         },
     )
     return evaluation.sha256_file(path)
@@ -95,6 +98,23 @@ def test_candidate_loader_accepts_reflection_paired_pretraining(
 
     assert contract["reflection_paired_pretraining"] is True
     assert contract["stage_schema"] == evaluation.REFLECTION_CHECKPOINT_STAGE_SCHEMA
+
+
+def test_candidate_loader_accepts_explicit_equivariance_pretraining(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "equivariant_candidate.pt"
+    checksum = _candidate_checkpoint(
+        checkpoint,
+        fixed_goal_grid=True,
+        reflection_paired=True,
+        equivariance_weight=10.0,
+    )
+
+    _policy, contract = evaluation.load_low7_candidate(checkpoint, checksum, "cpu")
+
+    assert contract["stage_schema"] == evaluation.EQUIVARIANT_CHECKPOINT_STAGE_SCHEMA
+    assert contract["equivariance_weight"] == 10.0
 
 
 @pytest.mark.parametrize(

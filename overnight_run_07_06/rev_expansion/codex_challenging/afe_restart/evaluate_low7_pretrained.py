@@ -84,6 +84,9 @@ SCENE_LABELS = {
 METRIC_VERSION = "low7_pretrained_raw_v1"
 CHECKPOINT_STAGE_SCHEMA = "afe_fresh_pretrain_v2_low7_uniform_pairs"
 REFLECTION_CHECKPOINT_STAGE_SCHEMA = "afe_fresh_pretrain_v3_low7_reflection_paired"
+EQUIVARIANT_CHECKPOINT_STAGE_SCHEMA = (
+    "afe_fresh_pretrain_v4_low7_reflection_equivariant"
+)
 MODEL_SCHEMA = "w8sg-hp-v3-low7-closest-boundary"
 T = 300
 REACH = 0.15
@@ -210,6 +213,7 @@ def load_low7_candidate(
     if stage_schema not in {
         CHECKPOINT_STAGE_SCHEMA,
         REFLECTION_CHECKPOINT_STAGE_SCHEMA,
+        EQUIVARIANT_CHECKPOINT_STAGE_SCHEMA,
     }:
         raise CheckpointContractError(
             f"checkpoint payload stage_schema={stage_schema!r} is not supported"
@@ -225,10 +229,18 @@ def load_low7_candidate(
             raise CheckpointContractError(
                 f"checkpoint payload {field}={payload.get(field)!r}, expected {expected_value!r}"
             )
-    if stage_schema == REFLECTION_CHECKPOINT_STAGE_SCHEMA:
+    if stage_schema in {
+        REFLECTION_CHECKPOINT_STAGE_SCHEMA,
+        EQUIVARIANT_CHECKPOINT_STAGE_SCHEMA,
+    }:
         if payload.get("reflection_paired_pretraining") is not True:
             raise CheckpointContractError(
                 "reflection-paired checkpoint lost its pretraining contract"
+            )
+    if stage_schema == EQUIVARIANT_CHECKPOINT_STAGE_SCHEMA:
+        if not float(payload.get("equivariance_weight", 0.0)) > 0.0:
+            raise CheckpointContractError(
+                "equivariant checkpoint lacks a positive consistency weight"
             )
     fixed_goal_grid = payload.get("fixed_goal") is not None
     if fixed_goal_grid:
@@ -269,6 +281,7 @@ def load_low7_candidate(
         "reflection_paired_pretraining": bool(
             payload.get("reflection_paired_pretraining", False)
         ),
+        "equivariance_weight": float(payload.get("equivariance_weight", 0.0)),
         "source_manifest": payload["source_manifest"],
         "source_query_hash_digest": payload["source_query_hash_digest"],
         "best_epoch": int(payload["best_epoch"]),

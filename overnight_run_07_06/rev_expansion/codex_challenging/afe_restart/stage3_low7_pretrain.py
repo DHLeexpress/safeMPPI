@@ -39,6 +39,7 @@ from .stage3_pretrain import seeded_cfm_loss
 DATA_SCHEMA = "afe_planned_demo_v3_low7_uniform_pairs"
 TRAIN_SCHEMA = "afe_fresh_pretrain_v2_low7_uniform_pairs"
 REFLECTION_TRAIN_SCHEMA = "afe_fresh_pretrain_v3_low7_reflection_paired"
+EQUIVARIANT_TRAIN_SCHEMA = "afe_fresh_pretrain_v4_low7_reflection_equivariant"
 GAMMAS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0)
 
 
@@ -87,7 +88,7 @@ def reflect_low7_batch(
     return reflected_grid, reflected_low7, hist.flip(-1), plans.flip(-1)
 
 
-def reflection_paired_cfm_loss(
+def reflection_paired_cfm_terms(
     policy: torch.nn.Module,
     grid: torch.Tensor,
     low7: torch.Tensor,
@@ -96,8 +97,8 @@ def reflection_paired_cfm_loss(
     *,
     generator: torch.Generator,
     sample_weight: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """CFM loss over exact original/reflection pairs with paired ``x0,tau``."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return CFM and direct velocity-equivariance losses on exact pairs."""
 
     reflected = reflect_low7_batch(grid, low7, hist, plans)
 
@@ -128,14 +129,54 @@ def reflection_paired_cfm_loss(
     context = policy.ctx_from(paired_grid, paired_low7, paired_hist)
     prediction = policy(x_tau, tau, context)
     per_sample = ((prediction - (x1 - x0)) ** 2).mean(dim=1)
+    original_prediction = prediction[0::2]
+    reflected_prediction = prediction[1::2]
+    reflected_original_prediction = original_prediction.reshape(
+        pair_count, -1, 2
+    ).flip(-1).reshape_as(original_prediction)
+    per_pair_equivariance = (
+        (reflected_prediction - reflected_original_prediction) ** 2
+    ).mean(dim=1)
     if sample_weight is None:
-        return per_sample.mean()
+        return per_sample.mean(), per_pair_equivariance.mean()
     weights = torch.repeat_interleave(
         sample_weight.to(device=per_sample.device, dtype=per_sample.dtype), 2
     )
     if weights.shape != per_sample.shape or bool((weights <= 0.0).any()):
         raise ValueError("sample_weight must be one positive scalar per source row")
-    return (per_sample * weights).sum() / weights.sum()
+    cfm = (per_sample * weights).sum() / weights.sum()
+    pair_weights = sample_weight.to(
+        device=per_sample.device, dtype=per_sample.dtype
+    )
+    equivariance = (
+        per_pair_equivariance * pair_weights
+    ).sum() / pair_weights.sum()
+    return cfm, equivariance
+
+
+def reflection_paired_cfm_loss(
+    policy: torch.nn.Module,
+    grid: torch.Tensor,
+    low7: torch.Tensor,
+    hist: torch.Tensor,
+    plans: torch.Tensor,
+    *,
+    generator: torch.Generator,
+    sample_weight: torch.Tensor | None = None,
+    equivariance_weight: float = 0.0,
+) -> torch.Tensor:
+    """CFM plus an explicit reflected-velocity consistency penalty."""
+
+    cfm, equivariance = reflection_paired_cfm_terms(
+        policy,
+        grid,
+        low7,
+        hist,
+        plans,
+        generator=generator,
+        sample_weight=sample_weight,
+    )
+    return cfm + float(equivariance_weight) * equivariance
 
 
 @dataclass(frozen=True)
@@ -365,10 +406,13 @@ def _cfm_eval(
     seed: int,
     amp: bool,
     reflection_paired: bool = False,
-) -> float:
+    equivariance_weight: float = 0.0,
+) -> dict[str, float]:
     model.eval()
     generator = torch.Generator(device=device).manual_seed(seed)
-    total = 0.0
+    total_objective = 0.0
+    total_cfm = 0.0
+    total_equivariance = 0.0
     mass = 0.0
     with torch.no_grad():
         for offset in range(0, len(rows), batch):
@@ -379,32 +423,58 @@ def _cfm_eval(
             plans = pool.plans[index].to(device)
             weight = weights[index].to(device)
             with _amp(device, amp):
-                objective = (
-                    reflection_paired_cfm_loss
-                    if reflection_paired
-                    else seeded_cfm_loss
-                )
-                loss = objective(
-                    model,
-                    grid,
-                    low,
-                    hist,
-                    plans,
-                    generator=generator,
-                    sample_weight=weight,
-                )
+                if reflection_paired:
+                    cfm, equivariance = reflection_paired_cfm_terms(
+                        model,
+                        grid,
+                        low,
+                        hist,
+                        plans,
+                        generator=generator,
+                        sample_weight=weight,
+                    )
+                    loss = cfm + float(equivariance_weight) * equivariance
+                else:
+                    cfm = seeded_cfm_loss(
+                        model,
+                        grid,
+                        low,
+                        hist,
+                        plans,
+                        generator=generator,
+                        sample_weight=weight,
+                    )
+                    equivariance = torch.zeros_like(cfm)
+                    loss = cfm
             batch_mass = float(weight.sum())
-            total += float(loss) * batch_mass
+            total_objective += float(loss) * batch_mass
+            total_cfm += float(cfm) * batch_mass
+            total_equivariance += float(equivariance) * batch_mass
             mass += batch_mass
-    return total / mass
+    return {
+        "objective": total_objective / mass,
+        "cfm": total_cfm / mass,
+        "equivariance": total_equivariance / mass,
+    }
 
 
 def _plot_history(rows: Sequence[Mapping[str, Any]], output: Path) -> None:
     epochs = [row["epoch"] for row in rows]
     figure, axis = plt.subplots(figsize=(7.2, 4.5))
     axis.plot(epochs, [row["train_cfm"] for row in rows], label="train CFM")
-    axis.plot(epochs, [row["validation_cfm"] for row in rows], label="held-out-pair CFM")
-    axis.set(xlabel="epoch", ylabel="trajectory-balanced CFM loss")
+    axis.plot(epochs, [row["validation_cfm"] for row in rows], label="held-out CFM")
+    if any(float(row["equivariance_weight"]) > 0.0 for row in rows):
+        axis.plot(
+            epochs,
+            [row["train_equivariance"] for row in rows],
+            label="train equivariance",
+        )
+        axis.plot(
+            epochs,
+            [row["validation_equivariance"] for row in rows],
+            label="held-out equivariance",
+        )
+    axis.set(xlabel="epoch", ylabel="trajectory-balanced loss")
     axis.grid(alpha=0.25)
     axis.legend(frameon=False)
     figure.tight_layout()
@@ -461,12 +531,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     cfm_rng = torch.Generator(device=device).manual_seed(args.seed + 2)
     history: list[dict[str, Any]] = []
     best_loss = math.inf
+    best_validation_cfm = math.inf
+    best_validation_equivariance = math.inf
     best_epoch = -1
     best_state: dict[str, torch.Tensor] | None = None
     csv_path = outdir / "tables/training_history.csv"
     fieldnames = (
-        "epoch", "train_cfm", "validation_cfm", "learning_rate",
-        "encoder_gradient_norm", "epoch_seconds",
+        "epoch", "train_objective", "train_cfm", "train_equivariance",
+        "validation_objective", "validation_cfm", "validation_equivariance",
+        "equivariance_weight", "learning_rate", "encoder_gradient_norm",
+        "epoch_seconds",
     )
     with csv_path.open("w", newline="") as handle:
         csv.DictWriter(handle, fieldnames=fieldnames).writeheader()
@@ -477,7 +551,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         epoch_mass = float(train_weight[rows].sum())
         batch_count = math.ceil(len(rows) / args.batch_size)
         target_mass = epoch_mass / batch_count
-        weighted_loss = 0.0
+        weighted_objective = 0.0
+        weighted_cfm = 0.0
+        weighted_equivariance = 0.0
         observed_mass = 0.0
         encoder_norm = 0.0
         for offset in range(0, len(rows), args.batch_size):
@@ -489,20 +565,29 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             weight = train_weight[index].to(device)
             optimizer.zero_grad(set_to_none=True)
             with _amp(device, args.amp):
-                objective = (
-                    reflection_paired_cfm_loss
-                    if args.reflection_paired_pretraining
-                    else seeded_cfm_loss
-                )
-                loss = objective(
-                    model,
-                    grid,
-                    low,
-                    hist,
-                    plans,
-                    generator=cfm_rng,
-                    sample_weight=weight,
-                )
+                if args.reflection_paired_pretraining:
+                    cfm, equivariance = reflection_paired_cfm_terms(
+                        model,
+                        grid,
+                        low,
+                        hist,
+                        plans,
+                        generator=cfm_rng,
+                        sample_weight=weight,
+                    )
+                    loss = cfm + args.equivariance_weight * equivariance
+                else:
+                    cfm = seeded_cfm_loss(
+                        model,
+                        grid,
+                        low,
+                        hist,
+                        plans,
+                        generator=cfm_rng,
+                        sample_weight=weight,
+                    )
+                    equivariance = torch.zeros_like(cfm)
+                    loss = cfm
             batch_mass = float(weight.sum())
             (loss * (batch_mass / target_mass)).backward()
             encoder_norm += math.sqrt(
@@ -514,7 +599,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip)
             optimizer.step()
-            weighted_loss += float(loss.detach()) * batch_mass
+            weighted_objective += float(loss.detach()) * batch_mass
+            weighted_cfm += float(cfm.detach()) * batch_mass
+            weighted_equivariance += float(equivariance.detach()) * batch_mass
             observed_mass += batch_mass
         scheduler.step()
         validation = _cfm_eval(
@@ -527,17 +614,25 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             seed=args.seed + 10_000,
             amp=args.amp,
             reflection_paired=args.reflection_paired_pretraining,
+            equivariance_weight=args.equivariance_weight,
         )
-        if validation < best_loss:
-            best_loss = validation
+        if validation["objective"] < best_loss:
+            best_loss = validation["objective"]
+            best_validation_cfm = validation["cfm"]
+            best_validation_equivariance = validation["equivariance"]
             best_epoch = epoch
             best_state = {
                 name: value.detach().cpu().clone() for name, value in model.state_dict().items()
             }
         row = {
             "epoch": epoch,
-            "train_cfm": weighted_loss / observed_mass,
-            "validation_cfm": validation,
+            "train_objective": weighted_objective / observed_mass,
+            "train_cfm": weighted_cfm / observed_mass,
+            "train_equivariance": weighted_equivariance / observed_mass,
+            "validation_objective": validation["objective"],
+            "validation_cfm": validation["cfm"],
+            "validation_equivariance": validation["equivariance"],
+            "equivariance_weight": args.equivariance_weight,
             "learning_rate": optimizer.param_groups[0]["lr"],
             "encoder_gradient_norm": encoder_norm / batch_count,
             "epoch_seconds": time.perf_counter() - epoch_started,
@@ -547,8 +642,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             csv.DictWriter(handle, fieldnames=fieldnames).writerow(row)
         if epoch % 10 == 0 or epoch == args.epochs - 1 or epoch == best_epoch:
             print(
-                f"[low7 pretrain {epoch:03d}/{args.epochs}] train={row['train_cfm']:.6f} "
-                f"val={validation:.6f} best={best_loss:.6f}@{best_epoch}",
+                f"[low7 pretrain {epoch:03d}/{args.epochs}] "
+                f"cfm={row['train_cfm']:.6f} eq={row['train_equivariance']:.6f} "
+                f"val={validation['objective']:.6f} best={best_loss:.6f}@{best_epoch}",
                 flush=True,
             )
     if best_state is None:
@@ -563,8 +659,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     extra = {
         "stage_schema": (
-            REFLECTION_TRAIN_SCHEMA
-            if args.reflection_paired_pretraining
+            EQUIVARIANT_TRAIN_SCHEMA
+            if args.equivariance_weight > 0.0
+            else REFLECTION_TRAIN_SCHEMA if args.reflection_paired_pretraining
             else TRAIN_SCHEMA
         ),
         "fresh_from_scratch": True,
@@ -578,7 +675,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "source_query_hash_digest": query_digest,
         "model_state_sha256": state_sha,
         "best_epoch": best_epoch,
-        "best_validation_cfm": best_loss,
+        "best_validation_objective": best_loss,
+        "best_validation_cfm": best_validation_cfm,
+        "best_validation_equivariance": best_validation_equivariance,
+        "equivariance_weight": args.equivariance_weight,
         "encoder_trainable_during_pretraining": True,
         "reflection_paired_pretraining": bool(args.reflection_paired_pretraining),
         "reflection_pair_contract": (
@@ -624,7 +724,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "batch_size": args.batch_size,
             "learning_rate": args.learning_rate,
             "best_epoch": best_epoch,
-            "best_validation_cfm": best_loss,
+            "best_validation_objective": best_loss,
+            "best_validation_cfm": best_validation_cfm,
+            "best_validation_equivariance": best_validation_equivariance,
+            "equivariance_weight": args.equivariance_weight,
             "reflection_paired_pretraining": bool(
                 args.reflection_paired_pretraining
             ),
@@ -646,6 +749,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "exact_xy_reflection_pairs": bool(args.reflection_paired_pretraining),
             "paired_cfm_source_noise_and_time": bool(
                 args.reflection_paired_pretraining
+            ),
+            "explicit_velocity_equivariance_loss": bool(
+                args.equivariance_weight > 0.0
             ),
             "expansion_started": False,
         },
@@ -688,6 +794,12 @@ def make_parser() -> argparse.ArgumentParser:
             "with paired CFM source noise and time"
         ),
     )
+    parser.add_argument(
+        "--equivariance-weight",
+        type=float,
+        default=0.0,
+        help="weight on direct v(Rx,Rc)=R v(x,c) consistency; requires reflection pairs",
+    )
     return parser
 
 
@@ -695,6 +807,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = make_parser().parse_args(argv)
     if min(args.epochs, args.batch_size, args.validation_batch_size) <= 0:
         raise ValueError("epochs and batch sizes must be positive")
+    if not math.isfinite(args.equivariance_weight) or args.equivariance_weight < 0.0:
+        raise ValueError("equivariance-weight must be finite and non-negative")
+    if args.equivariance_weight > 0.0 and not args.reflection_paired_pretraining:
+        raise ValueError("equivariance-weight requires reflection-paired-pretraining")
     summary = run(args)
     print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
 

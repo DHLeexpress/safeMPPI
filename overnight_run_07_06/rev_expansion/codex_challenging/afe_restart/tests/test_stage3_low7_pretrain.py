@@ -9,6 +9,7 @@ from afe_restart.stage3_low7_pretrain import (
     _objective_weights,
     paired_split,
     polar_reflection_indices,
+    reflection_paired_cfm_terms,
     reflect_low7_batch,
 )
 
@@ -110,3 +111,44 @@ def test_low7_reflection_is_an_involution_and_preserves_gamma() -> None:
         torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(reflected[1][:, -1], low7[:, -1])
     assert sorted(polar_reflection_indices().tolist()) == list(range(32))
+
+
+class _Velocity(torch.nn.Module):
+    u_max = 1.0
+    d = 20
+
+    def __init__(self, bias: tuple[float, float]) -> None:
+        super().__init__()
+        self.register_buffer("bias", torch.tensor(bias).repeat(10))
+
+    def ctx_from(self, grid, low7, hist):
+        return torch.zeros(len(grid), 1, device=grid.device)
+
+    def forward(self, x, tau, context):
+        return x + self.bias
+
+
+def test_direct_equivariance_term_detects_coordinate_bias() -> None:
+    grid = torch.zeros(3, 3, 32, 32)
+    low7 = torch.zeros(3, 7)
+    hist = torch.zeros(3, 16, 2)
+    plans = torch.randn(3, 10, 2)
+    symmetric = reflection_paired_cfm_terms(
+        _Velocity((0.0, 0.0)),
+        grid,
+        low7,
+        hist,
+        plans,
+        generator=torch.Generator().manual_seed(5),
+    )[1]
+    biased = reflection_paired_cfm_terms(
+        _Velocity((1.0, 0.0)),
+        grid,
+        low7,
+        hist,
+        plans,
+        generator=torch.Generator().manual_seed(5),
+    )[1]
+
+    torch.testing.assert_close(symmetric, torch.zeros_like(symmetric))
+    assert float(biased) > 0.5

@@ -13,6 +13,8 @@ GPU_A=${GPU_A:-1}
 GPU_B=${GPU_B:-3}
 SEED_A=${SEED_A:-20260717}
 SEED_B=${SEED_B:-20260718}
+EQ_WEIGHT_A=${EQ_WEIGHT_A:-0}
+EQ_WEIGHT_B=${EQ_WEIGHT_B:-0}
 M_SELECT=${M_SELECT:-50}
 M_CONFIRM=${M_CONFIRM:-100}
 
@@ -53,7 +55,9 @@ mkdir -p "$OUTPUT_ROOT"
 run_candidate() {
   local gpu=$1
   local seed=$2
-  local name="seed_${seed}"
+  local equivariance_weight=$3
+  local eq_tag=${equivariance_weight//./p}
+  local name="seed_${seed}_eq_${eq_tag}"
   local root="$OUTPUT_ROOT/$name"
   mkdir -p "$root"
   CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON" -m afe_restart.stage3_low7_pretrain \
@@ -67,6 +71,7 @@ run_candidate() {
     --seed "$seed" \
     --split-seed 31711 \
     --reflection-paired-pretraining \
+    --equivariance-weight "$equivariance_weight" \
     >"$root/pretrain.log" 2>&1
   local checkpoint="$root/pretrain/data/checkpoint_candidate.pt"
   local checksum
@@ -84,9 +89,9 @@ run_candidate() {
     >"$root/qualification_select.log" 2>&1
 }
 
-run_candidate "$GPU_A" "$SEED_A" &
+run_candidate "$GPU_A" "$SEED_A" "$EQ_WEIGHT_A" &
 PID_A=$!
-run_candidate "$GPU_B" "$SEED_B" &
+run_candidate "$GPU_B" "$SEED_B" "$EQ_WEIGHT_B" &
 PID_B=$!
 wait "$PID_A"
 wait "$PID_B"

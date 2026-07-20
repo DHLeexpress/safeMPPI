@@ -401,6 +401,16 @@ def test_reflection_paired_low7_contract_requires_embedded_model_provenance(
             "low7_radius1_canonical_v1", policy, corrupted, "f" * 64
         )
 
+    equivariant = dict(
+        checkpoint,
+        stage_schema="afe_fresh_pretrain_v4_low7_reflection_equivariant",
+        equivariance_weight=10.0,
+    )
+    _model_hash, eq_contract, _digest = AFE2.validate_checkpoint_contract(
+        "low7_radius1_canonical_v1", policy, equivariant, "f" * 64
+    )
+    assert eq_contract["equivariance_weight"] == 10.0
+
 
 def test_query_context_archive_preserves_embedding_inputs_in_float32(afe2_modules) -> None:
     AC, _ = afe2_modules

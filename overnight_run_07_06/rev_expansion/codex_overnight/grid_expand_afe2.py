@@ -336,23 +336,32 @@ def validate_checkpoint_contract(profile_name, policy, checkpoint, checkpoint_sh
             raise RuntimeError(
                 "low7 expansion requires ctx=39, trunk input=91, and 70,308 parameters"
             )
-        reflection_paired = (
-            checkpoint.get("stage_schema")
-            == "afe_fresh_pretrain_v3_low7_reflection_paired"
-        )
+        reflection_schemas = {
+            "afe_fresh_pretrain_v3_low7_reflection_paired",
+            "afe_fresh_pretrain_v4_low7_reflection_equivariant",
+        }
+        reflection_paired = checkpoint.get("stage_schema") in reflection_schemas
         if reflection_paired:
             if checkpoint.get("model_state_sha256") != model_sha256:
                 raise RuntimeError(
                     "reflection-paired low7 checkpoint embedded model hash mismatch"
                 )
             required_payload = {
-                "stage_schema": "afe_fresh_pretrain_v3_low7_reflection_paired",
+                "stage_schema": checkpoint.get("stage_schema"),
                 "fresh_from_scratch": True,
                 "endpoint_free": True,
                 "encoder_trainable_during_pretraining": True,
                 "expansion_promotion": False,
                 "reflection_paired_pretraining": True,
             }
+            if (
+                checkpoint.get("stage_schema")
+                == "afe_fresh_pretrain_v4_low7_reflection_equivariant"
+                and not float(checkpoint.get("equivariance_weight", 0.0)) > 0.0
+            ):
+                raise RuntimeError(
+                    "equivariant low7 checkpoint lacks a positive consistency weight"
+                )
         else:
             if checkpoint_sha256 != LOW7_CANDIDATE_CHECKPOINT_SHA256:
                 raise RuntimeError(
@@ -403,6 +412,9 @@ def validate_checkpoint_contract(profile_name, policy, checkpoint, checkpoint_sh
             "trunk_input_dim": 91,
             "parameter_count": 70_308,
             "reflection_paired_pretraining": reflection_paired,
+            "equivariance_weight": float(
+                checkpoint.get("equivariance_weight", 0.0)
+            ),
         }
     else:
         raise ValueError(f"unsupported checkpoint-contract profile: {profile_name}")
