@@ -96,6 +96,7 @@ def test_balanced_r0_gate_rejects_successful_route_bias(tmp_path) -> None:
     confirmation.write_text(json.dumps({
         "passed": True,
         "M_per_gamma": 100,
+        "raw_noise_design": "reflection-antithetic common-random-number pairs",
         "checkpoint": {"file_sha256": checksum},
         "per_gamma": per_gamma,
     }))

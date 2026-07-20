@@ -129,7 +129,25 @@ CUDA_VISIBLE_DEVICES="$GPU_A" "$PYTHON" \
   --M "$M_CONFIRM" \
   --seed-bank low7-balanced-r0-disjoint-confirmation-v1 \
   --reflection-antithetic \
-  >"$OUTPUT_ROOT/confirmation.log" 2>&1
+  >"$OUTPUT_ROOT/confirmation.log" 2>&1 &
+PID_CONFIRM=$!
+
+# This independent-iid audit is deliberately not a qualification gate.  It
+# shows the ordinary finite-M fluctuation that antithetic symmetry
+# qualification removes without changing the raw temperature-1 law.
+CUDA_VISIBLE_DEVICES="$GPU_B" "$PYTHON" \
+  "$REPO_ROOT/overnight_run_07_06/rev_expansion/codex_overnight/analysis/low7_balanced_r0_qualification.py" \
+  --checkpoint "${SELECTED[0]}" \
+  --expected-checkpoint-sha256 "${SELECTED[1]}" \
+  --outdir "$OUTPUT_ROOT/iid_audit" \
+  --device cuda:0 \
+  --M "$M_CONFIRM" \
+  --seed-bank low7-balanced-r0-iid-audit-v1 \
+  --report-only \
+  >"$OUTPUT_ROOT/iid_audit.log" 2>&1 &
+PID_IID=$!
+wait "$PID_CONFIRM"
+wait "$PID_IID"
 
 "$PYTHON" - "$OUTPUT_ROOT" <<'PY'
 from datetime import datetime, timezone
@@ -141,14 +159,22 @@ import sys
 root = Path(sys.argv[1]).resolve()
 selection = json.load(open(root / "selection.json"))
 confirmation = json.load(open(root / "confirmation/qualification.json"))
+iid_audit = json.load(open(root / "iid_audit/qualification.json"))
 if not confirmation["passed"]:
     raise RuntimeError("selected candidate failed disjoint confirmation")
+if confirmation.get("raw_noise_design") != (
+    "reflection-antithetic common-random-number pairs"
+):
+    raise RuntimeError("disjoint confirmation did not use the declared symmetry test")
 payload = {
     "status": "LOW7_BALANCED_R0_DELIVERY_COMPLETE",
     "created_at_utc": datetime.now(timezone.utc).isoformat(),
     "selected": selection["selected"],
     "confirmation": str(root / "confirmation/qualification.json"),
     "confirmation_passed": True,
+    "iid_audit": str(root / "iid_audit/qualification.json"),
+    "iid_audit_is_not_a_gate": True,
+    "iid_audit_passed_strict_finite_sample_gate": bool(iid_audit["passed"]),
 }
 (root / "DELIVERY_COMPLETE.json").write_text(
     json.dumps(payload, indent=2, sort_keys=True) + "\n"

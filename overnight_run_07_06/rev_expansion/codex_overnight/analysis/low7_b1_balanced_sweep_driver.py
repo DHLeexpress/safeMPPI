@@ -158,6 +158,10 @@ def qualified_checkpoint(delivery_path: Path) -> tuple[Path, str, dict]:
     confirmation = load_json(confirmation_path)
     if not confirmation.get("passed") or int(confirmation.get("M_per_gamma", -1)) != 100:
         raise RuntimeError("balanced-r0 confirmation is not the declared M=100/gamma gate")
+    if confirmation.get("raw_noise_design") != (
+        "reflection-antithetic common-random-number pairs"
+    ):
+        raise RuntimeError("balanced-r0 confirmation lacks the exact symmetry noise design")
     if confirmation.get("checkpoint", {}).get("file_sha256") != expected:
         raise RuntimeError("balanced-r0 confirmation/checkpoint SHA mismatch")
     per_gamma = confirmation.get("per_gamma", {})
