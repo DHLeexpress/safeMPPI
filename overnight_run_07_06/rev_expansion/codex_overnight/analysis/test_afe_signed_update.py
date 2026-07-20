@@ -65,9 +65,12 @@ class _Policy(torch.nn.Module):
         del time
         return 0.1 * values + self.trunk(context)
 
-    def cfm_loss(self, controls, context):
+    def cfm_loss(self, controls, context, weights=None):
         target = controls.mean(dim=1)
-        return (self.trunk(context) - target).square().mean()
+        per_sample = (self.trunk(context) - target).square().mean(dim=1)
+        if weights is not None:
+            return (per_sample * weights).mean()
+        return per_sample.mean()
 
 
 class _Store:
@@ -116,6 +119,29 @@ class _Store:
 
     def grid3_of(self, sids):
         return torch.zeros((len(sids), 3, 2, 2), dtype=torch.float32)
+
+
+class _ExactStore(_Store):
+    def __init__(self):
+        super().__init__()
+        self.ctx_meta = [(round_i, index, 0) for index, round_i in enumerate(self.q_round)]
+
+    def positive_epoch_ids(self, rng, *, eligible_ids, sampling):
+        assert sampling == "round_gamma_replica_context"
+        return [int(eligible_ids[index]) for index in rng.permutation(len(eligible_ids))]
+
+    def positive_batch(self, ids):
+        ids = [int(value) for value in ids]
+        return (*self._batch(ids), ids)
+
+    def positive_hierarchy_equal_mass(self, declared_gammas, *, eligible_ids):
+        assert list(declared_gammas) == [0.1]
+        mass = {int(query_id): 1.0 / len(eligible_ids) for query_id in eligible_ids}
+        return mass, {
+            "raw_mass_sum": 1.0,
+            "active_gammas": [0.1],
+            "missing_declared_gammas": [],
+        }
 
 
 def test_signed_update_uses_separate_recent_batches_and_normalized_gradients() -> None:
@@ -170,3 +196,62 @@ def test_signed_update_uses_separate_recent_batches_and_normalized_gradients() -
         assert step["scaled_negative_grad_norm"] == pytest.approx(expected_scaled)
         assert -1.0 <= step["gradient_cosine"] <= 1.0
         assert step["rho"] > 0.0
+
+
+def test_exact_signed_alpha_zero_is_the_unmodified_b1_update(monkeypatch) -> None:
+    expected = object()
+    monkeypatch.setattr(SU.AFE2, "update_round", lambda *args: expected)
+
+    result = SU.update_round_exact_positive_signed(
+        object(), object(), object(), object(), torch.device("cpu"), object(), 3,
+        alpha=0.0,
+    )
+
+    assert result is expected
+
+
+def test_exact_signed_update_uses_every_positive_once_and_nvp_only() -> None:
+    policy = _Policy()
+    store = _ExactStore()
+    cfg = SimpleNamespace(
+        arm="afe",
+        replay_window=4,
+        replay_update_mode="one_epoch_without_replacement",
+        replay_sampling="round_gamma_replica_context",
+        replay_loss_weighting="gamma_episode_context_query_equal_mass",
+        batch=2,
+        grad_clip=10.0,
+        seed=23,
+        gammas=[0.1],
+    )
+    optimizer = torch.optim.SGD(policy.parameters(), lr=0.01)
+
+    result = SU.update_round_exact_positive_signed(
+        policy,
+        optimizer,
+        store,
+        cfg,
+        torch.device("cpu"),
+        np.random.default_rng(7),
+        round_i=4,
+        alpha=0.1,
+        negative_rng=np.random.default_rng(13),
+    )
+
+    eligible_positive = set(store.positive_ids(round_i=4, replay_window=4))
+    assert result["signed_active"] is True
+    assert set(result["drawn_ids"]) == eligible_positive
+    assert all(count == 1 for count in result["drawn_ids"].values())
+    assert result["replay_epoch_coverage"] == 1.0
+    assert result["replay_duplicate_draws"] == 0
+    assert result["optimizer_draws"] == len(eligible_positive)
+    assert result["negative_replay_eligible"] == 2
+    assert set(result["negative_drawn_ids"]).issubset({5, 6})
+    assert all(
+        store.q_nvp_negative[query_id] == 1
+        for query_id in result["negative_drawn_ids"]
+    )
+    for step in result["signed_step_diagnostics"]:
+        assert step["scaled_negative_grad_norm"] == pytest.approx(
+            0.1 * step["positive_grad_norm"]
+        )

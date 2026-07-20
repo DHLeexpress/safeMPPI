@@ -359,6 +359,49 @@ def test_codex_checkpoint_contract_requires_both_allowlist_and_promotion_witness
         )
 
 
+def test_reflection_paired_low7_contract_requires_embedded_model_provenance(
+    afe2_modules,
+) -> None:
+    _, AFE2 = afe2_modules
+    from codex_challenging.afe_restart.policy import model_state_hash
+
+    policy = AFE2.HP.GridHPFlowPolicy(
+        repr_dim=32,
+        grid_hw=(32, 32),
+        trunk_hidden=(160, 96),
+        enc_depth=3,
+        raw_condition_dim=7,
+        conditioning_schema=AFE2.CX.LOW7_SCHEMA,
+    )
+    checkpoint = {
+        "config": policy.config(),
+        "stage_schema": "afe_fresh_pretrain_v3_low7_reflection_paired",
+        "fresh_from_scratch": True,
+        "endpoint_free": True,
+        "encoder_trainable_during_pretraining": True,
+        "expansion_promotion": False,
+        "reflection_paired_pretraining": True,
+        "fixed_goal": [4.7, 4.7],
+        "source_manifest": "/sealed/low7/manifest.json",
+        "source_query_hash_digest": "e" * 64,
+        "model_state_sha256": model_state_hash(policy),
+    }
+
+    model_hash, contract, digest = AFE2.validate_checkpoint_contract(
+        "low7_radius1_canonical_v1", policy, checkpoint, "f" * 64
+    )
+
+    assert contract["name"] == "qualified_reflection_paired_low7_candidate_v1"
+    assert contract["reflection_paired_pretraining"] is True
+    assert contract["checkpoint_model_state_sha256"] == model_hash
+    assert AFE2._canonical_json_sha256(contract) == digest
+    corrupted = dict(checkpoint, model_state_sha256="0" * 64)
+    with pytest.raises(RuntimeError, match="embedded model hash"):
+        AFE2.validate_checkpoint_contract(
+            "low7_radius1_canonical_v1", policy, corrupted, "f" * 64
+        )
+
+
 def test_query_context_archive_preserves_embedding_inputs_in_float32(afe2_modules) -> None:
     AC, _ = afe2_modules
     store = AC.DStore()

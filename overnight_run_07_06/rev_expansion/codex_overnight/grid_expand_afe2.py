@@ -336,17 +336,37 @@ def validate_checkpoint_contract(profile_name, policy, checkpoint, checkpoint_sh
             raise RuntimeError(
                 "low7 expansion requires ctx=39, trunk input=91, and 70,308 parameters"
             )
-        if checkpoint_sha256 != LOW7_CANDIDATE_CHECKPOINT_SHA256:
-            raise RuntimeError("low7 expansion requires the declared candidate checkpoint bytes")
-        if model_sha256 != LOW7_CANDIDATE_MODEL_SHA256:
-            raise RuntimeError("low7 candidate model-state hash mismatch")
-        required_payload = {
-            "stage_schema": "afe_fresh_pretrain_v2_low7_uniform_pairs",
-            "fresh_from_scratch": True,
-            "endpoint_free": True,
-            "encoder_trainable_during_pretraining": True,
-            "expansion_promotion": False,
-        }
+        reflection_paired = (
+            checkpoint.get("stage_schema")
+            == "afe_fresh_pretrain_v3_low7_reflection_paired"
+        )
+        if reflection_paired:
+            if checkpoint.get("model_state_sha256") != model_sha256:
+                raise RuntimeError(
+                    "reflection-paired low7 checkpoint embedded model hash mismatch"
+                )
+            required_payload = {
+                "stage_schema": "afe_fresh_pretrain_v3_low7_reflection_paired",
+                "fresh_from_scratch": True,
+                "endpoint_free": True,
+                "encoder_trainable_during_pretraining": True,
+                "expansion_promotion": False,
+                "reflection_paired_pretraining": True,
+            }
+        else:
+            if checkpoint_sha256 != LOW7_CANDIDATE_CHECKPOINT_SHA256:
+                raise RuntimeError(
+                    "legacy low7 expansion requires the declared candidate checkpoint bytes"
+                )
+            if model_sha256 != LOW7_CANDIDATE_MODEL_SHA256:
+                raise RuntimeError("low7 candidate model-state hash mismatch")
+            required_payload = {
+                "stage_schema": "afe_fresh_pretrain_v2_low7_uniform_pairs",
+                "fresh_from_scratch": True,
+                "endpoint_free": True,
+                "encoder_trainable_during_pretraining": True,
+                "expansion_promotion": False,
+            }
         for field, expected in required_payload.items():
             if checkpoint.get(field) != expected:
                 raise RuntimeError(
@@ -359,8 +379,16 @@ def validate_checkpoint_contract(profile_name, policy, checkpoint, checkpoint_sh
         if not isinstance(source_digest, str) or len(source_digest) != 64:
             raise RuntimeError("low7 checkpoint lacks its source-query digest")
         contract = {
-            "name": "authenticated_low7_candidate_v1",
-            "assumption_level": "exact_file_model_architecture_and_provenance_contract",
+            "name": (
+                "qualified_reflection_paired_low7_candidate_v1"
+                if reflection_paired else "authenticated_low7_candidate_v1"
+            ),
+            "assumption_level": (
+                "file_model_architecture_and_paired_pretraining_provenance; "
+                "external disjoint raw qualification required by B1 launcher"
+                if reflection_paired
+                else "exact_file_model_architecture_and_provenance_contract"
+            ),
             "checkpoint_file_sha256": checkpoint_sha256,
             "checkpoint_model_state_sha256": model_sha256,
             "stage_schema": checkpoint["stage_schema"],
@@ -374,6 +402,7 @@ def validate_checkpoint_contract(profile_name, policy, checkpoint, checkpoint_sh
             "ctx_dim": 39,
             "trunk_input_dim": 91,
             "parameter_count": 70_308,
+            "reflection_paired_pretraining": reflection_paired,
         }
     else:
         raise ValueError(f"unsupported checkpoint-contract profile: {profile_name}")

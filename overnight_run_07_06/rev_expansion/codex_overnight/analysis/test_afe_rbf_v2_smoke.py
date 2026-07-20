@@ -51,6 +51,7 @@ def _v2_args(**overrides):
         "route_metric_steps": 10,
         "route_ambiguity_band": 0.05,
         "nvp_audit_all_k": False,
+        "balanced_r0_delivery": None,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -81,6 +82,54 @@ def test_v2_lineage_mass_smoke_locks_weighting_execution_and_nvp_audit() -> None
         setattr(args, name, value)
         with pytest.raises(ValueError, match=name):
             RBF.validate_protocol_args(args)
+
+
+@pytest.mark.parametrize("gp_cap", [512, 1024])
+@pytest.mark.parametrize("ess_target", [0.25, 0.5])
+@pytest.mark.parametrize("alpha", [0.0, 0.001, 0.01])
+@pytest.mark.parametrize(
+    "execution_rule", [RBF.EX.MAX_STEP_MARGIN, RBF.EX.SAFEMPPI_COST]
+)
+def test_b1_balanced_sweep_accepts_only_declared_scientific_arms(
+    gp_cap, ess_target, alpha, execution_rule
+) -> None:
+    RBF.validate_protocol_args(_v2_args(
+        protocol_profile="b1_balanced_r0_sweep",
+        rounds=20,
+        replay_loss_weighting="gamma_episode_context_query_equal_mass",
+        execution_rule=execution_rule,
+        nvp_audit_all_k=True,
+        gp_cap=gp_cap,
+        adaptive_ess_target=ess_target,
+        negative_alpha=alpha,
+        balanced_r0_delivery="qualified.json",
+    ))
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("gp_cap", 256),
+        ("adaptive_ess_target", 0.75),
+        ("negative_alpha", 0.1),
+        ("execution_rule", RBF.EX.MAX_STEP_PROGRESS),
+        ("rollout_replicas", 16),
+    ],
+)
+def test_b1_balanced_sweep_rejects_undeclared_variants(name, value) -> None:
+    args = _v2_args(
+        protocol_profile="b1_balanced_r0_sweep",
+        rounds=20,
+        replay_loss_weighting="gamma_episode_context_query_equal_mass",
+        execution_rule=RBF.EX.MAX_STEP_MARGIN,
+        nvp_audit_all_k=True,
+        balanced_r0_delivery="qualified.json",
+    )
+    setattr(args, name, value)
+    with pytest.raises(ValueError, match=("B1" if name in {
+        "gp_cap", "adaptive_ess_target", "negative_alpha", "execution_rule"
+    } else name)):
+        RBF.validate_protocol_args(args)
 
 
 @pytest.mark.parametrize(
