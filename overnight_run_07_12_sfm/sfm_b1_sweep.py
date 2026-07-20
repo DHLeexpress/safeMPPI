@@ -54,8 +54,8 @@ def git_frozen_source():
     if status:
         raise RuntimeError("source worktree must be clean before a frozen run")
     branch = subprocess.check_output(["git", "branch", "--show-current"], cwd=ROOT, text=True).strip()
-    if branch != "agent/sfm-hp10-b1":
-        raise RuntimeError(f"wrong source branch: {branch}")
+    if not branch:
+        raise RuntimeError("frozen runs require a named, pushed branch")
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     remote = subprocess.check_output(
         ["git", "ls-remote", "--heads", "origin", branch], cwd=ROOT, text=True
@@ -125,12 +125,13 @@ def seed_bank_manifest(outdir, rounds=20):
     return dict(path=os.path.abspath(path), sha256=sha256_file(path), payload=payload)
 
 
-def authentication_manifest(outdir, checkpoint=None):
+def authentication_manifest(outdir, checkpoint=None, scene_profile="legacy_velocity_ood"):
     source_files = sorted(Path(HERE).glob("*.py")) + sorted((Path(HERE) / "analysis").glob("test_sfm_*.py"))
     dataset_files = [Path(DATASET) / "manifest.json"] + sorted(Path(DATASET).glob("*.pt"))
+    environment = SS.scene_profile(scene_profile)
     scenes = SS.scenario_snapshot(
         [scenario for round_i in range(1, 21) for scenario in SP.expansion_scenarios(round_i)],
-        n_ped=SP.N_PED, speed_range=SS.OOD_PED_SPEED_RANGE,
+        n_ped=environment["n_ped"], speed_range=tuple(environment["ped_speed_range"]),
     )
     scene_path = os.path.join(outdir, "scene_snapshot.json")
     write_json(scene_path, scenes)
@@ -139,6 +140,7 @@ def authentication_manifest(outdir, checkpoint=None):
         dataset={str(path): sha256_file(path) for path in dataset_files},
         dataset_root=os.path.abspath(DATASET), scene_snapshot=os.path.abspath(scene_path),
         scene_sha256=sha256_file(scene_path),
+        environment=environment,
         checkpoint=None if checkpoint is None else dict(path=os.path.abspath(checkpoint), sha256=sha256_file(checkpoint)),
     )
     path = os.path.join(outdir, "authentication.json")
@@ -298,11 +300,11 @@ def full_sweep_forecast(maximum_mean_round_seconds):
     return maximum_round, forecast, bool(forecast <= 6 * 3600)
 
 
-def smoke(checkpoint, preflight, outdir):
+def smoke(checkpoint, preflight, outdir, scene_profile):
     frozen = git_frozen_source()
     gpu = gpu_snapshot()
     seeds = seed_bank_manifest(outdir)
-    auth = authentication_manifest(outdir, checkpoint)
+    auth = authentication_manifest(outdir, checkpoint, scene_profile)
     selected = preflight["selected"]
     ell, cap = float(selected["ell"]), int(selected["cap"])
     python = sys.executable
@@ -313,6 +315,7 @@ def smoke(checkpoint, preflight, outdir):
             python, os.path.join(HERE, "sfm_b1_expand.py"), "--checkpoint", checkpoint,
             "--outdir", arm_dir, "--arm", arm, "--ell", str(ell), "--cap", str(cap),
             "--rounds", "2", "--smoke", "--device", "cuda:0", "--verifier-workers", "32",
+            "--scene-profile", scene_profile,
         ], f"smoke_{arm}"))
     started = time.perf_counter()
     logs = run_parallel(jobs, os.path.join(outdir, "logs"))
@@ -327,6 +330,7 @@ def smoke(checkpoint, preflight, outdir):
             eval_jobs.append((gpu_index, [
                 python, os.path.join(HERE, "sfm_b1_eval.py"), "--checkpoint", checkpoint_path,
                 "--ep0", str(SP.SMOKE_EVAL_EP0), "--M", "10", "--device", "cuda:0", "--out", report_path,
+                "--scene-profile", scene_profile,
             ], f"raw_{arm}_r{round_i}"))
             raw_reports[f"{arm}_r{round_i}"] = report_path
         logs.extend(run_parallel(eval_jobs, os.path.join(outdir, "logs")))
@@ -387,7 +391,7 @@ def _run_queue(jobs, logdir):
     return logs
 
 
-def full_sweep(checkpoint, preflight, outdir):
+def full_sweep(checkpoint, preflight, outdir, scene_profile):
     """Two waves A/B then C/D, followed by frozen-bank screening and confirmation."""
     selected_rbf = preflight["selected"]
     ell, cap = float(selected_rbf["ell"]), int(selected_rbf["cap"])
@@ -402,6 +406,7 @@ def full_sweep(checkpoint, preflight, outdir):
                 "--outdir", os.path.join(full_dir, f"arm_{arm}"), "--arm", arm,
                 "--ell", str(ell), "--cap", str(cap), "--rounds", "20",
                 "--device", "cuda:0", "--verifier-workers", "32",
+                "--scene-profile", scene_profile,
             ], f"full_{arm}"))
         logs.extend(run_parallel(jobs, os.path.join(full_dir, "logs")))
     # Fixed disjoint raw M20/gamma screening at only r0/r5/r10/r15/r20.
@@ -415,6 +420,7 @@ def full_sweep(checkpoint, preflight, outdir):
                 python, os.path.join(HERE, "sfm_b1_eval.py"),
                 "--checkpoint", os.path.join(full_dir, f"arm_{arm}", f"round_{round_i:02d}.pt"),
                 "--ep0", str(SP.SCREEN_EP0), "--M", "20", "--device", "cuda:0", "--out", output,
+                "--scene-profile", scene_profile,
             ], f"screen_{arm}_r{round_i}"))
     logs.extend(_run_queue(screen_jobs, os.path.join(full_dir, "logs")))
     selections = {}
@@ -451,12 +457,13 @@ def full_sweep(checkpoint, preflight, outdir):
                 python, os.path.join(HERE, "sfm_b1_eval.py"),
                 "--checkpoint", os.path.join(full_dir, f"arm_{arm}", f"round_{round_i:02d}.pt"),
                 "--ep0", str(SP.CONFIRM_EP0), "--M", "100", "--device", "cuda:0", "--out", output,
+                "--scene-profile", scene_profile,
             ], f"confirm_{arm}_{label}"))
     kazuki_output = os.path.join(full_dir, "confirm_default_kazuki_M100.json")
     confirm_jobs.append(([
         python, os.path.join(HERE, "sfm_b1_sweep.py"), "kazuki-eval",
         "--checkpoint", checkpoint, "--ep0", str(SP.CONFIRM_EP0), "--M", "100",
-        "--device", "cuda:0", "--out", kazuki_output,
+        "--device", "cuda:0", "--out", kazuki_output, "--scene-profile", scene_profile,
     ], "confirm_kazuki"))
     logs.extend(_run_queue(confirm_jobs, os.path.join(full_dir, "logs")))
     confirmation = {key: json.load(open(path)) for key, path in confirm_paths.items()}
@@ -484,6 +491,7 @@ def full_sweep(checkpoint, preflight, outdir):
     subprocess.run([
         python, os.path.join(HERE, "sfm_b1_viz.py"),
         "--r0", checkpoint, "--selected", selected_checkpoint,
+        "--scene-profile", scene_profile,
         "--gallery", os.path.join(full_dir, "selected_raw_gallery.png"),
         "--mp4", os.path.join(full_dir, "selected_raw_gallery.mp4"),
         "--device", "cuda:0", "--report", os.path.join(full_dir, "raw_gallery_report.json"),
@@ -501,17 +509,18 @@ def full_sweep(checkpoint, preflight, outdir):
     return complete
 
 
-def kazuki_evaluate(checkpoint, ep0, M, device, output):
+def kazuki_evaluate(checkpoint, ep0, M, device, output, scene_profile):
     """Separately labeled generate-refine comparator; never imported by sfm_b1_eval."""
     import sfm_kazuki as KZ
     policy, _ = GPS.load_sfm_policy(checkpoint, device=device)
     config = KZ.KazukiConfig(safe_coefs=(0.3,), goal_coef=0.5).validate()
+    environment = SS.scene_profile(scene_profile)
     rows = []
     for gamma in SP.GAMMAS:
         for episode in range(int(ep0), int(ep0) + int(M)):
             rollout = KZ.kazuki_sfm_deploy(
-                policy, episode, gamma, cfg=config, n_ped=SP.N_PED, T=SP.T,
-                device=device, ped_speed_range=SS.OOD_PED_SPEED_RANGE,
+                policy, episode, gamma, cfg=config, n_ped=environment["n_ped"], T=SP.T,
+                device=device, ped_speed_range=tuple(environment["ped_speed_range"]),
                 sample_seed=700_000, collect_diagnostics=False,
             )
             mode = "yield"
@@ -529,6 +538,7 @@ def kazuki_evaluate(checkpoint, ep0, M, device, output):
             ))
     payload = dict(
         method="default Kazuki generate-refine", safe_coef=0.3, goal_coef=0.5,
+        environment=environment,
         checkpoint=os.path.abspath(checkpoint), checkpoint_sha256=sha256_file(checkpoint),
         ep0=int(ep0), M_per_gamma=int(M), summary=BE.summarize(rows), rows=rows,
     )
@@ -555,6 +565,7 @@ def main():
     manifest = sub.add_parser("manifest")
     manifest.add_argument("--outdir", required=True)
     manifest.add_argument("--checkpoint")
+    manifest.add_argument("--scene-profile", required=True, choices=SS.SCIENTIFIC_EVAL_PROFILES)
     preflight = sub.add_parser("preflight")
     preflight.add_argument("--checkpoint", required=True)
     preflight.add_argument("--out", required=True)
@@ -563,16 +574,18 @@ def main():
     smoke_parser.add_argument("--checkpoint", required=True)
     smoke_parser.add_argument("--preflight", required=True)
     smoke_parser.add_argument("--outdir", required=True)
+    smoke_parser.add_argument("--scene-profile", required=True, choices=("legacy_velocity_ood", "requested_ood"))
     kazuki = sub.add_parser("kazuki-eval")
     kazuki.add_argument("--checkpoint", required=True)
     kazuki.add_argument("--ep0", type=int, required=True)
     kazuki.add_argument("--M", type=int, required=True)
     kazuki.add_argument("--device", default="cuda")
     kazuki.add_argument("--out", required=True)
+    kazuki.add_argument("--scene-profile", required=True, choices=SS.SCIENTIFIC_EVAL_PROFILES)
     args = parser.parse_args()
     if args.command == "manifest":
         seeds = seed_bank_manifest(args.outdir)
-        auth = authentication_manifest(args.outdir, args.checkpoint)
+        auth = authentication_manifest(args.outdir, args.checkpoint, args.scene_profile)
         write_json(os.path.join(args.outdir, "MANIFEST_COMPLETE.json"), dict(
             status="COMPLETE", seeds={key: value for key, value in seeds.items() if key != "payload"},
             authentication=auth, gpu=gpu_snapshot(),
@@ -582,10 +595,10 @@ def main():
     elif args.command == "smoke":
         with open(args.preflight) as stream:
             selected = json.load(stream)
-        report = smoke(args.checkpoint, selected, args.outdir)
+        report = smoke(args.checkpoint, selected, args.outdir, args.scene_profile)
         write_method_readme(args.outdir, report)
         if report["full_sweep_authorized"]:
-            full_sweep(args.checkpoint, selected, args.outdir)
+            full_sweep(args.checkpoint, selected, args.outdir, args.scene_profile)
         else:
             write_json(os.path.join(args.outdir, "BOUNDED_STOP.json"), dict(
                 status="STOPPED_BEFORE_FULL_SWEEP", reason="forecast_exceeds_six_hours",
@@ -593,7 +606,7 @@ def main():
                 limit_seconds=6 * 3600, scientific_knobs_changed=False,
             ))
     else:
-        kazuki_evaluate(args.checkpoint, args.ep0, args.M, args.device, args.out)
+        kazuki_evaluate(args.checkpoint, args.ep0, args.M, args.device, args.out, args.scene_profile)
 
 
 if __name__ == "__main__":

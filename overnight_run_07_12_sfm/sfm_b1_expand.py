@@ -50,6 +50,7 @@ class ArmConfig:
     n_theta: int = 180
     smoke: bool = False
     seed: int = 20260720
+    scene_profile: str = "legacy_velocity_ood"
 
     def validate(self):
         if (self.K, self.B, self.T, self.H, self.W, self.batch, self.lr, self.ess_target) != (
@@ -57,6 +58,8 @@ class ArmConfig:
             raise ValueError("scientific B1 knobs differ from the frozen protocol")
         if self.selector not in ("margin", "safemppi_cost"):
             raise ValueError("invalid arm selector")
+        if self.scene_profile not in ("legacy_velocity_ood", "requested_ood"):
+            raise ValueError("expansion requires an explicit OOD scene profile")
         if self.name == "A" and (self.selector != "margin" or self.alpha != 0.0):
             raise ValueError("arm A must be margin/alpha=0")
         if self.name in ("B", "C", "D") and self.selector != "safemppi_cost":
@@ -73,10 +76,10 @@ ARMS = {
 
 
 class Replica:
-    def __init__(self, scenario_id, gamma, *, n_ped=SP.N_PED):
+    def __init__(self, scenario_id, gamma, *, n_ped, ped_speed_range=SS.OOD_PED_SPEED_RANGE):
         self.scenario_id = int(scenario_id)
         self.gamma = float(gamma)
-        self.humans = SS.make_humans(scenario_id, 0, n_ped, SS.OOD_PED_SPEED_RANGE)
+        self.humans = SS.make_humans(scenario_id, 0, n_ped, ped_speed_range)
         self.state = np.zeros(4, np.float32)
         self.states = [self.state.copy()]
         self.controls = []
@@ -216,7 +219,8 @@ def nvp_fail_closed(replica):
     replica.status = "nvp"
 
 
-def gather_macro_round(policy, phi_policy, gp, beta, replicas, cfg, shard, device, executor, generator):
+def gather_macro_round(policy, phi_policy, gp, beta, replicas, cfg, shard, device, executor, generator,
+                       *, record_all_traces=False):
     """Freeze all acquisition state and gather one complete 8x7 macro-round."""
     timers = Counter()
     sigma_all, sigma_selected, ess_values = [], [], []
@@ -336,7 +340,7 @@ def gather_macro_round(policy, phi_policy, gp, beta, replicas, cfg, shard, devic
                 modes["executed"][chosen["mode"]] += 1
                 trace["executed_id"] = int(chosen["candidate_id"])
                 _advance(replica, chosen["controls"][0])
-            if len(traces) < 64 or chosen is None:
+            if record_all_traces or len(traces) < 64 or chosen is None:
                 traces.append(trace)
         timers["sfm_stepping"] += time.perf_counter() - start
     for replica in replicas:
@@ -380,6 +384,7 @@ def _save_checkpoint(policy, path, extra):
 
 def run_arm(checkpoint, outdir, cfg, *, ell, cap, device):
     cfg.validate()
+    environment = SS.scene_profile(cfg.scene_profile)
     os.makedirs(outdir, exist_ok=True)
     policy, source_checkpoint = GPS.load_sfm_policy(checkpoint, device=device)
     frozen_parameters = BS.configure_expansion_trainability(policy)
@@ -401,7 +406,13 @@ def run_arm(checkpoint, outdir, cfg, *, ell, cap, device):
             scenarios = SP.expansion_scenarios(round_i, smoke=cfg.smoke)
             if len(set(scenarios)) != 8:
                 raise RuntimeError("macro-round scenarios are not distinct")
-            replicas = [Replica(scenario, gamma) for scenario in scenarios for gamma in SP.GAMMAS]
+            replicas = [
+                Replica(
+                    scenario, gamma, n_ped=environment["n_ped"],
+                    ped_speed_range=tuple(environment["ped_speed_range"]),
+                )
+                for scenario in scenarios for gamma in SP.GAMMAS
+            ]
             if len(replicas) != 56:
                 raise RuntimeError("B1 macro-round must contain exactly 56 independent episodes")
             policy.eval()
@@ -454,7 +465,7 @@ def run_arm(checkpoint, outdir, cfg, *, ell, cap, device):
     manifest = dict(
         status="ARM_COMPLETE", arm=cfg.name, source_checkpoint=os.path.abspath(checkpoint),
         source_sha256=source_sha, recipe=asdict(cfg), ell=float(ell), cap=int(cap),
-        frozen_parameters=frozen_parameters, encoder_sha_before=encoder_before,
+        environment=environment, frozen_parameters=frozen_parameters, encoder_sha_before=encoder_before,
         encoder_sha_after=encoder_after, rounds=len(history), history=history,
     )
     with open(os.path.join(outdir, "method_manifest.json"), "w") as stream:
@@ -474,12 +485,16 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=20260720)
     parser.add_argument("--verifier-workers", type=int, default=32)
+    parser.add_argument(
+        "--scene-profile", required=True, choices=("legacy_velocity_ood", "requested_ood"),
+        help="Explicit expansion environment; legacy reproduces 103476d, requested_ood uses n_ped=30.",
+    )
     args = parser.parse_args()
     arm = ARMS[args.arm]
     cfg = ArmConfig(
         name=args.arm, selector=arm["selector"], alpha=arm["alpha"],
         rounds=args.rounds, smoke=args.smoke, seed=args.seed,
-        verifier_workers=args.verifier_workers,
+        verifier_workers=args.verifier_workers, scene_profile=args.scene_profile,
     )
     run_arm(args.checkpoint, args.outdir, cfg, ell=args.ell, cap=args.cap, device=args.device)
 

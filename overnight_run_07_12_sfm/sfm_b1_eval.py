@@ -202,12 +202,15 @@ def selection_key(summary):
     )
 
 
-def evaluate_policy(policy, bank, *, device, collect_trace=False, sample_seed=700_000):
+def evaluate_policy(policy, bank, *, device, scene_profile, collect_trace=False, sample_seed=700_000):
+    environment = SS.scene_profile(scene_profile)
     rows = []
     for gamma in SS.GAMMAS:
         for episode in bank[str(gamma)]:
             rows.append(raw_rollout(
                 policy, episode, gamma, device=device, sample_seed=sample_seed,
+                n_ped=environment["n_ped"],
+                ped_speed_range=tuple(environment["ped_speed_range"]),
                 collect_trace=collect_trace,
             ))
     return rows, summarize(rows)
@@ -221,22 +224,30 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
-def main():
+def build_parser():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--ep0", type=int, required=True)
     parser.add_argument("--M", type=int, required=True)
+    parser.add_argument("--scene-profile", required=True, choices=SS.SCIENTIFIC_EVAL_PROFILES)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--out", required=True)
-    args = parser.parse_args()
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
     policy, _ = GPS.load_sfm_policy(args.checkpoint, device=args.device)
     bank = {str(gamma): list(range(args.ep0, args.ep0 + args.M)) for gamma in SS.GAMMAS}
-    rows, summary = evaluate_policy(policy, bank, device=args.device)
+    rows, summary = evaluate_policy(
+        policy, bank, device=args.device, scene_profile=args.scene_profile,
+    )
     payload = dict(
         checkpoint=os.path.abspath(args.checkpoint), checkpoint_sha256=sha256_file(args.checkpoint),
-        bank=bank, summary=summary, rows=[{key: value for key, value in row.items()
-                                         if key not in ("states", "controls", "peds", "trace")} for row in rows],
+        bank=bank, environment=SS.scene_profile(args.scene_profile), summary=summary,
+        rows=[{key: value for key, value in row.items()
+              if key not in ("states", "controls", "peds", "trace")} for row in rows],
         empirical_target_note="CR<5% is an empirical target, not a proof under real SFM dynamics",
     )
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)

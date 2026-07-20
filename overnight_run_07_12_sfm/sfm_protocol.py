@@ -16,6 +16,13 @@ ROUNDS = 20
 SCENARIOS_PER_ROUND = 8
 N_PED = 20
 
+# Explicit environment metadata.  N_PED remains the legacy B1 expansion
+# constant; scientific evaluation selects one of the named profiles instead.
+TRAINING_ENVIRONMENT = SS.scene_profile("training")
+ID_ENVIRONMENT = SS.scene_profile("id")
+REQUESTED_OOD_ENVIRONMENT = SS.scene_profile("requested_ood")
+LEGACY_VELOCITY_OOD_ENVIRONMENT = SS.scene_profile("legacy_velocity_ood")
+
 # Demonstrations are below 8,000. Every named bank is mutually disjoint.
 PRETRAIN_GATE_EP0 = 12_000
 EXPANSION_EP0 = 20_000
@@ -24,6 +31,9 @@ CONFIRM_EP0 = 80_000
 KAZUKI_CONFIRM_EP0 = 90_000
 SMOKE_EP0 = 110_000
 SMOKE_EVAL_EP0 = 130_000
+DEPLOY_ID_EP0 = 150_000
+DEPLOY_OOD_EP0 = 170_000
+QUERY_DIAGNOSTIC_EP0 = 190_000
 
 
 def expansion_scenarios(round_i, *, smoke=False):

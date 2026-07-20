@@ -19,6 +19,58 @@ LEGACY_PED_SPEED_RANGE = (0.8, 1.3)
 ID_PED_SPEED_RANGE = (0.5, 1.0)
 OOD_PED_SPEED_RANGE = (1.0, 1.5)
 
+# These names are part of the evaluation contract written into every result.
+# The requested ``id`` benchmark matches the training speed range, but uses
+# fewer pedestrians than the training data; that distinction is kept explicit
+# rather than silently treating it as the full training distribution.
+SCENE_PROFILES = {
+    "training": dict(
+        n_ped=20,
+        ped_speed_range=ID_PED_SPEED_RANGE,
+        role="pretraining_data_distribution",
+        shift_from_training="none",
+    ),
+    "id": dict(
+        n_ped=10,
+        ped_speed_range=ID_PED_SPEED_RANGE,
+        role="requested_in_distribution_benchmark",
+        shift_from_training="lower pedestrian count (10 versus 20); speed range unchanged",
+    ),
+    "requested_ood": dict(
+        n_ped=30,
+        ped_speed_range=OOD_PED_SPEED_RANGE,
+        role="requested_density_and_velocity_ood_benchmark",
+        shift_from_training="higher pedestrian count (30 versus 20) and speed range 1.0-1.5 versus 0.5-1.0 m/s",
+    ),
+    "legacy_velocity_ood": dict(
+        n_ped=20,
+        ped_speed_range=OOD_PED_SPEED_RANGE,
+        role="legacy_103476d_velocity_ood_benchmark",
+        shift_from_training="pedestrian count unchanged; speed range 1.0-1.5 versus 0.5-1.0 m/s",
+    ),
+}
+SCIENTIFIC_EVAL_PROFILES = ("id", "requested_ood", "legacy_velocity_ood")
+
+
+def scene_profile(name):
+    """Return a JSON-native, complete environment contract for ``name``."""
+    if name not in SCENE_PROFILES:
+        raise ValueError(f"unknown scene profile {name!r}; choose from {tuple(SCENE_PROFILES)}")
+    profile = SCENE_PROFILES[name]
+    return dict(
+        scene_profile=str(name),
+        n_ped=int(profile["n_ped"]),
+        ped_speed_range=list(map(float, profile["ped_speed_range"])),
+        role=str(profile["role"]),
+        shift_from_training=str(profile["shift_from_training"]),
+        training_reference=dict(n_ped=20, ped_speed_range=list(map(float, ID_PED_SPEED_RANGE))),
+        goal=GOAL.astype(float).tolist(),
+        pedestrian_radius=float(R_PED),
+        dt=float(DT),
+        sensing_radius=float(R_SENSE),
+        task_bounds=[float(TASK_LO), float(TASK_HI)],
+    )
+
 
 def _validate_speed_range(speed_range):
     lo, hi = map(float, speed_range)
