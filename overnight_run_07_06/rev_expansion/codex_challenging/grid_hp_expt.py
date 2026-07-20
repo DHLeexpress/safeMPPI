@@ -273,10 +273,12 @@ class GridHPFlowPolicy(GP2.GridGRUFlowPolicy2):
                 )
             original_context, reflected_context = ctx.split(self.ctx_dim, dim=1)
             reflected_x = x.reshape(len(x), self.T, 2).flip(-1).reshape_as(x)
-            original_features = self.features(x, tau, original_context)
-            reflected_features = self.features(
-                reflected_x, tau, reflected_context
+            combined_features = self.features(
+                torch.cat((x, reflected_x), dim=0),
+                torch.cat((tau, tau), dim=0),
+                torch.cat((original_context, reflected_context), dim=0),
             )
+            original_features, reflected_features = combined_features.split(len(x))
             original_velocity = self.head(original_features)
             reflected_velocity = self.head(reflected_features).reshape(
                 len(x), self.T, 2
