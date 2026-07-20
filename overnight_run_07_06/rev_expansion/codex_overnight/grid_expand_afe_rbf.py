@@ -120,6 +120,8 @@ def validate_balanced_r0_delivery(path, checkpoint_path, checkpoint_sha256) -> d
     if (
         confirmation.get("passed") is not True
         or int(confirmation.get("M_per_gamma", -1)) != 100
+        or confirmation.get("raw_noise_design")
+        != "reflection-antithetic common-random-number pairs"
         or confirmation.get("checkpoint", {}).get("file_sha256")
         != checkpoint_sha256.lower()
     ):
@@ -2419,10 +2421,10 @@ def main():
             args.conditioning_schema != expected_low7_schema
             or not args.freeze_visual_encoder
         ):
-            raise ValueError(
-                "low7 OOD expansion requires the profile-declared low7 conditioning "
-                "and a frozen visual encoder"
-            )
+                raise ValueError(
+                    "low7 closest-boundary conditioning must match the profile and the "
+                    "visual encoder must be frozen"
+                )
     elif args.conditioning_schema != CX.LOW5_SCHEMA or args.freeze_visual_encoder:
         raise ValueError("legacy scenes retain low5 conditioning and a trainable encoder")
     trainability = configure_policy_trainability(policy, args.freeze_visual_encoder)
