@@ -56,7 +56,7 @@ class Arm:
 ARMS = tuple(
     Arm(cap, ess, alpha, execution)
     for cap, ess, alpha, execution in itertools.product(
-        (512, 1024),
+        (512, 768),
         (0.25, 0.5),
         (0.0, 0.001, 0.01),
         ("nominal_hp_max_step_margin", "nominal_hp_safemppi_cost"),
@@ -384,7 +384,7 @@ def global_key(record: dict):
 def run_preflight(args) -> list[dict]:
     probes = (
         (1, Arm(512, 0.25, 0.01, "nominal_hp_safemppi_cost")),
-        (3, Arm(1024, 0.5, 0.0, "nominal_hp_max_step_margin")),
+        (3, Arm(768, 0.5, 0.0, "nominal_hp_max_step_margin")),
     )
     def one(gpu_index, arm):
         root = args.out / "preflight" / arm.arm_id

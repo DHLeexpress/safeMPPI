@@ -21,7 +21,7 @@ def value(command, flag):
 def test_b1_matrix_is_the_declared_24_arm_factorial() -> None:
     assert len(DRIVER.ARMS) == 24
     assert len({arm.arm_id for arm in DRIVER.ARMS}) == 24
-    assert {arm.gp_cap for arm in DRIVER.ARMS} == {512, 1024}
+    assert {arm.gp_cap for arm in DRIVER.ARMS} == {512, 768}
     assert {arm.ess_target for arm in DRIVER.ARMS} == {0.25, 0.5}
     assert {arm.alpha for arm in DRIVER.ARMS} == {0.0, 0.001, 0.01}
     assert {arm.execution_rule for arm in DRIVER.ARMS} == {
@@ -38,7 +38,7 @@ def test_b1_command_preserves_sample_complete_b1_and_qualification(tmp_path) -> 
         pretrain_delivery=delivery,
         verifier_workers=48,
     )
-    arm = DRIVER.Arm(1024, 0.25, 0.001, "nominal_hp_safemppi_cost")
+    arm = DRIVER.Arm(768, 0.25, 0.001, "nominal_hp_safemppi_cost")
     command = DRIVER.trainer_command(args, arm, tmp_path / "run", preflight=False)
 
     assert value(command, "--protocol-profile") == "b1_balanced_r0_sweep"
@@ -46,7 +46,7 @@ def test_b1_command_preserves_sample_complete_b1_and_qualification(tmp_path) -> 
     assert value(command, "--rollout-replicas") == "8"
     assert value(command, "--K") == "16"
     assert value(command, "--B") == "4"
-    assert value(command, "--gp-cap") == "1024"
+    assert value(command, "--gp-cap") == "768"
     assert value(command, "--adaptive-ess-target") == "0.25"
     assert value(command, "--negative-alpha") == "0.001"
     assert value(command, "--execution-rule") == "nominal_hp_safemppi_cost"

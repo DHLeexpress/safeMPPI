@@ -2165,8 +2165,8 @@ def validate_protocol_args(args) -> None:
     if b1_balanced_sweep:
         if not getattr(args, "balanced_r0_delivery", None):
             raise ValueError("B1 balanced sweep requires --balanced-r0-delivery")
-        if args.gp_cap not in {512, 1024}:
-            raise ValueError("B1 balanced sweep GP cap must be 512 or 1024")
+        if args.gp_cap not in {512, 768}:
+            raise ValueError("B1 balanced sweep GP cap must be 512 or 768")
         if args.adaptive_ess_target not in {0.25, 0.5}:
             raise ValueError("B1 balanced sweep ESS target must be 0.25 or 0.5")
         if args.negative_alpha not in {0.0, 0.001, 0.01}:
