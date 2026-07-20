@@ -1,0 +1,847 @@
+"""Reusable, audit-first visualizations for the Hp10 density-OOD study.
+
+This module consumes already generated rollout/query traces.  Rendering never
+changes the replay store, the GP, an expansion checkpoint, or an execution
+decision.  Every green verifier set is tied to exactly one full-H positive
+window; failed or partial certificates are never drawn as green polytopes.
+"""
+from __future__ import annotations
+
+import argparse
+from collections import defaultdict
+import hashlib
+import json
+import math
+import os
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.animation as animation
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import FancyArrowPatch
+import numpy as np
+import torch
+
+import _paths  # noqa: F401
+from cfm_mppi.safegpc_adapter.polytope_v2 import build_polytope_v2
+import sfm_b1_cost as BC
+import sfm_b1_viz as BV
+import sfm_metrics2 as SM
+import sfm_scene as SS
+
+
+DISPLAY_GAMMAS = (0.1, 0.5, 1.0)
+METHOD_KEYS = ("r0", "selected", "kazuki")
+METHOD_LABELS = {
+    "r0": "Hp10 r0 raw",
+    "selected": "selected raw expansion",
+    "kazuki": "default Kazuki generate-guide-refine",
+}
+MAGENTA = "#CC79A7"
+METHOD_ALIASES = {
+    "r0": ("r0", "hp10_r0_raw"),
+    "selected": ("selected", "arm_a_r10_raw"),
+    "kazuki": ("kazuki", "default_kazuki"),
+}
+
+
+def _write_json(path, payload):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    temporary = path + ".tmp"
+    with open(temporary, "w") as stream:
+        json.dump(payload, stream, indent=2)
+    os.replace(temporary, path)
+
+
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _query_handles(*, include_nominal=False, include_guidance=False):
+    handles = [
+        Line2D([], [], color=BV.GRAY, lw=.8, label="K generated"),
+        Line2D([], [], color=BV.ORANGE, lw=1.5, marker=".", label="B queried"),
+        Line2D([], [], color=BV.GREEN, lw=2.0, marker=".", label="full-H SOCP positive"),
+        Line2D([], [], color=BV.ORANGE, lw=1.8, ls="--",
+               label="terminal-prefix y=1 (not full-H)"),
+        Line2D([], [], color=BV.RED, lw=2.0, marker="x", label="rejected"),
+        Line2D([], [], color=BV.BLUE, lw=3.2, label="executed first action"),
+        Line2D([], [], color=BV.GREEN, lw=.9, label="candidate-specific verifier h=1..10"),
+    ]
+    if include_nominal:
+        handles.append(Line2D([], [], color=BV.BLUE, lw=.9, label="nominal h=1..10"))
+    if include_guidance:
+        handles.append(Line2D([], [], color=MAGENTA, lw=2.5, label="Kazuki net guidance"))
+    return handles
+
+
+def _set_clean_axis(axis):
+    BV._set_world_frame(axis)
+    axis.set_title("")
+    axis.set_xlabel("")
+    axis.set_ylabel("")
+    axis.tick_params(axis="both", which="both", labelbottom=False, labelleft=False, length=0)
+
+
+def _query_result(trace, candidate_id):
+    """Classify a B query without conflating a terminal prefix with full-H D+."""
+    status, row = BV._candidate_status(trace, candidate_id)
+    if status != "positive":
+        return status, row
+    if bool(row["result"].get("full_h", False)) and int(row["result"].get("terminal_step", 10)) == 10:
+        return "positive_full_h", row
+    return "positive_terminal_prefix", row
+
+
+def _disk_is_separated(A, b, center, radius=SS.R_PED, tol=2.0e-6):
+    """Whether at least one half-space excludes the complete pedestrian disk."""
+    value = np.asarray(A, float) @ np.asarray(center, float) - np.asarray(b, float)
+    return bool(np.any(value - float(radius) >= -float(tol)))
+
+
+def checked_verifier_levels(trace, query_row, *, H=10):
+    """Return H candidate-specific levels and a current-disk geometry audit.
+
+    The compact verifier is local to the candidate trajectory.  If a current
+    pedestrian omitted by the local face construction visibly overlaps the
+    resulting set, the set is withheld instead of being painted as globally
+    safe.
+    """
+    polygons = BV.verifier_level_polygons(trace, query_row, H=H)
+    result = query_row["result"]
+    faces = [face for face in result["faces"] if bool(face.feasible)]
+    A = np.stack([np.asarray(face.a, float) for face in faces])
+    margins = np.asarray([float(face.m) for face in faces])
+    center = np.asarray(result["segment"], float)[0]
+    b = A @ center + margins
+    overlaps = [
+        index for index, pedestrian in enumerate(np.asarray(trace["ped_xy"], float))
+        if not _disk_is_separated(A, b, pedestrian)
+    ]
+    return dict(
+        polygons=([] if overlaps else polygons), requested_levels=int(H),
+        rendered_levels=(0 if overlaps else len(polygons)),
+        current_disk_overlap_indices=overlaps,
+        locally_clear=not overlaps,
+    )
+
+
+def nominal_safemppi_levels(trace, *, gamma=None, H=10, config=None):
+    """Velocity-aware nominal SafeMPPI levels at one raw-policy context."""
+    config = BC.frozen_expert_config() if config is None else config
+    state = np.asarray(trace["state"], np.float32)
+    ped_xy = np.asarray(trace["ped_xy"], np.float32)
+    ped_vel = np.asarray(trace["ped_vel"], np.float32)
+    obstacles = np.concatenate([
+        ped_xy, np.full((len(ped_xy), 1), SS.R_PED, np.float32),
+    ], axis=1)
+    polytope, info = build_polytope_v2(
+        state[:2], obstacles,
+        sensing_range=float(config.barrier_activation_radius),
+        n_base=int(config.polytope_nbase), margin=0.0,
+        obstacle_velocities=ped_vel, robot_velocity=state[2:4],
+        predict_gain=float(config.predict_gain),
+        predict_tau=float(config.horizon) * float(config.dt),
+    )
+    A = polytope.A.detach().cpu().numpy()
+    b = polytope.b.detach().cpu().numpy()
+    margins = np.maximum(b - A @ state[:2], 1.0e-9)
+    value = float(trace.get("gamma", gamma) if gamma is None else gamma)
+    return dict(
+        polygons=BV._level_polygons(A, margins, state[:2], value, H=H),
+        detected_faces=int(info["n_detected"]),
+        contains_robot=bool(np.all(A @ state[:2] <= b + 1.0e-7)),
+    )
+
+
+def draw_margin_query_frame(axis, trace, *, executed_levels=True):
+    """Draw one max-margin acquisition context without a nominal blue set."""
+    BV._draw_common(axis, trace, nominal_levels=False)
+    selected = list(map(int, trace["selected_ids"]))
+    for row in trace["all_K"]:
+        path = np.asarray(row["segment"])
+        axis.plot(path[:, 0], path[:, 1], color=BV.GRAY, lw=.65, alpha=.32, zorder=3)
+    for candidate_id in selected:
+        path = np.asarray(BV._trace_candidate(trace, candidate_id)["segment"])
+        axis.plot(path[:, 0], path[:, 1], color=BV.ORANGE, lw=1.3,
+                  marker=".", ms=1.9, alpha=.9, zorder=4)
+    rejected = []
+    positives = []
+    terminal_prefixes = []
+    for candidate_id in selected:
+        status, query = _query_result(trace, candidate_id)
+        if status not in ("positive_full_h", "positive_terminal_prefix", "negative"):
+            continue
+        path = np.asarray(BV._trace_candidate(trace, candidate_id)["segment"])
+        color = (BV.GREEN if status == "positive_full_h" else
+                 BV.ORANGE if status == "positive_terminal_prefix" else BV.RED)
+        axis.plot(path[:, 0], path[:, 1], color=color, lw=1.85,
+                  ls=("--" if status == "positive_terminal_prefix" else "-"),
+                  marker=".", ms=2.1, alpha=.96, zorder=5)
+        if status == "positive_full_h":
+            positives.append(candidate_id)
+        elif status == "positive_terminal_prefix":
+            terminal_prefixes.append(candidate_id)
+        else:
+            worst = int(query["result"].get("diagnostics", {}).get("worst_t", len(path) - 1))
+            worst = min(max(worst, 1), len(path) - 1)
+            axis.plot(path[worst, 0], path[worst, 1], "x", color=BV.RED,
+                      ms=6, mew=1.4, zorder=8)
+            rejected.append(candidate_id)
+    level_audit = None
+    executed = trace.get("executed_id")
+    if executed is not None:
+        path = np.asarray(BV._trace_candidate(trace, executed)["segment"])
+        axis.plot(path[:2, 0], path[:2, 1], color=BV.BLUE, lw=3.2, zorder=9)
+        axis.annotate("", xy=path[1], xytext=path[0],
+                      arrowprops=dict(arrowstyle="->", color=BV.BLUE, lw=2.8))
+        status, query = _query_result(trace, executed)
+        if status not in ("positive_full_h", "positive_terminal_prefix"):
+            raise ValueError("the executed candidate must be a resolved positive query")
+        if executed_levels and status == "positive_full_h":
+            level_audit = checked_verifier_levels(trace, query, H=10)
+            if level_audit["polygons"]:
+                BV._draw_level_polygons(
+                    axis, level_audit["polygons"], color=BV.GREEN,
+                    linewidth=.85, alpha=.78, zorder=2.5,
+                )
+    _set_clean_axis(axis)
+    return dict(
+        nominal_drawn=False, selected_ids=selected, positive_ids=positives,
+        terminal_prefix_positive_ids=terminal_prefixes, rejected_ids=rejected,
+        executed_id=(None if executed is None else int(executed)),
+        executed_verifier=(None if level_audit is None else {
+            key: value for key, value in level_audit.items() if key != "polygons"
+        }),
+    )
+
+
+def _trace_index(traces, scenario_id, gammas):
+    output = defaultdict(dict)
+    for trace in traces:
+        if int(trace["scenario_id"]) != int(scenario_id):
+            continue
+        gamma = round(float(trace["gamma"]), 6)
+        if gamma in tuple(round(float(value), 6) for value in gammas):
+            output[gamma][int(trace["step"])] = trace
+    missing = [gamma for gamma in gammas if not output[round(float(gamma), 6)]]
+    if missing:
+        raise ValueError(f"scenario {scenario_id} has no trace for gammas {missing}")
+    return output
+
+
+def render_margin_gathering_video(
+        traces, scenario_id, output_mp4, *, output_snapshot=None,
+        snapshot_step=None, gammas=DISPLAY_GAMMAS, fps=6, frame_stride=1):
+    """Render one explicit scenario as three gamma columns.
+
+    Columns freeze at their last available context after independent NVP or
+    termination.  The scenario and optional snapshot step are caller-supplied;
+    this function performs no outcome-based curation.
+    """
+    gammas = tuple(map(float, gammas))
+    if gammas != DISPLAY_GAMMAS:
+        raise ValueError(f"the density-OOD gathering view requires gammas={DISPLAY_GAMMAS}")
+    index = _trace_index(traces, scenario_id, gammas)
+    maximum = max(max(rows) for rows in index.values())
+    frame_steps = list(range(0, maximum + 1, int(frame_stride)))
+    if frame_steps[-1] != maximum:
+        frame_steps.append(maximum)
+    figure, axes = plt.subplots(1, 3, figsize=(13.8, 4.6))
+    figure.subplots_adjust(left=.02, right=.78, bottom=.03, top=.97, wspace=.025)
+    figure.legend(handles=_query_handles(), loc="center left", bbox_to_anchor=(.79, .55),
+                  fontsize=8, frameon=False)
+    figure.text(.79, .30, f"scenario {int(scenario_id)}\ncolumns: gamma 0.1 | 0.5 | 1.0\n"
+                "green set: executed candidate only", ha="left", va="top", fontsize=8)
+
+    def trace_at(gamma, step):
+        rows = index[round(float(gamma), 6)]
+        available = [value for value in rows if value <= int(step)]
+        return rows[max(available) if available else min(rows)]
+
+    rendered = {}
+    def update(step):
+        rendered.clear()
+        for column, gamma in enumerate(gammas):
+            axes[column].clear()
+            trace = trace_at(gamma, step)
+            rendered[str(gamma)] = draw_margin_query_frame(axes[column], trace)
+        return []
+
+    movie = animation.FuncAnimation(
+        figure, update, frames=frame_steps, interval=1000 / int(fps), blit=False,
+    )
+    os.makedirs(os.path.dirname(os.path.abspath(output_mp4)), exist_ok=True)
+    movie.save(output_mp4, writer=animation.FFMpegWriter(fps=fps, bitrate=2800), dpi=120)
+    snapshot_metadata = None
+    if output_snapshot is not None:
+        if snapshot_step is None:
+            raise ValueError("output_snapshot requires an explicit snapshot_step")
+        update(int(snapshot_step))
+        os.makedirs(os.path.dirname(os.path.abspath(output_snapshot)), exist_ok=True)
+        figure.savefig(output_snapshot, dpi=180, bbox_inches="tight")
+        snapshot_metadata = dict(step=int(snapshot_step), cells=dict(rendered))
+    plt.close(figure)
+    return dict(
+        semantics="diagnostic-only max-margin gather; no nominal overlay; only executed full-H positive may own green levels",
+        scenario_id=int(scenario_id), gammas=list(gammas), frame_steps=frame_steps,
+        mp4=os.path.abspath(output_mp4),
+        snapshot=(None if output_snapshot is None else os.path.abspath(output_snapshot)),
+        snapshot_metadata=snapshot_metadata,
+    )
+
+
+def _positive_control_spread(trace):
+    controls = []
+    endpoints = []
+    for candidate_id in trace["selected_ids"]:
+        status, query = _query_result(trace, candidate_id)
+        if status == "positive_full_h":
+            controls.append(np.asarray(query["controls"], float).reshape(-1))
+            endpoints.append(np.asarray(query["result"]["segment"], float)[-1])
+    if len(controls) < 2:
+        return 0.0, 0.0
+    horizon = int(np.asarray(controls[0]).size // 2)
+    denominator = 2.0 * float(SS.U_MAX) * math.sqrt(2.0 * horizon)
+    control = [np.linalg.norm(controls[i] - controls[j]) / denominator
+               for i in range(len(controls)) for j in range(i + 1, len(controls))]
+    endpoint = [np.linalg.norm(endpoints[i] - endpoints[j])
+                for i in range(len(endpoints)) for j in range(i + 1, len(endpoints))]
+    return float(np.clip(max(control), 0.0, 1.0)), float(max(endpoint))
+
+
+def _snapshot_row(trace):
+    statuses = [_query_result(trace, candidate_id)[0] for candidate_id in trace["selected_ids"]]
+    positive = sum(status == "positive_full_h" for status in statuses)
+    terminal_prefix = sum(status == "positive_terminal_prefix" for status in statuses)
+    negative = sum(status == "negative" for status in statuses)
+    control_spread, endpoint_spread = _positive_control_spread(trace)
+    return dict(
+        scenario_id=int(trace["scenario_id"]), gamma=float(trace["gamma"]),
+        step=int(trace["step"]), positive_full_h=positive,
+        positive_terminal_prefix=terminal_prefix, rejected=negative,
+        control_spread=control_spread, endpoint_spread=endpoint_spread,
+        control_spread_normalization="||Ui-Uj||/(2*u_max*sqrt(2H)), clipped to [0,1]",
+        eligible=positive >= 2 and negative >= 1,
+    )
+
+
+def rank_query_snapshots(traces):
+    """Exhaustively rank mixed B contexts by few rejections, then control spread."""
+    rows = [_snapshot_row(trace) for trace in traces]
+    eligible_rows = [row for row in rows if row["eligible"]]
+    eligible_rows.sort(key=lambda row: (
+        row["rejected"], -row["control_spread"], -row["endpoint_spread"],
+        row["scenario_id"], row["gamma"], row["step"],
+    ))
+    if not eligible_rows:
+        raise RuntimeError("no context has at least two full-H positives and at least one rejected B query")
+    chosen = eligible_rows[0]
+    return dict(
+        rule=("exhaustive over supplied traces: require >=2 full-H positives and >=1 rejection; "
+              "minimize rejection count, maximize normalized pairwise control spread, then endpoint spread; "
+              "tie-break by scenario, gamma, step"),
+        chosen=chosen, candidates=rows,
+    )
+
+
+def _find_trace(traces, key):
+    matched = [trace for trace in traces if (
+        int(trace["scenario_id"]) == int(key["scenario_id"])
+        and abs(float(trace["gamma"]) - float(key["gamma"])) <= 1.0e-8
+        and int(trace["step"]) == int(key["step"])
+    )]
+    if len(matched) != 1:
+        raise ValueError(f"query snapshot key matched {len(matched)} traces")
+    return matched[0]
+
+
+def render_candidate_query_snapshot(traces, output_png, *, selection=None, report_path=None):
+    """Render one candidate-specific panel per queried B plan."""
+    selection = rank_query_snapshots(traces) if selection is None else selection
+    trace = _find_trace(traces, selection["chosen"])
+    candidate_ids = list(map(int, trace["selected_ids"]))
+    columns = 2
+    rows = int(math.ceil(len(candidate_ids) / columns))
+    figure, axes = plt.subplots(rows, columns, figsize=(9.6, 4.5 * rows), squeeze=False)
+    figure.subplots_adjust(left=.02, right=.76, bottom=.03, top=.98, wspace=.03, hspace=.03)
+    candidate_metadata = []
+    for axis, candidate_id in zip(axes.flat, candidate_ids):
+        BV._draw_common(axis, trace, nominal_levels=False)
+        status, query = _query_result(trace, candidate_id)
+        path = np.asarray(BV._trace_candidate(trace, candidate_id)["segment"])
+        color = BV.GREEN if status == "positive_full_h" else BV.RED if status == "negative" else BV.ORANGE
+        axis.plot(path[:, 0], path[:, 1], color=color, lw=2.2,
+                  ls=("--" if status == "positive_terminal_prefix" else "-"),
+                  marker=".", ms=2.2, zorder=7)
+        level_audit = None
+        rejected_x = None
+        if status == "positive_full_h":
+            level_audit = checked_verifier_levels(trace, query, H=10)
+            if level_audit["polygons"]:
+                BV._draw_level_polygons(
+                    axis, level_audit["polygons"], color=BV.GREEN,
+                    linewidth=.85, alpha=.78, zorder=2.5,
+                )
+        elif status == "negative":
+            worst = int(query["result"].get("diagnostics", {}).get("worst_t", len(path) - 1))
+            worst = min(max(worst, 1), len(path) - 1)
+            rejected_x = path[worst].astype(float).tolist()
+            axis.plot(*path[worst], "x", color=BV.RED, ms=7, mew=1.6, zorder=9)
+        if trace.get("executed_id") is not None and int(trace["executed_id"]) == candidate_id:
+            axis.plot(path[:2, 0], path[:2, 1], color=BV.BLUE, lw=3.2, zorder=10)
+        _set_clean_axis(axis)
+        candidate_metadata.append(dict(
+            candidate_id=candidate_id, status=status,
+            full_h=bool(query and query["result"].get("full_h", False)),
+            verifier=(None if level_audit is None else {
+                key: value for key, value in level_audit.items() if key != "polygons"
+            }),
+            rejected_x=rejected_x,
+            executed=bool(trace.get("executed_id") is not None
+                          and int(trace["executed_id"]) == candidate_id),
+        ))
+    for axis in axes.flat[len(candidate_ids):]:
+        axis.set_visible(False)
+    figure.legend(handles=_query_handles(), loc="center left", bbox_to_anchor=(.77, .58),
+                  fontsize=8, frameon=False)
+    chosen = selection["chosen"]
+    figure.text(
+        .77, .36,
+        f"scenario {chosen['scenario_id']}\ngamma {chosen['gamma']:g}\nstep {chosen['step']}\n"
+        f"full-H positive {chosen['positive_full_h']}\nrejected {chosen['rejected']}\n"
+        f"control spread {chosen['control_spread']:.3f}",
+        ha="left", va="top", fontsize=8,
+    )
+    os.makedirs(os.path.dirname(os.path.abspath(output_png)), exist_ok=True)
+    figure.savefig(output_png, dpi=180, bbox_inches="tight")
+    plt.close(figure)
+    report = dict(
+        semantics="each panel is one B query; green levels are candidate-specific and full-H only",
+        output=os.path.abspath(output_png), selection=selection,
+        candidates=candidate_metadata,
+    )
+    if report_path is not None:
+        _write_json(report_path, report)
+    return report
+
+
+def _run_trace(run, step):
+    traces = list(run.get("trace") or [])
+    if not traces:
+        raise ValueError("mechanism comparison requires collect_trace/collect_diagnostics")
+    return traces[min(max(int(step), 0), len(traces) - 1)]
+
+
+def _draw_robot_and_pedestrians(axis, run, trace, step, color):
+    states = np.asarray(run["states"])
+    state_index = min(max(int(step), 0), len(states) - 1)
+    BV._draw_pedestrians(axis, trace["ped_xy"], alpha=.62)
+    for pedestrian, velocity in zip(np.asarray(trace["ped_xy"]), np.asarray(trace["ped_vel"])):
+        future = pedestrian[None] + np.arange(11)[:, None] * SS.DT * velocity[None]
+        axis.plot(future[:, 0], future[:, 1], ".--", color=BV.GRAY, ms=1.8, lw=.55, alpha=.5)
+    axis.plot(states[:state_index + 1, 0], states[:state_index + 1, 1], color=color, lw=1.8)
+    axis.plot(states[state_index, 0], states[state_index, 1], "o", color=color, ms=6, zorder=9)
+    axis.plot(SS.GOAL[0], SS.GOAL[1], "*", color="#F0E442", mec="#333333", ms=8)
+
+
+def draw_method_panel(axis, method, run, gamma, step, *, guidance_scale=3.0, guidance_cap=1.8):
+    """Draw one cell of the method-by-gamma comparison without titles/labels."""
+    if method not in METHOD_KEYS:
+        raise ValueError(f"unknown method {method!r}")
+    trace = _run_trace(run, step)
+    colors = {"r0": BV.BLUE, "selected": "#333333", "kazuki": "#7F3C8D"}
+    _draw_robot_and_pedestrians(axis, run, trace, step, colors[method])
+    metadata = dict(method=method, gamma=float(gamma), step=int(trace["step"]))
+    if method == "r0":
+        plan = np.asarray(trace["planned_states"], float)[:, :2]
+        axis.plot(plan[:, 0], plan[:, 1], color=BV.BLUE, lw=1.6, marker=".", ms=2)
+        nominal = nominal_safemppi_levels(trace, gamma=gamma, H=10)
+        BV._draw_level_polygons(axis, nominal["polygons"], color=BV.BLUE,
+                                linewidth=.78, alpha=.74, zorder=2)
+        metadata.update(nominal_levels=len(nominal["polygons"]),
+                        nominal_contains_robot=nominal["contains_robot"])
+    elif method == "selected":
+        plan = np.asarray(trace["planned_states"], float)[:, :2]
+        # Green is reserved for a complete H=10 certificate, not method identity.
+        axis.plot(plan[:, 0], plan[:, 1], color="#333333", lw=1.8, marker=".", ms=2)
+        result = SM.verify_query(
+            trace["state"], trace["controls"], trace["ped_xy"], trace["ped_vel"], gamma,
+        )
+        query = dict(candidate_id=0, controls=np.asarray(trace["controls"]), result=result)
+        level_audit = None
+        if result.get("resolved") and int(result.get("y", 0)) == 1 and bool(result.get("full_h")):
+            level_audit = checked_verifier_levels(dict(trace, gamma=float(gamma)), query, H=10)
+            if level_audit["polygons"]:
+                BV._draw_level_polygons(axis, level_audit["polygons"], color=BV.GREEN,
+                                        linewidth=.85, alpha=.78, zorder=2.5)
+        elif result.get("resolved"):
+            worst = int(result.get("diagnostics", {}).get("worst_t", len(plan) - 1))
+            worst = min(max(worst, 1), len(plan) - 1)
+            axis.plot(*plan[worst], "x", color=BV.RED, ms=7, mew=1.5, zorder=9)
+        metadata.update(
+            verifier_positive=bool(result.get("resolved") and int(result.get("y", 0)) == 1),
+            verifier_full_h_positive=bool(
+                result.get("resolved") and int(result.get("y", 0)) == 1
+                and bool(result.get("full_h")) and int(result.get("terminal_step", 10)) == 10
+            ),
+            verifier_levels=(0 if level_audit is None else level_audit["rendered_levels"]),
+            verifier_local_overlap=([] if level_audit is None else level_audit["current_disk_overlap_indices"]),
+            verifier_runtime_authority=False,
+        )
+    else:
+        plan = np.asarray(trace["selected_plan_positions"], float)
+        axis.plot(plan[:, 0], plan[:, 1], color="#7F3C8D", lw=1.8, marker=".", ms=2)
+        guidance = trace.get("accumulated_guidance")
+        if guidance:
+            vector = float(guidance_scale) * np.asarray(guidance["net_guidance_action"], float)
+            norm = float(np.linalg.norm(vector))
+            if norm > float(guidance_cap):
+                vector *= float(guidance_cap) / norm
+            start = np.asarray(trace["state"], float)[:2]
+            arrow = FancyArrowPatch(
+                tuple(start), tuple(start + vector), arrowstyle="-|>", mutation_scale=15,
+                lw=2.6, color=MAGENTA, shrinkA=0, shrinkB=0, zorder=11,
+            )
+            axis.add_patch(arrow)
+            metadata.update(
+                guidance_present=True,
+                net_guidance_action=np.asarray(guidance["net_guidance_action"], float).tolist(),
+                net_guidance_norm=float(guidance["net_guidance_norm"]),
+                display_scale=float(guidance_scale), display_cap=float(guidance_cap),
+            )
+        else:
+            metadata["guidance_present"] = False
+    _set_clean_axis(axis)
+    return metadata
+
+
+def _validate_method_runs(runs_by_method, gammas):
+    if set(runs_by_method) != set(METHOD_KEYS):
+        raise ValueError(f"method mapping keys must be exactly {METHOD_KEYS}")
+    episodes = set()
+    for method in METHOD_KEYS:
+        for gamma in gammas:
+            if float(gamma) not in runs_by_method[method]:
+                raise KeyError(f"{method} is missing gamma={gamma}")
+            episodes.add(int(runs_by_method[method][float(gamma)]["episode"]))
+    if len(episodes) != 1:
+        raise ValueError("all 3x3 cells must use one explicit episode ID")
+    return episodes.pop()
+
+
+def render_method_gamma_comparison(
+        runs_by_method, output_png, *, snapshot_step, output_mp4=None,
+        gammas=DISPLAY_GAMMAS, fps=8, frame_stride=2, report_path=None):
+    """Render rows=(r0, selected, Kazuki), columns=(gamma .1,.5,1)."""
+    gammas = tuple(map(float, gammas))
+    if gammas != DISPLAY_GAMMAS:
+        raise ValueError(f"comparison requires gammas={DISPLAY_GAMMAS}")
+    episode = _validate_method_runs(runs_by_method, gammas)
+
+    def make_figure():
+        figure, axes = plt.subplots(3, 3, figsize=(13.7, 12.0))
+        figure.subplots_adjust(left=.015, right=.78, bottom=.015, top=.985, wspace=.02, hspace=.02)
+        figure.legend(
+            handles=[
+                Line2D([], [], color=BV.BLUE, lw=1.5, label="r0 raw + nominal levels"),
+                Line2D([], [], color="#333333", lw=1.7, label="selected raw trajectory / planned window"),
+                Line2D([], [], color=BV.GREEN, lw=.9, label="offline full-H verifier (selected row only)"),
+                Line2D([], [], color="#7F3C8D", lw=1.5, label="Kazuki refined plan"),
+                Line2D([], [], color=MAGENTA, lw=2.5, label="Kazuki net guidance"),
+            ],
+            loc="center left", bbox_to_anchor=(.79, .58), fontsize=8, frameon=False,
+        )
+        figure.text(
+            .79, .38,
+            "columns\ngamma 0.1 | 0.5 | 1.0\n\nrows\nHp10 r0 raw\nselected raw expansion\n"
+            "default Kazuki\n\nselected green set is\noffline diagnostic only",
+            ha="left", va="top", fontsize=8,
+        )
+        return figure, axes
+
+    def draw(figure, axes, step):
+        cells = []
+        for row, method in enumerate(METHOD_KEYS):
+            for column, gamma in enumerate(gammas):
+                axes[row, column].clear()
+                cells.append(draw_method_panel(
+                    axes[row, column], method, runs_by_method[method][gamma], gamma, step,
+                ))
+        return cells
+
+    figure, axes = make_figure()
+    cells = draw(figure, axes, int(snapshot_step))
+    os.makedirs(os.path.dirname(os.path.abspath(output_png)), exist_ok=True)
+    figure.savefig(output_png, dpi=180, bbox_inches="tight")
+    plt.close(figure)
+    video_frames = None
+    if output_mp4 is not None:
+        figure, axes = make_figure()
+        maximum = max(
+            len(list(run.get("trace") or [])) for values in runs_by_method.values() for run in values.values()
+        ) - 1
+        video_frames = list(range(0, maximum + 1, int(frame_stride)))
+        if video_frames[-1] != maximum:
+            video_frames.append(maximum)
+        movie = animation.FuncAnimation(
+            figure, lambda step: (draw(figure, axes, step) and []),
+            frames=video_frames, interval=1000 / int(fps), blit=False,
+        )
+        movie.save(output_mp4, writer=animation.FFMpegWriter(fps=fps, bitrate=3200), dpi=95)
+        plt.close(figure)
+    report = dict(
+        semantics={
+            "r0": "raw temp=1 rollout; blue nominal set is diagnostic and did not select the action",
+            "selected": "raw temp=1 rollout; green verifier is an offline audit and did not select the action",
+            "kazuki": "generate-guide-refine comparator; magenta is guided minus unguided first action for one latent",
+        },
+        explicit_episode=int(episode), explicit_snapshot_step=int(snapshot_step),
+        gammas=list(gammas), rows=list(METHOD_KEYS), cells=cells,
+        png=os.path.abspath(output_png),
+        mp4=(None if output_mp4 is None else os.path.abspath(output_mp4)),
+        video_frames=video_frames,
+    )
+    if report_path is not None:
+        _write_json(report_path, report)
+    return report
+
+
+def select_comparison_episode(episode_runs, *, gammas=DISPLAY_GAMMAS):
+    """Predeclared exhaustive rule for a selected-success/baseline-failure case.
+
+    ``episode_runs`` maps every inspected episode to the same method/gamma run
+    mapping accepted by :func:`render_method_gamma_comparison`.  The complete
+    score table is returned so a publication case is reproducible rather than
+    hand-picked after looking at trajectories.
+    """
+    rows = []
+    for episode in sorted(map(int, episode_runs)):
+        runs = episode_runs[episode]
+        _validate_method_runs(runs, gammas)
+        selected_success = sum(bool(runs["selected"][float(gamma)]["success"]) for gamma in gammas)
+        contrasts = sum(
+            bool(runs["selected"][float(gamma)]["success"])
+            and (not bool(runs[baseline][float(gamma)]["success"]))
+            for baseline in ("r0", "kazuki") for gamma in gammas
+        )
+        baseline_failures = sum(
+            not bool(runs[baseline][float(gamma)]["success"])
+            for baseline in ("r0", "kazuki") for gamma in gammas
+        )
+        selected_clearances = [
+            float(runs["selected"][float(gamma)].get("min_clearance",
+                  runs["selected"][float(gamma)].get("min_clear", -float("inf"))))
+            for gamma in gammas
+        ]
+        rows.append(dict(
+            episode=episode, selected_successes=selected_success,
+            selected_all_gammas=selected_success == len(gammas), contrasts=contrasts,
+            baseline_failures=baseline_failures,
+            selected_min_clearance=min(selected_clearances),
+        ))
+    eligible = [row for row in rows if row["selected_all_gammas"] and row["contrasts"] >= 1]
+    if not eligible:
+        raise RuntimeError("no episode has selected success at all gammas and at least one r0/Kazuki failure")
+    eligible.sort(key=lambda row: (
+        -row["contrasts"], -row["baseline_failures"],
+        -row["selected_min_clearance"], row["episode"],
+    ))
+    return dict(
+        rule=("exhaustive fixed bank: require selected success at all displayed gammas and >=1 paired r0/Kazuki "
+              "failure; maximize selected-vs-baseline contrasts, then baseline failures, then selected minimum "
+              "clearance; tie-break by episode ID"),
+        chosen=eligible[0], candidates=rows,
+    )
+
+
+def _mapping_value(mapping, gamma):
+    candidates = (float(gamma), str(float(gamma)), f"{float(gamma):g}")
+    for key in candidates:
+        if key in mapping:
+            return mapping[key]
+    raise KeyError(f"method bundle is missing gamma={gamma}")
+
+
+def normalize_method_bundle(bundle, *, scenario_id, gammas=DISPLAY_GAMMAS):
+    """Normalize one explicit, already-run controller bundle for rendering.
+
+    Accepted payload: either the method mapping itself, or a dictionary with a
+    ``runs`` method mapping.  Method aliases match the density diagnostic's
+    persisted names.  No controller is invoked here.
+    """
+    if not isinstance(bundle, dict):
+        raise TypeError("method-runs bundle must be a dictionary")
+    if bundle.get("scenario_id") is not None and int(bundle["scenario_id"]) != int(scenario_id):
+        raise ValueError("method-runs bundle scenario does not match --scenario")
+    source = bundle.get("runs", bundle)
+    normalized = {}
+    for method in METHOD_KEYS:
+        aliases = [alias for alias in METHOD_ALIASES[method] if alias in source]
+        if len(aliases) != 1:
+            raise KeyError(f"method-runs bundle needs exactly one of {METHOD_ALIASES[method]}")
+        values = source[aliases[0]]
+        if not isinstance(values, dict):
+            raise TypeError(f"{aliases[0]} runs must be keyed by gamma")
+        normalized[method] = {}
+        for gamma in gammas:
+            run = _mapping_value(values, gamma)
+            if int(run["episode"]) != int(scenario_id):
+                raise ValueError(f"{aliases[0]} gamma={gamma} has the wrong episode")
+            normalized[method][float(gamma)] = run
+    return normalized
+
+
+def _snapshot_from_metadata(traces, path):
+    with open(path) as stream:
+        payload = json.load(stream)
+    selected = payload.get("selected_snapshot", payload.get("chosen"))
+    if not isinstance(selected, dict):
+        raise ValueError("snapshot metadata needs selected_snapshot or chosen")
+    key = dict(
+        scenario_id=int(selected["scenario_id"]), gamma=float(selected["gamma"]),
+        step=int(selected["step"]),
+    )
+    return _find_trace(traces, key), dict(source="metadata", path=os.path.abspath(path), key=key)
+
+
+def _explicit_snapshot_selection(trace, source):
+    row = _snapshot_row(trace)
+    return dict(
+        rule=f"explicit snapshot supplied by {source}; no renderer-side outcome curation",
+        chosen=row, candidates=[row],
+    )
+
+
+def render_bundle(
+        method_runs_path, query_traces_path, scenario_id, output_dir, *,
+        snapshot_trace_path=None, snapshot_metadata_path=None,
+        snapshot_step=None, snapshot_gamma=None):
+    """Render the complete density-OOD handoff without running controllers."""
+    sources = [snapshot_trace_path is not None, snapshot_metadata_path is not None, snapshot_step is not None]
+    if sum(sources) != 1:
+        raise ValueError("choose exactly one snapshot source: trace, metadata, or explicit step")
+    if snapshot_step is not None and snapshot_gamma is None:
+        raise ValueError("--snapshot-step requires --snapshot-gamma")
+    method_bundle = torch.load(method_runs_path, map_location="cpu", weights_only=False)
+    method_snapshot = method_bundle.get("shared_snapshot") if isinstance(method_bundle, dict) else None
+    if not isinstance(method_snapshot, dict) or "step" not in method_snapshot:
+        raise ValueError("method-runs bundle requires driver-declared shared_snapshot.step")
+    method_snapshot_step = int(method_snapshot["step"])
+    method_runs = normalize_method_bundle(method_bundle, scenario_id=scenario_id)
+    traces = torch.load(query_traces_path, map_location="cpu", weights_only=False)
+    if not isinstance(traces, list) or not traces:
+        raise ValueError("query-traces must contain a nonempty trace list")
+    if snapshot_trace_path is not None:
+        snapshot = torch.load(snapshot_trace_path, map_location="cpu", weights_only=False)
+        if not isinstance(snapshot, dict):
+            raise TypeError("snapshot-trace must contain one trace dictionary")
+        source = dict(source="trace", path=os.path.abspath(snapshot_trace_path), key={
+            "scenario_id": int(snapshot["scenario_id"]), "gamma": float(snapshot["gamma"]),
+            "step": int(snapshot["step"]),
+        })
+    elif snapshot_metadata_path is not None:
+        snapshot, source = _snapshot_from_metadata(traces, snapshot_metadata_path)
+    else:
+        key = dict(scenario_id=int(scenario_id), gamma=float(snapshot_gamma), step=int(snapshot_step))
+        snapshot = _find_trace(traces, key)
+        source = dict(source="explicit", key=key)
+    if int(snapshot["scenario_id"]) != int(scenario_id):
+        raise ValueError("snapshot scenario does not match --scenario")
+
+    os.makedirs(output_dir, exist_ok=False)
+    paths = {
+        "comparison_png": os.path.join(output_dir, "method_gamma_3x3.png"),
+        "comparison_mp4": os.path.join(output_dir, "method_gamma_3x3.mp4"),
+        "gathering_mp4": os.path.join(output_dir, "max_margin_gathering.mp4"),
+        "gathering_snapshot": os.path.join(output_dir, "max_margin_gathering_snapshot.png"),
+        "candidate_snapshot": os.path.join(output_dir, "candidate_specific_B.png"),
+    }
+    comparison = render_method_gamma_comparison(
+        method_runs, paths["comparison_png"], snapshot_step=method_snapshot_step,
+        output_mp4=paths["comparison_mp4"],
+    )
+    gathering = render_margin_gathering_video(
+        traces, int(scenario_id), paths["gathering_mp4"],
+        output_snapshot=paths["gathering_snapshot"], snapshot_step=int(snapshot["step"]),
+    )
+    candidate = render_candidate_query_snapshot(
+        [snapshot], paths["candidate_snapshot"],
+        selection=_explicit_snapshot_selection(snapshot, source["source"]),
+    )
+    artifacts = {
+        name: dict(path=os.path.abspath(path), bytes=os.path.getsize(path), sha256=_sha256(path))
+        for name, path in paths.items()
+    }
+    terminal_prefixes = [
+        (int(trace["scenario_id"]), float(trace["gamma"]), int(trace["step"]), int(candidate_id))
+        for trace in traces for candidate_id in trace["selected_ids"]
+        if _query_result(trace, candidate_id)[0] == "positive_terminal_prefix"
+    ]
+    manifest = dict(
+        status="DENSITY_OOD_VISUALIZATION_BUNDLE_COMPLETE",
+        diagnostic_only=True, controllers_rerun_by_renderer=False,
+        scenario_id=int(scenario_id), gammas=list(DISPLAY_GAMMAS),
+        source_files={
+            "method_runs": dict(path=os.path.abspath(method_runs_path), sha256=_sha256(method_runs_path),
+                                shared_snapshot=method_snapshot),
+            "query_traces": dict(path=os.path.abspath(query_traces_path), sha256=_sha256(query_traces_path)),
+            "snapshot": source,
+        },
+        terminal_prefix_audit=dict(
+            count=len(terminal_prefixes), green_paths=0, green_polytopes=0,
+            rule="y=1 with full_h=false is terminal-prefix positive, never full-H green",
+            keys=[list(value) for value in terminal_prefixes],
+        ),
+        snapshot_steps=dict(
+            method_comparison=dict(
+                step=method_snapshot_step,
+                source="method-runs shared_snapshot.step",
+                metadata=method_snapshot,
+            ),
+            query_gathering_and_candidates=dict(
+                step=int(snapshot["step"]), gamma=float(snapshot["gamma"]),
+                source=source["source"],
+            ),
+        ),
+        comparison=comparison, gathering=gathering, candidate_snapshot=candidate,
+        artifacts=artifacts,
+    )
+    manifest_path = os.path.join(output_dir, "render_manifest.json")
+    _write_json(manifest_path, manifest)
+    return manifest
+
+
+def build_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--method-runs", required=True,
+                        help="torch bundle of already-run r0/selected/Kazuki traces keyed by gamma")
+    parser.add_argument("--query-traces", required=True,
+                        help="torch list from diagnostic-only max-margin gathering")
+    parser.add_argument("--scenario", required=True, type=int)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--snapshot-trace")
+    source.add_argument("--snapshot-metadata")
+    source.add_argument("--snapshot-step", type=int)
+    parser.add_argument("--snapshot-gamma", type=float)
+    parser.add_argument("--output-dir", required=True)
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    render_bundle(
+        args.method_runs, args.query_traces, args.scenario, args.output_dir,
+        snapshot_trace_path=args.snapshot_trace,
+        snapshot_metadata_path=args.snapshot_metadata,
+        snapshot_step=args.snapshot_step, snapshot_gamma=args.snapshot_gamma,
+    )
+
+
+if __name__ == "__main__":
+    main()

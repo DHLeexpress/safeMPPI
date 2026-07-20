@@ -97,6 +97,30 @@ The paired query diagnostic never enters (D,D^+), the GP, or model training.
 It chooses encounter snapshots by a declared minimum-distance rule over both
 selectors, rather than visual curation.
 
+For the density-only study, `sfm_b1_density_diagnostic.py` keeps two evidence
+streams separate:
+
+- the unbiased M100/gamma deployment bank starts at scenario 210000;
+- the finite visualization-search bank starts at scenario 230000 and is
+  explicitly outcome-conditioned explanatory evidence, never an evaluation.
+
+The finite search evaluates every declared episode before applying its fixed
+tier rule. It then reruns the chosen episode with traces enabled and verifies
+that all nine method/gamma outcomes match the search. The 3x3 comparison uses
+one shared step selected by minimum mean robot--pedestrian distance over all
+nine cells. The max-margin query snapshot uses the fixed composition order
+P3/N1, P2/N2, then P4/N0 and breaks ties by normalized full-window control
+spread. No visual inspection changes either choice.
+
+`sfm_b1_density_viz.py` is render-only. Hp10 r0 and selected A-r10 are raw
+temperature-one rollouts: the blue nominal set and green selected-window
+certificate are diagnostic overlays and did not select either raw action.
+Kazuki is shown separately with its accumulated guidance vector. In the
+max-margin gathering video, no nominal set is drawn and only the actually
+executed full-H positive query may own a green verifier polytope. Each panel of
+the B-query snapshot instead fits its own candidate-specific verifier; rejected
+or terminal-prefix queries never receive a green H=10 set.
+
 ## Corrected deployment result (`b2caf9a_id_ood_deploy`)
 
 The fixed M100/gamma benchmark uses 700 rollouts per method.  The selected
@@ -135,6 +159,10 @@ manifest contains 113 independently rehashed artifacts.
 
 - A fitted H=10 verifier proves the queried window, not infinite-horizon
   viability under moving pedestrians.
+- The current compact verifier uses an `n_theta=180` angular moving-face fit
+  followed by a direct certificate check. It is not a generic CVXPY solve;
+  measured executor wall time per queried candidate must accompany real-time
+  claims.
 - The constant-velocity pedestrian prediction is a modeling assumption.
 - The requested `id` profile has lower density than the demonstration data and
   is therefore an easier matched-speed benchmark, not literally the full
@@ -160,4 +188,8 @@ manifest contains 113 independently rehashed artifacts.
 - `sfm_b1_benchmark.py`: matched deployment and checkpoint curves
 - `sfm_b1_query_diagnostic.py`: paired closed-loop selector diagnostics
 - `sfm_b1_viz.py`: gallery, query paths, and ten-level polytopes
+- `sfm_b1_density_diagnostic.py`: disjoint finite case search, traced method
+  reruns, max-margin query collection, and verifier timing
+- `sfm_b1_density_viz.py`: render-only 3x3, gathering MP4, and candidate-specific
+  query snapshot
 - `sfm_b1_deploy_driver.py`: authenticated two-GPU delivery driver
