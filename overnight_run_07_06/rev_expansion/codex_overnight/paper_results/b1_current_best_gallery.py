@@ -206,6 +206,7 @@ def run_kazuki(policy: Any, env: Any, safe_coef: float, m: int, t_cap: int,
         output = baseline.kazuki_deploy(
             policy, env, [safe_coef], gamma_ctx=0.5, T=t_cap, reach=reach,
             device=device, seed=seed,
+            conditioning_schema="low7_closest_boundary_tie_mean",
         )
         path = np.asarray(output["path"], dtype=np.float32)
         paths.append(path)
@@ -340,6 +341,7 @@ def main() -> int:
         "failure_marker": "red X at terminal position for CR or timeout; no text label",
         "kazuki_definition": {
             "gamma_ctx": 0.5,
+            "conditioning_schema": "low7_closest_boundary_tie_mean",
             "goal_coef": 0.0,
             "safe_coef_candidates": args.safe_coef_candidates,
             "selected_low": low_coef,

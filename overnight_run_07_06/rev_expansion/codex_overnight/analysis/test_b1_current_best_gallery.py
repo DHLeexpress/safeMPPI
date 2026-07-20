@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import inspect
 
 import numpy as np
 
@@ -49,3 +50,12 @@ def test_failure_classifier_marks_collision_not_success():
 
     path = np.asarray([[0.3, 0.3], [2.5, 2.5]])
     assert MODULE.classify_path(path, Env(), reach=0.15) == "CR"
+
+
+def test_kazuki_adapter_exposes_additive_conditioning_schema():
+    import kazuki_baseline
+
+    parameter = inspect.signature(kazuki_baseline.kazuki_deploy).parameters[
+        "conditioning_schema"
+    ]
+    assert parameter.default is None

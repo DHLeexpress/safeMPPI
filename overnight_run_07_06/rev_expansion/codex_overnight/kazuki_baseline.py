@@ -171,7 +171,8 @@ def flow_mppi_refine(policy, state, goal_t, obs_xy, r_col, dt, U_gen, prev_U, de
     return refined[best]                                                       # [H,2]
 
 
-def kazuki_deploy(policy, env, safe_coefs, gamma_ctx=0.5, T=250, reach=0.1, device="cpu", seed=0, rec=None):
+def kazuki_deploy(policy, env, safe_coefs, gamma_ctx=0.5, T=250, reach=0.1,
+                  device="cpu", seed=0, rec=None, conditioning_schema=None):
     """One receding-horizon episode from env.x0 (origin). Returns dict(path, reached, collided, steps).
     If rec is a list, appends per-step {state, cand, refined, best} for the their-style viz."""
     torch.manual_seed(seed); np.random.seed(seed)
@@ -187,14 +188,32 @@ def kazuki_deploy(policy, env, safe_coefs, gamma_ctx=0.5, T=250, reach=0.1, devi
     size = N_SAMPLE // len(safe_coefs)
     for i, c in enumerate(safe_coefs):
         sc[size * i: size * (i + 1)] = c
+    if conditioning_schema is not None:
+        import afe_context as CX
+        CX.require_declared_contract(
+            policy, conditioning_schema, CX.SCHEMA_DIMS[conditioning_schema]
+        )
     hist, path = [], [st[:2].copy()]
     prev_z = None; prev_U = None
     reached = collided = oob = False
     for t in range(T):
-        gT = torch.tensor(GF.axis_grid(st[:2], obs, rr), device=device)
-        lT = torch.tensor(GF.low5(st, goal, gamma_ctx), device=device)
-        hT = torch.tensor(GF.hist_pad(np.array(hist[-GF.K_HIST:]) if hist else np.zeros((0, 2)), GF.K_HIST),
-                          device=device)
+        if conditioning_schema is None:
+            gT = torch.tensor(GF.axis_grid(st[:2], obs, rr), device=device)
+            lT = torch.tensor(GF.low5(st, goal, gamma_ctx), device=device)
+            hT = torch.tensor(
+                GF.hist_pad(
+                    np.array(hist[-GF.K_HIST:]) if hist else np.zeros((0, 2)),
+                    GF.K_HIST,
+                ),
+                device=device,
+            )
+        else:
+            record = CX.build_context(
+                st, goal, gamma_ctx, hist, env, conditioning_schema
+            )
+            gT = torch.as_tensor(record.grid, device=device)
+            lT = torch.as_tensor(record.low5, device=device)
+            hT = torch.as_tensor(record.hist, device=device)
         ctx = policy.ctx_from(gT[None], lT[None], hT[None]).squeeze(0)   # 1-D so _expand_ctx broadcasts
         if prev_z is None:
             z = torch.randn(N_SAMPLE, d, device=device); taus = ODE_TIMES_FULL
