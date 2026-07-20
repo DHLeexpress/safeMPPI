@@ -130,12 +130,20 @@ def validate_balanced_r0_delivery(path, checkpoint_path, checkpoint_sha256) -> d
     for gamma, row in per_gamma.items():
         routes = row.get("all_routes", {})
         successful_routes = row.get("successful_routes", {})
+        route_interval = routes.get("u_fraction_wilson95", (-1.0, -1.0))
+        successful_interval = successful_routes.get(
+            "u_fraction_wilson95", (-1.0, -1.0)
+        )
         if (
             float(routes.get("balance", -1.0)) < 0.8
             or float(routes.get("resolved_fraction", -1.0)) < 0.95
             or int(row.get("success_count", -1)) < 10
             or float(successful_routes.get("balance", -1.0)) < 0.8
             or float(successful_routes.get("resolved_fraction", -1.0)) < 0.95
+            or not (float(route_interval[0]) <= 0.5 <= float(route_interval[1]))
+            or not (
+                float(successful_interval[0]) <= 0.5 <= float(successful_interval[1])
+            )
         ):
             raise RuntimeError(f"balanced-r0 confirmation failed at gamma={gamma}")
     return {

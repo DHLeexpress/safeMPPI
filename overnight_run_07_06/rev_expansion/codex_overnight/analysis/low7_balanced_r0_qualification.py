@@ -205,6 +205,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             failures.append(
                 f"gamma={gamma:g} balance={all_routes['balance']:.4f} < {args.minimum_balance:.4f}"
             )
+        if not (
+            all_routes["u_fraction_wilson95"][0]
+            <= 0.5
+            <= all_routes["u_fraction_wilson95"][1]
+        ):
+            failures.append(
+                f"gamma={gamma:g} all-route U fraction rejects 0.5 at Wilson95"
+            )
         if success_count < args.minimum_successes:
             failures.append(
                 f"gamma={gamma:g} successes={success_count} < {args.minimum_successes}"
@@ -213,6 +221,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             failures.append(
                 f"gamma={gamma:g} successful_balance={successful_routes['balance']:.4f} "
                 f"< {args.minimum_success_balance:.4f}"
+            )
+        if (
+            success_count >= args.minimum_successes
+            and not (
+                successful_routes["u_fraction_wilson95"][0]
+                <= 0.5
+                <= successful_routes["u_fraction_wilson95"][1]
+            )
+        ):
+            failures.append(
+                f"gamma={gamma:g} successful-route U fraction rejects 0.5 at Wilson95"
             )
         if (
             success_count >= args.minimum_successes
@@ -250,6 +269,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "minimum_success_balance_every_gamma": args.minimum_success_balance,
             "minimum_successes_every_gamma": args.minimum_successes,
             "minimum_resolved_fraction_every_gamma": args.minimum_resolved_fraction,
+            "u_fraction_wilson95_must_contain_half": True,
         },
         "per_gamma": summaries,
     }

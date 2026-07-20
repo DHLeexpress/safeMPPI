@@ -166,6 +166,10 @@ def qualified_checkpoint(delivery_path: Path) -> tuple[Path, str, dict]:
     for gamma, row in per_gamma.items():
         routes = row.get("all_routes", {})
         successful_routes = row.get("successful_routes", {})
+        route_interval = routes.get("u_fraction_wilson95", (-1.0, -1.0))
+        successful_interval = successful_routes.get(
+            "u_fraction_wilson95", (-1.0, -1.0)
+        )
         if float(routes.get("balance", -1.0)) < 0.8:
             raise RuntimeError(f"balanced-r0 gamma {gamma} failed route balance")
         if float(routes.get("resolved_fraction", -1.0)) < 0.95:
@@ -179,6 +183,14 @@ def qualified_checkpoint(delivery_path: Path) -> tuple[Path, str, dict]:
         if float(successful_routes.get("resolved_fraction", -1.0)) < 0.95:
             raise RuntimeError(
                 f"balanced-r0 gamma {gamma} failed successful-route resolution"
+            )
+        if not (float(route_interval[0]) <= 0.5 <= float(route_interval[1])):
+            raise RuntimeError(f"balanced-r0 gamma {gamma} rejects equal all-route mass")
+        if not (
+            float(successful_interval[0]) <= 0.5 <= float(successful_interval[1])
+        ):
+            raise RuntimeError(
+                f"balanced-r0 gamma {gamma} rejects equal successful-route mass"
             )
     return checkpoint, expected, {
         "delivery": str(delivery_path),
