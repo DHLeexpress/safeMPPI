@@ -248,7 +248,7 @@ def gather_macro_round(policy, phi_policy, gp, beta, replicas, cfg, shard, devic
             )
             selected_by_context.append(selected)
             acquisition_traces.append(acquisition)
-            all_values = gp.sigma(features[index]).detach().cpu().numpy()
+            all_values = gp.acquisition_sigma(features[index]).detach().cpu().numpy()
             sigma_all.extend(map(float, all_values))
             sigma_selected.extend(float(row["chosen_sigma"]) for row in acquisition)
             ess_values.extend(row["ess_norm"] for row in acquisition)
@@ -341,7 +341,17 @@ def gather_macro_round(policy, phi_policy, gp, beta, replicas, cfg, shard, devic
         timers["sfm_stepping"] += time.perf_counter() - start
     for replica in replicas:
         if replica.alive:
-            replica.status = "timeout"
+            terminal_xy, _ = SS.collect_humans(replica.humans)
+            terminal_clearance = float(
+                np.linalg.norm(terminal_xy - replica.state[:2][None], axis=1).min() - SS.R_PED
+            )
+            replica.minimum_clearance = min(replica.minimum_clearance, terminal_clearance)
+            if terminal_clearance < 0.0:
+                replica.status = "collision"
+            elif float(np.linalg.norm(replica.state[:2] - SS.GOAL)) < 0.5:
+                replica.status = "success"
+            else:
+                replica.status = "timeout"
             replica.alive = False
     if policy_sha256(policy) != frozen_hash:
         raise RuntimeError("policy changed during frozen macro-round")

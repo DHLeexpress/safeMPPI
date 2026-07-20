@@ -23,6 +23,7 @@ SCREEN_EP0 = 50_000
 CONFIRM_EP0 = 80_000
 KAZUKI_CONFIRM_EP0 = 90_000
 SMOKE_EP0 = 110_000
+SMOKE_EVAL_EP0 = 130_000
 
 
 def expansion_scenarios(round_i, *, smoke=False):

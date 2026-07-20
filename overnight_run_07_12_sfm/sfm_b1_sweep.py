@@ -116,6 +116,7 @@ def seed_bank_manifest(outdir, rounds=20):
         smoke={str(round_i): list(SP.expansion_scenarios(round_i, smoke=True)) for round_i in range(1, 3)},
         expansion={str(round_i): list(SP.expansion_scenarios(round_i)) for round_i in range(1, int(rounds) + 1)},
         screening={key: list(value) for key, value in SP.raw_bank(SP.SCREEN_EP0, 20).items()},
+        smoke_evaluation={key: list(value) for key, value in SP.raw_bank(SP.SMOKE_EVAL_EP0, 10).items()},
         confirmation={key: list(value) for key, value in SP.raw_bank(SP.CONFIRM_EP0, 100).items()},
         kazuki_confirmation={key: list(value) for key, value in SP.raw_bank(SP.KAZUKI_CONFIRM_EP0, 100).items()},
     )
@@ -148,7 +149,7 @@ def authentication_manifest(outdir, checkpoint=None):
 
 def _balanced_dataset_records(max_records=1200):
     per_gamma = int(np.ceil(max_records / len(SP.GAMMAS)))
-    records = []
+    by_gamma = {}
     for gamma in SP.GAMMAS:
         path = os.path.join(DATASET, f"sfm_windows_g{gamma}.pt")
         data = torch.load(path, map_location="cpu", mmap=True, weights_only=False)
@@ -170,12 +171,21 @@ def _balanced_dataset_records(max_records=1200):
             if not progressed:
                 break
             cursor += 1
+        by_gamma[float(gamma)] = []
         for index in selected:
-            records.append(dict(
+            by_gamma[float(gamma)].append(dict(
                 gamma=float(gamma), scenario_id=int(episodes[index]), step=int(steps[index]),
                 hp10=hp10[index], low=data["low5"][index], hist=data["hist"][index], controls=data["U"][index],
             ))
-    return records[:max_records]
+    records = []
+    for index in range(max(len(values) for values in by_gamma.values())):
+        for gamma in SP.GAMMAS:
+            values = by_gamma[float(gamma)]
+            if index < len(values):
+                records.append(values[index])
+                if len(records) == max_records:
+                    return records
+    return records
 
 
 @torch.no_grad()
@@ -219,7 +229,7 @@ def rbf_preflight(checkpoint, output, device):
                 selected_sigma, all_sigma = [], []
                 draw_generator = torch.Generator(device=device).manual_seed(818)
                 for features in candidate_features:
-                    all_sigma.extend(map(float, gp.sigma(features).cpu()))
+                    all_sigma.extend(map(float, gp.acquisition_sigma(features).cpu()))
                     _, trace = gp.sequential_acquire(features, 4, beta, generator=draw_generator)
                     selected_sigma.extend(row["chosen_sigma"] for row in trace)
                 diagnostic = BR.acquisition_diagnostics(all_sigma, selected_sigma)
@@ -309,7 +319,7 @@ def smoke(checkpoint, preflight, outdir):
             report_path = os.path.join(outdir, f"arm_{arm}", f"raw_r{round_i}_M10.json")
             eval_jobs.append((gpu_index, [
                 python, os.path.join(HERE, "sfm_b1_eval.py"), "--checkpoint", checkpoint_path,
-                "--ep0", str(SP.SCREEN_EP0), "--M", "10", "--device", "cuda:0", "--out", report_path,
+                "--ep0", str(SP.SMOKE_EVAL_EP0), "--M", "10", "--device", "cuda:0", "--out", report_path,
             ], f"raw_{arm}_r{round_i}"))
             raw_reports[f"{arm}_r{round_i}"] = report_path
         logs.extend(run_parallel(eval_jobs, os.path.join(outdir, "logs")))
@@ -436,7 +446,7 @@ def full_sweep(checkpoint, preflight, outdir):
     kazuki_output = os.path.join(full_dir, "confirm_default_kazuki_M100.json")
     confirm_jobs.append(([
         python, os.path.join(HERE, "sfm_b1_sweep.py"), "kazuki-eval",
-        "--checkpoint", checkpoint, "--ep0", str(SP.KAZUKI_CONFIRM_EP0), "--M", "100",
+        "--checkpoint", checkpoint, "--ep0", str(SP.CONFIRM_EP0), "--M", "100",
         "--device", "cuda:0", "--out", kazuki_output,
     ], "confirm_kazuki"))
     logs.extend(_run_queue(confirm_jobs, os.path.join(full_dir, "logs")))

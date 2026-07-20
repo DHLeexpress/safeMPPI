@@ -38,3 +38,14 @@ def test_lengthscale_demands_exactly_fifty():
     else:
         raise AssertionError("49 embeddings were accepted")
     assert R.mean_pairwise_lengthscale(torch.randn(50, 4)) > 0
+
+
+def test_preflight_rejects_no_uplift():
+    rows = [dict(ell_multiplier=ell, cap=cap, ess_solved=True, stable_conditioning=True, uplift=-.1)
+            for ell in (.5, 1.) for cap in (256, 512)]
+    try:
+        R.choose_preflight(rows)
+    except RuntimeError as error:
+        assert "positive" in str(error)
+    else:
+        raise AssertionError("non-uplifting preflight was selected")

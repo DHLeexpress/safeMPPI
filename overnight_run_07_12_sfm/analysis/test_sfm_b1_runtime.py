@@ -45,3 +45,18 @@ def test_default_kazuki_is_separately_labeled_generate_refine():
     config = K.KazukiConfig()
     assert config.safe_coefs == (0.3,) and config.goal_coef == 0.5
     assert config.n_copy > 0
+
+
+def test_raw_support_is_counted_without_render_trace(monkeypatch):
+    torch.manual_seed(22)
+    policy = GPS.build_sfm_policy(width=24, res_dropout=0.0)
+    monkeypatch.setattr(E.SS, "make_humans", lambda *args, **kwargs: [object()])
+    monkeypatch.setattr(
+        E.SS, "collect_humans",
+        lambda humans: (__import__("numpy").array([[3., 3.]], dtype="float32"),
+                        __import__("numpy").zeros((1, 2), dtype="float32")),
+    )
+    monkeypatch.setattr(E.SS, "advance_humans", lambda humans, state: None)
+    row = E.raw_rollout(policy, 1, .5, T=1, n_ped=1, collect_trace=False)
+    assert row["trace"] is None
+    assert sum(row["mode_counts"].values()) == 1

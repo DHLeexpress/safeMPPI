@@ -126,6 +126,12 @@ class RBFGP:
         covariance = self.posterior_covariance(features, include_observation_noise=False)
         return torch.diagonal(covariance).clamp_min(0.0).sqrt()
 
+    @torch.no_grad()
+    def acquisition_sigma(self, features):
+        """First-step marginal sigma in the same normalized scale as pending acquisition."""
+        covariance = self.posterior_covariance(features, include_observation_noise=True)
+        return (torch.diagonal(covariance) / (1.0 + self.lam)).clamp(0.0, 1.0).sqrt()
+
     @staticmethod
     def _condition(covariance, remaining, chosen_local):
         keep = torch.ones(len(covariance), dtype=torch.bool, device=covariance.device)
@@ -254,6 +260,8 @@ def choose_preflight(rows):
     selected_ell = max(sorted(ell_scores), key=lambda ell: ell_scores[ell])
     candidates = by_ell[selected_ell]
     cap512 = next(item for item in candidates if int(item["cap"]) == 512)
+    if float(cap512["uplift"]) <= 0.0:
+        raise RuntimeError("cap-512 does not produce positive median uncertainty uplift")
     threshold = 0.9 * float(cap512["uplift"])
     retained = [item for item in candidates if float(item["uplift"]) >= threshold]
     selected = min(retained, key=lambda item: int(item["cap"]))

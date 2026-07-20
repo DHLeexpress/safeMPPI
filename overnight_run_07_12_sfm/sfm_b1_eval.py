@@ -113,20 +113,26 @@ def raw_rollout(policy, episode, gamma, *, device="cpu", T=180, n_ped=20, temp=1
         controls.append(action)
         states.append(state.copy())
         pedestrian_rows.append(ped_xy.copy())
+        plan = [before.copy()]
+        cursor = before.copy()
+        for proposal_action in window.detach().cpu().numpy():
+            cursor = _step(cursor, proposal_action)
+            plan.append(cursor.copy())
+        ped_pred = ped_xy[None] + np.arange(11)[:, None, None] * SS.DT * ped_vel[None]
+        mode = classify_candidate(np.asarray(plan)[:, :2], ped_pred)
+        episode_modes[mode] += 1
         if collect_trace:
-            plan = [before.copy()]
-            cursor = before.copy()
-            for proposal_action in window.detach().cpu().numpy():
-                cursor = _step(cursor, proposal_action)
-                plan.append(cursor.copy())
-            ped_pred = ped_xy[None] + np.arange(11)[:, None, None] * SS.DT * ped_vel[None]
-            mode = classify_candidate(np.asarray(plan)[:, :2], ped_pred)
-            episode_modes[mode] += 1
             trace.append(dict(
                 step=step, state=before, action=action, controls=window.detach().cpu().numpy(),
                 planned_states=np.asarray(plan), ped_xy=ped_xy.copy(), ped_vel=ped_vel.copy(), mode=mode,
             ))
         SS.advance_humans(humans, state)
+    if not collision and not reached:
+        terminal_xy, _ = SS.collect_humans(humans)
+        terminal_clearance = float(np.linalg.norm(terminal_xy - state[:2][None], axis=1).min() - SS.R_PED)
+        minimum_clearance = min(minimum_clearance, terminal_clearance)
+        collision = terminal_clearance < 0.0
+        reached = bool(not collision and np.linalg.norm(state[:2] - SS.GOAL) < float(reach))
     states = np.asarray(states, np.float32)
     successful_clearance = minimum_clearance if reached and not collision else None
     return dict(
