@@ -287,6 +287,19 @@ def require_run(run_dir: Path, arm: Arm, rounds: int) -> dict:
     return {"complete": complete, "recipe": recipe, "probe": rows}
 
 
+def require_evaluation(outdir: Path, expected_status: str) -> dict:
+    complete = load_json(outdir / "EVALUATION_COMPLETE.json")
+    if complete.get("status") != expected_status:
+        raise RuntimeError(
+            f"B1 evaluation status {complete.get('status')!r} != {expected_status!r}"
+        )
+    for relative, expected in complete.get("artifact_sha256", {}).items():
+        path = outdir / relative
+        if not path.is_file() or sha256_file(path) != expected:
+            raise RuntimeError(f"B1 evaluation artifact hash failed: {path}")
+    return complete
+
+
 def arm_paths(out: Path, arm: Arm) -> dict[str, Path]:
     return {
         "run": out / "arms" / arm.arm_id,
@@ -307,6 +320,9 @@ def run_arm(args, arm: Arm, gpu_index: int) -> dict:
         "--run-root", str(paths["run"]), "--outdir", str(paths["screen"]),
         "--verifier-workers", str(args.verifier_workers),
     ], paths["screen_log"], gpu_index)
+    require_evaluation(
+        paths["screen"], "AFE_RBF_B1_BALANCED_SCREEN_DELIVERY_COMPLETE"
+    )
     selection = load_json(paths["screen"] / "selection.json")
     record = {
         "status": "ARM_COMPLETE",
@@ -462,6 +478,9 @@ def main() -> None:
         "--selected-round", str(selected_round),
         "--verifier-workers", str(min(128, cpu_count - 16)),
     ], args.out / "logs" / "confirmation.log", 1)
+    require_evaluation(
+        holdout, "AFE_RBF_B1_BALANCED_HOLDOUT_DELIVERY_COMPLETE"
+    )
     for filename in (
         "report.png", "report.pdf", "selected_raw_m50_gallery.png",
         "selected_raw_m50_gallery.pdf",
@@ -485,6 +504,20 @@ def main() -> None:
         "selected_arm": selected_arm.record(),
         "selected_round": selected_round,
         "elapsed_seconds": time.time() - started,
+    })
+    artifact_hashes = {
+        str(path.relative_to(args.out)): sha256_file(path)
+        for path in sorted(args.out.rglob("*"))
+        if path.is_file() and path.name != "DELIVERY_COMPLETE.json"
+    }
+    write_json_new(args.out / "DELIVERY_COMPLETE.json", {
+        "status": "LOW7_B1_BALANCED_R0_DELIVERY_COMPLETE",
+        "source_commit": source["commit"],
+        "checkpoint_sha256": args.checkpoint_sha256,
+        "arms_completed": len(records),
+        "selected_arm": selected_arm.record(),
+        "selected_round": selected_round,
+        "artifact_sha256": artifact_hashes,
     })
     print(f"LOW7 B1 BALANCED-R0 SWEEP COMPLETE: {args.out}", flush=True)
 
