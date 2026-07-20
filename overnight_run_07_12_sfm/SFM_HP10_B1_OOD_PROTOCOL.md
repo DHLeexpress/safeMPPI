@@ -91,6 +91,40 @@ The paired query diagnostic never enters (D,D^+), the GP, or model training.
 It chooses encounter snapshots by a declared minimum-distance rule over both
 selectors, rather than visual curation.
 
+## Corrected deployment result (`b2caf9a_id_ood_deploy`)
+
+The fixed M100/gamma benchmark uses 700 rollouts per method.  The selected
+checkpoint remains arm A, round 10; these measurements did not reselect it.
+
+| profile | method | SR | CR | successful clearance [m] | successful time [s] |
+|---|---|---:|---:|---:|---:|
+| `id` | Hp10 r0 raw | 0.9800 | 0.0200 | 0.4944 | 5.3125 |
+| `id` | selected A-r10 raw | 0.9786 | 0.0214 | 0.4968 | 5.3835 |
+| `id` | default Kazuki | 0.9986 | 0.0014 | 0.4437 | 3.1568 |
+| `requested_ood` | Hp10 r0 raw | 0.8457 | 0.1514 | 0.1611 | 7.6608 |
+| `requested_ood` | selected A-r10 raw | 0.8486 | 0.1500 | 0.1603 | 7.7721 |
+| `requested_ood` | default Kazuki | 0.9171 | 0.0814 | 0.2278 | 4.0431 |
+
+The lower-density requested ID profile is already saturated, and expansion does
+not improve it.  On density-plus-velocity OOD, A-r10 changes SR by only
+0.29 percentage points and CR by only 0.14 percentage points.  Default Kazuki
+is stronger but still misses the requested empirical CR below 5%.
+
+The fixed raw M50/gamma checkpoint curve on `requested_ood` is also modest and
+non-monotone: pooled SR is 0.8429 at r0, 0.8514 at r10, peaks at 0.8714 at r19,
+and ends at 0.8629 at r20.  The r19 value is a diagnostic observation, not a
+post-hoc replacement for the frozen A-r10 selection.
+
+Finally, all 18 diagnostic-only closed-loop runs (three scenarios, three gamma
+values, and two selectors) terminate by NVP after 13--23 steps.  SafeMPPI cost
+can rank an already-admissible queried set, but it does not repair loss of
+finite-K/B support.  The paired 3x3 figures retain these NVP cells rather than
+curating successful snapshots.
+
+The authenticated output is stored at
+`/home/dohyun/projects/sfm_hp10_b1_runs/b2caf9a_id_ood_deploy`; its delivery
+manifest contains 113 independently rehashed artifacts.
+
 ## Known blind spots
 
 - A fitted H=10 verifier proves the queried window, not infinite-horizon
