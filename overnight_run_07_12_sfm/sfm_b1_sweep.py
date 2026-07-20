@@ -291,6 +291,13 @@ def run_parallel(jobs, logdir):
     return [item[2] for item in processes]
 
 
+def full_sweep_forecast(maximum_mean_round_seconds):
+    """Return JSON-native timing values for the bounded-run decision."""
+    maximum_round = float(maximum_mean_round_seconds)
+    forecast = float(2 * 20 * maximum_round + 3600.0)
+    return maximum_round, forecast, bool(forecast <= 6 * 3600)
+
+
 def smoke(checkpoint, preflight, outdir):
     frozen = git_frozen_source()
     gpu = gpu_snapshot()
@@ -339,7 +346,9 @@ def smoke(checkpoint, preflight, outdir):
     for arm in ("A", "B"):
         manifest = json.load(open(os.path.join(outdir, f"arm_{arm}", "method_manifest.json")))
         arm_reports[arm] = manifest
-        maximum_round = max(maximum_round, np.mean([row["wall_seconds"] for row in manifest["history"]]))
+        maximum_round = max(maximum_round, float(np.mean(
+            [row["wall_seconds"] for row in manifest["history"]]
+        )))
         if manifest["encoder_sha_before"] != manifest["encoder_sha_after"]:
             raise RuntimeError(f"arm {arm} encoder changed")
         for row in manifest["history"]:
@@ -349,7 +358,7 @@ def smoke(checkpoint, preflight, outdir):
             if len(visited) != eligible or len({tuple(value) for value in visited}) != eligible:
                 raise RuntimeError(f"arm {arm} replay coverage mismatch")
     # Two waves, twenty rounds each, plus the mandated one-hour final reserve.
-    forecast = 2 * 20 * maximum_round + 3600.0
+    maximum_round, forecast, full_sweep_authorized = full_sweep_forecast(maximum_round)
     report = dict(
         status="SMOKE_COMPLETE", source=frozen, gpu=gpu, shared_gpu_override=True,
         seed_banks={key: value for key, value in seeds.items() if key != "payload"},
@@ -361,7 +370,7 @@ def smoke(checkpoint, preflight, outdir):
                         for key, path in raw_reports.items()},
         query_visualization=dict(path=os.path.abspath(viz_report_path), sha256=sha256_file(viz_report_path)),
         full_four_arm_forecast_seconds=forecast, final_reserve_seconds=3600,
-        full_sweep_authorized=forecast <= 6 * 3600, arms=arm_reports,
+        full_sweep_authorized=full_sweep_authorized, arms=arm_reports,
     )
     write_json(os.path.join(outdir, "smoke_report.json"), report)
     return report

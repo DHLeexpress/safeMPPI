@@ -1,11 +1,14 @@
 import ast
+import json
 from pathlib import Path
 
+import numpy as np
 import torch
 
 import grid_policy_sfm as GPS
 import sfm_b1_eval as E
 import sfm_b1_expand as X
+import sfm_b1_sweep as SW
 
 
 def test_nvp_isolates_one_replica(monkeypatch):
@@ -60,3 +63,11 @@ def test_raw_support_is_counted_without_render_trace(monkeypatch):
     row = E.raw_rollout(policy, 1, .5, T=1, n_ped=1, collect_trace=False)
     assert row["trace"] is None
     assert sum(row["mode_counts"].values()) == 1
+
+
+def test_forecast_boundary_is_json_native_for_numpy_timing():
+    maximum_round, forecast, authorized = SW.full_sweep_forecast(np.float64(25.5))
+    assert type(maximum_round) is float
+    assert type(forecast) is float
+    assert type(authorized) is bool
+    json.dumps(dict(maximum_round=maximum_round, forecast=forecast, authorized=authorized))
