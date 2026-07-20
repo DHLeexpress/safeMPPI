@@ -87,22 +87,42 @@ def _draw_scene(axis: Any, env: Any) -> None:
     axis.set_yticks([])
 
 
+def _gallery_rows(
+    rows: list[dict[str, Any]], count: int, *, reflection_antithetic: bool
+) -> list[dict[str, Any]]:
+    ordered = sorted(rows, key=lambda row: row["rollout_index"])
+    if not reflection_antithetic:
+        return ordered[:count]
+    if len(ordered) % 2:
+        raise ValueError("reflection-antithetic gallery requires an even cell size")
+    half = len(ordered) // 2
+    interleaved = [
+        row
+        for pair_index in range(half)
+        for row in (ordered[pair_index], ordered[pair_index + half])
+    ]
+    return interleaved[:count]
+
+
 def _render_gallery(
     output: Path,
     episodes: list[dict[str, Any]],
     env: Any,
     summaries: dict[str, dict[str, Any]],
     count: int,
+    *,
+    reflection_antithetic: bool,
 ) -> None:
     colors = {int(RM.MODE_U): "#3366cc", int(RM.MODE_R): "#ee7733", 0: "#777777"}
     figure, axes = plt.subplots(1, len(EVAL.GAMMAS), figsize=(23.5, 3.8), squeeze=False)
     for column, gamma in enumerate(EVAL.GAMMAS):
         axis = axes[0, column]
         _draw_scene(axis, env)
-        cell = sorted(
-            (row for row in episodes if row["gamma"] == gamma),
-            key=lambda row: row["rollout_index"],
-        )[:count]
+        cell = _gallery_rows(
+            [row for row in episodes if row["gamma"] == gamma],
+            count,
+            reflection_antithetic=reflection_antithetic,
+        )
         for row in cell:
             path = np.asarray(row["path"])
             color = colors[row["route_mode"]]
@@ -136,7 +156,11 @@ def _render_gallery(
         frameon=False,
     )
     figure.suptitle(
-        f"Raw temperature-1 pretrained rollouts; fixed indices 0..{count - 1}",
+        (
+            f"Raw temperature-1 pretrained rollouts; {count // 2} reflection pairs"
+            if reflection_antithetic
+            else f"Raw temperature-1 pretrained rollouts; fixed indices 0..{count - 1}"
+        ),
         fontsize=13,
     )
     figure.tight_layout(rect=(0, 0.10, 1, 0.90))
@@ -304,6 +328,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         env,
         summaries,
         min(args.gallery_count, args.m),
+        reflection_antithetic=args.reflection_antithetic,
     )
     if not passed and not args.report_only:
         raise RuntimeError("raw r0 U/R qualification failed: " + "; ".join(failures))

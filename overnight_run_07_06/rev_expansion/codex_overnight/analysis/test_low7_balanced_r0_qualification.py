@@ -23,3 +23,11 @@ def test_wilson_interval_contains_empirical_fraction() -> None:
     lower, upper = Q._wilson(50, 100)
     assert lower < 0.5 < upper
     assert Q._wilson(0, 0) == [0.0, 1.0]
+
+
+def test_antithetic_gallery_interleaves_each_base_with_its_reflection() -> None:
+    rows = [{"rollout_index": index} for index in range(8)]
+
+    selected = Q._gallery_rows(rows, 6, reflection_antithetic=True)
+
+    assert [row["rollout_index"] for row in selected] == [0, 4, 1, 5, 2, 6]
