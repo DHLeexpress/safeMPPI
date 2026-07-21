@@ -100,7 +100,11 @@ The moving-pedestrian verifier used here is the compact 2-D implementation in
 `sfm_metrics2.py`: a 180-angle moving-face fit followed by a direct certificate
 check.  It evaluates the intended polytope conditions, but it is not a generic
 CVXPY/conic-solver call.  Consequently, measured verifier latency is reported
-as angular-fit certificate latency, not as real-time SOCP-solver latency.
+as angular-fit certificate latency, not as real-time SOCP-solver latency.  A
+returned witness is checked against the complete window and is therefore sound
+under the constant-velocity pedestrian model; discretizing the face normal can
+miss a feasible continuous-normal witness, so the implementation is not a
+complete SOCP feasibility oracle.
 
 The paired query diagnostic never enters (D,D^+), the GP, or model training.
 It chooses encounter snapshots by a declared minimum-distance rule over both
