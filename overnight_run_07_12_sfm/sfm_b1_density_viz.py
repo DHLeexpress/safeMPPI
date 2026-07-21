@@ -619,6 +619,21 @@ def render_method_gamma_comparison(
         raise ValueError(f"comparison requires gammas={DISPLAY_GAMMAS}")
     episode = _validate_method_runs(runs_by_method, gammas)
     verifier_cache = {}
+    kazuki_guidance = runs_by_method["kazuki"][gammas[0]].get("effective_guidance", {})
+    for gamma in gammas[1:]:
+        if runs_by_method["kazuki"][gamma].get("effective_guidance", {}) != kazuki_guidance:
+            raise ValueError("3x3 comparison requires one declared Kazuki coefficient pair")
+    safe_values = tuple(kazuki_guidance.get("safe_coefs", ()))
+    safe_text = ",".join(f"{float(value):g}" for value in safe_values) or "n/a"
+    goal_text = ("n/a" if kazuki_guidance.get("goal_coef") is None
+                 else f"{float(kazuki_guidance['goal_coef']):g}")
+    reference_run = runs_by_method["selected"][gammas[0]]
+    reference_trace = _run_trace(reference_run, 0)
+    n_ped = int(len(np.asarray(reference_trace["ped_xy"])))
+    speed_range = tuple(map(float, reference_run.get("ped_speed_range", ())))
+    environment_text = f"n_ped={n_ped}"
+    if len(speed_range) == 2:
+        environment_text += f"\nspeed={speed_range[0]:g}--{speed_range[1]:g} m/s"
 
     def selected_verifier(gamma, step):
         trace = _run_trace(runs_by_method["selected"][gamma], step)
@@ -646,7 +661,8 @@ def render_method_gamma_comparison(
         figure.text(
             .79, .38,
             "columns\ngamma 0.1 | 0.5 | 1.0\n\nrows\nSafeMPPI expert\nArm-A r10 learned raw\n"
-            "Kazuki generate-guide-refine\n\ngreen appears only when the learned\n"
+            f"Kazuki generate-guide-refine\n  safe={safe_text}, goal={goal_text}\n\n{environment_text}\n\n"
+            "green appears only when the learned\n"
             "raw H=10 window passes exact SOCP",
             ha="left", va="top", fontsize=8,
         )
@@ -693,6 +709,8 @@ def render_method_gamma_comparison(
         },
         explicit_episode=int(episode), explicit_snapshot_step=int(snapshot_step),
         gammas=list(gammas), rows=list(METHOD_KEYS), cells=cells,
+        environment=dict(n_ped=n_ped, ped_speed_range=list(speed_range)),
+        kazuki_guidance=dict(safe_coefs=list(safe_values), goal_coef=kazuki_guidance.get("goal_coef")),
         verifier_cache_entries=len(verifier_cache),
         png=os.path.abspath(output_png),
         mp4=(None if output_mp4 is None else os.path.abspath(output_mp4)),

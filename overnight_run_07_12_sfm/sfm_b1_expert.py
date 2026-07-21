@@ -121,6 +121,7 @@ def rollout(episode, gamma, *, n_ped, ped_speed_range, T=180, reach=0.5,
         states=np.asarray(states, np.float32), controls=np.asarray(controls, np.float32),
         peds=np.asarray(pedestrian_rows, np.float32),
         ped_vels=np.asarray(pedestrian_velocities, np.float32),
+        n_ped=int(n_ped), ped_speed_range=tuple(map(float, ped_speed_range)),
         trace=(trace if collect_trace else None),
         expert_semantics=("SafeMPPI demonstration expert: 2048 rollouts, MPPI temperature=.1, "
                           "centroid_gain=.2, predict_gain=.25, pedestrian velocity supplied"),
