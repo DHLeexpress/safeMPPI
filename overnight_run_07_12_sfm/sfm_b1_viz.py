@@ -86,7 +86,7 @@ def verifier_level_polygons(trace, query_row, H=10):
     """Candidate-fitted verifier sets; all feasible real and artificial faces bound them."""
     result = query_row["result"]
     if not result.get("resolved") or int(result.get("y", 0)) != 1:
-        raise ValueError("verifier level sets require a resolved SOCP-positive query")
+        raise ValueError("verifier level sets require a resolved verifier-positive query")
     if not bool(result.get("full_h", False)) or int(result.get("terminal_step", H)) != int(H):
         raise ValueError("verifier visualization requires a full-H query")
     faces = [face for face in result.get("faces", []) if bool(face.feasible)]
@@ -159,7 +159,7 @@ def _query_legend(axis):
     handles = [
         Line2D([], [], color=GRAY, lw=.8, label="K generated"),
         Line2D([], [], color=ORANGE, lw=1.5, marker=".", label="B queried"),
-        Line2D([], [], color=GREEN, lw=2.0, marker=".", label="SOCP positive"),
+        Line2D([], [], color=GREEN, lw=2.0, marker=".", label="verifier positive"),
         Line2D([], [], color=RED, lw=2.0, marker="x", label="rejected / worst h"),
         Line2D([], [], color=BLUE, lw=3.2, label="executed first action"),
         Line2D([], [], color=BLUE, lw=.9, label="nominal H_P levels h=1..10"),
@@ -201,7 +201,7 @@ def draw_query_frame(axis, trace, *, show_legend=True, show_executed_levels=True
         if show_executed_levels:
             status, query = _candidate_status(trace, executed)
             if status != "positive":
-                raise ValueError("executed candidate is not a resolved SOCP-positive query")
+                raise ValueError("executed candidate is not a resolved verifier-positive query")
             if query["result"].get("full_h"):
                 _draw_level_polygons(
                     axis, verifier_level_polygons(trace, query),

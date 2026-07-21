@@ -34,8 +34,10 @@ frozen visual encoder.  At each alive context, B1:
 2. uses an RBF-GP posterior uncertainty to query (B=4) windows;
 3. stores every resolved query in (D), and every full-horizon positive in
    (D^+);
-4. executes only a queried plan satisfying the full-H verifier and
-   (H_P(x_{t+1})\ge(1-\gamma)H_P(x_t));
+4. executes only a resolved queried plan with \(y=1\) and
+   (H_P(x_{t+1})\ge(1-\gamma)H_P(x_t)); \(y=1\) is either a complete
+   H=10 certificate or a certified absorbing goal-terminal prefix, while only
+   complete H=10 positives enter \(D^+\);
 5. terminates that replica on no verified positive (NVP);
 6. replays the most recent (W=2) rounds with equal mass over
    gamma -> (round, episode) -> context -> positive query.
@@ -88,10 +90,17 @@ and safety guidance plus MPPI refinement.
 - a diagnostic-only paired OOD rollout for the margin and SafeMPPI-cost
   selectors, followed by two fixed-frame 3x3 certificate figures.
 
-The query figure colors are fixed: gray (K), orange queried (B), green
-SOCP-positive, red rejected, and thick blue executed first action.  Blue nominal
-and green verifier polytopes contain exactly the ten gamma-dependent horizon
-sets.  At \(\gamma=1\), the ten sets genuinely coincide and are labeled as such.
+The query figure colors are fixed: gray (K), orange queried (B), green complete
+H=10 verifier-positive, orange dashed certified terminal prefix, red rejected,
+and thick blue executed first action.  Blue nominal and green verifier
+polytopes contain exactly the ten gamma-dependent horizon sets.  At
+\(\gamma=1\), the ten sets genuinely coincide and are labeled as such.
+
+The moving-pedestrian verifier used here is the compact 2-D implementation in
+`sfm_metrics2.py`: a 180-angle moving-face fit followed by a direct certificate
+check.  It evaluates the intended polytope conditions, but it is not a generic
+CVXPY/conic-solver call.  Consequently, measured verifier latency is reported
+as angular-fit certificate latency, not as real-time SOCP-solver latency.
 
 The paired query diagnostic never enters (D,D^+), the GP, or model training.
 It chooses encounter snapshots by a declared minimum-distance rule over both

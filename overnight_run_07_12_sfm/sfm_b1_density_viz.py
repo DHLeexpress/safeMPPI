@@ -66,7 +66,7 @@ def _query_handles(*, include_nominal=False, include_guidance=False):
     handles = [
         Line2D([], [], color=BV.GRAY, lw=.8, label="K generated"),
         Line2D([], [], color=BV.ORANGE, lw=1.5, marker=".", label="B queried"),
-        Line2D([], [], color=BV.GREEN, lw=2.0, marker=".", label="full-H SOCP positive"),
+        Line2D([], [], color=BV.GREEN, lw=2.0, marker=".", label="full-H verifier positive"),
         Line2D([], [], color=BV.ORANGE, lw=1.8, ls="--",
                label="terminal-prefix y=1 (not full-H)"),
         Line2D([], [], color=BV.RED, lw=2.0, marker="x", label="rejected"),
