@@ -82,7 +82,11 @@ def evaluate_kazuki(checkpoint, bank, *, scene_profile, device,
         method=f"Kazuki generate-guide-refine ({variant})",
         checkpoint=os.path.abspath(checkpoint), checkpoint_sha256=BE.sha256_file(checkpoint),
         safe_coef=float(safe_coef), goal_coef=float(goal_coef), variant=str(variant),
+        refinement_cost=config.refinement_cost,
+        refinement_cost_manifest=(KZ.BC.scorer_manifest()
+                                  if config.refinement_cost == "b1_safemppi" else None),
         comparator_semantics=("same learned prior plus reward guidance and MPPI refinement; "
+                              "all MPPI refinement stages use the frozen B1 SafeMPPI proposal cost; "
                               "not raw flow; coefficients declared before comparison"),
         summary=BE.summarize(rows), rows=rows,
     )

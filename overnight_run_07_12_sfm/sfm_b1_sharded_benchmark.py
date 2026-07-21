@@ -210,7 +210,11 @@ def _evaluate_kazuki_cell(checkpoint, episodes, gamma, *, method, scene_profile,
         method=METHOD_RESULT_NAMES[method],
         checkpoint=os.path.abspath(checkpoint), checkpoint_sha256=BE.sha256_file(checkpoint),
         safe_coef=values["safe_coef"], goal_coef=values["goal_coef"],
-        comparator_semantics="learned prior plus reward guidance and MPPI refinement; not raw flow",
+        refinement_cost=config.refinement_cost,
+        refinement_cost_manifest=(BB.KZ.BC.scorer_manifest()
+                                  if config.refinement_cost == "b1_safemppi" else None),
+        comparator_semantics=("learned prior plus reward guidance and MPPI refinement; "
+                              "all refinement stages use the frozen B1 SafeMPPI proposal cost; not raw flow"),
         rows=rows,
     )
 
@@ -231,6 +235,8 @@ def _validate_cell(payload, expected_contract):
         }
         if observed_config != expected_config:
             raise RuntimeError("cell Kazuki configuration mismatch")
+        if result.get("refinement_cost") != "b1_safemppi":
+            raise RuntimeError("cell Kazuki refinement cost is not B1-matched")
     checkpoint = expected_contract["checkpoints"][expected_contract["used_checkpoint"]]
     if (result.get("checkpoint") != checkpoint["path"]
             or result.get("checkpoint_sha256") != checkpoint["sha256"]):

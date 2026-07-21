@@ -73,6 +73,41 @@ def test_signed_visits_every_eligible_negative_once(tmp_path):
     assert abs(report["negative_mass"]["total"] - 1) < 1e-12
 
 
+def test_four_optimizer_steps_partition_positive_and_negative_support_once(tmp_path):
+    torch.manual_seed(13)
+    recent = _recent(tmp_path)
+    policy = GPS.build_sfm_policy(width=24, res_dropout=0.0)
+    S.configure_expansion_trainability(policy)
+    optimizer = torch.optim.Adam([p for p in policy.parameters() if p.requires_grad], lr=1e-5)
+    report = S.signed_update(
+        policy, optimizer, recent, alpha=.001, batch=4, seed=10, optimizer_steps=4,
+    )
+    assert report["optimizer_steps"] == report["optimizer_steps_requested"] == 4
+    assert len(report["positive_visited"]) == report["positive_eligible"]
+    assert len(set(report["positive_visited"])) == report["positive_eligible"]
+    assert len(report["negative_visited"]) == report["negative_eligible"]
+    assert len(set(report["negative_visited"])) == report["negative_eligible"]
+    assert report["positive_replay_coverage"] == report["negative_replay_coverage"] == 1.0
+    assert sum(report["positive_step_sizes"]) == report["positive_eligible"]
+    assert sum(report["negative_step_sizes"]) == report["negative_eligible"]
+
+
+def test_alpha_zero_multistep_still_never_reads_negatives(tmp_path, monkeypatch):
+    torch.manual_seed(14)
+    recent = _recent(tmp_path)
+    policy = GPS.build_sfm_policy(width=24, res_dropout=0.0)
+    S.configure_expansion_trainability(policy)
+    optimizer = torch.optim.Adam([p for p in policy.parameters() if p.requires_grad], lr=1e-5)
+    monkeypatch.setattr(recent, "negative_records", lambda: (_ for _ in ()).throw(AssertionError("D- read")))
+    report = S.signed_update(
+        policy, optimizer, recent, alpha=0.0, batch=4, seed=11, optimizer_steps=4,
+    )
+    assert report["optimizer_steps"] == 4
+    assert len(report["visited"]) == report["eligible"]
+    assert len(set(report["visited"])) == report["eligible"]
+    assert report["replay_coverage"] == 1.0
+
+
 def test_signed_negative_only_still_visits_all_without_changing_policy(tmp_path):
     recent = S.RecentRounds(tmp_path)
     shard = S.RoundShard(1)

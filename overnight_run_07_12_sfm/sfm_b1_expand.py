@@ -8,6 +8,7 @@ import copy
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import math
 import os
 import random
 import time
@@ -46,6 +47,7 @@ class ArmConfig:
     temp: float = 1.0
     phi_s: float = 0.9
     gp_lam: float = 1.0e-2
+    optimizer_steps: int = 1
     verifier_workers: int = 32
     smoke: bool = False
     seed: int = 20260720
@@ -57,14 +59,23 @@ class ArmConfig:
             raise ValueError("scientific B1 knobs differ from the frozen protocol")
         if self.selector not in ("margin", "safemppi_cost"):
             raise ValueError("invalid arm selector")
+        if not math.isfinite(float(self.alpha)) or float(self.alpha) < 0.0:
+            raise ValueError("alpha must be finite and nonnegative")
+        if int(self.optimizer_steps) not in {1, 4, 16}:
+            raise ValueError("optimizer_steps must be one of the declared sweep values {1,4,16}")
         if self.scene_profile not in (
                 "legacy_velocity_ood", "requested_ood", "density_ood",
                 "double_density_velocity_ood"):
             raise ValueError("expansion requires an explicit OOD scene profile")
-        if self.name == "A" and (self.selector != "margin" or self.alpha != 0.0):
+        if self.name == "A" and (self.selector != "margin" or self.alpha != 0.0
+                                 or self.optimizer_steps != 1):
             raise ValueError("arm A must be margin/alpha=0")
         if self.name in ("B", "C", "D") and self.selector != "safemppi_cost":
             raise ValueError("arms B-D require SafeMPPI cost selection")
+        if self.name in ARMS and self.optimizer_steps != 1:
+            raise ValueError("legacy A-D controls use exactly one optimizer step")
+        if self.name not in ARMS and self.selector != "margin":
+            raise ValueError("alpha/optimizer sweep arms keep max-step-margin execution fixed")
         return self
 
 
@@ -436,6 +447,7 @@ def run_arm(checkpoint, outdir, cfg, *, ell, cap, device):
             replay = BS.signed_update(
                 policy, optimizer, recent, alpha=cfg.alpha, batch=cfg.batch,
                 device=device, seed=cfg.seed + round_i,
+                optimizer_steps=cfg.optimizer_steps,
             )
             gather["timers"]["replay"] = time.perf_counter() - replay_start
             encoder_after_round = BS.module_sha256(policy.enc_grid)
@@ -480,7 +492,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--outdir", required=True)
-    parser.add_argument("--arm", choices=tuple(ARMS), required=True)
+    arm_group = parser.add_mutually_exclusive_group(required=True)
+    arm_group.add_argument("--arm", choices=tuple(ARMS))
+    arm_group.add_argument("--custom-name")
+    parser.add_argument("--selector", choices=("margin", "safemppi_cost"))
+    parser.add_argument("--alpha", type=float)
+    parser.add_argument("--optimizer-steps", type=int, default=1)
     parser.add_argument("--ell", type=float, required=True)
     parser.add_argument("--cap", type=int, choices=(256, 512), required=True)
     parser.add_argument("--rounds", type=int, default=20)
@@ -497,11 +514,21 @@ def main():
               "and double_density_velocity_ood uses n_ped=40 at 1.0--2.0 m/s."),
     )
     args = parser.parse_args()
-    arm = ARMS[args.arm]
+    if args.arm is not None:
+        if args.selector is not None or args.alpha is not None or args.optimizer_steps != 1:
+            parser.error("legacy --arm A-D cannot be combined with custom sweep knobs")
+        arm = ARMS[args.arm]
+        name = args.arm
+    else:
+        if args.selector is None or args.alpha is None:
+            parser.error("--custom-name requires --selector and --alpha")
+        arm = dict(selector=args.selector, alpha=args.alpha)
+        name = args.custom_name
     cfg = ArmConfig(
-        name=args.arm, selector=arm["selector"], alpha=arm["alpha"],
+        name=name, selector=arm["selector"], alpha=arm["alpha"],
         rounds=args.rounds, smoke=args.smoke, seed=args.seed,
         verifier_workers=args.verifier_workers, scene_profile=args.scene_profile,
+        optimizer_steps=args.optimizer_steps,
     )
     run_arm(args.checkpoint, args.outdir, cfg, ell=args.ell, cap=args.cap, device=args.device)
 

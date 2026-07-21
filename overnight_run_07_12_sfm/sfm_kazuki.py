@@ -15,6 +15,7 @@ import torch
 import grid_feats as GF
 import sfm_features as SF
 import sfm_hp_history as HH
+import sfm_b1_cost as BC
 import sfm_scene as SS
 from di_grid_viz import di_step
 from cfm_mppi.evaluation.render_sfm_kazuki_policy import _advance_humans, _collect_humans
@@ -36,6 +37,10 @@ class KazukiConfig:
     a_cbf: float = 1.0
     k_worst: int = 5
     markup: float = 1.01
+    # Keep Kazuki's generate--guide--refine mechanics, but score every generated,
+    # perturbed, and refined window with the same frozen proposal cost as B1.
+    # ``legacy_kazuki`` remains available only to reproduce pre-match artifacts.
+    refinement_cost: str = "b1_safemppi"
     # Claude's H=10 adaptation of the original MPPI cost scaling.
     collision_weight: float = 20.0
     goal_weight: float = 2.0
@@ -118,6 +123,8 @@ class KazukiConfig:
             raise ValueError("safe_coefs must be nonnegative")
         if self.safe_coef_gamma_span < 0 or self.goal_coef_gamma_span < 0:
             raise ValueError("gamma guidance spans must be nonnegative")
+        if self.refinement_cost not in {"b1_safemppi", "legacy_kazuki"}:
+            raise ValueError(f"unknown refinement cost: {self.refinement_cost}")
         if self.n_sample < 1 or self.n_elite < 1 or self.n_copy < 1:
             raise ValueError("sample/elite/copy counts must be positive")
         if self.filter_solver not in {"jacobi", "exact"}:
@@ -312,6 +319,7 @@ def goal_reward(pos, goal):
 
 
 def stage_cost_batch(pos, U, goal, ped_pred, r_col, cfg, prev_U=None):
+    """Legacy SFM Kazuki port cost, retained only for artifact reproduction."""
     H = pos.shape[1]
     goal_c = torch.linalg.vector_norm(pos - goal[None, None], dim=2)
     d = torch.linalg.vector_norm(pos.unsqueeze(2) - ped_pred.unsqueeze(0), dim=3)
@@ -323,6 +331,16 @@ def stage_cost_batch(pos, U, goal, ped_pred, r_col, cfg, prev_U=None):
     if prev_U is not None:
         cost = cost + float(cfg.warm_consistency_weight) * ((U - prev_U[None]) ** 2).sum((1, 2))
     return cost
+
+
+def refinement_cost_batch(state, U, goal, ped_xy, ped_vel, ped_pred, r_col, cfg, prev_U=None):
+    """Dispatch the declared MPPI objective without changing Kazuki's proposal mechanics."""
+    if cfg.refinement_cost == "b1_safemppi":
+        return BC.safemppi_proposal_cost(
+            state, U, goal, ped_xy, ped_vel, config=BC.frozen_expert_config()
+        )
+    pos, _ = di_rollout_t(state, U, SS.DT)
+    return stage_cost_batch(pos, U, goal, ped_pred, r_col, cfg, prev_U)
 
 
 def _select_refined_index(refined_cost, refined_min_clear, cfg):
@@ -838,9 +856,12 @@ def guided_generate(policy, ctx, state, goal, ped_pred, ped_vel, r_col, z_init, 
 
 
 @torch.no_grad()
-def flow_mppi_refine(policy, state, goal, ped_pred, r_col, U_gen, prev_U, cfg, collect_diagnostics=False):
+def flow_mppi_refine(policy, state, goal, ped_xy, ped_vel, ped_pred, r_col,
+                     U_gen, prev_U, cfg, collect_diagnostics=False):
     pos, _ = di_rollout_t(state, U_gen, SS.DT)
-    generated_cost = stage_cost_batch(pos, U_gen, goal, ped_pred, r_col, cfg, prev_U)
+    generated_cost = refinement_cost_batch(
+        state, U_gen, goal, ped_xy, ped_vel, ped_pred, r_col, cfg, prev_U
+    )
     n_elite = min(int(cfg.n_elite), len(U_gen))
     top = torch.topk(generated_cost, k=n_elite, largest=False).indices
     elites = U_gen[top]; E = len(elites)
@@ -848,12 +869,16 @@ def flow_mppi_refine(policy, state, goal, ped_pred, r_col, U_gen, prev_U, cfg, c
     pert = torch.clamp(pert + float(cfg.mppi_sigma) * torch.randn_like(pert),
                        -float(policy.u_max), float(policy.u_max))
     ppos, _ = di_rollout_t(state, pert, SS.DT)
-    pcost = stage_cost_batch(ppos, pert, goal, ped_pred, r_col, cfg, prev_U).reshape(E, int(cfg.n_copy))
+    pcost = refinement_cost_batch(
+        state, pert, goal, ped_xy, ped_vel, ped_pred, r_col, cfg, prev_U
+    ).reshape(E, int(cfg.n_copy))
     shift = pcost.min(dim=1, keepdim=True).values
     weight = torch.softmax(-(pcost - shift) / float(cfg.mppi_lambda), dim=1)
     refined = (weight[:, :, None, None] * pert.reshape(E, int(cfg.n_copy), *pert.shape[1:])).sum(1)
     rpos, _ = di_rollout_t(state, refined, SS.DT)
-    refined_cost = stage_cost_batch(rpos, refined, goal, ped_pred, r_col, cfg, prev_U)
+    refined_cost = refinement_cost_batch(
+        state, refined, goal, ped_xy, ped_vel, ped_pred, r_col, cfg, prev_U
+    )
     rclear = torch.linalg.vector_norm(rpos.unsqueeze(2) - ped_pred.unsqueeze(0), dim=3) - r_col
     refined_min_clear = rclear.amin(dim=(1, 2))
     best = _select_refined_index(refined_cost, refined_min_clear, cfg); U_best = refined[best]
@@ -872,6 +897,9 @@ def flow_mppi_refine(policy, state, goal, ped_pred, r_col, U_gen, prev_U, cfg, c
         refined_cost_best=float(refined_cost[best].cpu()), refined_min_pred_clear=float(rclear[best].min().cpu()),
         refined_safe_mode_fraction=float((refined_min_clear >= float(cfg.refined_clearance_margin)).float().mean().cpu()),
         hard_clearance_select=bool(cfg.hard_clearance_select),
+        refinement_cost=str(cfg.refinement_cost),
+        refinement_cost_manifest=(BC.scorer_manifest()
+                                  if cfg.refinement_cost == "b1_safemppi" else None),
         selected_elite=int(best), selected_generated_index=int(top[best].cpu()),
         elite_generated_indices=top.detach().cpu().numpy(),
         best_planned_positions=rpos[best].cpu().numpy(),
@@ -964,7 +992,7 @@ def kazuki_sfm_deploy(policy, episode, gamma, cfg=None, n_ped=20, T=180, reach=0
         U_unguided = (torch.clamp(z1_unguided.reshape(cfg.n_sample, H, 2) * float(policy.u_max),
                                   -float(policy.u_max), float(policy.u_max))
                       if collect_diagnostics else None)
-        U_best, refine_diag = flow_mppi_refine(policy, state, goal, ped_pred,
+        U_best, refine_diag = flow_mppi_refine(policy, state, goal, ped_xy, ped_vel, ped_pred,
                                                SS.R_PED + cfg.collision_margin, U_gen, prev_U, guidance_cfg,
                                                collect_diagnostics=collect_diagnostics)
         action = U_best[0].detach().cpu().numpy().astype(np.float32)

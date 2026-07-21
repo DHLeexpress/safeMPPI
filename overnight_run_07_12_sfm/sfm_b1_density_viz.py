@@ -550,24 +550,43 @@ def draw_method_panel(axis, method, run, gamma, step, *, verifier_result=None,
                         expert_sequence_kind=trace["sequence_kind"])
     elif method == "selected":
         plan = np.asarray(trace["planned_states"], float)[:, :2]
-        # Green is reserved for a complete H=10 certificate, not method identity.
-        axis.plot(plan[:, 0], plan[:, 1], color="#333333", lw=.82, marker="o", ms=2.2)
         result = verifier_result if verifier_result is not None else VS.verify_query(
             trace["state"], trace["controls"], trace["ped_xy"], trace["ped_vel"], gamma,
         )
+        resolved = bool(result.get("resolved"))
+        positive = bool(resolved and int(result.get("y", 0)) == 1)
+        full_h_positive = bool(
+            positive and bool(result.get("full_h"))
+            and int(result.get("terminal_step", 10)) == 10
+        )
+        terminal_prefix_positive = bool(positive and not full_h_positive)
+        rejected = bool(resolved and int(result.get("y", 0)) == 0)
+        terminal_step = int(result.get("terminal_step", 10)) if resolved else None
+
+        # Green is reserved for a complete H=10 certificate, not method identity.
+        # A certified goal hit is an accepted absorbing prefix: show only the
+        # verified prefix in orange and never mark its unexecuted tail rejected.
+        if terminal_prefix_positive:
+            segment = np.asarray(result.get("segment", plan), float)[:, :2]
+            prefix = segment[:min(terminal_step + 1, len(segment))]
+            axis.plot(prefix[:, 0], prefix[:, 1], "--", color=BV.ORANGE,
+                      lw=.95, marker=".", ms=2.2)
+            axis.plot(*prefix[-1], "o", color=BV.ORANGE, ms=5.0, zorder=9)
+        else:
+            axis.plot(plan[:, 0], plan[:, 1], color="#333333", lw=.82, marker="o", ms=2.2)
         query = dict(candidate_id=0, controls=np.asarray(trace["controls"]), result=result)
         level_audit = None
-        if result.get("resolved") and int(result.get("y", 0)) == 1 and bool(result.get("full_h")):
+        if full_h_positive:
             level_audit = checked_verifier_levels(dict(trace, gamma=float(gamma)), query, H=10)
             _draw_verifier_geometry(axis, level_audit)
-        elif result.get("resolved"):
+        elif rejected:
             axis.plot(*plan[-1], "x", color=BV.RED, ms=7, mew=1.5, zorder=9)
         metadata.update(
-            verifier_positive=bool(result.get("resolved") and int(result.get("y", 0)) == 1),
-            verifier_full_h_positive=bool(
-                result.get("resolved") and int(result.get("y", 0)) == 1
-                and bool(result.get("full_h")) and int(result.get("terminal_step", 10)) == 10
-            ),
+            verifier_positive=positive,
+            verifier_full_h_positive=full_h_positive,
+            terminal_prefix_positive=terminal_prefix_positive,
+            rejected=rejected,
+            terminal_step=terminal_step,
             verifier_levels=(0 if level_audit is None else level_audit["rendered_levels"]),
             verifier_local_overlap=([] if level_audit is None else level_audit["current_disk_overlap_indices"]),
             verifier_runtime_authority=False,

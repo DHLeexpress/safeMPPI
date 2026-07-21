@@ -202,6 +202,37 @@ def test_expert_trace_accepts_one_float32_ulp_between_action_and_mean(monkeypatc
     assert report["expert_sequence_kind"] == "reward_weighted_mean"
 
 
+def test_selected_goal_terminal_prefix_is_orange_truncated_and_not_rejected():
+    planned = np.zeros((11, 4), np.float32)
+    planned[:, :2] = _segment()
+    trace = dict(
+        step=0, state=np.zeros(4), controls=np.zeros((10, 2), np.float32),
+        planned_states=planned, ped_xy=np.zeros((0, 2)), ped_vel=np.zeros((0, 2)),
+    )
+    run = dict(states=np.zeros((2, 4)), trace=[trace])
+    figure, axis = plt.subplots()
+    report = V.draw_method_panel(
+        axis, "selected", run, .5, 0, verifier_result=_prefix_result(),
+    )
+    orange_prefixes = [
+        line for line in axis.lines
+        if line.get_color() == V.BV.ORANGE and line.get_linestyle() == "--"
+    ]
+    red_rejections = [
+        line for line in axis.lines
+        if line.get_color() == V.BV.RED and line.get_marker() == "x"
+    ]
+    plt.close(figure)
+    assert report["terminal_prefix_positive"] is True
+    assert report["rejected"] is False
+    assert report["terminal_step"] == 4
+    assert report["verifier_full_h_positive"] is False
+    assert report["verifier_levels"] == 0
+    assert len(orange_prefixes) == 1
+    assert len(orange_prefixes[0].get_xdata()) == 5
+    assert red_rejections == []
+
+
 def test_method_bundle_accepts_density_diagnostic_aliases():
     bundle = dict(scenario_id=11, shared_snapshot=dict(step=0), runs={
         "safemppi_expert": {gamma: _run(False) for gamma in V.DISPLAY_GAMMAS},

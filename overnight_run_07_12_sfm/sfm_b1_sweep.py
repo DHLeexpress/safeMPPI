@@ -124,10 +124,20 @@ def seed_bank_manifest(outdir, rounds=20):
         deployment_density_ood={
             key: list(value) for key, value in SP.raw_bank(SP.DEPLOY_DENSITY_OOD_EP0, 100).items()
         },
+        temperature_selection={
+            key: list(value) for key, value in SP.raw_bank(SP.TEMPERATURE_SELECT_EP0, 10).items()
+        },
+        curve_screening={
+            key: list(value) for key, value in SP.raw_bank(SP.CURVE_SCREEN_EP0, 50).items()
+        },
+        final_confirmation={
+            key: list(value) for key, value in SP.raw_bank(SP.FINAL_CONFIRM_EP0, 100).items()
+        },
         query_diagnostic_scenarios=list(range(SP.QUERY_DIAGNOSTIC_EP0, SP.QUERY_DIAGNOSTIC_EP0 + 3)),
         environment_contracts={
             name: SS.scene_profile(name)
-            for name in ("training", "id", "legacy_velocity_ood", "requested_ood", "density_ood")
+            for name in ("training", "id", "legacy_velocity_ood", "requested_ood", "density_ood",
+                         "double_density_velocity_ood")
         },
     )
     path = os.path.join(outdir, "seed_banks.json")

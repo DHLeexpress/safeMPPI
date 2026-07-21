@@ -50,6 +50,8 @@ def _payload(base, method, gamma):
     )
     if method in S.KAZUKI_CONFIGS:
         result.update(**S.KAZUKI_CONFIGS[method],
+                      refinement_cost="b1_safemppi",
+                      refinement_cost_manifest=S.BB.KZ.BC.scorer_manifest(),
                       comparator_semantics="learned prior plus reward guidance and MPPI refinement; not raw flow")
     else:
         result["raw_semantics"] = (
