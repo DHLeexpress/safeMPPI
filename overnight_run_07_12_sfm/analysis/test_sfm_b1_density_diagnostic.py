@@ -1,6 +1,7 @@
 import copy
 
 import numpy as np
+import pytest
 
 import sfm_b1_density_diagnostic as D
 
@@ -74,7 +75,7 @@ def _query(candidate, positive, value):
     controls = np.full((10, 2), value, np.float32)
     return dict(
         candidate_id=candidate, controls=controls,
-        result=dict(resolved=True, y=int(positive), full_h=bool(positive)),
+        result=dict(resolved=True, y=int(positive), full_h=True, terminal_step=10),
     )
 
 
@@ -114,19 +115,16 @@ def test_snapshot_strict_order_is_p3n1_then_p2n2_then_p4n0():
     assert [row["tier"] for row in scores] == [2, 1, 0]
 
 
-def test_terminal_prefix_is_neither_positive_nor_negative_and_disqualifies_strict():
+def test_partial_query_is_rejected_by_snapshot_scoring():
     trace = dict(
         scenario_id=1, gamma=.1, step=0, selected_ids=[0, 1, 2, 3], executed_id=0,
         query_rows=[_query(0, True, 0), _query(1, True, .1),
                     _query(2, True, .2), _query(3, False, .3)],
     )
     trace["query_rows"][2]["result"]["full_h"] = False
-    score = D.snapshot_score(trace, 0)
-    assert score["full_h_positive"] == 2
-    assert score["verifier_rejected"] == 1
-    assert score["terminal_prefix"] == 1
-    assert not score["strict_composition_eligible"]
-    assert score["tier"] == 4
+    trace["query_rows"][2]["result"]["terminal_step"] = 3
+    with pytest.raises(ValueError, match="full H=10"):
+        D.snapshot_score(trace, 0)
 
 
 def test_verifier_timing_counts_attempts_errors_and_amortized_parallel_wall_time():
@@ -152,7 +150,7 @@ def test_parser_defaults_to_cuda_and_declared_rbf_preflight_values():
     ])
     assert args.device == "cuda"
     assert args.ell == D.DEFAULT_ELL
-    assert args.cap == 256
+    assert args.cap == D.SP.GP_CAP == 512
 
 
 def test_methods_alias_accepts_search_contract_and_defaults_to_cuda():

@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 import sfm_b1_viz as V
 
@@ -46,3 +47,12 @@ def test_verifier_levels_include_feasible_artificial_faces_for_bounded_sets():
     assert len(polygons) == 10
     np.testing.assert_allclose(polygons[0][1].min(axis=0), [1.5, 2.5])
     np.testing.assert_allclose(polygons[0][1].max(axis=0), [2.5, 3.5])
+
+
+def test_candidate_status_rejects_legacy_terminal_prefix():
+    trace = dict(query_rows=[dict(
+        candidate_id=2,
+        result=dict(resolved=True, y=1, full_h=False, terminal_step=3),
+    )])
+    with pytest.raises(ValueError, match="legacy partial B1 query"):
+        V._candidate_status(trace, 2)

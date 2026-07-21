@@ -100,16 +100,18 @@ def test_double_density_velocity_ood_is_accepted_by_expansion_contract():
     assert config.scene_profile == "double_density_velocity_ood"
 
 
-def test_alpha_optimizer_sweep_keeps_margin_execution_and_declared_steps():
+def test_alpha_inner_epoch_sweep_keeps_margin_execution_and_declared_replay():
     config = X.ArmConfig(
-        name="margin_alpha0p001_steps016", selector="margin", alpha=.001,
-        optimizer_steps=16, scene_profile="double_density_velocity_ood",
+        name="margin_alpha0p001_inner004", selector="margin", alpha=.001,
+        optimizer_steps=16, inner_epochs=4, lr=1e-4, sanity_M=10,
+        scene_profile="double_density_velocity_ood",
     ).validate()
-    assert config.selector == "margin" and config.optimizer_steps == 16
+    assert (config.selector, config.optimizer_steps, config.inner_epochs) == ("margin", 16, 4)
     with pytest.raises(ValueError, match="max-step-margin"):
         X.ArmConfig(
             name="custom_cost", selector="safemppi_cost", alpha=.001,
-            optimizer_steps=4, scene_profile="double_density_velocity_ood",
+            optimizer_steps=16, inner_epochs=4, lr=1e-4, sanity_M=10,
+            scene_profile="double_density_velocity_ood",
         ).validate()
 
 

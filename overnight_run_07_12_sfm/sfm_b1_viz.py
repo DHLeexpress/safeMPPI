@@ -127,6 +127,9 @@ def _candidate_status(trace, candidate_id):
         if int(row["candidate_id"]) == int(candidate_id):
             if not row["result"].get("resolved"):
                 return "error", row
+            if (not bool(row["result"].get("full_h"))
+                    or int(row["result"].get("terminal_step", -1)) != 10):
+                raise ValueError("visualization received a legacy partial B1 query")
             return ("positive" if int(row["result"]["y"]) else "negative"), row
     return "unqueried", None
 
@@ -202,14 +205,10 @@ def draw_query_frame(axis, trace, *, show_legend=True, show_executed_levels=True
             status, query = _candidate_status(trace, executed)
             if status != "positive":
                 raise ValueError("executed candidate is not a resolved verifier-positive query")
-            if query["result"].get("full_h"):
-                _draw_level_polygons(
-                    axis, verifier_level_polygons(trace, query),
-                    color=GREEN, linewidth=.85, alpha=.78, zorder=2.5,
-                )
-            else:
-                axis.text(.99, .01, "terminal-prefix query: no H=10 levels",
-                          transform=axis.transAxes, ha="right", va="bottom", fontsize=6, color=RED)
+            _draw_level_polygons(
+                axis, verifier_level_polygons(trace, query),
+                color=GREEN, linewidth=.85, alpha=.78, zorder=2.5,
+            )
     axis.set_title(
         f"r{trace['round']} s{trace['scenario_id']} gamma={trace['gamma']} t={trace['step']}"
         + (" | NVP" if executed is None else "")
@@ -242,7 +241,7 @@ def render_zoom_panels(trace, output):
         path = np.asarray(_trace_candidate(trace, candidate)["segment"])
         color = GREEN if status == "positive" else RED if status == "negative" else ORANGE
         axis.plot(path[:, 0], path[:, 1], color=color, lw=2.4, zorder=8)
-        if status == "positive" and query["result"].get("full_h"):
+        if status == "positive":
             _draw_time_indexed_sets(axis, trace, query)
         axis.set_title(f"queried candidate {candidate}: {status}; each h uses its h-set")
     for axis in axes.flat[len(selected):]:

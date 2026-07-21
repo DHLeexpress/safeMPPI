@@ -96,21 +96,34 @@ def nominal_hp_margin(state, first_action, ped_xy, gamma):
 
 
 def select_admissible(query_rows, *, selector, state, ped_xy, ped_vel, gamma):
-    """Gate by y and one-step nominal Hp before either frozen selector."""
+    """Gate full-H positives by one-step nominal Hp before either selector."""
     admissible = []
+    state = np.asarray(state, np.float32).reshape(4)
+    start_goal_distance = float(np.linalg.norm(state[:2] - SS.GOAL))
     for row in query_rows:
-        if not row["result"].get("resolved") or int(row["result"].get("y", 0)) != 1:
+        result = row["result"]
+        if not result.get("resolved"):
             continue
-        margin, hp_old, hp_new = nominal_hp_margin(state, row["controls"][0], ped_xy, gamma)
+        if not bool(result.get("full_h")) or int(result.get("terminal_step", -1)) != 10:
+            raise ValueError("B1 execution requires every resolved query to be full H=10")
+        if int(result.get("y", 0)) != 1:
+            continue
+        first_action = np.asarray(row["controls"][0], np.float32)
+        margin, hp_old, hp_new = nominal_hp_margin(state, first_action, ped_xy, gamma)
+        next_position = state[:2] + SS.DT * state[2:4] + 0.5 * SS.DT ** 2 * first_action
+        step_progress = start_goal_distance - float(np.linalg.norm(next_position - SS.GOAL))
         row["hp_margin"] = float(margin)
         row["hp_old"] = float(hp_old)
         row["hp_new"] = float(hp_new)
+        row["step_progress"] = float(step_progress)
         if margin >= -1.0e-9:
             admissible.append(row)
     if not admissible:
         return None
     if selector == "margin":
-        return max(admissible, key=lambda row: (row["hp_margin"], -int(row["candidate_id"])))
+        return max(admissible, key=lambda row: (
+            row["hp_margin"], row["step_progress"], -int(row["candidate_id"]),
+        ))
     if selector != "safemppi_cost":
         raise ValueError(f"unknown selector: {selector}")
     controls = torch.as_tensor(np.stack([row["controls"] for row in admissible]), dtype=torch.float32)

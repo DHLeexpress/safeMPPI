@@ -48,34 +48,43 @@ class ArmConfig:
     phi_s: float = 0.9
     gp_lam: float = 1.0e-2
     optimizer_steps: int = 1
+    inner_epochs: int = 1
+    sanity_M: int = 0
     verifier_workers: int = 32
     smoke: bool = False
     seed: int = 20260720
     scene_profile: str = "legacy_velocity_ood"
 
     def validate(self):
-        if (self.K, self.B, self.T, self.H, self.W, self.batch, self.lr, self.ess_target) != (
-                16, 4, 180, 10, 2, 128, 1.0e-5, 0.5):
+        if (self.K, self.B, self.T, self.H, self.W, self.batch, self.ess_target) != (
+                16, 4, 180, 10, 2, 128, 0.5):
             raise ValueError("scientific B1 knobs differ from the frozen protocol")
         if self.selector not in ("margin", "safemppi_cost"):
             raise ValueError("invalid arm selector")
         if not math.isfinite(float(self.alpha)) or float(self.alpha) < 0.0:
             raise ValueError("alpha must be finite and nonnegative")
-        if int(self.optimizer_steps) not in {1, 4, 16}:
-            raise ValueError("optimizer_steps must be one of the declared sweep values {1,4,16}")
         if self.scene_profile not in (
                 "legacy_velocity_ood", "requested_ood", "density_ood",
                 "double_density_velocity_ood"):
             raise ValueError("expansion requires an explicit OOD scene profile")
         if self.name == "A" and (self.selector != "margin" or self.alpha != 0.0
-                                 or self.optimizer_steps != 1):
+                                 or self.optimizer_steps != 1 or self.inner_epochs != 1):
             raise ValueError("arm A must be margin/alpha=0")
         if self.name in ("B", "C", "D") and self.selector != "safemppi_cost":
             raise ValueError("arms B-D require SafeMPPI cost selection")
-        if self.name in ARMS and self.optimizer_steps != 1:
-            raise ValueError("legacy A-D controls use exactly one optimizer step")
+        if self.name in ARMS and (
+                self.optimizer_steps != 1 or self.inner_epochs != 1
+                or self.lr != SP.LR or self.sanity_M != 0):
+            raise ValueError("legacy A-D controls use the frozen one-step replay")
         if self.name not in ARMS and self.selector != "margin":
-            raise ValueError("alpha/optimizer sweep arms keep max-step-margin execution fixed")
+            raise ValueError("alpha/replay sweep arms keep max-step-margin execution fixed")
+        if self.name not in ARMS and (
+                self.optimizer_steps != SP.OPTIMIZER_CHUNKS
+                or self.inner_epochs not in SP.INNER_EPOCHS
+                or self.lr != SP.SWEEP_LR or self.sanity_M != SP.SANITY_M):
+            raise ValueError(
+                "custom sweep requires 16 chunks, inner epochs {1,4,16}, lr=1e-4, and M10 sanity"
+            )
         return self
 
 
@@ -182,9 +191,12 @@ def _record_batch(records, device):
 
 @torch.no_grad()
 def gp_from_recent(policy, recent, *, ell, cap, lam, phi_s, device, seed):
-    records = recent.positive_records()
-    ordered = BS.hierarchical_order(records, seed) if records else []
-    selected = ordered[:int(cap)]
+    del seed  # GP retention is fixed when each round shard is completed.
+    if int(cap) != SP.GP_CAP:
+        raise ValueError(f"latest B1 GP memory requires cap={SP.GP_CAP}")
+    selected = recent.gp_records()
+    if len(selected) > int(cap):
+        raise AssertionError("retained GP memory exceeds the declared cap")
     gp = BR.RBFGP(ell, lam)
     if selected:
         feature_parts = []
@@ -193,6 +205,25 @@ def gp_from_recent(policy, recent, *, ell, cap, lam, phi_s, device, seed):
             feature_parts.append(policy.phi_s(controls, policy.ctx_from(hp10, low, hist), s=phi_s))
         gp.set_buffer(torch.cat(feature_parts))
     return gp, [(shard.round_i, int(query["query_id"])) for shard, query in selected]
+
+
+def gp_memory_diagnostics(recent):
+    records = recent.gp_records()
+    per_round, per_gamma = Counter(), Counter()
+    identities = []
+    for shard, query in records:
+        context = shard.contexts[int(query["context_id"])]
+        per_round[int(shard.round_i)] += 1
+        per_gamma[str(float(context["gamma"]))] += 1
+        identities.append((int(shard.round_i), int(query["query_id"])))
+    fingerprint = hashlib.sha256(json.dumps(identities, separators=(",", ":")).encode()).hexdigest()
+    gamma_counts = {str(float(gamma)): int(per_gamma[str(float(gamma))]) for gamma in SP.GAMMAS}
+    if gamma_counts and max(gamma_counts.values()) - min(gamma_counts.values()) > 1:
+        raise AssertionError("two-round GP memory is not gamma-balanced")
+    return dict(
+        count=len(records), per_round=dict(sorted(per_round.items())),
+        per_gamma=gamma_counts, identity_sha256=fingerprint,
+    )
 
 
 def _initial_beta(phi_policy, gp, replicas, cfg, device, seed):
@@ -208,6 +239,8 @@ def _initial_beta(phi_policy, gp, replicas, cfg, device, seed):
         gp, [features[index] for index in range(len(live))], B=cfg.B,
         target=cfg.ess_target, seed=seed + 17,
     )
+    if abs(float(ess) - float(cfg.ess_target)) > 1.0e-4:
+        raise RuntimeError(f"adaptive beta missed ESS/K target: {ess} != {cfg.ess_target}")
     return beta, ess
 
 
@@ -256,16 +289,12 @@ def gather_macro_round(policy, phi_policy, gp, beta, replicas, cfg, shard, devic
         start = time.perf_counter()
         with torch.no_grad():
             features = _features(phi_policy, windows, batch, cfg.phi_s)
-        selected_by_context = []
-        acquisition_traces = []
-        for index in range(len(live)):
-            selected, acquisition = gp.sequential_acquire(
-                features[index], cfg.B, beta, generator=generator
-            )
-            selected_by_context.append(selected)
-            acquisition_traces.append(acquisition)
-            all_values = gp.acquisition_sigma(features[index]).detach().cpu().numpy()
-            sigma_all.extend(map(float, all_values))
+        base_sigma = gp.acquisition_sigma_batched(features)
+        selected_by_context, acquisition_traces = gp.sequential_acquire_batched(
+            features, cfg.B, beta, generator=generator
+        )
+        sigma_all.extend(map(float, base_sigma.detach().cpu().reshape(-1)))
+        for acquisition in acquisition_traces:
             sigma_selected.extend(float(row["chosen_sigma"]) for row in acquisition)
             ess_values.extend(row["ess_norm"] for row in acquisition)
         timers["phi_rbf"] += time.perf_counter() - start
@@ -319,6 +348,7 @@ def gather_macro_round(policy, phi_policy, gp, beta, replicas, cfg, shard, devic
                     context_id, candidate_id, controls,
                     sigma=pending_sigma,
                     result=result, acquisition_step=acquisition_step, mode=mode,
+                    gp_base_sigma=float(base_sigma[context_index, candidate_id]),
                 )
                 row = dict(candidate_id=candidate_id, query_id=query_id, controls=controls,
                            result=result, mode=mode)
@@ -333,6 +363,8 @@ def gather_macro_round(policy, phi_policy, gp, beta, replicas, cfg, shard, devic
                 stored = shard.queries[row["query_id"]]
                 if "hp_margin" in row:
                     stored["hp_margin"] = float(row["hp_margin"])
+                if "step_progress" in row:
+                    stored["step_progress"] = float(row["step_progress"])
                 if "expert_cost" in row:
                     stored["expert_cost"] = float(row["expert_cost"])
             trace = dict(
@@ -394,8 +426,47 @@ def _save_checkpoint(policy, path, extra):
     os.replace(complete + ".tmp", complete)
 
 
+def _run_sanity(policy, cfg, *, round_i, device, executor, noise, noise_meta, outdir):
+    """Canonical temperature-one M10 monitor; never used as training data."""
+    import sfm_b1_curve_eval as CE
+
+    policy.eval()
+    rollout_start = time.perf_counter()
+    rows = CE.run_batched_raw(
+        policy, scene_profile=cfg.scene_profile, ep0=SP.SMOKE_EVAL_EP0,
+        M=cfg.sanity_M, base_noise=noise, temperature=1.0, device=device,
+    )
+    rollout_seconds = time.perf_counter() - rollout_start
+    certificate_start = time.perf_counter()
+    rows = CE._attach_validity(rows, [
+        future.result() for future in CE._submit_v_safe(rows, executor)
+    ])
+    certificate_seconds = time.perf_counter() - certificate_start
+    payload = dict(
+        status="SFM_B1_ROUND_SANITY_COMPLETE", round=int(round_i),
+        role="development_monitor_only", temperature_by_gamma={
+            str(gamma): 1.0 for gamma in SP.GAMMAS
+        },
+        bank=noise_meta, summary=CE.summarize(rows, seed=cfg.seed + int(round_i) * 31),
+        timers=dict(
+            gpu_policy_rollout=rollout_seconds,
+            full_H10_certificate_wait=certificate_seconds,
+            total=rollout_seconds + certificate_seconds,
+        ),
+        no_training_feedback=True, no_trajectory_artifacts=True,
+    )
+    path = os.path.join(outdir, f"sanity_r{int(round_i):02d}.json")
+    temporary = path + ".tmp"
+    with open(temporary, "w") as stream:
+        json.dump(payload, stream, indent=2, allow_nan=False)
+    os.replace(temporary, path)
+    return payload
+
+
 def run_arm(checkpoint, outdir, cfg, *, ell, cap, device):
     cfg.validate()
+    if cfg.name not in ARMS and int(cap) != SP.GP_CAP:
+        raise ValueError(f"custom B1 sweep requires GP cap={SP.GP_CAP}")
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
@@ -413,6 +484,13 @@ def run_arm(checkpoint, outdir, cfg, *, ell, cap, device):
     optimizer = torch.optim.Adam(
         [parameter for parameter in policy.parameters() if parameter.requires_grad], lr=cfg.lr
     )
+    sanity_noise = sanity_meta = None
+    if cfg.sanity_M:
+        import sfm_b1_curve_eval as CE
+        sanity_noise, sanity_meta = CE.noise_bank(
+            scene_profile=cfg.scene_profile, ep0=SP.SMOKE_EVAL_EP0,
+            M=cfg.sanity_M, d=policy.d,
+        )
     recent = BS.RecentRounds(os.path.join(outdir, "round_shards"), cfg.W)
     history = []
     torch_generator = torch.Generator(device=device).manual_seed(cfg.seed)
@@ -421,7 +499,13 @@ def run_arm(checkpoint, outdir, cfg, *, ell, cap, device):
         source_sha256=source_sha, encoder_sha256=encoder_before,
         training_randomness="per-query SHA256-keyed CFM x0/tau/residual-dropout design",
     ))
+    baseline_sanity = None
     with ProcessPoolExecutor(max_workers=cfg.verifier_workers) as executor:
+        if cfg.sanity_M:
+            baseline_sanity = _run_sanity(
+                policy, cfg, round_i=0, device=device, executor=executor,
+                noise=sanity_noise, noise_meta=sanity_meta, outdir=outdir,
+            )
         for round_i in range(1, cfg.rounds + 1):
             round_start = time.perf_counter()
             scenarios = SP.expansion_scenarios(round_i, smoke=cfg.smoke)
@@ -444,6 +528,7 @@ def run_arm(checkpoint, outdir, cfg, *, ell, cap, device):
                 phi_policy, recent, ell=ell, cap=cap, lam=cfg.gp_lam,
                 phi_s=cfg.phi_s, device=device, seed=cfg.seed + round_i * 101,
             )
+            gp_memory = gp_memory_diagnostics(recent)
             beta, calibrated_ess = _initial_beta(
                 phi_policy, gp, replicas, cfg, device, cfg.seed + round_i * 1009
             )
@@ -451,13 +536,22 @@ def run_arm(checkpoint, outdir, cfg, *, ell, cap, device):
             gather = gather_macro_round(
                 policy, phi_policy, gp, beta, replicas, cfg, shard, device, executor, torch_generator
             )
+            retention = BS.retain_gp_upper_quartile(
+                shard, SP.GAMMAS, seed=cfg.seed + round_i * 7919,
+                total=SP.GP_RETAIN_PER_ROUND,
+            )
             shard_manifest = recent.append_and_save(shard)
             replay_start = time.perf_counter()
-            replay = BS.signed_update(
-                policy, optimizer, recent, alpha=cfg.alpha, batch=cfg.batch,
-                device=device, seed=cfg.seed + round_i,
-                optimizer_steps=cfg.optimizer_steps,
+            replay_kwargs = dict(
+                alpha=cfg.alpha, batch=cfg.batch, device=device, seed=cfg.seed + round_i,
             )
+            if cfg.name in ARMS:
+                replay_kwargs["optimizer_steps"] = cfg.optimizer_steps
+            else:
+                replay_kwargs.update(
+                    optimizer_chunks=cfg.optimizer_steps, inner_epochs=cfg.inner_epochs,
+                )
+            replay = BS.signed_update(policy, optimizer, recent, **replay_kwargs)
             gather["timers"]["replay"] = time.perf_counter() - replay_start
             encoder_after_round = BS.module_sha256(policy.enc_grid)
             if encoder_after_round != encoder_before:
@@ -469,12 +563,20 @@ def run_arm(checkpoint, outdir, cfg, *, ell, cap, device):
                 recipe=asdict(cfg), ell=float(ell), cap=int(cap), beta=float(beta),
                 training_randomness="per-query SHA256-keyed CFM x0/tau/residual-dropout design",
             ))
+            sanity = None
+            if cfg.sanity_M:
+                sanity = _run_sanity(
+                    policy, cfg, round_i=round_i, device=device, executor=executor,
+                    noise=sanity_noise, noise_meta=sanity_meta, outdir=outdir,
+                )
+                gather["timers"]["sanity"] = sanity["timers"]["total"]
             record = dict(
                 round=round_i, scenarios=list(scenarios), beta=float(beta),
                 verifier=SM.verifier_manifest(),
                 calibrated_ess_over_K=float(calibrated_ess), gp_buffer_ids=gp_ids,
-                gp=gp.diagnostics(), gather={key: value for key, value in gather.items() if key != "traces"},
-                replay=replay, shard=shard_manifest, encoder_sha256=encoder_after_round,
+                gp=gp.diagnostics(), gp_memory=gp_memory, gp_retention=retention,
+                gather={key: value for key, value in gather.items() if key != "traces"},
+                replay=replay, sanity=sanity, shard=shard_manifest, encoder_sha256=encoder_after_round,
                 checkpoint=os.path.abspath(checkpoint_path), checkpoint_sha256=_sha256_file(checkpoint_path),
                 wall_seconds=time.perf_counter() - round_start,
             )
@@ -483,6 +585,10 @@ def run_arm(checkpoint, outdir, cfg, *, ell, cap, device):
                 stream.write(json.dumps(record) + "\n")
             torch.save(gather["traces"], os.path.join(outdir, f"query_trace_r{round_i:02d}.pt"))
             print(json.dumps({key: record[key] for key in ("round", "beta", "wall_seconds")}), flush=True)
+            if os.path.exists(os.path.join(outdir, "STOP_AFTER_CURRENT_ROUND")):
+                raise RuntimeError(
+                    f"development monitor requested stop after completed round {round_i}"
+                )
     encoder_after = BS.module_sha256(policy.enc_grid)
     if encoder_after != encoder_before:
         raise RuntimeError("arm-level visual encoder SHA mismatch")
@@ -492,6 +598,7 @@ def run_arm(checkpoint, outdir, cfg, *, ell, cap, device):
         verifier=SM.verifier_manifest(),
         environment=environment, frozen_parameters=frozen_parameters, encoder_sha_before=encoder_before,
         encoder_sha_after=encoder_after, rounds=len(history), history=history,
+        baseline_sanity=baseline_sanity,
         training_randomness=dict(
             global_seed=int(cfg.seed),
             design="SHA256(seed,sign,round,query_id) -> CFM x0/tau/residual-dropout mask",
@@ -513,7 +620,10 @@ def main():
     arm_group.add_argument("--custom-name")
     parser.add_argument("--selector", choices=("margin", "safemppi_cost"))
     parser.add_argument("--alpha", type=float)
-    parser.add_argument("--optimizer-steps", type=int, default=1)
+    parser.add_argument("--optimizer-steps", type=int)
+    parser.add_argument("--inner-epochs", type=int)
+    parser.add_argument("--lr", type=float)
+    parser.add_argument("--sanity-M", type=int)
     parser.add_argument("--ell", type=float, required=True)
     parser.add_argument("--cap", type=int, choices=(256, 512), required=True)
     parser.add_argument("--rounds", type=int, default=20)
@@ -531,20 +641,28 @@ def main():
     )
     args = parser.parse_args()
     if args.arm is not None:
-        if args.selector is not None or args.alpha is not None or args.optimizer_steps != 1:
+        if any(value is not None for value in (
+                args.selector, args.alpha, args.optimizer_steps, args.inner_epochs,
+                args.lr, args.sanity_M)):
             parser.error("legacy --arm A-D cannot be combined with custom sweep knobs")
         arm = ARMS[args.arm]
         name = args.arm
+        optimizer_steps, inner_epochs, lr, sanity_M = 1, 1, SP.LR, 0
     else:
         if args.selector is None or args.alpha is None:
             parser.error("--custom-name requires --selector and --alpha")
         arm = dict(selector=args.selector, alpha=args.alpha)
         name = args.custom_name
+        optimizer_steps = SP.OPTIMIZER_CHUNKS if args.optimizer_steps is None else args.optimizer_steps
+        inner_epochs = 1 if args.inner_epochs is None else args.inner_epochs
+        lr = SP.SWEEP_LR if args.lr is None else args.lr
+        sanity_M = SP.SANITY_M if args.sanity_M is None else args.sanity_M
     cfg = ArmConfig(
         name=name, selector=arm["selector"], alpha=arm["alpha"],
         rounds=args.rounds, smoke=args.smoke, seed=args.seed,
         verifier_workers=args.verifier_workers, scene_profile=args.scene_profile,
-        optimizer_steps=args.optimizer_steps,
+        optimizer_steps=optimizer_steps, inner_epochs=inner_epochs,
+        lr=lr, sanity_M=sanity_M,
     )
     run_arm(args.checkpoint, args.outdir, cfg, ell=args.ell, cap=args.cap, device=args.device)
 

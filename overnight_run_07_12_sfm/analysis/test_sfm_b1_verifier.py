@@ -13,13 +13,24 @@ def test_label_is_only_task_collision_and_moving_certificate():
     assert "progress" not in result and "cost" not in result
 
 
-def test_early_goal_is_prefix_only_and_not_replay_eligible():
+def test_predicted_goal_crossing_still_certifies_full_h():
+    state = np.array([5.4, 6.0, 1.0, 0.0], np.float32)
+    result = M.verify_query(
+        state, np.zeros((10, 2)), np.zeros((0, 2)), np.zeros((0, 2)), .5
+    )
+    assert np.min(np.linalg.norm(result["segment"] - M.SS.GOAL[None], axis=1)) < .5
+    assert result["resolved"] and result["terminal_step"] == 10
+    assert result["full_h"] and result["y"] == 1 and result["train_eligible"]
+
+
+def test_post_goal_tail_violation_rejects_the_full_window():
     state = np.array([5.7, 6.0, 2.0, 0.0], np.float32)
     result = M.verify_query(
         state, np.zeros((10, 2)), np.zeros((0, 2)), np.zeros((0, 2)), .5
     )
-    assert result["resolved"] and result["terminal_step"] < 10
-    assert not result["full_h"] and not result["train_eligible"]
+    assert np.min(np.linalg.norm(result["segment"] - M.SS.GOAL[None], axis=1)) < .5
+    assert result["resolved"] and result["terminal_step"] == 10 and result["full_h"]
+    assert result["y"] == 0 and not result["taskspace"] and not result["train_eligible"]
 
 
 def test_worker_contract_has_no_legacy_theta_grid_argument():

@@ -31,17 +31,20 @@ def test_banks_must_be_disjoint_and_nonempty():
         C.assert_final_confirmation_bank(C.SCREEN_EP0, 100)
 
 
-def test_temperature_is_one_shared_scalar_and_ties_prefer_one():
+def test_temperature_vector_ties_prefer_one_and_can_differ_by_gamma():
     candidates = {temperature: _summary() for temperature in C.TEMPERATURES}
-    chosen, key = C.select_temperature(candidates)
-    assert chosen == 1.0 and isinstance(key, list)
+    chosen, key = C.select_temperature_vector(candidates)
+    assert set(chosen) == {str(gamma) for gamma in C.SP.GAMMAS}
+    assert set(chosen.values()) == {1.0} and isinstance(key, list)
     better = copy.deepcopy(candidates)
-    better[.95]["pooled"]["CR"] = .1
-    for cell in better[.95]["per_gamma"].values():
-        cell["CR"] = .1
-    assert C.select_temperature(better)[0] == .95
+    better[.95]["per_gamma"]["0.1"]["CR"] = .1
+    selected, _ = C.select_temperature_vector(better)
+    assert selected["0.1"] == .95
+    assert all(selected[str(gamma)] == 1.0 for gamma in C.SP.GAMMAS if gamma != .1)
     with pytest.raises(ValueError):
-        C.select_temperature({1.0: _summary()})
+        C.select_temperature_vector({1.0: _summary()})
+    with pytest.raises(ValueError, match="every declared gamma"):
+        C.temperature_vector({"0.1": 1.0})
 
 
 def test_selection_key_penalizes_gamma_order_violation():
@@ -78,6 +81,12 @@ def test_cell_contract_key_authenticates_temperature_and_bank():
         checkpoint_sha256="c", round_i=2, scene_profile="matched_id",
         bank=bank, temperature=.95, role="screen",
     )
+    vector = C.temperature_vector(1.0)
+    vector["0.1"] = .95
+    assert base != C.cell_contract_key(
+        checkpoint_sha256="c", round_i=2, scene_profile="matched_id",
+        bank=bank, temperature=vector, role="screen",
+    )
     changed = dict(bank, sha256="b")
     assert base != C.cell_contract_key(
         checkpoint_sha256="c", round_i=2, scene_profile="matched_id",
@@ -85,7 +94,7 @@ def test_cell_contract_key_authenticates_temperature_and_bank():
     )
 
 
-def test_v_safe_includes_partial_terminal_tail_and_exits_early(monkeypatch):
+def test_v_safe_certifies_every_full_planned_horizon_and_exits_early(monkeypatch):
     spans = []
 
     def certificate(segment, pedestrians, gamma):
@@ -94,13 +103,14 @@ def test_v_safe_includes_partial_terminal_tail_and_exits_early(monkeypatch):
 
     monkeypatch.setattr(C.SM, "certify_moving_window", certificate)
     row = dict(
-        states=np.zeros((6, 4), np.float32), controls=np.zeros((5, 2), np.float32),
-        ped_xy=np.ones((5, 1, 2), np.float32) * 5,
-        ped_vel=np.zeros((5, 1, 2), np.float32), gamma=.5, collision=False,
+        states=np.zeros((3, 4), np.float32), steps=2,
+        planned_segments=np.zeros((2, C.H + 1, 2), np.float32),
+        ped_xy=np.ones((2, 1, 2), np.float32) * 5,
+        ped_vel=np.zeros((2, 1, 2), np.float32), gamma=.5, collision=False,
     )
     result = C._v_safe_worker(row)
-    assert result == dict(v_safe=True, verifier_errors=0, windows=3)
-    assert spans == [5, 3, 1]
+    assert result == dict(v_safe=True, verifier_errors=0, windows=2)
+    assert spans == [C.H, C.H]
 
     calls = 0
 
@@ -112,6 +122,9 @@ def test_v_safe_includes_partial_terminal_tail_and_exits_early(monkeypatch):
     monkeypatch.setattr(C.SM, "certify_moving_window", reject_first)
     assert not C._v_safe_worker(row)["v_safe"]
     assert calls == 1
+
+    malformed = dict(row, planned_segments=np.zeros((2, C.H, 2), np.float32))
+    assert C._v_safe_worker(malformed)["verifier_errors"] == 1
 
 
 class _FakePolicy(torch.nn.Module):
@@ -151,6 +164,31 @@ def test_raw_rollout_batches_all_active_episodes_per_tick(monkeypatch):
     assert all(row["status"] == "timeout" for row in rows)
 
 
+def test_raw_rollout_applies_the_declared_temperature_per_gamma(monkeypatch):
+    monkeypatch.setattr(C.SS, "make_humans", lambda *args, **kwargs: [object()])
+    monkeypatch.setattr(
+        C.SS, "collect_humans",
+        lambda humans: (np.array([[5.0, 0.0]], np.float32), np.zeros((1, 2), np.float32)),
+    )
+    monkeypatch.setattr(C.SS, "advance_humans", lambda humans, state: None)
+    observed = []
+
+    def integrate(policy, latents, context, nfe):
+        observed.extend(latents[:, 0].detach().cpu().tolist())
+        return torch.zeros((len(latents), C.H, 2), device=latents.device)
+
+    monkeypatch.setattr(C.BE, "integrate_latents", integrate)
+    policy = _FakePolicy()
+    noise = np.ones((len(C.SP.GAMMAS), 1, 1, policy.d), np.float32)
+    temperatures = {str(gamma): .9 + .01 * index
+                    for index, gamma in enumerate(C.SP.GAMMAS)}
+    C.run_batched_raw(
+        policy, scene_profile="matched_id", ep0=10, M=1, base_noise=noise,
+        temperature=temperatures, device="cpu", T_steps=1,
+    )
+    assert np.allclose(observed, [temperatures[str(gamma)] for gamma in C.SP.GAMMAS])
+
+
 def test_cli_matches_sweep_orchestration_contract():
     args = C.build_parser().parse_args([
         "run", "--checkpoint-dir", "x", "--scene-profile", "double_density_velocity_ood",
@@ -163,6 +201,12 @@ def test_cli_matches_sweep_orchestration_contract():
         "--scene-profile", "double_density_velocity_ood", "--outdir", "z",
     ])
     assert confirmation.M == 100 and confirmation.ep0 == C.SP.FINAL_CONFIRM_EP0
+    vector = C.build_parser().parse_args([
+        "confirm", "--checkpoint", "r.pt", "--round", "7",
+        "--temperature-by-gamma", '{"0.1":0.9,"0.2":0.95,"0.3":1,"0.4":1,"0.5":1,"0.7":1.05,"1.0":1.1}',
+        "--scene-profile", "double_density_velocity_ood", "--outdir", "z",
+    ])
+    assert vector.temperature_by_gamma.startswith("{")
 
 
 def test_pooled_intervals_cluster_the_shared_episode_across_gamma():

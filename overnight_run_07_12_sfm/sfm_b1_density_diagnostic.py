@@ -37,7 +37,7 @@ DISPLAY_GAMMAS = (0.1, 0.5, 1.0)
 DEFAULT_DIAGNOSTIC_EP0 = 230_000
 DEFAULT_DIAGNOSTIC_N = 24
 DEFAULT_ELL = 0.24210826720721101
-DEFAULT_CAP = 256
+DEFAULT_CAP = SP.GP_CAP
 DEFAULT_SAMPLE_SEED = 700_000
 METHODS = ("safemppi_expert", "arm_a_r10_raw", "default_kazuki")
 
@@ -445,20 +445,22 @@ def _pairwise_control_spread(rows):
 
 
 def snapshot_score(trace, trace_index):
+    for row in trace["query_rows"]:
+        result = row["result"]
+        if result.get("resolved") and (
+                not bool(result.get("full_h"))
+                or int(result.get("terminal_step", -1)) != SP.H):
+            raise ValueError("snapshot scoring requires every resolved query to be full H=10")
     positives = [row for row in trace["query_rows"]
                  if row["result"].get("resolved") and int(row["result"].get("y", 0)) == 1
                  and bool(row["result"].get("full_h"))]
     rejected = [row for row in trace["query_rows"]
                 if row["result"].get("resolved") and int(row["result"].get("y", -1)) == 0]
-    terminal_prefix = [row for row in trace["query_rows"]
-                       if row["result"].get("resolved")
-                       and int(row["result"].get("y", 0)) == 1
-                       and not bool(row["result"].get("full_h"))]
     unresolved = max(0, len(trace["selected_ids"]) - len(trace["query_rows"]))
     executed = trace.get("executed_id") is not None
     all_four_resolved = (len(trace["selected_ids"]) == SP.B
                          and len(trace["query_rows"]) == SP.B and unresolved == 0)
-    strict = bool(all_four_resolved and not terminal_prefix and executed)
+    strict = bool(all_four_resolved and executed)
     if strict and len(positives) == 3 and len(rejected) == 1:
         tier, label = 0, "ideal P3/N1: three full-H positives and one verifier rejection"
     elif strict and len(positives) == 2 and len(rejected) == 2:
@@ -466,7 +468,7 @@ def snapshot_score(trace, trace_index):
     elif strict and len(positives) == 4 and len(rejected) == 0:
         tier, label = 2, "fallback P4/N0: four full-H positives and no verifier rejection"
     elif strict:
-        tier, label = 3, "other all-resolved, terminal-prefix-free executed composition"
+        tier, label = 3, "other all-resolved executed composition"
     elif executed:
         tier, label = 4, "non-strict executed fallback"
     else:
@@ -477,7 +479,7 @@ def snapshot_score(trace, trace_index):
         gamma=float(trace["gamma"]), step=int(trace["step"]), tier=tier, tier_label=label,
         selected_B=len(trace["selected_ids"]), resolved=len(trace["query_rows"]),
         full_h_positive=len(positives), verifier_rejected=len(rejected),
-        terminal_prefix=len(terminal_prefix), unresolved=unresolved,
+        unresolved=unresolved,
         all_B_resolved=bool(all_four_resolved), strict_composition_eligible=bool(strict),
         executed=bool(executed), executed_id=trace.get("executed_id"), spread=spread,
     )
@@ -571,8 +573,8 @@ def run_collect(checkpoint, recent_dir, round_i, *, scenario, ell, cap, device,
         status="DENSITY_OOD_MARGIN_QUERY_DIAGNOSTIC_COMPLETE", diagnostic_only=True,
         enters_D_or_Dplus=False, enters_gp=False, updates_checkpoint=False,
         scenario_id=int(scenario), gammas=list(DISPLAY_GAMMAS), environment=environment,
-        selector=("max one-step nominal Hp margin among resolved y=1, nominal-Hp-admissible B queries; "
-                  "y=1 may be full H=10 or a certified absorbing goal-terminal prefix"),
+        selector=("max one-step nominal Hp margin among resolved full-H y=1, "
+                  "nominal-Hp-admissible B queries"),
         checkpoint=dict(path=os.path.abspath(checkpoint), sha256=BE.sha256_file(checkpoint)),
         recent_dir=os.path.abspath(recent_dir), recent_through_round=int(round_i),
         gp=dict(ell=float(ell), cap=int(cap), lambda_=1.0e-2,
@@ -583,9 +585,8 @@ def run_collect(checkpoint, recent_dir, round_i, *, scenario, ell, cap, device,
         snapshot_trace="snapshot_trace.pt", snapshot_trace_source_path=os.path.abspath(snapshot_path),
         selected_snapshot=selected_snapshot,
         snapshot_selection_rule=(
-            "strict all-B-resolved/no-terminal-prefix composition tiers P3/N1, then P2/N2, "
-            "then P4/N0; within tier maximize normalized D_U mean/max and D_1 mean; "
-            "terminal-prefix y=1 queries are neither P nor N and disqualify strict tiers"
+            "strict all-B-resolved composition tiers P3/N1, then P2/N2, then P4/N0; "
+            "within tier maximize normalized D_U mean/max and D_1 mean"
         ),
         snapshot_scores=snapshot_scores,
         finite_search=(None if search_payload is None else dict(

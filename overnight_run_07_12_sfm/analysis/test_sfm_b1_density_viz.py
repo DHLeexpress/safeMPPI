@@ -4,6 +4,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import pytest
 import torch
 
 import sfm_b1_density_viz as V
@@ -35,7 +36,7 @@ def _result(positive, scale=1.0):
     )
 
 
-def _prefix_result(scale=1.0):
+def _partial_result(scale=1.0):
     value = _result(True, scale)
     value.update(full_h=False, terminal_step=4)
     return value
@@ -70,26 +71,16 @@ def test_margin_frame_has_no_nominal_and_only_executed_verifier_levels():
     assert report["rejected_ids"] == [3]
 
 
-def test_terminal_prefix_positive_is_never_green_or_full_h():
+def test_legacy_partial_query_is_rejected_instead_of_rendered():
     trace = _query_trace()
-    trace["query_rows"][0]["result"] = _prefix_result()
+    trace["query_rows"][0]["result"] = _partial_result()
     trace["executed_id"] = 0
     figure, axis = plt.subplots()
-    report = V.draw_margin_query_frame(axis, trace)
-    plt.close(figure)
-    assert report["positive_ids"] == [1, 2]
-    assert report["terminal_prefix_positive_ids"] == [0]
-    assert report["executed_verifier"] is None
-    rendered = V.render_candidate_query_snapshot(
-        [trace], str((__import__("pathlib").Path(__file__).parent / "_prefix_test.png")),
-        selection=V._explicit_snapshot_selection(trace, "test"),
-    )
     try:
-        prefix = next(row for row in rendered["candidates"] if row["candidate_id"] == 0)
-        assert prefix["status"] == "positive_terminal_prefix"
-        assert prefix["verifier"] is None
+        with pytest.raises(ValueError, match="legacy partial B1 query"):
+            V.draw_margin_query_frame(axis, trace)
     finally:
-        __import__("pathlib").Path(rendered["output"]).unlink(missing_ok=True)
+        plt.close(figure)
 
 
 def test_query_snapshot_ranking_prefers_few_rejections_then_control_spread():
@@ -202,7 +193,7 @@ def test_expert_trace_accepts_one_float32_ulp_between_action_and_mean(monkeypatc
     assert report["expert_sequence_kind"] == "reward_weighted_mean"
 
 
-def test_selected_goal_terminal_prefix_is_orange_truncated_and_not_rejected():
+def test_selected_full_h_positive_draws_all_verifier_levels_without_orange_prefix():
     planned = np.zeros((11, 4), np.float32)
     planned[:, :2] = _segment()
     trace = dict(
@@ -212,7 +203,7 @@ def test_selected_goal_terminal_prefix_is_orange_truncated_and_not_rejected():
     run = dict(states=np.zeros((2, 4)), trace=[trace])
     figure, axis = plt.subplots()
     report = V.draw_method_panel(
-        axis, "selected", run, .5, 0, verifier_result=_prefix_result(),
+        axis, "selected", run, .5, 0, verifier_result=_result(True),
     )
     orange_prefixes = [
         line for line in axis.lines
@@ -223,13 +214,11 @@ def test_selected_goal_terminal_prefix_is_orange_truncated_and_not_rejected():
         if line.get_color() == V.BV.RED and line.get_marker() == "x"
     ]
     plt.close(figure)
-    assert report["terminal_prefix_positive"] is True
     assert report["rejected"] is False
-    assert report["terminal_step"] == 4
-    assert report["verifier_full_h_positive"] is False
-    assert report["verifier_levels"] == 0
-    assert len(orange_prefixes) == 1
-    assert len(orange_prefixes[0].get_xdata()) == 5
+    assert report["terminal_step"] == 10
+    assert report["verifier_full_h_positive"] is True
+    assert report["verifier_levels"] == 10
+    assert orange_prefixes == []
     assert red_rejections == []
 
 
@@ -302,5 +291,7 @@ def test_render_bundle_is_render_only_and_writes_manifest(tmp_path, monkeypatch)
     assert seen == {"method_step": 6, "query_step": 3}
     assert manifest["snapshot_steps"]["method_comparison"]["step"] == 6
     assert manifest["snapshot_steps"]["query_gathering_and_candidates"]["step"] == 3
-    assert manifest["terminal_prefix_audit"]["green_polytopes"] == 0
+    assert manifest["query_horizon_contract"] == (
+        "every resolved B query is reverified over all H=10 transitions"
+    )
     assert (tmp_path / "rendered" / "render_manifest.json").exists()

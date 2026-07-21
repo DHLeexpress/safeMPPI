@@ -2,18 +2,17 @@
 
 This evaluator never filters or changes an action.  For each checkpoint it:
 
-1. selects one latent-noise temperature, shared by every gamma, on a fixed
+1. jointly selects one latent-noise temperature per gamma on a fixed
    M=10/gamma validation bank;
-2. freezes that temperature; and
-3. evaluates both canonical temperature one and the selected temperature on
+2. freezes that seven-temperature vector; and
+3. evaluates both canonical temperature one and the selected vector on
    a disjoint M=50/gamma screening bank.
 
 Only compact metrics are written.  ``V_safe`` is an episode predicate: the
-executed trajectory must be physically collision/task-space safe and every
-stride-two executed segment (H<=10, including the terminal tail) must pass the
-same exact moving-pedestrian certificate used by B1 acquisition.  Certificate
-inputs use the pedestrian positions and velocities observed at that context;
-they are never reconstructed from a scenario identifier.
+executed trajectory must be physically collision/task-space safe and the full
+generated H=10 plan at every executed planning context must pass the same exact
+moving-pedestrian certificate used by B1 acquisition.  Reaching the goal ends
+execution, but never shortens the last plan submitted to the verifier.
 """
 from __future__ import annotations
 
@@ -21,6 +20,7 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 import hashlib
+import itertools
 import json
 import math
 import multiprocessing as mp
@@ -44,7 +44,7 @@ import sfm_protocol as SP
 import sfm_scene as SS
 
 
-VERSION = "sfm_b1_curve_eval_v1"
+VERSION = "sfm_b1_curve_eval_v2"
 TEMPERATURES = (0.90, 0.95, 1.00, 1.05, 1.10)
 TUNE_EP0 = 300_000
 TUNE_M = 10
@@ -53,7 +53,6 @@ SCREEN_M = 50
 NFE = 8
 T = SP.T
 H = SP.H
-STRIDE = 2
 
 
 def _sha256_file(path: str | os.PathLike[str]) -> str:
@@ -123,16 +122,35 @@ def noise_bank(*, scene_profile: str, ep0: int, M: int, d: int, T_steps: int = T
     )
 
 
+def temperature_vector(value: float | dict[str, float]) -> dict[str, float]:
+    """Return a complete, JSON-stable gamma -> temperature mapping."""
+    if isinstance(value, dict):
+        expected = {str(gamma) for gamma in SP.GAMMAS}
+        if set(value) != expected:
+            raise ValueError("temperature vector must contain every declared gamma exactly once")
+        result = {str(gamma): float(value[str(gamma)]) for gamma in SP.GAMMAS}
+    else:
+        result = {str(gamma): float(value) for gamma in SP.GAMMAS}
+    if any(not math.isfinite(item) or item <= 0.0 for item in result.values()):
+        raise ValueError("temperatures must be finite and positive")
+    return result
+
+
+def _is_canonical_temperature(value: float | dict[str, float]) -> bool:
+    return all(item == 1.0 for item in temperature_vector(value).values())
+
+
 def cell_contract_key(*, checkpoint_sha256: str, round_i: int, scene_profile: str,
-                      bank: dict, temperature: float, role: str) -> str:
+                      bank: dict, temperature: float | dict[str, float], role: str) -> str:
+    temperatures = temperature_vector(temperature)
     return _sha256_json(dict(
         version=VERSION, evaluator_sha256=_sha256_file(__file__),
         checkpoint_sha256=str(checkpoint_sha256), round=int(round_i),
-        scene_profile=str(scene_profile), bank=bank, temperature=float(temperature),
+        scene_profile=str(scene_profile), bank=bank, temperature_by_gamma=temperatures,
         role=str(role), NFE=NFE, T=T, verifier=SM.verifier_manifest(),
-        v_safe=("whole executed trajectory is collision/task-space safe and every stride-2 "
-                "executed segment of at most H=10, including terminal tail, passes the exact "
-                "moving-pedestrian certificate at the episode gamma"),
+        v_safe=("whole executed trajectory is collision/task-space safe and every generated "
+                "full-H=10 planned window passes the exact moving-pedestrian certificate at "
+                "the contemporaneous context and episode gamma"),
     ))
 
 
@@ -149,6 +167,7 @@ class _Episode:
     states: list[np.ndarray] = field(default_factory=lambda: [np.zeros(4, np.float32)])
     ped_xy: list[np.ndarray] = field(default_factory=list)
     ped_vel: list[np.ndarray] = field(default_factory=list)
+    planned_segments: list[np.ndarray] = field(default_factory=list)
     status: str | None = None
     min_clearance: float = float("inf")
 
@@ -171,11 +190,10 @@ def _terminal_check(episode: _Episode, ped_xy: np.ndarray) -> bool:
 
 @torch.no_grad()
 def run_batched_raw(policy, *, scene_profile: str, ep0: int, M: int,
-                    base_noise: np.ndarray, temperature: float, device: str,
+                    base_noise: np.ndarray, temperature: float | dict[str, float], device: str,
                     T_steps: int = T) -> list[dict]:
     """Run all gamma/episode cells with one policy batch per control tick."""
-    if not math.isfinite(float(temperature)) or float(temperature) <= 0.0:
-        raise ValueError("temperature must be finite and positive")
+    temperatures = temperature_vector(temperature)
     environment = SS.scene_profile(scene_profile)
     expected = (len(SP.GAMMAS), int(M), int(T_steps), int(policy.d))
     if tuple(base_noise.shape) != expected or base_noise.dtype != np.float32:
@@ -215,7 +233,7 @@ def run_batched_raw(policy, *, scene_profile: str, ep0: int, M: int,
             )))
             latents.append(base_noise[
                 episode.gamma_index, episode.rollout_index, step,
-            ] * float(temperature))
+            ] * temperatures[str(episode.gamma)])
         if not active:
             break
         hp10_tensor = torch.stack(hp10).to(device)
@@ -226,9 +244,14 @@ def run_batched_raw(policy, *, scene_profile: str, ep0: int, M: int,
             policy, torch.as_tensor(np.asarray(latents), device=device), context, nfe=NFE,
         ).detach().cpu().numpy()
         for (episode, ped_xy, ped_vel), window in zip(active, windows):
+            if tuple(window.shape) != (H, 2):
+                raise RuntimeError(f"generated plan {tuple(window.shape)} != {(H, 2)}")
             action = np.asarray(window[0], np.float32)
             episode.ped_xy.append(ped_xy)
             episode.ped_vel.append(ped_vel)
+            episode.planned_segments.append(
+                SM.rollout_positions(episode.state, np.asarray(window, np.float32))
+            )
             episode.controls.append(action)
             episode.state = BE._step(episode.state, action)
             episode.states.append(episode.state.copy())
@@ -248,7 +271,7 @@ def run_batched_raw(policy, *, scene_profile: str, ep0: int, M: int,
             min_clearance=float(episode.min_clearance),
             successful_clearance=(float(episode.min_clearance) if success else None),
             states=np.asarray(episode.states, np.float32),
-            controls=np.asarray(episode.controls, np.float32),
+            planned_segments=np.asarray(episode.planned_segments, np.float32),
             ped_xy=np.asarray(episode.ped_xy, np.float32),
             ped_vel=np.asarray(episode.ped_vel, np.float32),
         ))
@@ -257,20 +280,21 @@ def run_batched_raw(policy, *, scene_profile: str, ep0: int, M: int,
 
 def _v_safe_worker(row: dict) -> dict:
     states = np.asarray(row["states"], np.float32)
-    controls = np.asarray(row["controls"], np.float32)
+    planned_segments = np.asarray(row["planned_segments"], np.float32)
     ped_xy = np.asarray(row["ped_xy"], np.float32)
     ped_vel = np.asarray(row["ped_vel"], np.float32)
-    n_steps = len(controls)
-    if len(states) != n_steps + 1 or len(ped_xy) != n_steps or len(ped_vel) != n_steps:
+    n_steps = int(row["steps"])
+    if (len(states) != n_steps + 1 or len(planned_segments) != n_steps
+            or len(ped_xy) != n_steps or len(ped_vel) != n_steps):
+        return dict(v_safe=False, verifier_errors=1, windows=0)
+    if n_steps and tuple(planned_segments.shape[1:]) != (H + 1, 2):
         return dict(v_safe=False, verifier_errors=1, windows=0)
     if row["collision"] or not SM.taskspace_ok(states[:, :2]) or n_steps < 1:
         return dict(v_safe=False, verifier_errors=0, windows=0)
     windows = 0
-    for start in range(0, n_steps, STRIDE):
-        span = min(H, n_steps - start)
-        segment = states[start:start + span + 1, :2]
+    for segment, current_xy, current_vel in zip(planned_segments, ped_xy, ped_vel):
         try:
-            pedestrians = SM.predict_pedestrians(ped_xy[start], ped_vel[start], H=span)
+            pedestrians = SM.predict_pedestrians(current_xy, current_vel, H=H)
             taskspace = SM.taskspace_ok(segment)
             collision_free = SM.collision_free_time_indexed(segment, pedestrians)
             certified, _, _ = SM.certify_moving_window(segment, pedestrians, row["gamma"])
@@ -295,7 +319,7 @@ def _attach_validity(rows: list[dict], validity: list[dict]) -> list[dict]:
     output = []
     for row, value in zip(rows, validity):
         compact = {key: item for key, item in row.items()
-                   if key not in ("states", "controls", "ped_xy", "ped_vel")}
+                   if key not in ("states", "planned_segments", "ped_xy", "ped_vel")}
         compact.update(value)
         output.append(compact)
     return output
@@ -387,26 +411,52 @@ def _ordering_score(values: list[float | None]) -> tuple[int, float]:
     return int(missing), float(violation)
 
 
-def temperature_selection_key(summary: dict, temperature: float) -> tuple:
-    cells = [summary["per_gamma"][str(gamma)] for gamma in SP.GAMMAS]
+def _metric_selection_key(cells: list[dict], pooled: dict,
+                          temperatures: dict[str, float]) -> tuple:
     clearance = [cell["successful_clearance"]["mean"] for cell in cells]
     times = [cell["successful_time_to_goal"]["mean"] for cell in cells]
     clearance_missing, clearance_violation = _ordering_score(clearance)
     time_missing, time_violation = _ordering_score(times)
     return (
-        max(cell["CR"] for cell in cells), summary["pooled"]["CR"],
-        -min(cell["V_safe"] for cell in cells), -summary["pooled"]["V_safe"],
-        max(cell["timeout"] for cell in cells), -min(cell["SR"] for cell in cells),
+        max(cell["CR"] for cell in cells), pooled["CR"],
+        -min(cell["V_safe"] for cell in cells), -pooled["V_safe"],
         clearance_missing, clearance_violation, time_missing, time_violation,
-        abs(math.log(float(temperature))), float(temperature),
+        max(cell["timeout"] for cell in cells), pooled["timeout"],
+        -min(cell["SR"] for cell in cells), -pooled["SR"],
+        sum(abs(math.log(temperatures[str(gamma)])) for gamma in SP.GAMMAS),
+        *(temperatures[str(gamma)] for gamma in SP.GAMMAS),
     )
 
 
-def select_temperature(candidates: dict[float, dict]) -> tuple[float, list]:
+def temperature_selection_key(summary: dict,
+                              temperature: float | dict[str, float]) -> tuple:
+    temperatures = temperature_vector(temperature)
+    cells = [summary["per_gamma"][str(gamma)] for gamma in SP.GAMMAS]
+    return _metric_selection_key(cells, summary["pooled"], temperatures)
+
+
+def _validation_vector_key(candidates: dict[float, dict], values: tuple[float, ...]) -> tuple:
+    temperatures = {str(gamma): float(value) for gamma, value in zip(SP.GAMMAS, values)}
+    cells = [
+        candidates[temperatures[str(gamma)]]["per_gamma"][str(gamma)]
+        for gamma in SP.GAMMAS
+    ]
+    pooled = {
+        metric: sum(float(cell[metric]) for cell in cells) / len(cells)
+        for metric in ("CR", "V_safe", "timeout", "SR")
+    }
+    return _metric_selection_key(cells, pooled, temperatures)
+
+
+def select_temperature_vector(candidates: dict[float, dict]) -> tuple[dict[str, float], list]:
     if set(map(float, candidates)) != set(TEMPERATURES):
         raise ValueError("temperature selection requires the complete predeclared grid")
-    chosen = min(TEMPERATURES, key=lambda value: temperature_selection_key(candidates[value], value))
-    return float(chosen), list(temperature_selection_key(candidates[chosen], chosen))
+    values = min(
+        itertools.product(TEMPERATURES, repeat=len(SP.GAMMAS)),
+        key=lambda item: _validation_vector_key(candidates, item),
+    )
+    chosen = {str(gamma): float(value) for gamma, value in zip(SP.GAMMAS, values)}
+    return chosen, list(_validation_vector_key(candidates, values))
 
 
 @dataclass
@@ -419,8 +469,9 @@ class _PendingCell:
 
 def _begin_cell(policy, *, checkpoint_sha: str, round_i: int, scene_profile: str,
                 ep0: int, M: int, noise: np.ndarray, noise_meta: dict,
-                temperature: float, role: str, device: str, executor,
+                temperature: float | dict[str, float], role: str, device: str, executor,
                 path: str | os.PathLike[str]) -> dict | _PendingCell:
+    temperatures = temperature_vector(temperature)
     key = cell_contract_key(
         checkpoint_sha256=checkpoint_sha, round_i=round_i, scene_profile=scene_profile,
         bank=noise_meta, temperature=temperature, role=role,
@@ -441,11 +492,12 @@ def _begin_cell(policy, *, checkpoint_sha: str, round_i: int, scene_profile: str
         status="SFM_B1_CURVE_CELL_COMPLETE", cell_key=key, role=role,
         round=int(round_i), checkpoint_sha256=checkpoint_sha,
         scene_profile=scene_profile, ep0=int(ep0), M_per_gamma=int(M),
-        temperature=float(temperature), noise_bank=noise_meta,
+        temperature_by_gamma=temperatures, noise_bank=noise_meta,
         metric_semantics=dict(
             policy="unguided flow; NFE=8; one generated window/context; execute first action",
-            V_safe=("episode conjunction over physical task/collision safety and exact stride-2 "
-                    "executed-trajectory certificates, including the partial terminal tail"),
+            V_safe=("episode conjunction over physical task/collision safety and the exact "
+                    "certificate for every generated full-H=10 plan, including the final "
+                    "pre-goal planning context"),
             clearance="mean of per-trajectory minimum clearance over successful episodes only",
             time="successful episodes only",
         ),
@@ -527,7 +579,7 @@ def _plot(records: list[dict], output_stem: str, *, best_round: int) -> None:
         if metric in ("CR", "V_safe"):
             axis.set_ylim(-.03, 1.03)
     axes[0, 0].legend(ncol=2, fontsize=8)
-    figure.suptitle("Solid: validation-selected shared temperature; dotted: canonical temperature 1")
+    figure.suptitle("Solid: validation-selected per-gamma temperatures; dotted: canonical temperature 1")
     for suffix in ("png", "pdf"):
         figure.savefig(f"{output_stem}.{suffix}", dpi=300, bbox_inches="tight")
     plt.close(figure)
@@ -536,6 +588,15 @@ def _plot(records: list[dict], output_stem: str, *, best_round: int) -> None:
 def run(args) -> dict:
     rounds = parse_rounds(args.rounds)
     assert_disjoint_banks(args.tune_ep0, args.tune_M, args.screen_ep0, args.screen_M)
+    checkpoint_paths = {
+        round_i: os.path.join(args.checkpoint_dir, f"round_{round_i:02d}.pt")
+        for round_i in rounds
+    }
+    missing = [path for path in checkpoint_paths.values() if not os.path.isfile(path)]
+    if missing:
+        raise FileNotFoundError(
+            f"post-expansion evaluation requires every declared checkpoint; missing {missing[0]}"
+        )
     environment = SS.scene_profile(args.scene_profile)
     os.makedirs(args.outdir, exist_ok=True)
     validation_dir = os.path.join(args.outdir, "validation")
@@ -543,7 +604,7 @@ def run(args) -> dict:
     os.makedirs(validation_dir, exist_ok=True)
     os.makedirs(screening_dir, exist_ok=True)
 
-    first_checkpoint = os.path.join(args.checkpoint_dir, f"round_{rounds[0]:02d}.pt")
+    first_checkpoint = checkpoint_paths[rounds[0]]
     probe, _ = GPS.load_sfm_policy(first_checkpoint, device="cpu")
     tune_noise, tune_meta = noise_bank(
         scene_profile=args.scene_profile, ep0=args.tune_ep0, M=args.tune_M, d=probe.d,
@@ -556,9 +617,7 @@ def run(args) -> dict:
     context = mp.get_context("spawn")
     with ProcessPoolExecutor(max_workers=int(args.workers), mp_context=context) as executor:
         for round_i in rounds:
-            checkpoint = os.path.join(args.checkpoint_dir, f"round_{round_i:02d}.pt")
-            if not os.path.isfile(checkpoint):
-                raise FileNotFoundError(checkpoint)
+            checkpoint = checkpoint_paths[round_i]
             checkpoint_sha = _sha256_file(checkpoint)
             policy, _ = GPS.load_sfm_policy(checkpoint, device=args.device)
             policy.eval()
@@ -578,9 +637,9 @@ def run(args) -> dict:
                 cell = _finish_cell(pending_validation[temperature])
                 validation[float(temperature)] = cell["summary"]
                 validation_cells[str(temperature)] = cell["cell_key"]
-            chosen, selection_key = select_temperature(validation)
+            chosen, selection_key = select_temperature_vector(validation)
             schedule.append(dict(
-                round=round_i, temperature=chosen, selection_key=selection_key,
+                round=round_i, temperature_by_gamma=chosen, selection_key=selection_key,
                 validation_cells=validation_cells,
             ))
             pending_canonical = _begin_cell(
@@ -590,12 +649,13 @@ def run(args) -> dict:
                 role="canonical_temp1_screening", device=args.device, executor=executor,
                 path=os.path.join(screening_dir, f"r{round_i:02d}_temp1.json"),
             )
-            if chosen == 1.0:
+            if _is_canonical_temperature(chosen):
                 canonical = _finish_cell(pending_canonical)
                 selected_cell = canonical
                 _write_json(os.path.join(screening_dir, f"r{round_i:02d}_selected.json"), dict(
                     status="SFM_B1_CURVE_SELECTED_ALIAS", round=round_i,
-                    selected_temperature=1.0, alias_of=f"r{round_i:02d}_temp1.json",
+                    selected_temperature_by_gamma=chosen,
+                    alias_of=f"r{round_i:02d}_temp1.json",
                     cell_key=canonical["cell_key"],
                 ))
             else:
@@ -610,9 +670,11 @@ def run(args) -> dict:
                 canonical = _finish_cell(pending_canonical)
                 selected_cell = _finish_cell(pending_selected)
             records.extend((
-                dict(round=round_i, mode="canonical_temp1", temperature=1.0,
+                dict(round=round_i, mode="canonical_temp1",
+                     temperature_by_gamma=temperature_vector(1.0),
                      cell_key=canonical["cell_key"], summary=canonical["summary"]),
-                dict(round=round_i, mode="validation_selected_temperature", temperature=chosen,
+                dict(round=round_i, mode="validation_selected_temperature",
+                     temperature_by_gamma=chosen,
                      cell_key=selected_cell["cell_key"], summary=selected_cell["summary"]),
             ))
             del policy
@@ -620,11 +682,10 @@ def run(args) -> dict:
     schedule_payload = dict(
         status="TEMPERATURE_SCHEDULE_COMPLETE", version=VERSION,
         selection_bank=tune_meta, screening_bank=screen_meta,
-        grid=list(TEMPERATURES), shared_across_gammas=True,
-        selection_key=("worst CR, pooled CR, -worst V_safe, -pooled V_safe, worst timeout, "
-                       "-worst SR, undefined/clearance-order violation, "
-                       "undefined/time-order violation, "
-                       "distance from temperature 1"),
+        grid=list(TEMPERATURES), shared_across_gammas=False,
+        selection_key=("worst CR, pooled CR, -worst V_safe, -pooled V_safe, "
+                       "undefined/clearance-order violation, undefined/time-order violation, "
+                       "worst/pooled timeout, -worst/pooled SR, distance from temperature 1"),
         entries=schedule,
     )
     schedule_path = os.path.join(args.outdir, "temperature_schedule.json")
@@ -636,7 +697,7 @@ def run(args) -> dict:
     os.replace(metrics_path + ".tmp", metrics_path)
     selected_records = [row for row in records if row["mode"] == "validation_selected_temperature"]
     best = min(selected_records, key=lambda row: temperature_selection_key(
-        row["summary"], row["temperature"],
+        row["summary"], row["temperature_by_gamma"],
     ))
     _plot(records, os.path.join(args.outdir, "raw_checkpoint_curves"),
           best_round=int(best["round"]))
@@ -649,11 +710,16 @@ def run(args) -> dict:
         evaluator_sha256=_sha256_file(__file__),
         checkpoint_dir=os.path.abspath(args.checkpoint_dir), rounds=rounds,
         environment=environment, validation_bank=tune_meta, screening_bank=screen_meta,
-        temperature_grid=list(TEMPERATURES), canonical_control=True,
-        best_screening=dict(round=best["round"], temperature=best["temperature"],
-                            key=list(temperature_selection_key(best["summary"], best["temperature"]))),
-        no_test_leakage=("temperature selected only on M10 validation; M50 screening is evaluated "
-                         "after lock and never changes the temperature"),
+        temperature_grid=list(TEMPERATURES), shared_across_gammas=False,
+        canonical_control=True, post_expansion_only=True,
+        best_screening=dict(
+            round=best["round"], temperature_by_gamma=best["temperature_by_gamma"],
+            key=list(temperature_selection_key(
+                best["summary"], best["temperature_by_gamma"],
+            )),
+        ),
+        no_test_leakage=("the per-gamma temperature vector is selected only on M10 validation; "
+                         "M50 screening is evaluated after lock and never changes that vector"),
         interpretation=("solid curves are a validation-tuned deployment policy, not intrinsic "
                         "temperature-1 generator performance; dotted curves are canonical temp=1"),
         no_trajectory_artifacts=True, verifier=SM.verifier_manifest(), artifact_sha256=artifacts,
@@ -663,10 +729,12 @@ def run(args) -> dict:
 
 
 def confirm(args) -> dict:
-    """One disjoint M100 confirmation after arm/round/temperature selection is frozen."""
+    """One disjoint M100 confirmation after arm/round/temperature-vector selection."""
     assert_final_confirmation_bank(args.ep0, args.M)
-    if not math.isfinite(float(args.temperature)) or float(args.temperature) <= 0.0:
-        raise ValueError("confirmation temperature must be finite and positive")
+    selected_temperatures = temperature_vector(
+        json.loads(args.temperature_by_gamma)
+        if args.temperature_by_gamma is not None else args.temperature
+    )
     os.makedirs(args.outdir, exist_ok=False)
     checkpoint_sha = _sha256_file(args.checkpoint)
     policy, _ = GPS.load_sfm_policy(args.checkpoint, device=args.device)
@@ -683,14 +751,14 @@ def confirm(args) -> dict:
             role="final_confirmation_canonical_temp1", device=args.device, executor=executor,
             path=os.path.join(args.outdir, "canonical_temp1.json"),
         )
-        if float(args.temperature) == 1.0:
+        if _is_canonical_temperature(selected_temperatures):
             canonical = _finish_cell(pending_canonical)
             selected = canonical
         else:
             pending_selected = _begin_cell(
                 policy, checkpoint_sha=checkpoint_sha, round_i=args.round,
                 scene_profile=args.scene_profile, ep0=args.ep0, M=args.M,
-                noise=noise, noise_meta=noise_meta, temperature=args.temperature,
+                noise=noise, noise_meta=noise_meta, temperature=selected_temperatures,
                 role="final_confirmation_validation_selected_temperature",
                 device=args.device, executor=executor,
                 path=os.path.join(args.outdir, "selected_temperature.json"),
@@ -700,7 +768,7 @@ def confirm(args) -> dict:
     result = dict(
         status="SFM_B1_FINAL_CONFIRMATION_COMPLETE", version=VERSION,
         checkpoint=os.path.abspath(args.checkpoint), checkpoint_sha256=checkpoint_sha,
-        selected_round=int(args.round), selected_temperature=float(args.temperature),
+        selected_round=int(args.round), selected_temperature_by_gamma=selected_temperatures,
         environment=SS.scene_profile(args.scene_profile), bank=noise_meta,
         selection_frozen_before_confirmation=True,
         canonical_temp1=canonical["summary"], selected_temperature_result=selected["summary"],
@@ -732,7 +800,12 @@ def build_parser() -> argparse.ArgumentParser:
     confirmation = sub.add_parser("confirm")
     confirmation.add_argument("--checkpoint", required=True)
     confirmation.add_argument("--round", type=int, required=True)
-    confirmation.add_argument("--temperature", type=float, required=True)
+    temperatures = confirmation.add_mutually_exclusive_group(required=True)
+    temperatures.add_argument("--temperature", type=float)
+    temperatures.add_argument(
+        "--temperature-by-gamma",
+        help='JSON object keyed by every declared gamma, e.g. {"0.1":0.95,...}',
+    )
     confirmation.add_argument("--scene-profile", required=True, choices=SS.SCIENTIFIC_EVAL_PROFILES)
     confirmation.add_argument("--outdir", required=True)
     confirmation.add_argument("--device", default="cuda:0")

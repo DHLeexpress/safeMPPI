@@ -109,6 +109,62 @@ def test_alpha_zero_multistep_still_never_reads_negatives(tmp_path, monkeypatch)
     assert report["replay_coverage"] == 1.0
 
 
+def test_fixed_sixteen_chunks_repeat_the_same_support_each_epoch(tmp_path, monkeypatch):
+    torch.manual_seed(141)
+    recent = _recent(tmp_path)
+    policy = GPS.build_sfm_policy(width=24, res_dropout=0.0)
+    S.configure_expansion_trainability(policy)
+    optimizer = torch.optim.Adam([p for p in policy.parameters() if p.requires_grad], lr=1e-4)
+    monkeypatch.setattr(
+        recent, "negative_records",
+        lambda: (_ for _ in ()).throw(AssertionError("alpha=0 touched D-")),
+    )
+    report = S.signed_update(
+        policy, optimizer, recent, alpha=0.0, batch=128, seed=111,
+        optimizer_chunks=16, inner_epochs=4,
+    )
+    assert report["optimizer_chunks"] == 16
+    assert report["inner_epochs"] == 4
+    assert report["optimizer_steps"] == 64
+    assert report["replay_coverage"] == 1.0
+    assert report["replay_visits_per_eligible"] == 4.0
+    assert report["visit_min"] == report["visit_max"] == 4
+    assert all(
+        abs(sum(report["step_global_mass"][start:start + 16]) - 1.0) < 1e-12
+        for start in range(0, len(report["step_global_mass"]), 16)
+    )
+    epoch_size = report["eligible"]
+    epochs = [report["visited"][start:start + epoch_size]
+              for start in range(0, len(report["visited"]), epoch_size)]
+    assert len(epochs) == 4 and all(epoch == epochs[0] for epoch in epochs[1:])
+
+
+def test_signed_fixed_chunks_visits_every_sign_once_per_epoch(tmp_path):
+    torch.manual_seed(142)
+    recent = _recent(tmp_path)
+    policy = GPS.build_sfm_policy(width=24, res_dropout=0.0)
+    S.configure_expansion_trainability(policy)
+    optimizer = torch.optim.Adam([p for p in policy.parameters() if p.requires_grad], lr=1e-4)
+    report = S.signed_update(
+        policy, optimizer, recent, alpha=.001, batch=128, seed=112,
+        optimizer_chunks=16, inner_epochs=4,
+    )
+    assert report["optimizer_steps"] == 64
+    assert report["positive_replay_coverage"] == report["negative_replay_coverage"] == 1.0
+    assert report["positive_replay_visits_per_eligible"] == 4.0
+    assert report["negative_replay_visits_per_eligible"] == 4.0
+    assert report["positive_visit_min"] == report["positive_visit_max"] == 4
+    assert report["negative_visit_min"] == report["negative_visit_max"] == 4
+    assert all(
+        abs(sum(report["positive_step_global_mass"][start:start + 16]) - 1.0) < 1e-12
+        for start in range(0, len(report["positive_step_global_mass"]), 16)
+    )
+    assert all(
+        abs(sum(report["negative_step_global_mass"][start:start + 16]) - 1.0) < 1e-12
+        for start in range(0, len(report["negative_step_global_mass"]), 16)
+    )
+
+
 def test_multistep_update_is_reproducible_independent_of_global_rng(tmp_path):
     torch.manual_seed(15)
     recent = _recent(tmp_path)

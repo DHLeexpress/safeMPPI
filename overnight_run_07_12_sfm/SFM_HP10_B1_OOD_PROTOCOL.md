@@ -35,9 +35,8 @@ frozen visual encoder.  At each alive context, B1:
 3. stores every resolved query in (D), and every full-horizon positive in
    (D^+);
 4. executes only a resolved queried plan with \(y=1\) and
-   (H_P(x_{t+1})\ge(1-\gamma)H_P(x_t)); \(y=1\) is either a complete
-   H=10 certificate or a certified absorbing goal-terminal prefix, while only
-   complete H=10 positives enter \(D^+\);
+   (H_P(x_{t+1})\ge(1-\gamma)H_P(x_t)); every \(y\) is computed from the
+   complete H=10 window, even when its predicted states cross the goal;
 5. terminates that replica on no verified positive (NVP);
 6. replays the most recent (W=2) rounds with equal mass over
    gamma -> (round, episode) -> context -> positive query.
@@ -59,12 +58,25 @@ embeddings:
 
 - \(\ell_0=0.48421653441442203\)
 - selected multiplier (0.5), \(\ell=0.24210826720721101\)
-- cap 256, \(\lambda=0.01\)
+- original preflight-selected cap 256, \(\lambda=0.01\)
 - calibrated \(\beta=0.11756989408559083\), normalized ESS 0.5
 - uplift 0.06455287337303162, condition 540.5854, effective rank 30.6369
 
-These are preflight values, not a guarantee that sequential realized ESS remains
-exactly 0.5 throughout a rollout.
+The current alpha-by-replay-epoch study keeps this authenticated length scale
+but uses the stable cap-512 preflight row. After each round it retains at most
+256 upper-quartile full-H positives, using rotating per-gamma quotas of 36/37;
+the two-round GP memory therefore contains at most 512 records with 73/74 per
+gamma when both rounds fill. No quota is borrowed across gamma. The GP remains
+fixed across all 56 episodes inside a macro-round, and beta is recalibrated once
+at the start of every round to normalized ESS 0.5. These are acquisition
+contracts, not a claim that every later sequential selection has exactly the
+same realized ESS.
+
+The current replay sweep fixes 16 optimizer chunks, learning rate \(10^{-4}\),
+and varies \(\alpha\in\{0,10^{-3},10^{-2}\}\) and complete replay epochs
+\(E\in\{1,4,16\}\). Every eligible record in W=2 is visited exactly E times.
+The original gamma -> (round, episode) -> context -> query mass is retained
+across the 16 chunks rather than being renormalized independently per chunk.
 
 ## Honest selection of the existing checkpoint
 
@@ -91,8 +103,8 @@ and safety guidance plus MPPI refinement.
   selectors, followed by two fixed-frame 3x3 certificate figures.
 
 The query figure colors are fixed: gray (K), orange queried (B), green complete
-H=10 verifier-positive, orange dashed certified terminal prefix, red rejected,
-and thick blue executed first action.  Blue nominal and green verifier
+H=10 verifier-positive, red rejected, and thick blue executed first action.
+Blue nominal and green verifier
 polytopes contain exactly the ten gamma-dependent horizon sets.  At
 \(\gamma=1\), the ten sets genuinely coincide and are labeled as such.
 
@@ -132,7 +144,9 @@ Kazuki is shown separately with its accumulated guidance vector. In the
 max-margin gathering video, no nominal set is drawn and only the actually
 executed full-H positive query may own a green verifier polytope. Each panel of
 the B-query snapshot instead fits its own candidate-specific verifier; rejected
-or terminal-prefix queries never receive a green H=10 set.
+queries never receive a green H=10 set. Reaching the goal terminates the real
+closed-loop episode only after the executed first action; it never truncates a
+candidate certificate or creates an absorbing terminal prefix.
 
 ## Corrected deployment result (`b2caf9a_id_ood_deploy`)
 

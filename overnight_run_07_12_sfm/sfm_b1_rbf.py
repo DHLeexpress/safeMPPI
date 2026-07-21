@@ -122,6 +122,37 @@ class RBFGP:
         return covariance
 
     @torch.no_grad()
+    def posterior_covariance_batched(self, features, include_observation_noise=True):
+        """Posterior covariance for independent ``[context,K,D]`` pools.
+
+        The GP memory is shared, but no covariance or pending observation is
+        introduced across contexts.  Only the expensive solve against the
+        common GP buffer is batched.
+        """
+        query = l2_normalize(torch.as_tensor(features).detach())
+        if query.ndim != 3:
+            raise ValueError("batched GP queries must have shape [context,K,D]")
+        difference = query[:, :, None, :] - query[:, None, :, :]
+        covariance = torch.exp(
+            -difference.square().sum(-1) / (2.0 * self.ell ** 2)
+        )
+        if self.X is not None:
+            contexts, candidates, dimension = query.shape
+            cross = self._kernel(query.reshape(-1, dimension), self.X).reshape(
+                contexts, candidates, len(self.X)
+            )
+            solved = torch.cholesky_solve(
+                cross.reshape(-1, len(self.X)).T.to(torch.float64), self.L
+            ).T.to(cross.dtype).reshape_as(cross)
+            covariance = covariance - torch.einsum("cim,cjm->cij", cross, solved)
+        covariance = 0.5 * (covariance + covariance.transpose(1, 2))
+        if include_observation_noise:
+            covariance = covariance + self.lam * torch.eye(
+                covariance.shape[-1], dtype=query.dtype, device=query.device
+            )[None]
+        return covariance
+
+    @torch.no_grad()
     def sigma(self, features):
         covariance = self.posterior_covariance(features, include_observation_noise=False)
         return torch.diagonal(covariance).clamp_min(0.0).sqrt()
@@ -131,6 +162,13 @@ class RBFGP:
         """First-step marginal sigma in the same normalized scale as pending acquisition."""
         covariance = self.posterior_covariance(features, include_observation_noise=True)
         return (torch.diagonal(covariance) / (1.0 + self.lam)).clamp(0.0, 1.0).sqrt()
+
+    @torch.no_grad()
+    def acquisition_sigma_batched(self, features):
+        covariance = self.posterior_covariance_batched(features, include_observation_noise=True)
+        return (torch.diagonal(covariance, dim1=1, dim2=2) / (1.0 + self.lam)).clamp(
+            0.0, 1.0
+        ).sqrt()
 
     @staticmethod
     def _condition(covariance, remaining, chosen_local):
@@ -184,6 +222,64 @@ class RBFGP:
         return selected, trace
 
     @torch.no_grad()
+    def sequential_acquire_batched(self, features, steps, beta, *, generator=None):
+        """Pending-conditioned acquisition for many independent contexts."""
+        if not math.isfinite(float(beta)) or float(beta) <= 0.0:
+            raise ValueError("beta must be finite and positive")
+        features = torch.as_tensor(features)
+        covariance = self.posterior_covariance_batched(features)
+        context_count, candidate_count = covariance.shape[:2]
+        remaining = torch.arange(candidate_count, device=features.device)[None].expand(
+            context_count, -1
+        ).clone()
+        selected = [[] for _ in range(context_count)]
+        traces = [[] for _ in range(context_count)]
+        for _ in range(int(steps)):
+            scores = (torch.diagonal(covariance, dim1=1, dim2=2) / (1.0 + self.lam)).clamp(
+                0.0, 1.0
+            )
+            weights = torch.exp(
+                ((scores - scores.max(dim=1, keepdim=True).values) / float(beta)).clamp(-30.0, 30.0)
+            )
+            probability = weights / weights.sum(dim=1, keepdim=True)
+            local = torch.multinomial(probability, 1, generator=generator).squeeze(1)
+            chosen = remaining.gather(1, local[:, None]).squeeze(1)
+            ess = 1.0 / (
+                probability.to(torch.float64).square().sum(dim=1) * probability.shape[1]
+            )
+            for context in range(context_count):
+                traces[context].append(dict(
+                    remaining=remaining[context].detach().cpu(),
+                    scores=scores[context].detach().cpu(),
+                    probability=probability[context].detach().cpu(),
+                    chosen=int(chosen[context]),
+                    chosen_sigma=float(scores[context, local[context]].sqrt()),
+                    ess_norm=float(ess[context]),
+                ))
+                selected[context].append(int(chosen[context]))
+            if covariance.shape[1] == 1:
+                covariance = covariance.new_zeros((context_count, 0, 0))
+                remaining = remaining[:, :0]
+                continue
+            all_indices = torch.arange(covariance.shape[1], device=features.device)[None].expand(
+                context_count, -1
+            )
+            keep = all_indices != local[:, None]
+            indices = all_indices[keep].reshape(context_count, -1)
+            reduced = covariance.gather(
+                1, indices[:, :, None].expand(-1, -1, covariance.shape[2])
+            ).gather(2, indices[:, None, :].expand(-1, indices.shape[1], -1))
+            cross = covariance.gather(2, local[:, None, None].expand(-1, covariance.shape[1], 1))
+            cross = cross.squeeze(2).gather(1, indices)
+            denominator = covariance[
+                torch.arange(context_count, device=features.device), local, local
+            ].clamp_min(1.0e-12)
+            covariance = reduced - cross[:, :, None] * cross[:, None, :] / denominator[:, None, None]
+            covariance = 0.5 * (covariance + covariance.transpose(1, 2))
+            remaining = remaining.gather(1, indices)
+        return selected, traces
+
+    @torch.no_grad()
     def diagnostics(self):
         if self.X is None:
             return dict(n=0, kernel_condition=1.0, kernel_effective_rank=0.0, jitter=None)
@@ -224,11 +320,41 @@ def solve_beta(score_vectors, target=0.5, *, lower=1.0e-6, upper=10.0, iteration
 
 
 def calibrate_beta(gp, feature_batches, *, B=4, target=0.5, seed=0):
-    generator = torch.Generator(device=torch.as_tensor(feature_batches[0]).device).manual_seed(int(seed))
+    device = torch.as_tensor(feature_batches[0]).device
+    generator = torch.Generator(device=device).manual_seed(int(seed))
     vectors = []
-    for features in feature_batches:
-        order = torch.randperm(len(features), generator=generator, device=torch.as_tensor(features).device)
-        vectors.extend(gp.sequential_score_vectors(features, order, B))
+    stacked = torch.stack([torch.as_tensor(features, device=device) for features in feature_batches])
+    covariance = gp.posterior_covariance_batched(stacked)
+    context_count, candidate_count = covariance.shape[:2]
+    remaining = torch.arange(candidate_count, device=device)[None].expand(context_count, -1).clone()
+    orders = torch.stack([
+        torch.randperm(candidate_count, generator=generator, device=device)
+        for _ in range(context_count)
+    ])
+    for step in range(int(B)):
+        scores = (torch.diagonal(covariance, dim1=1, dim2=2) / (1.0 + gp.lam)).clamp(0.0, 1.0)
+        vectors.extend(scores[context] for context in range(context_count))
+        chosen = orders[:, step]
+        local = torch.stack([
+            torch.nonzero(remaining[context] == chosen[context], as_tuple=False).flatten()[0]
+            for context in range(context_count)
+        ])
+        if covariance.shape[1] == 1:
+            break
+        all_indices = torch.arange(covariance.shape[1], device=device)[None].expand(context_count, -1)
+        keep = all_indices != local[:, None]
+        indices = all_indices[keep].reshape(context_count, -1)
+        reduced = covariance.gather(
+            1, indices[:, :, None].expand(-1, -1, covariance.shape[2])
+        ).gather(2, indices[:, None, :].expand(-1, indices.shape[1], -1))
+        cross = covariance.gather(2, local[:, None, None].expand(-1, covariance.shape[1], 1))
+        cross = cross.squeeze(2).gather(1, indices)
+        denominator = covariance[
+            torch.arange(context_count, device=device), local, local
+        ].clamp_min(1.0e-12)
+        covariance = reduced - cross[:, :, None] * cross[:, None, :] / denominator[:, None, None]
+        covariance = 0.5 * (covariance + covariance.transpose(1, 2))
+        remaining = remaining.gather(1, indices)
     return solve_beta(vectors, target)
 
 

@@ -163,14 +163,15 @@ def certify_moving_window(segment, pedestrians, gamma, *, K=ARTIFICIAL_FACES,
     robot_c = robot - center
     radius = max(float(SS.R_SENSE), float(r_pad) * float(np.linalg.norm(robot_c, axis=1).max()))
     if len(robot) == 1:
-        # Reaching the goal at the current state creates an absorbing empty
-        # verification horizon.  It is valid but never replay-eligible.
+        # This generic helper also audits the zero-transition tail of an
+        # already executed trajectory.  Queried B1 plans never take this path:
+        # verify_query below requires and certifies all H=10 transitions.
         return True, [], dict(
             solver="exact_2d_angular_interval_socp", angular_grid=False,
             slack=float("inf"), worst_t=0, R_eff=float(radius),
             n_real=0, n_real_feasible=0, n_artificial=0,
             n_artificial_feasible=0, K_artificial=ARTIFICIAL_FACES,
-            empty_terminal_prefix=True,
+            empty_executed_tail=True,
         )
     alpha = (1.0 - float(gamma)) ** np.arange(len(robot), dtype=float)
     beta = 1.0 - alpha
@@ -201,31 +202,28 @@ def certify_moving_window(segment, pedestrians, gamma, *, K=ARTIFICIAL_FACES,
     )
 
 
-def verify_query(state, controls, ped_xy, ped_vel, gamma, *, reach=0.5):
-    """Resolve y without performance/cost terms; errors are explicit and non-storable."""
+def verify_query(state, controls, ped_xy, ped_vel, gamma):
+    """Certify every queried plan over all H=10 transitions.
+
+    Goal reach is a closed-loop episode trigger after the selected first action;
+    it never truncates a candidate window or changes its verifier label.
+    """
     try:
         controls = np.asarray(controls, np.float32).reshape(-1, 2)
         if len(controls) != 10:
             raise ValueError("B1 verifier requires H=10")
         robot = rollout_positions(state, controls)
         pedestrian = predict_pedestrians(ped_xy, ped_vel, H=len(controls))
-        goal_distance = np.linalg.norm(robot - SS.GOAL[None], axis=1)
-        reached = np.flatnonzero(goal_distance < float(reach))
-        terminal_step = int(reached[0]) if len(reached) else len(controls)
-        # A goal hit defines an absorbing terminal prefix. Post-goal repeats are not verified or replayed.
-        prefix_robot = robot[:terminal_step + 1]
-        prefix_pedestrian = pedestrian[:terminal_step + 1]
-        task = taskspace_ok(prefix_robot)
-        collision = collision_free_time_indexed(prefix_robot, prefix_pedestrian)
+        task = taskspace_ok(robot)
+        collision = collision_free_time_indexed(robot, pedestrian)
         certificate, faces, diagnostics = certify_moving_window(
-            prefix_robot, prefix_pedestrian, gamma,
+            robot, pedestrian, gamma,
         )
         y = bool(task and collision and certificate)
         return dict(
             resolved=True, error=None, y=int(y), taskspace=bool(task),
             collision_free=bool(collision), certificate=bool(certificate),
-            full_h=bool(terminal_step == len(controls)), terminal_step=terminal_step,
-            train_eligible=bool(y and terminal_step == len(controls)),
+            full_h=True, terminal_step=len(controls), train_eligible=bool(y),
             segment=robot, pedestrian_prediction=pedestrian, faces=faces,
             diagnostics=diagnostics,
         )

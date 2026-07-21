@@ -3,7 +3,8 @@
 This module consumes already generated rollout/query traces.  Rendering never
 changes the replay store, the GP, an expansion checkpoint, or an execution
 decision.  Every green verifier set is tied to exactly one full-H positive
-window; failed or partial certificates are never drawn as green polytopes.
+window; the renderer rejects legacy partial-query results instead of silently
+presenting them as part of the current protocol.
 """
 from __future__ import annotations
 
@@ -66,8 +67,6 @@ def _query_handles(*, include_nominal=False, include_guidance=False):
         Line2D([], [], color=BV.GRAY, lw=.8, label="K generated"),
         Line2D([], [], color=BV.ORANGE, lw=1.5, marker=".", label="B queried"),
         Line2D([], [], color=BV.GREEN, lw=2.0, marker=".", label="full-H verifier positive"),
-        Line2D([], [], color=BV.ORANGE, lw=1.8, ls="--",
-               label="terminal-prefix y=1 (not full-H)"),
         Line2D([], [], color=BV.RED, lw=2.0, marker="x", label="rejected"),
         Line2D([], [], color=BV.BLUE, lw=3.2, label="executed first action"),
         Line2D([], [], color=BV.GREEN, lw=.55, label="exact SOCP h=1..10"),
@@ -92,13 +91,15 @@ def _set_clean_axis(axis):
 
 
 def _query_result(trace, candidate_id):
-    """Classify a B query without conflating a terminal prefix with full-H D+."""
+    """Classify a B query under the mandatory full-H runtime contract."""
     status, row = BV._candidate_status(trace, candidate_id)
+    if row is not None and row["result"].get("resolved"):
+        result = row["result"]
+        if not bool(result.get("full_h")) or int(result.get("terminal_step", -1)) != 10:
+            raise ValueError("visualization received a legacy partial B1 query; reverify it over H=10")
     if status != "positive":
         return status, row
-    if bool(row["result"].get("full_h", False)) and int(row["result"].get("terminal_step", 10)) == 10:
-        return "positive_full_h", row
-    return "positive_terminal_prefix", row
+    return "positive_full_h", row
 
 
 def _disk_is_separated(A, b, center, radius=SS.R_PED, tol=2.0e-6):
@@ -225,21 +226,16 @@ def draw_margin_query_frame(axis, trace, *, executed_levels=True, nominal_levels
                   marker="o", ms=1.9, alpha=.9, zorder=4)
     rejected = []
     positives = []
-    terminal_prefixes = []
     for candidate_id in selected:
         status, query = _query_result(trace, candidate_id)
-        if status not in ("positive_full_h", "positive_terminal_prefix", "negative"):
+        if status not in ("positive_full_h", "negative"):
             continue
         path = np.asarray(BV._trace_candidate(trace, candidate_id)["segment"])
-        color = (BV.GREEN if status == "positive_full_h" else
-                 BV.ORANGE if status == "positive_terminal_prefix" else BV.RED)
+        color = BV.GREEN if status == "positive_full_h" else BV.RED
         axis.plot(path[:, 0], path[:, 1], color=color, lw=.92,
-                  ls=("--" if status == "positive_terminal_prefix" else "-"),
                   marker="o", ms=2.1, alpha=.96, zorder=5)
         if status == "positive_full_h":
             positives.append(candidate_id)
-        elif status == "positive_terminal_prefix":
-            terminal_prefixes.append(candidate_id)
         else:
             axis.plot(path[-1, 0], path[-1, 1], "x", color=BV.RED,
                       ms=6, mew=1.4, zorder=8)
@@ -252,9 +248,9 @@ def draw_margin_query_frame(axis, trace, *, executed_levels=True, nominal_levels
         axis.annotate("", xy=path[1], xytext=path[0],
                       arrowprops=dict(arrowstyle="->", color=BV.BLUE, lw=2.8))
         status, query = _query_result(trace, executed)
-        if status not in ("positive_full_h", "positive_terminal_prefix"):
-            raise ValueError("the executed candidate must be a resolved positive query")
-        if executed_levels and status == "positive_full_h":
+        if status != "positive_full_h":
+            raise ValueError("the executed candidate must be a resolved full-H positive query")
+        if executed_levels:
             level_audit = checked_verifier_levels(trace, query, H=10)
             _draw_verifier_geometry(axis, level_audit)
     _set_clean_axis(axis)
@@ -264,7 +260,7 @@ def draw_margin_query_frame(axis, trace, *, executed_levels=True, nominal_levels
             key: value for key, value in nominal.items()
             if key not in ("polygons", "outer_polygon")
         }),
-        terminal_prefix_positive_ids=terminal_prefixes, rejected_ids=rejected,
+        rejected_ids=rejected,
         executed_id=(None if executed is None else int(executed)),
         executed_verifier=(None if level_audit is None else {
             key: value for key, value in level_audit.items()
@@ -382,13 +378,12 @@ def _positive_control_spread(trace):
 def _snapshot_row(trace):
     statuses = [_query_result(trace, candidate_id)[0] for candidate_id in trace["selected_ids"]]
     positive = sum(status == "positive_full_h" for status in statuses)
-    terminal_prefix = sum(status == "positive_terminal_prefix" for status in statuses)
     negative = sum(status == "negative" for status in statuses)
     control_spread, endpoint_spread = _positive_control_spread(trace)
     return dict(
         scenario_id=int(trace["scenario_id"]), gamma=float(trace["gamma"]),
         step=int(trace["step"]), positive_full_h=positive,
-        positive_terminal_prefix=terminal_prefix, rejected=negative,
+        rejected=negative,
         control_spread=control_spread, endpoint_spread=endpoint_spread,
         control_spread_normalization="||Ui-Uj||/(2*u_max*sqrt(2H)), clipped to [0,1]",
         eligible=positive >= 2 and negative >= 1,
@@ -442,7 +437,6 @@ def render_candidate_query_snapshot(traces, output_png, *, selection=None, repor
         path = np.asarray(BV._trace_candidate(trace, candidate_id)["segment"])
         color = BV.GREEN if status == "positive_full_h" else BV.RED if status == "negative" else BV.ORANGE
         axis.plot(path[:, 0], path[:, 1], color=color, lw=.92,
-                  ls=("--" if status == "positive_terminal_prefix" else "-"),
                   marker="o", ms=2.3, zorder=7)
         level_audit = None
         rejected_x = None
@@ -554,26 +548,17 @@ def draw_method_panel(axis, method, run, gamma, step, *, verifier_result=None,
             trace["state"], trace["controls"], trace["ped_xy"], trace["ped_vel"], gamma,
         )
         resolved = bool(result.get("resolved"))
+        if resolved and (
+                not bool(result.get("full_h"))
+                or int(result.get("terminal_step", -1)) != 10):
+            raise ValueError("learned-plan visualization requires a full H=10 verifier result")
         positive = bool(resolved and int(result.get("y", 0)) == 1)
-        full_h_positive = bool(
-            positive and bool(result.get("full_h"))
-            and int(result.get("terminal_step", 10)) == 10
-        )
-        terminal_prefix_positive = bool(positive and not full_h_positive)
+        full_h_positive = positive
         rejected = bool(resolved and int(result.get("y", 0)) == 0)
         terminal_step = int(result.get("terminal_step", 10)) if resolved else None
 
         # Green is reserved for a complete H=10 certificate, not method identity.
-        # A certified goal hit is an accepted absorbing prefix: show only the
-        # verified prefix in orange and never mark its unexecuted tail rejected.
-        if terminal_prefix_positive:
-            segment = np.asarray(result.get("segment", plan), float)[:, :2]
-            prefix = segment[:min(terminal_step + 1, len(segment))]
-            axis.plot(prefix[:, 0], prefix[:, 1], "--", color=BV.ORANGE,
-                      lw=.95, marker=".", ms=2.2)
-            axis.plot(*prefix[-1], "o", color=BV.ORANGE, ms=5.0, zorder=9)
-        else:
-            axis.plot(plan[:, 0], plan[:, 1], color="#333333", lw=.82, marker="o", ms=2.2)
+        axis.plot(plan[:, 0], plan[:, 1], color="#333333", lw=.82, marker="o", ms=2.2)
         query = dict(candidate_id=0, controls=np.asarray(trace["controls"]), result=result)
         level_audit = None
         if full_h_positive:
@@ -584,7 +569,6 @@ def draw_method_panel(axis, method, run, gamma, step, *, verifier_result=None,
         metadata.update(
             verifier_positive=positive,
             verifier_full_h_positive=full_h_positive,
-            terminal_prefix_positive=terminal_prefix_positive,
             rejected=rejected,
             terminal_step=terminal_step,
             verifier_levels=(0 if level_audit is None else level_audit["rendered_levels"]),
@@ -964,11 +948,9 @@ def render_bundle(
         name: dict(path=os.path.abspath(path), bytes=os.path.getsize(path), sha256=_sha256(path))
         for name, path in paths.items()
     }
-    terminal_prefixes = [
-        (int(trace["scenario_id"]), float(trace["gamma"]), int(trace["step"]), int(candidate_id))
-        for trace in traces for candidate_id in trace["selected_ids"]
-        if _query_result(trace, candidate_id)[0] == "positive_terminal_prefix"
-    ]
+    for trace in traces:
+        for candidate_id in trace["selected_ids"]:
+            _query_result(trace, candidate_id)
     manifest = dict(
         status="DENSITY_OOD_VISUALIZATION_BUNDLE_COMPLETE",
         diagnostic_only=True, controllers_rerun_by_renderer=False,
@@ -981,11 +963,7 @@ def render_bundle(
             "snapshot": source,
             "all_success_method_runs": success_source,
         },
-        terminal_prefix_audit=dict(
-            count=len(terminal_prefixes), green_paths=0, green_polytopes=0,
-            rule="y=1 with full_h=false is terminal-prefix positive, never full-H green",
-            keys=[list(value) for value in terminal_prefixes],
-        ),
+        query_horizon_contract="every resolved B query is reverified over all H=10 transitions",
         snapshot_steps=dict(
             method_comparison=dict(
                 step=method_snapshot_step,

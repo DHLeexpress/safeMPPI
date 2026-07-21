@@ -30,6 +30,25 @@ def test_pending_point_conditioning_reduces_duplicate_score():
     assert all(0 < row["ess_norm"] <= 1 for row in trace)
 
 
+def test_batched_covariance_and_acquisition_match_independent_contexts():
+    torch.manual_seed(12)
+    train = torch.randn(17, 7)
+    features = torch.randn(3, 6, 7)
+    gp = R.RBFGP(.6, 1e-2)
+    gp.set_buffer(train)
+    expected = torch.stack([gp.posterior_covariance(row) for row in features])
+    torch.testing.assert_close(gp.posterior_covariance_batched(features), expected)
+    torch.testing.assert_close(
+        gp.acquisition_sigma_batched(features),
+        torch.stack([gp.acquisition_sigma(row) for row in features]),
+    )
+    generator = torch.Generator().manual_seed(7)
+    selected, traces = gp.sequential_acquire_batched(features, 4, .1, generator=generator)
+    assert len(selected) == len(traces) == 3
+    assert all(len(values) == len(set(values)) == 4 for values in selected)
+    assert all(len(values) == 4 for values in traces)
+
+
 def test_lengthscale_demands_exactly_fifty():
     try:
         R.mean_pairwise_lengthscale(torch.randn(49, 4))

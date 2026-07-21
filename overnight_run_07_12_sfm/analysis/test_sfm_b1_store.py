@@ -27,14 +27,25 @@ def test_D_partitions_and_errors_enter_none(tmp_path):
     cid = context(store)
     store.add_resolved_query(cid, 0, np.zeros((10, 2)), .2, result(1), acquisition_step=0)
     store.add_resolved_query(cid, 1, np.zeros((10, 2)), .3, result(0), acquisition_step=1)
-    store.add_resolved_query(cid, 2, np.zeros((10, 2)), .4, result(1, full_h=False), acquisition_step=2)
     store.add_error(context_key=(1, .1, 0), candidate_id=3, error="SOCP")
-    assert len(store.D) == 3
+    assert len(store.D) == 2
     assert len(store.Dplus) == 1
     assert len(store.Dminus) == 1
     assert len(store.errors) == 1
-    assert not store.queries[2]["train_eligible"]
     manifest = store.save(tmp_path / "round.pt")
-    assert manifest["D"] == 3 and manifest["Dplus"] == 1 and manifest["Dminus"] == 1
+    assert manifest["D"] == 2 and manifest["Dplus"] == 1 and manifest["Dminus"] == 1
     restored = S.RoundShard.load(tmp_path / "round.pt")
     assert restored.validate()["errors"] == 1
+
+
+def test_partial_goal_prefix_cannot_enter_query_store():
+    store = S.RoundShard(1)
+    cid = context(store)
+    try:
+        store.add_resolved_query(
+            cid, 0, np.zeros((10, 2)), .2, result(1, full_h=False), acquisition_step=0,
+        )
+    except ValueError as error:
+        assert "full H=10" in str(error)
+    else:
+        raise AssertionError("partial verifier result entered D")

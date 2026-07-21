@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 import sfm_b1_alpha_steps_sweep as S
 
 
@@ -12,7 +14,8 @@ def _cell(value):
 
 def _record(value):
     return dict(
-        round=2, temperature=1.0,
+        round=2,
+        temperature_by_gamma={str(g): 1.0 for g in S.CE.SP.GAMMAS},
         summary=dict(pooled=_cell(value), per_gamma={str(g): _cell(value) for g in S.CE.SP.GAMMAS}),
     )
 
@@ -20,10 +23,10 @@ def _record(value):
 def test_factorial_is_exact_nine_margin_arms():
     arms = S.arm_grid()
     assert len(arms) == 9 and len({arm.name for arm in arms}) == 9
-    assert {(arm.alpha, arm.optimizer_steps) for arm in arms} == {
-        (alpha, steps) for alpha in S.ALPHAS for steps in S.OPTIMIZER_STEPS
+    assert {(arm.alpha, arm.inner_epochs) for arm in arms} == {
+        (alpha, epochs) for alpha in S.ALPHAS for epochs in S.INNER_EPOCHS
     }
-    assert arms[0].name == "margin_alpha0_steps001"
+    assert arms[0].name == "margin_alpha0_inner001"
 
 
 def test_screening_prefers_metrics_before_update_complexity():
@@ -38,11 +41,19 @@ def test_preflight_is_bound_to_checkpoint(tmp_path, monkeypatch):
     payload = dict(
         status="RBF_PREFLIGHT_COMPLETE", checkpoint_sha256=S.SW.sha256_file(checkpoint),
         lengthscale_count=50, lambda_=1e-2,
-        selected=dict(ess_solved=True, stable_conditioning=True, cap=256, ell=.2),
+        selected=dict(
+            ess_solved=True, stable_conditioning=True, cap=256, ell=.2,
+            ell_multiplier=.5,
+        ),
+        candidates=[dict(
+            ess_solved=True, stable_conditioning=True, cap=512, ell=.2,
+            ell_multiplier=.5,
+        )],
     )
     path = tmp_path / "preflight.json"; path.write_text(json.dumps(payload))
     expected_sha = S.SW.sha256_file(path)
-    assert S._load_preflight(path, checkpoint, expected_sha) == payload
+    loaded = S._load_preflight(path, checkpoint, expected_sha)
+    assert loaded["sweep_selected"] == payload["candidates"][0]
     try:
         S._load_preflight(path, checkpoint, "bad")
         assert False
@@ -54,3 +65,14 @@ def test_preflight_is_bound_to_checkpoint(tmp_path, monkeypatch):
         assert False
     except RuntimeError as error:
         assert "checkpoint" in str(error)
+
+
+def test_output_root_is_fail_closed_and_symlink_safe(tmp_path, monkeypatch):
+    root = tmp_path / "research1"
+    root.mkdir()
+    monkeypatch.setattr(S, "OUTPUT_ROOT", str(root))
+    assert S._validate_output_root(root / "fresh") == str(root / "fresh")
+    with pytest.raises(ValueError, match="fresh directory"):
+        S._validate_output_root(root)
+    with pytest.raises(ValueError, match="fresh directory"):
+        S._validate_output_root(tmp_path / "elsewhere")

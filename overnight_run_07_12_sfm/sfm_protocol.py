@@ -16,6 +16,17 @@ ROUNDS = 20
 SCENARIOS_PER_ROUND = 8
 N_PED = 20
 
+# Latest max-margin sweep contract.  Replay and GP memory are intentionally
+# separate: replay consumes every eligible W=2 query, whereas uncertainty uses
+# only the balanced high-uncertainty retention set.
+SWEEP_LR = 1.0e-4
+OPTIMIZER_CHUNKS = 16
+INNER_EPOCHS = (1, 4, 16)
+GP_RETAIN_PER_ROUND = 256
+GP_CAP = 512
+GP_RETAIN_QUANTILE = 0.75
+SANITY_M = 10
+
 # Explicit environment metadata.  N_PED remains the legacy B1 expansion
 # constant; scientific evaluation selects one of the named profiles instead.
 TRAINING_ENVIRONMENT = SS.scene_profile("training")
