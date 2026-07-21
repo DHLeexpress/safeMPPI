@@ -180,6 +180,28 @@ def test_expert_config_and_stored_nominal_geometry_are_faithful(monkeypatch):
     assert nominal["base_faces"] == 16 and nominal["velocity_used"] is True
 
 
+def test_expert_trace_accepts_one_float32_ulp_between_action_and_mean(monkeypatch):
+    controls = np.zeros((10, 2), np.float32)
+    controls[0, 0] = 1.0
+    action = controls[0].copy()
+    action[0] = np.nextafter(action[0], np.float32(2.0))
+    trace = dict(
+        step=0, state=np.zeros(4), action=action, controls=controls,
+        planned_states=np.zeros((11, 4)), ped_xy=np.zeros((0, 2)),
+        ped_vel=np.zeros((0, 2)), sequence_kind="reward_weighted_mean",
+    )
+    run = dict(states=np.zeros((2, 4)), trace=[trace])
+    monkeypatch.setattr(V, "nominal_safemppi_levels", lambda *args, **kwargs: dict(
+        polygons=[], outer_polygon=np.array([[-1., -1.], [1., -1.], [1., 1.], [-1., 1.]]),
+        contains_robot=True,
+        base_faces=16, detected_faces=0, velocity_used=True,
+    ))
+    figure, axis = plt.subplots()
+    report = V.draw_method_panel(axis, "expert", run, .5, 0)
+    plt.close(figure)
+    assert report["expert_sequence_kind"] == "reward_weighted_mean"
+
+
 def test_method_bundle_accepts_density_diagnostic_aliases():
     bundle = dict(scenario_id=11, shared_snapshot=dict(step=0), runs={
         "safemppi_expert": {gamma: _run(False) for gamma in V.DISPLAY_GAMMAS},
