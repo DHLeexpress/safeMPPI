@@ -168,6 +168,28 @@ The authenticated output is stored at
 `/home/dohyun/projects/sfm_hp10_b1_runs/b2caf9a_id_ood_deploy`; its delivery
 manifest contains 113 independently rehashed artifacts.
 
+## Density-only pre-expansion result (`density_ood_deploy_sharded_927d1a3`)
+
+The requested density-only profile keeps the configured desired-speed range at
+0.5--1.0 m/s and changes `n_ped` from 20 to 50.  A process-isolated fixed bank
+evaluated 100 predeclared scenario IDs per gamma (700 rollouts per method):
+
+| method | SR | CR | timeout | successful clearance [m] | successful time [s] |
+|---|---:|---:|---:|---:|---:|
+| Hp10 r0 raw | 0.9957 | 0.0043 | 0.0000 | 0.2064 | 9.5900 |
+| selected A-r10 raw | 0.9914 | 0.0043 | 0.0043 | 0.2075 | 9.6591 |
+| default Kazuki | 0.9900 | 0.0100 | 0.0000 | 0.2330 | 4.8036 |
+
+The pooled intervals resample scenario IDs while retaining all seven gamma
+rows.  All 21 method--gamma cells and output hashes passed authentication.  The
+sharded run took 16 minutes 53 seconds on physical GPU 3; the unchanged serial
+launcher would have taken about four hours because SFM pedestrian interaction
+is CPU-serial and quadratic in pedestrian count.
+
+This result rejects density-only 20-to-50 as a discriminative expansion target:
+r0 already satisfies the requested empirical CR below 5%, and A-r10 does not
+improve it.  No new expansion was launched from this pre-expansion gate.
+
 ## Known blind spots
 
 - A fitted H=10 verifier proves the queried window, not infinite-horizon
