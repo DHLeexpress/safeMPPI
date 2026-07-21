@@ -286,7 +286,28 @@ def _tensor_batch(records, device):
     return grid.float(), low.float(), hist.float(), controls.float()
 
 
-def _accumulate_objective(policy, records, mass, batch, device):
+def _query_design(policy, records, *, seed, stream, device):
+    """Stateless CFM/dropout randomness keyed to each stored verifier query."""
+    x0, tau, dropout = [], [], []
+    keep = 1.0 - float(policy.res_dropout)
+    if not 0.0 < keep <= 1.0:
+        raise ValueError("invalid residual-dropout keep probability")
+    for shard, query in records:
+        identity = f"{int(seed)}:{stream}:{int(shard.round_i)}:{int(query['query_id'])}"
+        query_seed = int.from_bytes(hashlib.sha256(identity.encode()).digest()[:8], "little")
+        generator = torch.Generator(device="cpu").manual_seed(query_seed)
+        x0.append(torch.randn(policy.d, generator=generator))
+        tau.append(torch.rand(1, generator=generator).clamp(1.0e-4, 1.0))
+        mask = torch.rand(
+            len(policy.trunk.blocks), policy.width, generator=generator,
+        ) < keep
+        dropout.append(mask.float() / keep)
+    return (
+        torch.stack(x0).to(device), torch.cat(tau).to(device), torch.stack(dropout).to(device),
+    )
+
+
+def _accumulate_objective(policy, records, mass, batch, device, *, seed, stream):
     policy.train()
     visited = []
     total_loss = 0.0
@@ -296,7 +317,13 @@ def _accumulate_objective(policy, records, mass, batch, device):
         per_weights = torch.as_tensor([
             len(values) * mass[(id(shard), int(query["query_id"]))] for shard, query in values
         ], dtype=controls.dtype, device=device)
-        loss = policy.cfm_loss(controls, context, weights=per_weights)
+        x0, tau, dropout = _query_design(
+            policy, values, seed=seed, stream=stream, device=device,
+        )
+        loss = policy.cfm_loss_designed(
+            controls, context, x0=x0, tau=tau,
+            dropout_scale=dropout, weights=per_weights,
+        )
         loss.backward()
         total_loss += float(loss.detach())
         visited.extend((shard.round_i, int(query["query_id"])) for shard, query in values)
@@ -334,12 +361,14 @@ def _normalized_subset_mass(records, global_mass):
 
 
 def _positive_multi_step(policy, optimizer, ordered, global_mass, accounting, *,
-                         optimizer_steps, batch, device):
+                         optimizer_steps, batch, device, seed):
     visited, total_loss, step_sizes, step_global_mass = [], 0.0, [], []
     for values in _step_partitions(ordered, optimizer_steps):
         mass, original_mass = _normalized_subset_mass(values, global_mass)
         optimizer.zero_grad(set_to_none=True)
-        loss, seen = _accumulate_objective(policy, values, mass, batch, device)
+        loss, seen = _accumulate_objective(
+            policy, values, mass, batch, device, seed=seed, stream="positive",
+        )
         optimizer.step()
         total_loss += loss
         visited.extend(seen)
@@ -350,6 +379,7 @@ def _positive_multi_step(policy, optimizer, ordered, global_mass, accounting, *,
         mass=accounting, optimizer_steps=len(step_sizes),
         optimizer_steps_requested=int(optimizer_steps), step_sizes=step_sizes,
         step_global_mass=step_global_mass, replay_coverage=len(visited) / len(ordered),
+        loss_step_mean=total_loss / len(step_sizes),
     )
 
 
@@ -361,22 +391,26 @@ def positive_only_update(policy, optimizer, recent, *, batch=128, device="cpu", 
     optimizer.zero_grad(set_to_none=True)
     if not ordered:
         return dict(path="positive_only", eligible=0, visited=[], loss=0.0, mass=accounting,
-                    optimizer_steps=0, optimizer_steps_requested=int(optimizer_steps))
+                    optimizer_steps=0, optimizer_steps_requested=int(optimizer_steps),
+                    loss_step_mean=None)
     if int(optimizer_steps) != 1:
         return _positive_multi_step(
             policy, optimizer, ordered, mass, accounting, optimizer_steps=optimizer_steps,
-            batch=batch, device=device,
+            batch=batch, device=device, seed=seed,
         )
-    loss, visited = _accumulate_objective(policy, ordered, mass, batch, device)
+    loss, visited = _accumulate_objective(
+        policy, ordered, mass, batch, device, seed=seed, stream="positive",
+    )
     optimizer.step()
     return dict(path="positive_only", eligible=len(ordered), visited=visited, loss=loss,
                 mass=accounting, optimizer_steps=1, optimizer_steps_requested=1,
-                step_sizes=[len(ordered)], step_global_mass=[1.0], replay_coverage=1.0)
+                step_sizes=[len(ordered)], step_global_mass=[1.0], replay_coverage=1.0,
+                loss_step_mean=loss)
 
 
 def _signed_multi_step(policy, optimizer, pos_order, neg_order, pos_mass, neg_mass,
                        pos_accounting, neg_accounting, *, alpha, optimizer_steps,
-                       batch, device, eps):
+                       batch, device, eps, seed):
     positive_chunks = _step_partitions(pos_order, optimizer_steps)
     negative_chunks = ([neg_order[index::len(positive_chunks)] for index in range(len(positive_chunks))]
                        if neg_order else [[] for _ in positive_chunks])
@@ -388,7 +422,7 @@ def _signed_multi_step(policy, optimizer, pos_order, neg_order, pos_mass, neg_ma
         local_pos_mass, original_pos_mass = _normalized_subset_mass(positives, pos_mass)
         optimizer.zero_grad(set_to_none=True)
         positive_loss, seen_positive = _accumulate_objective(
-            policy, positives, local_pos_mass, batch, device
+            policy, positives, local_pos_mass, batch, device, seed=seed, stream="positive",
         )
         positive_gradient = _gradient_snapshot(policy)
         positive_norm = _gradient_norm(positive_gradient)
@@ -396,7 +430,7 @@ def _signed_multi_step(policy, optimizer, pos_order, neg_order, pos_mass, neg_ma
             local_neg_mass, original_neg_mass = _normalized_subset_mass(negatives, neg_mass)
             optimizer.zero_grad(set_to_none=True)
             negative_loss, seen_negative = _accumulate_objective(
-                policy, negatives, local_neg_mass, batch, device
+                policy, negatives, local_neg_mass, batch, device, seed=seed, stream="negative",
             )
             negative_gradient = _gradient_snapshot(policy)
             negative_norm = _gradient_norm(negative_gradient)
@@ -437,6 +471,8 @@ def _signed_multi_step(policy, optimizer, pos_order, neg_order, pos_mass, neg_ma
         positive_step_global_mass=pos_step_mass, negative_step_global_mass=neg_step_mass,
         positive_replay_coverage=len(pos_visited) / len(pos_order),
         negative_replay_coverage=len(neg_visited) / len(neg_order) if neg_order else None,
+        positive_loss_step_mean=sum(positive_losses) / len(positive_chunks),
+        negative_loss_step_mean=sum(negative_losses) / len(positive_chunks),
     )
 
 
@@ -465,7 +501,9 @@ def signed_update(policy, optimizer, recent, *, alpha, batch=128, device="cpu", 
         # The signed scale is exactly zero without g_pos, but alpha>0 still requires
         # deterministic, once-only accounting of every eligible verifier negative.
         optimizer.zero_grad(set_to_none=True)
-        neg_loss, neg_visited = _accumulate_objective(policy, neg_order, neg_mass, batch, device)
+        neg_loss, neg_visited = _accumulate_objective(
+            policy, neg_order, neg_mass, batch, device, seed=seed, stream="negative",
+        )
         negative_gradient = _gradient_snapshot(policy)
         negative_norm = _gradient_norm(negative_gradient)
         optimizer.zero_grad(set_to_none=True)
@@ -476,19 +514,24 @@ def signed_update(policy, optimizer, recent, *, alpha, batch=128, device="cpu", 
             positive_visited=[], negative_visited=neg_visited,
             positive_mass=pos_accounting, negative_mass=neg_accounting, optimizer_steps=0,
             optimizer_steps_requested=int(optimizer_steps),
+            positive_loss_step_mean=None, negative_loss_step_mean=None,
         )
     if int(optimizer_steps) != 1:
         return _signed_multi_step(
             policy, optimizer, pos_order, neg_order, pos_mass, neg_mass,
             pos_accounting, neg_accounting, alpha=alpha,
-            optimizer_steps=optimizer_steps, batch=batch, device=device, eps=eps,
+            optimizer_steps=optimizer_steps, batch=batch, device=device, eps=eps, seed=seed,
         )
     optimizer.zero_grad(set_to_none=True)
-    pos_loss, pos_visited = _accumulate_objective(policy, pos_order, pos_mass, batch, device)
+    pos_loss, pos_visited = _accumulate_objective(
+        policy, pos_order, pos_mass, batch, device, seed=seed, stream="positive",
+    )
     positive_gradient = _gradient_snapshot(policy)
     positive_norm = _gradient_norm(positive_gradient)
     optimizer.zero_grad(set_to_none=True)
-    neg_loss, neg_visited = _accumulate_objective(policy, neg_order, neg_mass, batch, device)
+    neg_loss, neg_visited = _accumulate_objective(
+        policy, neg_order, neg_mass, batch, device, seed=seed, stream="negative",
+    )
     negative_gradient = _gradient_snapshot(policy)
     negative_norm = _gradient_norm(negative_gradient)
     rho = float(alpha) * positive_norm / (negative_norm + float(eps))
@@ -512,5 +555,6 @@ def signed_update(policy, optimizer, recent, *, alpha, batch=128, device="cpu", 
         positive_eligible=len(pos_order), negative_eligible=len(neg_order),
         positive_visited=pos_visited, negative_visited=neg_visited,
         positive_mass=pos_accounting, negative_mass=neg_accounting, optimizer_steps=1,
-        optimizer_steps_requested=1,
+        optimizer_steps_requested=1, positive_loss_step_mean=pos_loss,
+        negative_loss_step_mean=neg_loss,
     )

@@ -54,7 +54,8 @@ def test_alpha_zero_is_bitwise_positive_only_and_never_reads_negatives(tmp_path,
     torch.manual_seed(991)
     expected = S.positive_only_update(policy_a, optimizer_a, recent, batch=128, seed=4)
     monkeypatch.setattr(recent, "negative_records", lambda: (_ for _ in ()).throw(AssertionError("D- read")))
-    torch.manual_seed(991)
+    # The explicit per-query design, not process-global RNG, controls CFM and dropout.
+    torch.manual_seed(123456)
     actual = S.signed_update(policy_b, optimizer_b, recent, alpha=0.0, batch=128, seed=4)
     assert expected["visited"] == actual["visited"]
     for left, right in zip(policy_a.state_dict().values(), policy_b.state_dict().values()):
@@ -106,6 +107,31 @@ def test_alpha_zero_multistep_still_never_reads_negatives(tmp_path, monkeypatch)
     assert len(report["visited"]) == report["eligible"]
     assert len(set(report["visited"])) == report["eligible"]
     assert report["replay_coverage"] == 1.0
+
+
+def test_multistep_update_is_reproducible_independent_of_global_rng(tmp_path):
+    torch.manual_seed(15)
+    recent = _recent(tmp_path)
+    policy_a = GPS.build_sfm_policy(width=24, res_dropout=0.05)
+    policy_b = copy.deepcopy(policy_a)
+    S.configure_expansion_trainability(policy_a)
+    S.configure_expansion_trainability(policy_b)
+    optimizer_a = torch.optim.Adam([p for p in policy_a.parameters() if p.requires_grad], lr=1e-5)
+    optimizer_b = torch.optim.Adam([p for p in policy_b.parameters() if p.requires_grad], lr=1e-5)
+    torch.manual_seed(16)
+    report_a = S.signed_update(
+        policy_a, optimizer_a, recent, alpha=.001, batch=4, seed=19, optimizer_steps=4,
+    )
+    torch.manual_seed(99999)
+    report_b = S.signed_update(
+        policy_b, optimizer_b, recent, alpha=.001, batch=4, seed=19, optimizer_steps=4,
+    )
+    assert report_a["positive_visited"] == report_b["positive_visited"]
+    assert report_a["negative_visited"] == report_b["negative_visited"]
+    assert report_a["positive_loss_step_mean"] == report_b["positive_loss_step_mean"]
+    assert report_a["negative_loss_step_mean"] == report_b["negative_loss_step_mean"]
+    for left, right in zip(policy_a.state_dict().values(), policy_b.state_dict().values()):
+        assert torch.equal(left, right)
 
 
 def test_signed_negative_only_still_visits_all_without_changing_policy(tmp_path):

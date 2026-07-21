@@ -283,6 +283,7 @@ def _job_environment(uuid):
     environment.update(
         CUDA_VISIBLE_DEVICES=uuid, OMP_NUM_THREADS="1", MKL_NUM_THREADS="1",
         OPENBLAS_NUM_THREADS="1", NUMEXPR_NUM_THREADS="1", TORCH_NUM_THREADS="1",
+        CUBLAS_WORKSPACE_CONFIG=":4096:8",
         PYTHONPATH=HERE + os.pathsep + environment.get("PYTHONPATH", ""),
         LD_LIBRARY_PATH="/home/dohyun/miniforge3/lib" + os.pathsep + environment.get("LD_LIBRARY_PATH", ""),
     )

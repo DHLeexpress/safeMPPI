@@ -396,6 +396,14 @@ def _save_checkpoint(policy, path, extra):
 
 def run_arm(checkpoint, outdir, cfg, *, ell, cap, device):
     cfg.validate()
+    random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.seed)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True)
     environment = SS.scene_profile(cfg.scene_profile)
     os.makedirs(outdir, exist_ok=True)
     policy, source_checkpoint = GPS.load_sfm_policy(checkpoint, device=device)
@@ -411,6 +419,7 @@ def run_arm(checkpoint, outdir, cfg, *, ell, cap, device):
     _save_checkpoint(policy, os.path.join(outdir, "round_00.pt"), dict(
         round=0, arm=cfg.name, source_checkpoint=os.path.abspath(checkpoint),
         source_sha256=source_sha, encoder_sha256=encoder_before,
+        training_randomness="per-query SHA256-keyed CFM x0/tau/residual-dropout design",
     ))
     with ProcessPoolExecutor(max_workers=cfg.verifier_workers) as executor:
         for round_i in range(1, cfg.rounds + 1):
@@ -458,6 +467,7 @@ def run_arm(checkpoint, outdir, cfg, *, ell, cap, device):
                 round=round_i, arm=cfg.name, source_checkpoint=os.path.abspath(checkpoint),
                 source_sha256=source_sha, encoder_sha256=encoder_after_round,
                 recipe=asdict(cfg), ell=float(ell), cap=int(cap), beta=float(beta),
+                training_randomness="per-query SHA256-keyed CFM x0/tau/residual-dropout design",
             ))
             record = dict(
                 round=round_i, scenarios=list(scenarios), beta=float(beta),
@@ -482,6 +492,12 @@ def run_arm(checkpoint, outdir, cfg, *, ell, cap, device):
         verifier=SM.verifier_manifest(),
         environment=environment, frozen_parameters=frozen_parameters, encoder_sha_before=encoder_before,
         encoder_sha_after=encoder_after, rounds=len(history), history=history,
+        training_randomness=dict(
+            global_seed=int(cfg.seed),
+            design="SHA256(seed,sign,round,query_id) -> CFM x0/tau/residual-dropout mask",
+            invariant_to_batching_and_optimizer_step_partition=True,
+            deterministic_algorithms=True,
+        ),
     )
     with open(os.path.join(outdir, "method_manifest.json"), "w") as stream:
         json.dump(manifest, stream, indent=2)
