@@ -48,7 +48,7 @@ fi
   --scene-profile double_density_velocity_ood \
   --outdir "$OUTDIR" \
   --rounds 20 \
-  --workers 16 \
+  --workers 8 \
   --tune-M 10 \
   --screen-M 50 \
   --confirm-M 100 \

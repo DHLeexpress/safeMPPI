@@ -78,11 +78,11 @@ and varies \(\alpha\in\{0,10^{-3},10^{-2}\}\) and complete replay epochs
 The original gamma -> (round, episode) -> context -> query mass is retained
 across the 16 chunks rather than being renormalized independently per chunk.
 
-On Helios, the sweep scheduler exposes four process slots: `1a` and `1b` on
-physical GPU 1, and `3a` and `3b` on physical GPU 3. Thus two independent arm
-processes share each GPU; every process receives 16 disjoint verifier CPU
+On Helios, the sweep scheduler exposes eight process slots: `1a`--`1d` on
+physical GPU 1 and `3a`--`3d` on physical GPU 3. Thus four independent arm
+processes share each GPU; every process receives 8 disjoint verifier CPU
 workers. Before any scientific sweep, a fail-closed three-round runtime gate
-runs four extreme alpha/epoch configurations under this exact scheduler. The
+runs eight representative alpha/epoch configurations under this exact scheduler. The
 gate authenticates the source, checkpoint, preflight, scene, GPU assignment,
 GP cap/quota behavior, and measured wall-time forecast before later jobs are
 admitted.

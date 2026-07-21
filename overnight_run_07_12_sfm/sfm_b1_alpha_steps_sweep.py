@@ -32,8 +32,8 @@ OPTIMIZER_CHUNKS = 16
 SWEEP_LR = 1.0e-4
 OUTPUT_ROOT = "/data3/research1"
 RUNTIME_GATE_ROUNDS = 3
-FOUR_SLOTS = ("1a", "3a", "1b", "3b")
-ARM_WORKERS = 16
+SCHEDULER_SLOTS = ("1a", "3a", "1b", "3b", "1c", "3c", "1d", "3d")
+ARM_WORKERS = 8
 
 
 def _tag(value: float) -> str:
@@ -92,11 +92,12 @@ def _load_preflight(path, checkpoint, expected_sha256):
     return payload
 
 
-def _four_slot_waves(jobs, logdir):
+def _slot_waves(jobs, logdir):
     logs = []
-    for start in range(0, len(jobs), len(FOUR_SLOTS)):
+    for start in range(0, len(jobs), len(SCHEDULER_SLOTS)):
         wave = []
-        for slot, (command, name) in zip(FOUR_SLOTS, jobs[start:start + len(FOUR_SLOTS)]):
+        for slot, (command, name) in zip(
+                SCHEDULER_SLOTS, jobs[start:start + len(SCHEDULER_SLOTS)]):
             wave.append((slot, command, name))
         logs.extend(SW.run_parallel(wave, logdir))
     return logs
@@ -224,15 +225,23 @@ def _plot_arm_comparison(outdir, arms, rows_by_arm, *, winner, winning_round):
 
 
 def _runtime_gate(args, *, ell, cap, python, source, preflight_sha256):
-    """Benchmark four shared-GPU extremes after W=2/cap-512 become active."""
+    """Benchmark eight shared-GPU arms after W=2/cap-512 become active."""
     gate_started = time.perf_counter()
     root = os.path.join(args.outdir, "runtime_gate")
+    # Match the saturated scientific wave exactly; the ninth arm is a lighter
+    # E=1 tail and is conservatively charged at this wave's maximum time.
     specs = (
-        ("runtime_alpha0_inner1", 0.0, 1),
         ("runtime_alpha0_inner16", 0.0, 16),
-        ("runtime_alpha0p01_inner1", .01, 1),
+        ("runtime_alpha0p001_inner16", .001, 16),
         ("runtime_alpha0p01_inner16", .01, 16),
+        ("runtime_alpha0_inner4", 0.0, 4),
+        ("runtime_alpha0p001_inner4", .001, 4),
+        ("runtime_alpha0p01_inner4", .01, 4),
+        ("runtime_alpha0_inner1", 0.0, 1),
+        ("runtime_alpha0p001_inner1", .001, 1),
     )
+    if len(specs) != len(SCHEDULER_SLOTS):
+        raise AssertionError("runtime gate must saturate every declared scheduler slot")
     def command(outdir, name, alpha, epochs):
         return [
             python, os.path.join(SW.HERE, "sfm_b1_expand.py"),
@@ -248,7 +257,9 @@ def _runtime_gate(args, *, ell, cap, python, source, preflight_sha256):
     directories = [os.path.join(root, name) for name, _, _ in specs]
     logs = SW.run_parallel([
         (slot, command(directory, name, alpha, epochs), f"train_{name}")
-        for slot, directory, (name, alpha, epochs) in zip(FOUR_SLOTS, directories, specs)
+        for slot, directory, (name, alpha, epochs) in zip(
+            SCHEDULER_SLOTS, directories, specs
+        )
     ], os.path.join(root, "logs"))
     methods = []
     for directory in directories:
@@ -266,7 +277,7 @@ def _runtime_gate(args, *, ell, cap, python, source, preflight_sha256):
     baseline_seconds = max(
         float(method["baseline_sanity"]["timers"]["total"]) for method in methods
     )
-    waves = math.ceil(len(arm_grid()) / len(FOUR_SLOTS))
+    waves = math.ceil(len(arm_grid()) / len(SCHEDULER_SLOTS))
     training_seconds = waves * (
         baseline_seconds + int(args.rounds) * train_round_seconds
     )
@@ -286,7 +297,7 @@ def _runtime_gate(args, *, ell, cap, python, source, preflight_sha256):
             None if not stage_seconds else max(stage_seconds, key=stage_seconds.get)
         ),
         benchmark_rounds=RUNTIME_GATE_ROUNDS,
-        arm_count=len(arm_grid()), parallel_slots=list(FOUR_SLOTS),
+        arm_count=len(arm_grid()), parallel_slots=list(SCHEDULER_SLOTS),
         workers_per_arm=ARM_WORKERS, parallel_waves=waves, rounds=int(args.rounds),
         forecast_components=dict(
             training=training_seconds, candidate_screening=candidate_screen_seconds,
@@ -328,8 +339,8 @@ def _load_runtime_forecast(path, *, source, args, preflight_sha256):
     for key, value in expected.items():
         if payload.get(key) != value:
             raise RuntimeError(f"runtime forecast {key} mismatch: {payload.get(key)!r} != {value!r}")
-    if payload.get("parallel_slots") != list(FOUR_SLOTS):
-        raise RuntimeError("runtime forecast was not measured with the four-slot scheduler")
+    if payload.get("parallel_slots") != list(SCHEDULER_SLOTS):
+        raise RuntimeError("runtime forecast was not measured with the eight-slot scheduler")
     forecast_seconds = float(payload.get("forecast_seconds", math.inf))
     current_limit = float(args.max_hours) * 3600.0
     if (not math.isfinite(forecast_seconds) or forecast_seconds > current_limit
@@ -352,7 +363,7 @@ def run(args):
     if not math.isfinite(float(args.max_hours)) or float(args.max_hours) <= 0.0:
         raise ValueError("max-hours must be finite and positive")
     if int(args.workers) != ARM_WORKERS:
-        raise ValueError(f"four-slot scientific sweep requires {ARM_WORKERS} verifier workers per arm")
+        raise ValueError(f"eight-slot scientific sweep requires {ARM_WORKERS} verifier workers per arm")
     if os.path.exists(args.outdir):
         raise FileExistsError(f"refusing existing output root: {args.outdir}")
     _validate_output_root(args.outdir)
@@ -394,7 +405,7 @@ def run(args):
                     "metrics shortlist four checkpoints; disjoint M10 tunes temperature, "
                     "one selected-vector M50 screens, and untouched M100 confirms both the "
                     "locked vector and canonical temperature one"),
-        scheduler=dict(slots=list(FOUR_SLOTS), workers_per_arm=ARM_WORKERS),
+        scheduler=dict(slots=list(SCHEDULER_SLOTS), workers_per_arm=ARM_WORKERS),
         runtime_limit_hours=float(args.max_hours),
     )
     SW.write_json(os.path.join(args.outdir, "recipe.json"), recipe)
@@ -422,7 +433,12 @@ def run(args):
         return payload
 
     training_jobs = []
-    for arm in arms:
+    # Put replay-heavy arms in the saturated wave and leave a light E=1 arm
+    # for the unavoidable ninth-arm tail. This changes scheduling only.
+    training_order = sorted(
+        arms, key=lambda arm: (-int(arm.inner_epochs), abs(float(arm.alpha)), arm.name),
+    )
+    for arm in training_order:
         training_jobs.append(([
             python, os.path.join(SW.HERE, "sfm_b1_expand.py"),
             "--checkpoint", args.checkpoint, "--outdir", os.path.join(args.outdir, "arms", arm.name),
@@ -435,7 +451,7 @@ def run(args):
             "--scene-profile", args.scene_profile,
         ], f"train_{arm.name}"))
     logs = list(runtime_forecast["logs"])
-    logs.extend(_four_slot_waves(training_jobs, os.path.join(args.outdir, "logs")))
+    logs.extend(_slot_waves(training_jobs, os.path.join(args.outdir, "logs")))
 
     rows_by_arm, shortlist = _development_shortlist(
         args.outdir, arms, expected_rounds=args.rounds,
@@ -459,7 +475,7 @@ def run(args):
             "--device", "cuda:0", "--workers", str(ARM_WORKERS),
             "--tune-M", str(args.tune_M), "--screen-M", str(args.screen_M),
         ], f"candidate_{arm.name}_r{int(row['round']):02d}"))
-    logs.extend(_four_slot_waves(evaluation_jobs, os.path.join(args.outdir, "logs")))
+    logs.extend(_slot_waves(evaluation_jobs, os.path.join(args.outdir, "logs")))
 
     candidates, table = [], []
     for arm, _ in shortlist:

@@ -30,6 +30,22 @@ def test_factorial_is_exact_nine_margin_arms():
     assert arms[0].name == "margin_alpha0_inner001"
 
 
+def test_slot_waves_schedule_eight_then_one(monkeypatch, tmp_path):
+    waves = []
+
+    def fake_run_parallel(jobs, logdir):
+        waves.append(list(jobs))
+        return [str(tmp_path / f"{name}.log") for _, _, name in jobs]
+
+    monkeypatch.setattr(S.SW, "run_parallel", fake_run_parallel)
+    jobs = [(["python", f"{index}.py"], f"job{index}") for index in range(9)]
+    logs = S._slot_waves(jobs, tmp_path)
+    assert [len(wave) for wave in waves] == [8, 1]
+    assert [slot for slot, _, _ in waves[0]] == list(S.SCHEDULER_SLOTS)
+    assert waves[1][0][0] == S.SCHEDULER_SLOTS[0]
+    assert len(logs) == 9
+
+
 def test_screening_prefers_metrics_before_update_complexity():
     simple = S.SweepArm(0.0, 1)
     strong = S.SweepArm(.01, 16)
@@ -128,7 +144,7 @@ def test_runtime_forecast_and_logs_must_stay_under_output_root(tmp_path, monkeyp
         status="RUNTIME_GATE_PASS", source_commit="abc",
         checkpoint_sha256=S.SW.sha256_file(checkpoint), preflight_sha256="preflight",
         scene_profile=args.scene_profile, workers_per_arm=S.ARM_WORKERS,
-        arm_count=len(S.arm_grid()), parallel_slots=list(S.FOUR_SLOTS),
+        arm_count=len(S.arm_grid()), parallel_slots=list(S.SCHEDULER_SLOTS),
         rounds=20, benchmark_rounds=S.RUNTIME_GATE_ROUNDS,
         forecast_seconds=5.0 * 3600.0, limit_seconds=6.0 * 3600.0,
         logs=[str(log)],
@@ -138,6 +154,14 @@ def test_runtime_forecast_and_logs_must_stay_under_output_root(tmp_path, monkeyp
     assert S._load_runtime_forecast(
         forecast, source=source, args=args, preflight_sha256="preflight",
     ) == payload
+
+    payload["parallel_slots"] = ["1a", "3a", "1b", "3b"]
+    forecast.write_text(json.dumps(payload))
+    with pytest.raises(RuntimeError, match="eight-slot"):
+        S._load_runtime_forecast(
+            forecast, source=source, args=args, preflight_sha256="preflight",
+        )
+    payload["parallel_slots"] = list(S.SCHEDULER_SLOTS)
 
     outside = tmp_path / "outside.json"
     outside.write_text(json.dumps(payload))

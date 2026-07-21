@@ -32,8 +32,8 @@ GPU_UUIDS = {
     "3": "GPU-b5993142-760d-a6fe-9430-3d0e65203b6d",
 }
 GPU_SLOT_TO_INDEX = {
-    "1": "1", "1a": "1", "1b": "1",
-    "3": "3", "3a": "3", "3b": "3",
+    "1": "1", "1a": "1", "1b": "1", "1c": "1", "1d": "1",
+    "3": "3", "3a": "3", "3b": "3", "3c": "3", "3d": "3",
 }
 
 
@@ -120,8 +120,10 @@ def cpu_pools(cpulist_path=None):
         raise RuntimeError("NUMA-1 does not expose 64 CPUs for disjoint pools")
     return {
         "1": cpus[:32], "3": cpus[32:64],
-        "1a": cpus[:16], "1b": cpus[16:32],
-        "3a": cpus[32:48], "3b": cpus[48:64],
+        "1a": cpus[:8], "1b": cpus[8:16],
+        "1c": cpus[16:24], "1d": cpus[24:32],
+        "3a": cpus[32:40], "3b": cpus[40:48],
+        "3c": cpus[48:56], "3d": cpus[56:64],
     }
 
 
