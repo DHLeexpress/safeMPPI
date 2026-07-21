@@ -31,6 +31,10 @@ GPU_UUIDS = {
     "1": "GPU-50fb5dae-52a8-5843-bc81-b869586dccde",
     "3": "GPU-b5993142-760d-a6fe-9430-3d0e65203b6d",
 }
+GPU_SLOT_TO_INDEX = {
+    "1": "1", "1a": "1", "1b": "1",
+    "3": "3", "3a": "3", "3b": "3",
+}
 
 
 def sha256_file(path):
@@ -101,8 +105,8 @@ def gpu_snapshot():
     )
 
 
-def cpu_pools():
-    path = Path("/sys/devices/system/node/node1/cpulist")
+def cpu_pools(cpulist_path=None):
+    path = Path(cpulist_path or "/sys/devices/system/node/node1/cpulist")
     if not path.exists():
         raise RuntimeError("NUMA node 1 CPU list is unavailable")
     cpus = []
@@ -114,7 +118,18 @@ def cpu_pools():
             cpus.append(int(part))
     if len(cpus) < 64:
         raise RuntimeError("NUMA-1 does not expose 64 CPUs for disjoint pools")
-    return {"1": cpus[:32], "3": cpus[32:64]}
+    return {
+        "1": cpus[:32], "3": cpus[32:64],
+        "1a": cpus[:16], "1b": cpus[16:32],
+        "3a": cpus[32:48], "3b": cpus[48:64],
+    }
+
+
+def gpu_index_for_slot(slot):
+    try:
+        return GPU_SLOT_TO_INDEX[str(slot)]
+    except KeyError as error:
+        raise ValueError(f"unknown GPU/CPU slot {slot!r}") from error
 
 
 def _compact_cpu_list(values):
@@ -305,10 +320,11 @@ def run_parallel(jobs, logdir):
     pools = cpu_pools()
     processes = []
     os.makedirs(logdir, exist_ok=True)
-    for gpu_index, command, name in jobs:
+    for gpu_slot, command, name in jobs:
+        gpu_index = gpu_index_for_slot(gpu_slot)
         log_path = os.path.join(logdir, name + ".log")
         stream = open(log_path, "w")
-        wrapped = ["taskset", "-c", _compact_cpu_list(pools[gpu_index]), *command]
+        wrapped = ["taskset", "-c", _compact_cpu_list(pools[gpu_slot]), *command]
         process = subprocess.Popen(
             wrapped, cwd=ROOT, env=_job_environment(GPU_UUIDS[gpu_index]),
             stdout=stream, stderr=subprocess.STDOUT, text=True,

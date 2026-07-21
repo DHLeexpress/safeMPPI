@@ -1,12 +1,18 @@
 """Batched SFM checkpoint curves with leak-free temperature selection.
 
-This evaluator never filters or changes an action.  For each checkpoint it:
+This evaluator never filters or changes an action.  The full-curve command:
 
 1. jointly selects one latent-noise temperature per gamma on a fixed
    M=10/gamma validation bank;
 2. freezes that seven-temperature vector; and
 3. evaluates both canonical temperature one and the selected vector on
    a disjoint M=50/gamma screening bank.
+
+The candidate command applies the same M=10 temperature-vector selection to
+one checkpoint and evaluates only that locked vector on the disjoint M=50
+bank.  The single-vector confirmation option similarly evaluates exactly one
+predeclared vector on the final M=100 bank, so canonical and tuned policies can
+be launched independently without duplicate rollouts.
 
 Only compact metrics are written.  ``V_safe`` is an episode predicate: the
 executed trajectory must be physically collision/task-space safe and the full
@@ -398,6 +404,19 @@ def summarize(rows: list[dict], seed: int = 0) -> dict:
     return dict(pooled=pooled, per_gamma=per_gamma)
 
 
+def assert_zero_verifier_errors(summary: dict, *, role: str) -> None:
+    """Fail closed before any verifier-tainted metric can affect selection."""
+    cells = [("pooled", summary["pooled"])] + [
+        (str(gamma), summary["per_gamma"][str(gamma)]) for gamma in SP.GAMMAS
+    ]
+    contaminated = {
+        name: int(cell.get("verifier_errors", -1))
+        for name, cell in cells if int(cell.get("verifier_errors", -1)) != 0
+    }
+    if contaminated:
+        raise RuntimeError(f"{role} contains verifier errors: {contaminated}")
+
+
 def _ordering_score(values: list[float | None]) -> tuple[int, float]:
     missing = sum(value is None or not math.isfinite(float(value)) for value in values)
     finite = [None if value is None or not math.isfinite(float(value)) else float(value)
@@ -510,12 +529,14 @@ def _begin_cell(policy, *, checkpoint_sha: str, round_i: int, scene_profile: str
 
 def _finish_cell(cell: dict | _PendingCell) -> dict:
     if isinstance(cell, dict):
+        assert_zero_verifier_errors(cell["summary"], role=cell.get("role", "cached cell"))
         return cell
     validity = [future.result() for future in cell.futures]
     compact = _attach_validity(cell.rows, validity)
     cell.payload["summary"] = summarize(
         compact, seed=int(cell.payload["round"]) * 1000 + int(cell.payload["ep0"]),
     )
+    assert_zero_verifier_errors(cell.payload["summary"], role=cell.payload["role"])
     _write_json(cell.path, cell.payload)
     return cell.payload
 
@@ -728,8 +749,142 @@ def run(args) -> dict:
     return complete
 
 
+def candidate(args) -> dict:
+    """Tune one checkpoint on M10, then screen only the locked vector on M50."""
+    assert_disjoint_banks(args.tune_ep0, args.tune_M, args.screen_ep0, args.screen_M)
+    os.makedirs(args.outdir, exist_ok=False)
+    validation_dir = os.path.join(args.outdir, "validation")
+    screening_dir = os.path.join(args.outdir, "screening")
+    os.makedirs(validation_dir)
+    os.makedirs(screening_dir)
+
+    checkpoint_sha = _sha256_file(args.checkpoint)
+    policy, _ = GPS.load_sfm_policy(args.checkpoint, device=args.device)
+    policy.eval()
+    tune_noise, tune_meta = noise_bank(
+        scene_profile=args.scene_profile, ep0=args.tune_ep0, M=args.tune_M, d=policy.d,
+    )
+    screen_noise, screen_meta = noise_bank(
+        scene_profile=args.scene_profile, ep0=args.screen_ep0, M=args.screen_M, d=policy.d,
+    )
+    validation_summaries = {}
+    validation_cells = {}
+    context = mp.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=int(args.workers), mp_context=context) as executor:
+        pending_validation = {}
+        for temperature in TEMPERATURES:
+            tag = str(temperature).replace(".", "p")
+            pending_validation[temperature] = _begin_cell(
+                policy, checkpoint_sha=checkpoint_sha, round_i=args.round,
+                scene_profile=args.scene_profile, ep0=args.tune_ep0, M=args.tune_M,
+                noise=tune_noise, noise_meta=tune_meta, temperature=temperature,
+                role="candidate_temperature_validation", device=args.device, executor=executor,
+                path=os.path.join(validation_dir, f"t{tag}.json"),
+            )
+        selection_input = {}
+        for temperature in TEMPERATURES:
+            cell = _finish_cell(pending_validation[temperature])
+            selection_input[float(temperature)] = cell["summary"]
+            validation_summaries[str(temperature)] = cell["summary"]
+            validation_cells[str(temperature)] = cell["cell_key"]
+        chosen, selection_key = select_temperature_vector(selection_input)
+        screening = _finish_cell(_begin_cell(
+            policy, checkpoint_sha=checkpoint_sha, round_i=args.round,
+            scene_profile=args.scene_profile, ep0=args.screen_ep0, M=args.screen_M,
+            noise=screen_noise, noise_meta=screen_meta, temperature=chosen,
+            role="candidate_selected_temperature_screening", device=args.device,
+            executor=executor, path=os.path.join(screening_dir, "selected_temperature.json"),
+        ))
+
+    record = dict(
+        mode="candidate_selected_temperature", round=int(args.round),
+        temperature_by_gamma=chosen, summary=screening["summary"],
+    )
+    metrics_path = os.path.join(args.outdir, "metrics.jsonl")
+    with open(metrics_path + ".tmp", "w") as stream:
+        stream.write(json.dumps(record, allow_nan=False) + "\n")
+    os.replace(metrics_path + ".tmp", metrics_path)
+    artifacts = {}
+    for path in sorted(Path(args.outdir).rglob("*")):
+        if path.is_file() and path.name != "COMPLETE.json":
+            artifacts[str(path.relative_to(args.outdir))] = _sha256_file(path)
+    complete = dict(
+        status="SFM_B1_CANDIDATE_SCREEN_COMPLETE", version=VERSION,
+        evaluator_sha256=_sha256_file(__file__), round=int(args.round),
+        checkpoint=os.path.abspath(args.checkpoint), checkpoint_sha256=checkpoint_sha,
+        environment=SS.scene_profile(args.scene_profile),
+        temperature_by_gamma=chosen, selection_key=selection_key,
+        validation=dict(
+            bank=tune_meta, grid=list(TEMPERATURES), summaries=validation_summaries,
+            cells=validation_cells,
+        ),
+        screening=dict(
+            mode="candidate_selected_temperature", bank=screen_meta,
+            cell_key=screening["cell_key"], summary=screening["summary"],
+        ),
+        no_test_leakage=("temperature vector selected only on disjoint M10 validation; "
+                         "the locked vector alone was evaluated on M50 screening"),
+        canonical_screening_run=False, no_trajectory_artifacts=True,
+        verifier=SM.verifier_manifest(), artifact_sha256=artifacts,
+    )
+    _write_json(os.path.join(args.outdir, "COMPLETE.json"), complete)
+    return complete
+
+
+def confirm_single(args) -> dict:
+    """Evaluate exactly one supplied temperature vector on the final M100 bank."""
+    assert_final_confirmation_bank(args.ep0, args.M)
+    selected_temperatures = temperature_vector(
+        json.loads(args.temperature_by_gamma)
+        if args.temperature_by_gamma is not None else args.temperature
+    )
+    os.makedirs(args.outdir, exist_ok=False)
+    checkpoint_sha = _sha256_file(args.checkpoint)
+    policy, _ = GPS.load_sfm_policy(args.checkpoint, device=args.device)
+    policy.eval()
+    noise, noise_meta = noise_bank(
+        scene_profile=args.scene_profile, ep0=args.ep0, M=args.M, d=policy.d,
+    )
+    context = mp.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=int(args.workers), mp_context=context) as executor:
+        cell = _finish_cell(_begin_cell(
+            policy, checkpoint_sha=checkpoint_sha, round_i=args.round,
+            scene_profile=args.scene_profile, ep0=args.ep0, M=args.M,
+            noise=noise, noise_meta=noise_meta, temperature=selected_temperatures,
+            role="final_confirmation_single_temperature", device=args.device,
+            executor=executor, path=os.path.join(args.outdir, "single_temperature.json"),
+        ))
+    record = dict(
+        mode="single_temperature_confirmation", round=int(args.round),
+        temperature_by_gamma=selected_temperatures, summary=cell["summary"],
+    )
+    metrics_path = os.path.join(args.outdir, "metrics.jsonl")
+    with open(metrics_path + ".tmp", "w") as stream:
+        stream.write(json.dumps(record, allow_nan=False) + "\n")
+    os.replace(metrics_path + ".tmp", metrics_path)
+    artifacts = {
+        path.name: _sha256_file(path)
+        for path in sorted(Path(args.outdir).iterdir())
+        if path.is_file() and path.name != "COMPLETE.json"
+    }
+    complete = dict(
+        status="SFM_B1_SINGLE_CONFIRMATION_COMPLETE", version=VERSION,
+        evaluator_sha256=_sha256_file(__file__), round=int(args.round),
+        checkpoint=os.path.abspath(args.checkpoint), checkpoint_sha256=checkpoint_sha,
+        temperature_by_gamma=selected_temperatures, summary=cell["summary"],
+        environment=SS.scene_profile(args.scene_profile), bank=noise_meta,
+        selection_frozen_before_confirmation=True, single_vector_only=True,
+        verifier=SM.verifier_manifest(), no_trajectory_artifacts=True,
+        artifact_sha256=artifacts,
+    )
+    _write_json(os.path.join(args.outdir, "COMPLETE.json"), complete)
+    return complete
+
+
 def confirm(args) -> dict:
     """One disjoint M100 confirmation after arm/round/temperature-vector selection."""
+    if getattr(args, "single_vector_only", False):
+        return confirm_single(args)
     assert_final_confirmation_bank(args.ep0, args.M)
     selected_temperatures = temperature_vector(
         json.loads(args.temperature_by_gamma)
@@ -797,6 +952,19 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--tune-M", type=int, default=TUNE_M)
     command.add_argument("--screen-ep0", type=int, default=SCREEN_EP0)
     command.add_argument("--screen-M", type=int, default=SCREEN_M)
+    candidate_command = sub.add_parser("candidate")
+    candidate_command.add_argument("--checkpoint", required=True)
+    candidate_command.add_argument("--round", type=int, required=True)
+    candidate_command.add_argument(
+        "--scene-profile", required=True, choices=SS.SCIENTIFIC_EVAL_PROFILES,
+    )
+    candidate_command.add_argument("--outdir", required=True)
+    candidate_command.add_argument("--device", default="cuda:0")
+    candidate_command.add_argument("--workers", type=int, default=32)
+    candidate_command.add_argument("--tune-ep0", type=int, default=TUNE_EP0)
+    candidate_command.add_argument("--tune-M", type=int, default=TUNE_M)
+    candidate_command.add_argument("--screen-ep0", type=int, default=SCREEN_EP0)
+    candidate_command.add_argument("--screen-M", type=int, default=SCREEN_M)
     confirmation = sub.add_parser("confirm")
     confirmation.add_argument("--checkpoint", required=True)
     confirmation.add_argument("--round", type=int, required=True)
@@ -812,6 +980,10 @@ def build_parser() -> argparse.ArgumentParser:
     confirmation.add_argument("--workers", type=int, default=32)
     confirmation.add_argument("--ep0", type=int, default=SP.FINAL_CONFIRM_EP0)
     confirmation.add_argument("--M", type=int, default=100)
+    confirmation.add_argument(
+        "--single-vector-only", action="store_true",
+        help="evaluate only the supplied vector, without a canonical-temperature companion",
+    )
     return parser
 
 
@@ -819,6 +991,8 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.command == "run":
         run(args)
+    elif args.command == "candidate":
+        candidate(args)
     elif args.command == "confirm":
         confirm(args)
 

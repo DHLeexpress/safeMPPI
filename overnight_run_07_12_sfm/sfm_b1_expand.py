@@ -442,12 +442,14 @@ def _run_sanity(policy, cfg, *, round_i, device, executor, noise, noise_meta, ou
         future.result() for future in CE._submit_v_safe(rows, executor)
     ])
     certificate_seconds = time.perf_counter() - certificate_start
+    summary = CE.summarize(rows, seed=cfg.seed + int(round_i) * 31)
+    CE.assert_zero_verifier_errors(summary, role=f"round-{int(round_i)} sanity")
     payload = dict(
         status="SFM_B1_ROUND_SANITY_COMPLETE", round=int(round_i),
         role="development_monitor_only", temperature_by_gamma={
             str(gamma): 1.0 for gamma in SP.GAMMAS
         },
-        bank=noise_meta, summary=CE.summarize(rows, seed=cfg.seed + int(round_i) * 31),
+        bank=noise_meta, summary=summary,
         timers=dict(
             gpu_policy_rollout=rollout_seconds,
             full_H10_certificate_wait=certificate_seconds,
@@ -522,6 +524,10 @@ def run_arm(checkpoint, outdir, cfg, *, ell, cap, device):
                 raise RuntimeError("B1 macro-round must contain exactly 56 independent episodes")
             policy.eval()
             phi_policy = copy.deepcopy(policy).eval()
+            if getattr(phi_policy, "gru", None) is not None:
+                # deepcopy breaks cuDNN's packed GRU storage; repack without
+                # changing any parameter or numerical policy output.
+                phi_policy.gru.flatten_parameters()
             for parameter in phi_policy.parameters():
                 parameter.requires_grad_(False)
             gp, gp_ids = gp_from_recent(

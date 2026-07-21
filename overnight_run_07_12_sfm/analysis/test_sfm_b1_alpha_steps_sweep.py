@@ -8,6 +8,7 @@ import sfm_b1_alpha_steps_sweep as S
 def _cell(value):
     return dict(
         n=50, SR=1-value, CR=value, V_safe=1-value, timeout=0.0,
+        verifier_errors=0,
         successful_clearance=dict(mean=.2), successful_time_to_goal=dict(mean=8.0),
     )
 
@@ -76,3 +77,86 @@ def test_output_root_is_fail_closed_and_symlink_safe(tmp_path, monkeypatch):
         S._validate_output_root(root)
     with pytest.raises(ValueError, match="fresh directory"):
         S._validate_output_root(tmp_path / "elsewhere")
+
+
+def test_development_shortlist_keeps_best_per_alpha_plus_best_remaining(tmp_path):
+    arms = S.arm_grid()
+    # E=1 wins within every alpha; alpha=0/E=4 is the best remaining arm.
+    arm_values = {
+        arm: (.10 + arm.alpha + {1: 0.0, 4: .01, 16: .03}[arm.inner_epochs])
+        for arm in arms
+    }
+    temperatures = {str(gamma): 1.0 for gamma in S.CE.SP.GAMMAS}
+    for arm in arms:
+        directory = tmp_path / "arms" / arm.name
+        directory.mkdir(parents=True)
+        baseline = dict(
+            round=0, temperature_by_gamma=temperatures,
+            summary=_record(arm_values[arm] + .2)["summary"],
+        )
+        adapted = dict(
+            round=1, temperature_by_gamma=temperatures,
+            summary=_record(arm_values[arm])["summary"],
+        )
+        (directory / "method_manifest.json").write_text(json.dumps(dict(
+            status="ARM_COMPLETE", rounds=1,
+            baseline_sanity=baseline, history=[dict(sanity=adapted)],
+        )))
+    _, shortlist = S._development_shortlist(tmp_path, arms, expected_rounds=1)
+    selected = [arm for arm, _ in shortlist]
+    assert len(selected) == len(set(selected)) == 4
+    assert {(arm.alpha, arm.inner_epochs) for arm in selected[:3]} == {
+        (alpha, 1) for alpha in S.ALPHAS
+    }
+    assert (selected[3].alpha, selected[3].inner_epochs) == (0.0, 4)
+
+
+def test_runtime_forecast_and_logs_must_stay_under_output_root(tmp_path, monkeypatch):
+    root = tmp_path / "research1"
+    root.mkdir()
+    monkeypatch.setattr(S, "OUTPUT_ROOT", str(root))
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    log = root / "gate.log"
+    log.write_text("complete")
+    source = dict(commit="abc")
+    args = type("Args", (), dict(
+        checkpoint=str(checkpoint), scene_profile="double_density_velocity_ood",
+        rounds=20, max_hours=6.0,
+    ))()
+    payload = dict(
+        status="RUNTIME_GATE_PASS", source_commit="abc",
+        checkpoint_sha256=S.SW.sha256_file(checkpoint), preflight_sha256="preflight",
+        scene_profile=args.scene_profile, workers_per_arm=S.ARM_WORKERS,
+        arm_count=len(S.arm_grid()), parallel_slots=list(S.FOUR_SLOTS),
+        rounds=20, benchmark_rounds=S.RUNTIME_GATE_ROUNDS,
+        forecast_seconds=5.0 * 3600.0, limit_seconds=6.0 * 3600.0,
+        logs=[str(log)],
+    )
+    forecast = root / "forecast.json"
+    forecast.write_text(json.dumps(payload))
+    assert S._load_runtime_forecast(
+        forecast, source=source, args=args, preflight_sha256="preflight",
+    ) == payload
+
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps(payload))
+    with pytest.raises(RuntimeError, match="stored under"):
+        S._load_runtime_forecast(
+            outside, source=source, args=args, preflight_sha256="preflight",
+        )
+
+    payload["logs"] = [str(tmp_path / "missing.log")]
+    forecast.write_text(json.dumps(payload))
+    with pytest.raises(RuntimeError, match="log must exist"):
+        S._load_runtime_forecast(
+            forecast, source=source, args=args, preflight_sha256="preflight",
+        )
+
+    payload["logs"] = [str(log)]
+    payload["forecast_seconds"] = 7.0 * 3600.0
+    forecast.write_text(json.dumps(payload))
+    with pytest.raises(RuntimeError, match="current time limit"):
+        S._load_runtime_forecast(
+            forecast, source=source, args=args, preflight_sha256="preflight",
+        )

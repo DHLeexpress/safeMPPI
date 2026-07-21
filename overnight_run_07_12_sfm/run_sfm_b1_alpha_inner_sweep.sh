@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -lt 4 ]]; then
-  echo "usage: $0 CHECKPOINT PREFLIGHT PREFLIGHT_SHA256 RUN_NAME [--runtime-gate-only]" >&2
+  echo "usage: $0 CHECKPOINT PREFLIGHT PREFLIGHT_SHA256 RUN_NAME [--runtime-gate-only | --runtime-forecast PATH]" >&2
   exit 2
 fi
 
@@ -16,8 +16,16 @@ if [[ ! $RUN_NAME =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
   echo "RUN_NAME must be one path-safe component" >&2
   exit 2
 fi
-if [[ $# -gt 1 || ( $# -eq 1 && $1 != "--runtime-gate-only" ) ]]; then
-  echo "only the optional --runtime-gate-only flag is accepted" >&2
+if [[ $# -eq 1 && $1 != "--runtime-gate-only" ]]; then
+  echo "one trailing argument must be --runtime-gate-only" >&2
+  exit 2
+fi
+if [[ $# -eq 2 && $1 != "--runtime-forecast" ]]; then
+  echo "two trailing arguments must be --runtime-forecast PATH" >&2
+  exit 2
+fi
+if [[ $# -gt 2 ]]; then
+  echo "too many trailing arguments" >&2
   exit 2
 fi
 
@@ -40,7 +48,7 @@ fi
   --scene-profile double_density_velocity_ood \
   --outdir "$OUTDIR" \
   --rounds 20 \
-  --workers 32 \
+  --workers 16 \
   --tune-M 10 \
   --screen-M 50 \
   --confirm-M 100 \

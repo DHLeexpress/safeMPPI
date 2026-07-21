@@ -78,6 +78,15 @@ and varies \(\alpha\in\{0,10^{-3},10^{-2}\}\) and complete replay epochs
 The original gamma -> (round, episode) -> context -> query mass is retained
 across the 16 chunks rather than being renormalized independently per chunk.
 
+On Helios, the sweep scheduler exposes four process slots: `1a` and `1b` on
+physical GPU 1, and `3a` and `3b` on physical GPU 3. Thus two independent arm
+processes share each GPU; every process receives 16 disjoint verifier CPU
+workers. Before any scientific sweep, a fail-closed three-round runtime gate
+runs four extreme alpha/epoch configurations under this exact scheduler. The
+gate authenticates the source, checkpoint, preflight, scene, GPU assignment,
+GP cap/quota behavior, and measured wall-time forecast before later jobs are
+admitted.
+
 ## Honest selection of the existing checkpoint
 
 Arm A round 10 remains the selected checkpoint because it won the declared,
@@ -92,6 +101,25 @@ Raw evaluation means temperature one, NFE 8, one generated window per context,
 and execution of its first action.  It uses no RBF uncertainty, verifier,
 SafeMPPI selector, or fallback.  Kazuki is separately named because it adds goal
 and safety guidance plus MPPI refinement.
+
+The current alpha-by-replay-epoch study uses the following leak-separated
+selection sequence:
+
+1. Every arm receives canonical raw temperature-one M10/gamma evaluation at
+   every round. These records are development monitoring, not confirmation.
+2. The development records nominate four checkpoints: the best checkpoint for
+   each of the three alpha values, plus the best distinct remaining candidate.
+3. For each shortlisted checkpoint, a disjoint M10/gamma bank selects and locks
+   one seven-gamma temperature vector. Only that locked vector receives one
+   M50/gamma screening evaluation.
+4. The winning arm, round, and temperature vector are frozen from the M50
+   screen. An untouched M100/gamma bank then performs the paired final
+   confirmation: canonical temperature one and the locked temperature vector.
+
+No exhaustive post-hoc rerun of every checkpoint is part of this protocol.
+Every Helios artifact produced by the study--including logs, checkpoints,
+metrics, manifests, figures, and videos--must be rooted under
+`/data3/research1`; the source worktree contains code only.
 
 `sfm_b1_deploy_driver.py` performs:
 

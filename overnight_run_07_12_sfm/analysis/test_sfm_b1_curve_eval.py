@@ -1,4 +1,5 @@
 import copy
+import json
 
 import numpy as np
 import pytest
@@ -10,6 +11,7 @@ import sfm_b1_curve_eval as C
 def _cell(*, cr=.2, v_safe=.4, sr=.7, timeout=.1, clearance=.3, time=8.0):
     return dict(
         n=10, CR=cr, V_safe=v_safe, SR=sr, timeout=timeout,
+        verifier_errors=0,
         successful_clearance=dict(mean=clearance),
         successful_time_to_goal=dict(mean=time),
     )
@@ -29,6 +31,15 @@ def test_banks_must_be_disjoint_and_nonempty():
     C.assert_final_confirmation_bank(C.SP.FINAL_CONFIRM_EP0, 100)
     with pytest.raises(ValueError):
         C.assert_final_confirmation_bank(C.SCREEN_EP0, 100)
+
+
+def test_verifier_errors_abort_before_selection():
+    clean = _summary()
+    C.assert_zero_verifier_errors(clean, role="test")
+    contaminated = copy.deepcopy(clean)
+    contaminated["per_gamma"]["0.1"]["verifier_errors"] = 1
+    with pytest.raises(RuntimeError, match="verifier errors"):
+        C.assert_zero_verifier_errors(contaminated, role="test")
 
 
 def test_temperature_vector_ties_prefer_one_and_can_differ_by_gamma():
@@ -207,6 +218,105 @@ def test_cli_matches_sweep_orchestration_contract():
         "--scene-profile", "double_density_velocity_ood", "--outdir", "z",
     ])
     assert vector.temperature_by_gamma.startswith("{")
+    candidate = C.build_parser().parse_args([
+        "candidate", "--checkpoint", "r.pt", "--round", "7",
+        "--scene-profile", "double_density_velocity_ood", "--outdir", "z",
+    ])
+    assert candidate.command == "candidate"
+    assert candidate.tune_M == 10 and candidate.screen_M == 50
+    single = C.build_parser().parse_args([
+        "confirm", "--checkpoint", "r.pt", "--round", "7", "--temperature", "1",
+        "--single-vector-only", "--scene-profile", "double_density_velocity_ood",
+        "--outdir", "z",
+    ])
+    assert single.single_vector_only
+
+
+class _ImmediateExecutor:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def _patch_compact_evaluation(monkeypatch, calls):
+    monkeypatch.setattr(C, "ProcessPoolExecutor", _ImmediateExecutor)
+    monkeypatch.setattr(C.GPS, "load_sfm_policy", lambda *args, **kwargs: (_FakePolicy(), {}))
+    monkeypatch.setattr(
+        C, "noise_bank",
+        lambda **kwargs: (
+            np.zeros((1,), np.float32),
+            dict(ep0=kwargs["ep0"], M=kwargs["M"], sha256=f'{kwargs["ep0"]}-{kwargs["M"]}'),
+        ),
+    )
+
+    def begin(policy, **kwargs):
+        calls.append(dict(kwargs))
+        temperature = C.temperature_vector(kwargs["temperature"])
+        return dict(
+            cell_key=f"cell-{len(calls)}", temperature_by_gamma=temperature,
+            summary=_summary(),
+        )
+
+    monkeypatch.setattr(C, "_begin_cell", begin)
+
+
+def test_candidate_tunes_m10_then_runs_only_selected_m50(monkeypatch, tmp_path):
+    calls = []
+    _patch_compact_evaluation(monkeypatch, calls)
+    checkpoint = tmp_path / "round_07.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    outdir = tmp_path / "candidate"
+    args = C.build_parser().parse_args([
+        "candidate", "--checkpoint", str(checkpoint), "--round", "7",
+        "--scene-profile", "double_density_velocity_ood", "--outdir", str(outdir),
+        "--device", "cpu", "--workers", "1",
+    ])
+    complete = C.candidate(args)
+    assert complete["status"] == "SFM_B1_CANDIDATE_SCREEN_COMPLETE"
+    assert complete["round"] == 7
+    assert complete["checkpoint"] == str(checkpoint.resolve())
+    assert len([call for call in calls if call["M"] == C.TUNE_M]) == len(C.TEMPERATURES)
+    screens = [call for call in calls if call["M"] == C.SCREEN_M]
+    assert len(screens) == 1
+    assert screens[0]["role"] == "candidate_selected_temperature_screening"
+    assert not any("canonical" in call["role"] for call in calls)
+    records = [json.loads(line) for line in (outdir / "metrics.jsonl").read_text().splitlines()]
+    assert records == [dict(
+        mode="candidate_selected_temperature", round=7,
+        temperature_by_gamma=C.temperature_vector(1.0), summary=_summary(),
+    )]
+
+
+def test_single_confirmation_runs_only_supplied_vector(monkeypatch, tmp_path):
+    calls = []
+    _patch_compact_evaluation(monkeypatch, calls)
+    checkpoint = tmp_path / "round_07.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    outdir = tmp_path / "confirm"
+    vector = C.temperature_vector(1.0)
+    vector["0.1"] = .9
+    args = C.build_parser().parse_args([
+        "confirm", "--checkpoint", str(checkpoint), "--round", "7",
+        "--temperature-by-gamma", json.dumps(vector), "--single-vector-only",
+        "--scene-profile", "double_density_velocity_ood", "--outdir", str(outdir),
+        "--device", "cpu", "--workers", "1",
+    ])
+    complete = C.confirm(args)
+    assert complete["status"] == "SFM_B1_SINGLE_CONFIRMATION_COMPLETE"
+    assert complete["round"] == 7
+    assert complete["temperature_by_gamma"] == vector
+    assert complete["summary"] == _summary()
+    assert len(calls) == 1
+    assert calls[0]["role"] == "final_confirmation_single_temperature"
+    assert calls[0]["temperature"] == vector
+    records = [json.loads(line) for line in (outdir / "metrics.jsonl").read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["mode"] == "single_temperature_confirmation"
 
 
 def test_pooled_intervals_cluster_the_shared_episode_across_gamma():
