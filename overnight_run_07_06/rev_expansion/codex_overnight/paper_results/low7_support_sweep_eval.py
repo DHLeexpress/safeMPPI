@@ -77,6 +77,7 @@ B1_HOLDOUT_PROFILE = EV.EvaluationProfile(
 )
 SCENE = "low7_radius1_canonical_v1"
 COARSE_ROUNDS = (0, *range(5, 101, 5))
+B1_STUDIES = {"b1", "b1_margin50"}
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -107,7 +108,7 @@ def holdout_noise_bank(
     bank = generator.standard_normal(
         (len(EV.GAMMAS), profile.m, EV.T, int(policy_dim)), dtype=np.float32
     )
-    screen_profile = B1_SCREEN_PROFILE if study == "b1" else SCREEN_PROFILE
+    screen_profile = B1_SCREEN_PROFILE if study in B1_STUDIES else SCREEN_PROFILE
     screen, screen_meta = EV.build_noise_bank(scene_profile, policy_dim, screen_profile)
     if seed == int(screen_meta["seed"]):
         raise RuntimeError("M50 holdout and M10 screening resolved to the same master seed")
@@ -489,7 +490,9 @@ def main():
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--outdir", type=Path, required=True)
     parser.add_argument("--mode", choices=("screen", "holdout"), required=True)
-    parser.add_argument("--study", choices=("support", "b1"), default="support")
+    parser.add_argument(
+        "--study", choices=("support", "b1", "b1_margin50"), default="support"
+    )
     parser.add_argument("--selected-round", type=int)
     parser.add_argument("--reference-r0-evaluation", type=Path)
     parser.add_argument("--verifier-workers", type=int, required=True)
@@ -498,21 +501,21 @@ def main():
         raise FileExistsError(f"support evaluation output must be absent: {args.outdir}")
     profile = (
         (B1_SCREEN_PROFILE if args.mode == "screen" else B1_HOLDOUT_PROFILE)
-        if args.study == "b1"
+        if args.study in B1_STUDIES
         else (SCREEN_PROFILE if args.mode == "screen" else HOLDOUT_PROFILE)
     )
     contract = EV.validate_completed_run(
         args.run_root, SCENE, EV.V2_SMOKE_EVAL_PROFILE
     )
-    expected_algorithm = (
-        "afe_rbf_low7_b1_balanced_r0_sweep_v1"
-        if args.study == "b1"
-        else "afe_rbf_low7_v3_optimizer_demo_support_v1"
-    )
+    expected_algorithm = {
+        "support": "afe_rbf_low7_v3_optimizer_demo_support_v1",
+        "b1": "afe_rbf_low7_b1_balanced_r0_sweep_v1",
+        "b1_margin50": "afe_rbf_low7_b1_balanced_r0_margin50_v1",
+    }[args.study]
     if contract["algorithm"] != expected_algorithm:
         raise RuntimeError(f"{args.study} evaluator received the wrong trainer algorithm")
     final_round = int(contract["completed_round"])
-    expected_final = 20 if args.study == "b1" else 100
+    expected_final = {"support": 100, "b1": 20, "b1_margin50": 50}[args.study]
     if final_round != expected_final:
         raise RuntimeError(
             f"{args.study} evaluator expected r{expected_final}, got r{final_round}"
@@ -526,7 +529,7 @@ def main():
         bank, bank_meta = EV.build_noise_bank(SCENE, int(policy0.d), profile)
         rounds = (
             list(range(final_round + 1))
-            if args.study == "b1" else list(COARSE_ROUNDS)
+            if args.study in B1_STUDIES else list(COARSE_ROUNDS)
         )
     else:
         if args.selected_round is None or not 0 <= args.selected_round <= final_round:

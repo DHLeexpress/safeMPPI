@@ -84,7 +84,7 @@ def test_v2_lineage_mass_smoke_locks_weighting_execution_and_nvp_audit() -> None
             RBF.validate_protocol_args(args)
 
 
-@pytest.mark.parametrize("gp_cap", [512, 1024])
+@pytest.mark.parametrize("gp_cap", [512, 768])
 @pytest.mark.parametrize("ess_target", [0.25, 0.5])
 @pytest.mark.parametrize("alpha", [0.0, 0.001, 0.01])
 @pytest.mark.parametrize(
@@ -103,6 +103,7 @@ def test_b1_balanced_sweep_accepts_only_declared_scientific_arms(
         adaptive_ess_target=ess_target,
         negative_alpha=alpha,
         balanced_r0_delivery="qualified.json",
+        conditioning_schema=CX.LOW7_TIE_SCHEMA,
     ))
 
 
@@ -124,12 +125,47 @@ def test_b1_balanced_sweep_rejects_undeclared_variants(name, value) -> None:
         execution_rule=RBF.EX.MAX_STEP_MARGIN,
         nvp_audit_all_k=True,
         balanced_r0_delivery="qualified.json",
+        conditioning_schema=CX.LOW7_TIE_SCHEMA,
     )
     setattr(args, name, value)
     with pytest.raises(ValueError, match=("B1" if name in {
         "gp_cap", "adaptive_ess_target", "negative_alpha", "execution_rule"
     } else name)):
         RBF.validate_protocol_args(args)
+
+
+def test_b1_margin50_changes_only_rounds_and_execution_law() -> None:
+    RBF.validate_protocol_args(_v2_args(
+        protocol_profile="b1_balanced_r0_margin50",
+        rounds=50,
+        replay_loss_weighting="gamma_episode_context_query_equal_mass",
+        execution_rule=RBF.EX.MAX_STEP_MARGIN,
+        nvp_audit_all_k=True,
+        gp_cap=512,
+        adaptive_ess_target=0.25,
+        negative_alpha=0.01,
+        balanced_r0_delivery="qualified.json",
+        conditioning_schema=CX.LOW7_TIE_SCHEMA,
+    ))
+    for name, value in (
+        ("rounds", 20),
+        ("execution_rule", RBF.EX.SAFEMPPI_COST),
+    ):
+        args = _v2_args(
+            protocol_profile="b1_balanced_r0_margin50",
+            rounds=50,
+            replay_loss_weighting="gamma_episode_context_query_equal_mass",
+            execution_rule=RBF.EX.MAX_STEP_MARGIN,
+            nvp_audit_all_k=True,
+            gp_cap=512,
+            adaptive_ess_target=0.25,
+            negative_alpha=0.01,
+            balanced_r0_delivery="qualified.json",
+            conditioning_schema=CX.LOW7_TIE_SCHEMA,
+        )
+        setattr(args, name, value)
+        with pytest.raises(ValueError, match=name if name == "rounds" else "margin50"):
+            RBF.validate_protocol_args(args)
 
 
 @pytest.mark.parametrize(

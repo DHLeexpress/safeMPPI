@@ -1414,6 +1414,8 @@ def run(policy, env, cfg, device, outdir, checkpoint_path, checkpoint_sha256,
 
         if cfg.protocol_profile in {"v3_support_sweep", "v3_support_preflight"}:
             algorithm = "afe_rbf_low7_v3_optimizer_demo_support_v1"
+        elif cfg.protocol_profile == "b1_balanced_r0_margin50":
+            algorithm = "afe_rbf_low7_b1_balanced_r0_margin50_v1"
         elif cfg.protocol_profile in {
             "b1_balanced_r0_sweep", "b1_balanced_r0_preflight"
         }:
@@ -2092,13 +2094,15 @@ def validate_protocol_args(args) -> None:
         "v3_support_sweep", "v3_support_preflight"
     }
     b1_balanced_sweep = args.protocol_profile in {
-        "b1_balanced_r0_sweep", "b1_balanced_r0_preflight"
+        "b1_balanced_r0_sweep", "b1_balanced_r0_preflight",
+        "b1_balanced_r0_margin50",
     }
     if args.protocol_profile not in {
         "v2_smoke", "v2_lineage_mass_smoke",
         "v3_support_sweep", "v3_support_preflight",
         "b1_balanced_r0_sweep",
         "b1_balanced_r0_preflight",
+        "b1_balanced_r0_margin50",
     }:
         raise ValueError(f"unknown RBF protocol profile: {args.protocol_profile}")
 
@@ -2108,6 +2112,7 @@ def validate_protocol_args(args) -> None:
             1 if args.protocol_profile == "v3_support_preflight"
             else 100 if args.protocol_profile == "v3_support_sweep"
             else 1 if args.protocol_profile == "b1_balanced_r0_preflight"
+            else 50 if args.protocol_profile == "b1_balanced_r0_margin50"
             else 20 if b1_balanced_sweep
             else 10
         ),
@@ -2144,6 +2149,8 @@ def validate_protocol_args(args) -> None:
             if args.protocol_profile in {
                 "v2_lineage_mass_smoke", "v3_support_sweep", "v3_support_preflight"
             }
+            else "nominal_hp_max_step_margin"
+            if args.protocol_profile == "b1_balanced_r0_margin50"
             else args.execution_rule if b1_balanced_sweep
             else "nominal_hp_max_step_margin_only"
         ),
@@ -2173,6 +2180,11 @@ def validate_protocol_args(args) -> None:
             raise ValueError("B1 balanced sweep alpha must be 0, 0.001, or 0.01")
         if args.execution_rule not in {EX.MAX_STEP_MARGIN, EX.SAFEMPPI_COST}:
             raise ValueError("B1 balanced sweep execution rule is undeclared")
+        if (
+            args.protocol_profile == "b1_balanced_r0_margin50"
+            and args.execution_rule != EX.MAX_STEP_MARGIN
+        ):
+            raise ValueError("B1 margin50 requires nominal-Hp max-step-margin execution")
         exact.update({
             "replay_loss_weighting": "gamma_episode_context_query_equal_mass",
             "execution_rule": args.execution_rule,
@@ -2215,6 +2227,7 @@ def main():
             "v3_support_sweep", "v3_support_preflight",
             "b1_balanced_r0_sweep",
             "b1_balanced_r0_preflight",
+            "b1_balanced_r0_margin50",
         ),
         default="v1",
     )
@@ -2383,7 +2396,8 @@ def main():
         )
     )
     if args.protocol_profile in {
-        "b1_balanced_r0_sweep", "b1_balanced_r0_preflight"
+        "b1_balanced_r0_sweep", "b1_balanced_r0_preflight",
+        "b1_balanced_r0_margin50",
     }:
         if checkpoint_contract.get("reflection_paired_pretraining") is not True:
             raise RuntimeError("B1 balanced profiles require reflection-paired pretraining")
@@ -2413,7 +2427,8 @@ def main():
         expected_low7_schema = (
             CX.LOW7_TIE_SCHEMA
             if args.protocol_profile in {
-                "b1_balanced_r0_sweep", "b1_balanced_r0_preflight"
+                "b1_balanced_r0_sweep", "b1_balanced_r0_preflight",
+                "b1_balanced_r0_margin50",
             }
             else CX.LOW7_SCHEMA
         )
