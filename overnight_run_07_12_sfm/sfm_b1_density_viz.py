@@ -529,8 +529,8 @@ def draw_method_panel(axis, method, run, gamma, step, *, verifier_result=None,
             raise ValueError("SafeMPPI expert trace must carry one H=10 reward-weighted sequence")
         if trace.get("sequence_kind") != "reward_weighted_mean":
             raise ValueError("SafeMPPI expert trace does not identify the executed MPPI mean sequence")
-        # ``action`` and ``mean_sequence[0]`` leave the planner through two
-        # float32 device-to-host paths.  They may differ by one float32 ULP
+        # ``action`` and ``mean_sequence[0]`` are formed by two mathematically
+        # equivalent float32 reductions.  They may differ by one float32 ULP
         # even though they are the same reward-weighted MPPI control.
         action_atol = 8.0 * np.finfo(np.float32).eps
         if not np.allclose(np.asarray(trace["action"], float), controls[0],
