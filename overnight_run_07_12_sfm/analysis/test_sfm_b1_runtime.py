@@ -70,19 +70,32 @@ def test_raw_support_is_counted_without_render_trace(monkeypatch):
 
 def test_scene_profiles_make_training_shift_explicit():
     training = SS.scene_profile("training")
+    matched_id = SS.scene_profile("matched_id")
     requested_id = SS.scene_profile("id")
     density_ood = SS.scene_profile("density_ood")
     requested_ood = SS.scene_profile("requested_ood")
+    double_ood = SS.scene_profile("double_density_velocity_ood")
     legacy = SS.scene_profile("legacy_velocity_ood")
     assert (training["n_ped"], training["ped_speed_range"]) == (20, [.5, 1.0])
+    assert (matched_id["n_ped"], matched_id["ped_speed_range"]) == (20, [.5, 1.0])
     assert (requested_id["n_ped"], requested_id["ped_speed_range"]) == (10, [.5, 1.0])
     assert (density_ood["n_ped"], density_ood["ped_speed_range"]) == (50, [.5, 1.0])
     assert (requested_ood["n_ped"], requested_ood["ped_speed_range"]) == (30, [1.0, 1.5])
+    assert (double_ood["n_ped"], double_ood["ped_speed_range"]) == (40, [1.0, 2.0])
     assert (legacy["n_ped"], legacy["ped_speed_range"]) == (20, [1.0, 1.5])
     assert requested_id["training_reference"] == training["training_reference"]
+    assert matched_id["training_reference"] == training["training_reference"]
     assert density_ood["training_reference"] == training["training_reference"]
     assert "10 versus 20" in requested_id["shift_from_training"]
     assert "50 versus 20" in density_ood["shift_from_training"]
+
+
+def test_double_density_velocity_ood_is_accepted_by_expansion_contract():
+    config = X.ArmConfig(
+        name="A", selector="margin", alpha=0.0,
+        scene_profile="double_density_velocity_ood",
+    ).validate()
+    assert config.scene_profile == "double_density_velocity_ood"
 
 
 def test_scientific_eval_cli_requires_scene_profile():

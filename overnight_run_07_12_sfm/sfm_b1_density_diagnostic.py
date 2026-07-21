@@ -22,6 +22,7 @@ import torch
 
 import _paths  # noqa: F401
 import grid_policy_sfm as GPS
+import sfm_b1_expert as EX
 import sfm_b1_eval as BE
 import sfm_b1_expand as BX
 import sfm_b1_rbf as BR
@@ -38,7 +39,7 @@ DEFAULT_DIAGNOSTIC_N = 24
 DEFAULT_ELL = 0.24210826720721101
 DEFAULT_CAP = 256
 DEFAULT_SAMPLE_SEED = 700_000
-METHODS = ("hp10_r0_raw", "arm_a_r10_raw", "default_kazuki")
+METHODS = ("safemppi_expert", "arm_a_r10_raw", "default_kazuki")
 
 
 def _write_json(path, payload):
@@ -79,6 +80,12 @@ def density_ood_environment():
     )
 
 
+def visual_environment(scene_profile):
+    if scene_profile == "density_ood":
+        return density_ood_environment()
+    return SS.scene_profile(scene_profile)
+
+
 def diagnostic_bank(ep0=DEFAULT_DIAGNOSTIC_EP0, count=DEFAULT_DIAGNOSTIC_N,
                     sample_seed=DEFAULT_SAMPLE_SEED):
     if int(count) < 1:
@@ -115,7 +122,10 @@ def _run_search_cell(policies, scenario, gamma, *, environment, device, sample_s
         ped_speed_range=tuple(environment["ped_speed_range"]),
         sample_seed=int(sample_seed),
     )
-    r0 = BE.raw_rollout(policies["hp10_r0_raw"], **common)
+    expert = EX.rollout(
+        scenario, gamma, device=device, T=SP.T, n_ped=int(environment["n_ped"]),
+        ped_speed_range=tuple(environment["ped_speed_range"]),
+    )
     selected = BE.raw_rollout(policies["arm_a_r10_raw"], **common)
     kazuki = KZ.kazuki_sfm_deploy(
         policies["default_kazuki"], cfg=KZ.KazukiConfig(
@@ -123,7 +133,7 @@ def _run_search_cell(policies, scenario, gamma, *, environment, device, sample_s
         ).validate(), collect_diagnostics=False, **common,
     )
     return [
-        _status_row("hp10_r0_raw", scenario, gamma, r0),
+        _status_row("safemppi_expert", scenario, gamma, expert),
         _status_row("arm_a_r10_raw", scenario, gamma, selected),
         _status_row("default_kazuki", scenario, gamma, kazuki),
     ]
@@ -145,24 +155,24 @@ def scenario_score(rows):
                  for method, values in by_method.items()}
     failures = {method: len(DISPLAY_GAMMAS) - successes[method] for method in METHODS}
     selected_all = successes["arm_a_r10_raw"] == len(DISPLAY_GAMMAS)
-    r0_failed = failures["hp10_r0_raw"] > 0
+    expert_failed = failures["safemppi_expert"] > 0
     kazuki_failed = failures["default_kazuki"] > 0
-    if selected_all and r0_failed and kazuki_failed:
+    if selected_all and expert_failed and kazuki_failed:
         tier, label = 0, "selected succeeds for all gammas; both comparators fail"
-    elif selected_all and (r0_failed or kazuki_failed):
+    elif selected_all and (expert_failed or kazuki_failed):
         tier, label = 1, "selected succeeds for all gammas; at least one comparator fails"
     elif selected_all:
         tier, label = 2, "all three methods succeed for all gammas"
-    elif successes["arm_a_r10_raw"] > max(successes["hp10_r0_raw"], successes["default_kazuki"]):
+    elif successes["arm_a_r10_raw"] > max(successes["safemppi_expert"], successes["default_kazuki"]):
         tier, label = 3, "selected has strictly more successes than both comparators"
-    elif successes["arm_a_r10_raw"] > min(successes["hp10_r0_raw"], successes["default_kazuki"]):
+    elif successes["arm_a_r10_raw"] > min(successes["safemppi_expert"], successes["default_kazuki"]):
         tier, label = 4, "selected has more successes than at least one comparator"
     else:
         tier, label = 5, "fallback: no requested dominance pattern in this scenario"
     paired_wins = sum(
         bool(selected["success"] and not comparator["success"])
         for selected in by_method["arm_a_r10_raw"]
-        for comparator in by_method["hp10_r0_raw"] + by_method["default_kazuki"]
+        for comparator in by_method["safemppi_expert"] + by_method["default_kazuki"]
         if abs(float(selected["gamma"]) - float(comparator["gamma"])) <= 1.0e-9
     )
     selected_clearance = [row["min_clearance"] for row in by_method["arm_a_r10_raw"]
@@ -185,7 +195,7 @@ def choose_scenario(rows, scenarios):
         ordering = (
             score["tier"], -score["successes"]["arm_a_r10_raw"],
             -score["paired_selected_wins"],
-            -(score["failures"]["hp10_r0_raw"] + score["failures"]["default_kazuki"]),
+            -(score["failures"]["safemppi_expert"] + score["failures"]["default_kazuki"]),
             clearance_order, scenario,
         )
         scored.append(dict(scenario_id=scenario, score=score, ordering=list(ordering)))
@@ -198,7 +208,7 @@ def run_search(r0, selected, *, ep0, count, device, sample_seed, outdir):
     r0_policy, _ = GPS.load_sfm_policy(r0, device=device)
     selected_policy, _ = GPS.load_sfm_policy(selected, device=device)
     policies = dict(
-        hp10_r0_raw=r0_policy.eval(), arm_a_r10_raw=selected_policy.eval(),
+        arm_a_r10_raw=selected_policy.eval(),
         default_kazuki=r0_policy,
     )
     environment = bank["environment"]
@@ -211,7 +221,7 @@ def run_search(r0, selected, *, ep0, count, device, sample_seed, outdir):
             ))
     chosen, scores = choose_scenario(rows, bank["scenarios"])
     checkpoints = dict(
-        hp10_r0_raw=dict(path=os.path.abspath(r0), sha256=BE.sha256_file(r0)),
+        safemppi_expert=EX.manifest(),
         arm_a_r10_raw=dict(path=os.path.abspath(selected), sha256=BE.sha256_file(selected)),
         default_kazuki=dict(path=os.path.abspath(r0), sha256=BE.sha256_file(r0)),
     )
@@ -220,7 +230,8 @@ def run_search(r0, selected, *, ep0, count, device, sample_seed, outdir):
         diagnostic_only=True, unbiased_evaluation=False,
         warning="Selection uses displayed outcomes on a finite bank; never report these cells as an unbiased evaluation.",
         bank=bank, controllers=dict(
-            hp10_r0_raw="temp=1,NFE=8,one raw window,execute first action",
+            safemppi_expert=("expert reconstructed from the dataset-manifest configuration: "
+                            "2048 rollouts, MPPI temp=.1, predict_gain=.25, pedestrian velocity supplied"),
             arm_a_r10_raw="temp=1,NFE=8,one raw window,execute first action; no selector at deployment",
             default_kazuki="r0 prior, safe_coef=0.3, goal_coef=0.5, generate-guide-refine",
         ), checkpoints=checkpoints, rows=rows, scenario_scores=scores,
@@ -313,16 +324,17 @@ def validate_method_rerun(search_payload, scenario, rows):
 
 
 def run_methods(r0, selected, *, scenario, device, sample_seed, outdir,
-                search_payload=None):
+                search_payload=None, scene_profile="density_ood",
+                kazuki_safe_coef=.3, kazuki_goal_coef=.5):
     """Collect the complete trace bundle consumed by the 3x3 renderer."""
     if search_payload is not None:
-        expected_r0 = search_payload["checkpoints"]["hp10_r0_raw"]["sha256"]
+        expected_r0 = search_payload["checkpoints"]["default_kazuki"]["sha256"]
         expected_selected = search_payload["checkpoints"]["arm_a_r10_raw"]["sha256"]
         if BE.sha256_file(r0) != expected_r0 or BE.sha256_file(selected) != expected_selected:
             raise RuntimeError("method trace checkpoints differ from the finite diagnostic search")
         if int(sample_seed) != int(search_payload["bank"]["sample_seed"]):
             raise RuntimeError("method trace sample seed differs from the finite diagnostic search")
-    environment = density_ood_environment()
+    environment = visual_environment(scene_profile)
     r0_policy, _ = GPS.load_sfm_policy(r0, device=device)
     selected_policy, _ = GPS.load_sfm_policy(selected, device=device)
     r0_policy.eval(); selected_policy.eval()
@@ -335,14 +347,17 @@ def run_methods(r0, selected, *, scenario, device, sample_seed, outdir,
             ped_speed_range=tuple(environment["ped_speed_range"]),
             sample_seed=int(sample_seed),
         )
-        methods["hp10_r0_raw"][str(gamma)] = BE.raw_rollout(
-            r0_policy, collect_trace=True, **common,
+        methods["safemppi_expert"][str(gamma)] = EX.rollout(
+            scenario, gamma, device=device, T=SP.T, n_ped=int(environment["n_ped"]),
+            ped_speed_range=tuple(environment["ped_speed_range"]), collect_trace=True,
         )
         methods["arm_a_r10_raw"][str(gamma)] = BE.raw_rollout(
             selected_policy, collect_trace=True, **common,
         )
         methods["default_kazuki"][str(gamma)] = KZ.kazuki_sfm_deploy(
-            r0_policy, cfg=KZ.KazukiConfig(safe_coefs=(0.3,), goal_coef=0.5).validate(),
+            r0_policy, cfg=KZ.KazukiConfig(
+                safe_coefs=(float(kazuki_safe_coef),), goal_coef=float(kazuki_goal_coef),
+            ).validate(),
             collect_diagnostics=True, **common,
         )
         for method in METHODS:
@@ -351,21 +366,24 @@ def run_methods(r0, selected, *, scenario, device, sample_seed, outdir,
                             validate_method_rerun(search_payload, scenario, rows))
     shared_snapshot = choose_shared_method_step(methods)
     bundle = dict(
-        version=1, status="DENSITY_OOD_DISPLAY_METHOD_TRACES_COMPLETE",
+        version=1, status="SFM_B1_DISPLAY_METHOD_TRACES_COMPLETE",
         diagnostic_only=True, scenario_id=int(scenario), gammas=list(DISPLAY_GAMMAS),
         sample_seed=int(sample_seed), environment=environment,
+        kazuki_coefficients=dict(
+            safe_coef=float(kazuki_safe_coef), goal_coef=float(kazuki_goal_coef),
+        ),
         shared_snapshot=shared_snapshot, runs=methods,
     )
     os.makedirs(outdir, exist_ok=False)
     bundle_path = os.path.join(outdir, "method_traces.pt")
     _save_torch(bundle_path, bundle)
     checkpoints = dict(
-        hp10_r0_raw=dict(path=os.path.abspath(r0), sha256=BE.sha256_file(r0)),
+        safemppi_expert=EX.manifest(),
         arm_a_r10_raw=dict(path=os.path.abspath(selected), sha256=BE.sha256_file(selected)),
         default_kazuki=dict(path=os.path.abspath(r0), sha256=BE.sha256_file(r0)),
     )
     manifest = dict(
-        status="DENSITY_OOD_DISPLAY_METHOD_INPUTS_COMPLETE",
+        status="SFM_B1_DISPLAY_METHOD_INPUTS_COMPLETE",
         diagnostic_only=True, unbiased_evaluation=False,
         scenario_id=int(scenario), gammas=list(DISPLAY_GAMMAS),
         sample_seed=int(sample_seed), environment=environment, checkpoints=checkpoints,
@@ -374,8 +392,9 @@ def run_methods(r0, selected, *, scenario, device, sample_seed, outdir,
         trace_bundle_source_path=os.path.abspath(bundle_path),
         trace_bundle_sha256=BE.sha256_file(bundle_path),
         trace_contract=(
-            "same scenario/gamma/sample seed/environment; r0 and A-r10 are raw temp=1/NFE=8 "
-            "with collect_trace=True; default Kazuki uses r0, safe_coef=.3, goal_coef=.5 "
+            "same scenario/gamma/environment; first row reconstructs the declared demonstration SafeMPPI expert; "
+            f"A-r10 is raw temp=1/NFE=8; Kazuki uses r0, safe_coef={kazuki_safe_coef:g}, "
+            f"goal_coef={kazuki_goal_coef:g} "
             "with collect_diagnostics=True"
         ),
         finite_search=(None if search_payload is None else dict(
@@ -527,7 +546,7 @@ def run_collect(checkpoint, recent_dir, round_i, *, scenario, ell, cap, device,
     with ProcessPoolExecutor(max_workers=int(verifier_workers)) as executor:
         gather = BX.gather_macro_round(
             policy, phi_policy, gp, beta, replicas, cfg, shard, device, executor, generator,
-            record_all_traces=True, verifier_worker=VS.verify_in_worker,
+            record_all_traces=True,
         )
     traces = gather.pop("traces")
     selected_snapshot, snapshot_scores = choose_snapshot(traces)
@@ -583,6 +602,10 @@ def build_parser():
     method_source = methods.add_mutually_exclusive_group(required=True)
     method_source.add_argument("--search-json"); method_source.add_argument("--scenario", type=int)
     methods.add_argument("--sample-seed", type=int, default=DEFAULT_SAMPLE_SEED)
+    methods.add_argument("--scene-profile", choices=SS.SCIENTIFIC_EVAL_PROFILES,
+                         default="density_ood")
+    methods.add_argument("--kazuki-safe-coef", type=float, default=.3)
+    methods.add_argument("--kazuki-goal-coef", type=float, default=.5)
     methods.add_argument("--device", default="cuda"); methods.add_argument("--outdir", required=True)
     collect = sub.add_parser("collect")
     collect.add_argument("--checkpoint", required=True); collect.add_argument("--recent-dir", required=True)
@@ -612,6 +635,9 @@ def main(argv=None):
         run_methods(
             args.r0, args.selected, scenario=scenario, device=args.device,
             sample_seed=args.sample_seed, outdir=args.outdir, search_payload=search_payload,
+            scene_profile=args.scene_profile,
+            kazuki_safe_coef=args.kazuki_safe_coef,
+            kazuki_goal_coef=args.kazuki_goal_coef,
         )
         return
     if args.search_json:

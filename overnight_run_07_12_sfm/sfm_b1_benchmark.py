@@ -51,10 +51,13 @@ def evaluate_raw(checkpoint, bank, *, scene_profile, device):
     )
 
 
-def evaluate_kazuki(checkpoint, bank, *, scene_profile, device):
+def evaluate_kazuki(checkpoint, bank, *, scene_profile, device,
+                    safe_coef=0.3, goal_coef=0.5, variant="default"):
     policy, _ = GPS.load_sfm_policy(checkpoint, device=device)
     environment = SS.scene_profile(scene_profile)
-    config = KZ.KazukiConfig(safe_coefs=(0.3,), goal_coef=0.5).validate()
+    config = KZ.KazukiConfig(
+        safe_coefs=(float(safe_coef),), goal_coef=float(goal_coef),
+    ).validate()
     rows = []
     for gamma in SP.GAMMAS:
         for episode in bank[str(gamma)]:
@@ -76,10 +79,11 @@ def evaluate_kazuki(checkpoint, bank, *, scene_profile, device):
                 mode_counts={},
             ))
     return dict(
-        method="default Kazuki generate-guide-refine",
+        method=f"Kazuki generate-guide-refine ({variant})",
         checkpoint=os.path.abspath(checkpoint), checkpoint_sha256=BE.sha256_file(checkpoint),
-        safe_coef=0.3, goal_coef=0.5,
-        comparator_semantics="learned prior plus reward guidance and MPPI refinement; not raw flow",
+        safe_coef=float(safe_coef), goal_coef=float(goal_coef), variant=str(variant),
+        comparator_semantics=("same learned prior plus reward guidance and MPPI refinement; "
+                              "not raw flow; coefficients declared before comparison"),
         summary=BE.summarize(rows), rows=rows,
     )
 
@@ -130,7 +134,13 @@ def run_benchmark(r0, selected, *, scene_profile, ep0, M, device, outdir):
     methods = {
         "Hp10 r0 raw": evaluate_raw(r0, bank, scene_profile=scene_profile, device=device),
         "selected B1 raw": evaluate_raw(selected, bank, scene_profile=scene_profile, device=device),
-        "default Kazuki": evaluate_kazuki(r0, bank, scene_profile=scene_profile, device=device),
+        "default Kazuki (.3 safe, .5 goal)": evaluate_kazuki(
+            r0, bank, scene_profile=scene_profile, device=device,
+        ),
+        "goal-stress Kazuki (.3 safe, 1.0 goal)": evaluate_kazuki(
+            r0, bank, scene_profile=scene_profile, device=device,
+            safe_coef=.3, goal_coef=1.0, variant="predeclared goal-stress",
+        ),
     }
     payload = dict(
         status="MATCHED_DEPLOYMENT_COMPLETE", environment=environment,

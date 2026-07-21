@@ -6,7 +6,7 @@ import sfm_b1_density_diagnostic as D
 
 
 def _rows(scenario, *, r0, selected, kazuki):
-    values = {"hp10_r0_raw": r0, "arm_a_r10_raw": selected, "default_kazuki": kazuki}
+    values = {"safemppi_expert": r0, "arm_a_r10_raw": selected, "default_kazuki": kazuki}
     return [dict(
         method=method, scenario_id=scenario, gamma=gamma, success=bool(success),
         collision=not bool(success), timeout=False, steps=10, min_clearance=.1,

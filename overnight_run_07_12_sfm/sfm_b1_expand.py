@@ -47,7 +47,6 @@ class ArmConfig:
     phi_s: float = 0.9
     gp_lam: float = 1.0e-2
     verifier_workers: int = 32
-    n_theta: int = 180
     smoke: bool = False
     seed: int = 20260720
     scene_profile: str = "legacy_velocity_ood"
@@ -58,7 +57,9 @@ class ArmConfig:
             raise ValueError("scientific B1 knobs differ from the frozen protocol")
         if self.selector not in ("margin", "safemppi_cost"):
             raise ValueError("invalid arm selector")
-        if self.scene_profile not in ("legacy_velocity_ood", "requested_ood", "density_ood"):
+        if self.scene_profile not in (
+                "legacy_velocity_ood", "requested_ood", "density_ood",
+                "double_density_velocity_ood"):
             raise ValueError("expansion requires an explicit OOD scene profile")
         if self.name == "A" and (self.selector != "margin" or self.alpha != 0.0):
             raise ValueError("arm A must be margin/alpha=0")
@@ -220,7 +221,7 @@ def nvp_fail_closed(replica):
 
 
 def gather_macro_round(policy, phi_policy, gp, beta, replicas, cfg, shard, device, executor, generator,
-                       *, record_all_traces=False, verifier_worker=None):
+                       *, record_all_traces=False):
     """Freeze all acquisition state and gather one complete 8x7 macro-round."""
     timers = Counter()
     sigma_all, sigma_selected, ess_values = [], [], []
@@ -264,11 +265,10 @@ def gather_macro_round(policy, phi_policy, gp, beta, replicas, cfg, shard, devic
                 tasks.append((
                     context_index, candidate_id, prepared["state"],
                     windows[context_index, candidate_id].detach().cpu().numpy(),
-                    prepared["ped_xy"], prepared["ped_vel"], replica.gamma, cfg.n_theta,
+                    prepared["ped_xy"], prepared["ped_vel"], replica.gamma,
                 ))
         start = time.perf_counter()
-        worker = SM.verify_in_worker if verifier_worker is None else verifier_worker
-        results = list(executor.map(worker, tasks))
+        results = list(executor.map(SM.verify_in_worker, tasks))
         timers["verifier"] += time.perf_counter() - start
         by_context = defaultdict(list)
         for context_index, candidate_id, result in results:
@@ -449,6 +449,7 @@ def run_arm(checkpoint, outdir, cfg, *, ell, cap, device):
             ))
             record = dict(
                 round=round_i, scenarios=list(scenarios), beta=float(beta),
+                verifier=SM.verifier_manifest(),
                 calibrated_ess_over_K=float(calibrated_ess), gp_buffer_ids=gp_ids,
                 gp=gp.diagnostics(), gather={key: value for key, value in gather.items() if key != "traces"},
                 replay=replay, shard=shard_manifest, encoder_sha256=encoder_after_round,
@@ -466,6 +467,7 @@ def run_arm(checkpoint, outdir, cfg, *, ell, cap, device):
     manifest = dict(
         status="ARM_COMPLETE", arm=cfg.name, source_checkpoint=os.path.abspath(checkpoint),
         source_sha256=source_sha, recipe=asdict(cfg), ell=float(ell), cap=int(cap),
+        verifier=SM.verifier_manifest(),
         environment=environment, frozen_parameters=frozen_parameters, encoder_sha_before=encoder_before,
         encoder_sha_after=encoder_after, rounds=len(history), history=history,
     )
@@ -488,9 +490,11 @@ def main():
     parser.add_argument("--verifier-workers", type=int, default=32)
     parser.add_argument(
         "--scene-profile", required=True,
-        choices=("legacy_velocity_ood", "requested_ood", "density_ood"),
+        choices=("legacy_velocity_ood", "requested_ood", "density_ood",
+                 "double_density_velocity_ood"),
         help=("Explicit expansion environment: legacy reproduces 103476d, "
-              "requested_ood shifts density and speed, and density_ood uses n_ped=50 at training speeds."),
+              "requested_ood shifts density and speed, density_ood uses n_ped=50 at training speeds, "
+              "and double_density_velocity_ood uses n_ped=40 at 1.0--2.0 m/s."),
     )
     args = parser.parse_args()
     arm = ARMS[args.arm]

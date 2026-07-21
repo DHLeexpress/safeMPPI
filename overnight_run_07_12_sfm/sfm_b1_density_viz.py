@@ -31,15 +31,15 @@ import sfm_scene as SS
 
 
 DISPLAY_GAMMAS = (0.1, 0.5, 1.0)
-METHOD_KEYS = ("r0", "selected", "kazuki")
+METHOD_KEYS = ("expert", "selected", "kazuki")
 METHOD_LABELS = {
-    "r0": "Hp10 r0 raw",
+    "expert": "SafeMPPI demonstration expert",
     "selected": "Arm-A r10 learned raw",
-    "kazuki": "default Kazuki generate-guide-refine",
+    "kazuki": "Kazuki generate-guide-refine",
 }
 MAGENTA = "#CC79A7"
 METHOD_ALIASES = {
-    "r0": ("r0", "hp10_r0_raw"),
+    "expert": ("expert", "safemppi_expert"),
     "selected": ("selected", "arm_a_r10_raw"),
     "kazuki": ("kazuki", "default_kazuki"),
 }
@@ -148,15 +148,25 @@ def checked_verifier_levels(trace, query_row, *, H=10):
 
 
 def nominal_safemppi_levels(trace, *, gamma=None, H=10):
-    """Position-only nominal SafeMPPI geometry with a 16-sided outer set."""
+    """The trace-owning nominal SafeMPPI geometry and 16-sided outer set."""
     state = np.asarray(trace["state"], np.float32)
-    ped_xy = np.asarray(trace["ped_xy"], np.float32)
-    obstacles = np.concatenate([
-        ped_xy, np.full((len(ped_xy), 1), SS.R_PED, np.float32),
-    ], axis=1)
-    _, (A, b, margins) = polytope_HP(
-        state[:2], obstacles, sensing=SS.R_SENSE, n_base=16,
-    )
+    stored = trace.get("nominal_polytope")
+    if stored is None:
+        ped_xy = np.asarray(trace["ped_xy"], np.float32)
+        obstacles = np.concatenate([
+            ped_xy, np.full((len(ped_xy), 1), SS.R_PED, np.float32),
+        ], axis=1)
+        _, (A, b, margins) = polytope_HP(
+            state[:2], obstacles, sensing=SS.R_SENSE, n_base=16,
+        )
+        velocity_used = False
+    else:
+        if int(stored.get("n_base", -1)) != 16:
+            raise ValueError("stored SafeMPPI nominal polytope is not K=16")
+        if stored.get("velocity_used") is not True:
+            raise ValueError("stored SafeMPPI nominal polytope did not use pedestrian velocity")
+        A, b, margins = stored["A"], stored["b"], stored["margins"]
+        velocity_used = True
     A = np.asarray(A, float); b = np.asarray(b, float)
     margins = np.asarray(margins, float)
     outer = BV.halfspace_polygon(A, b)
@@ -168,7 +178,7 @@ def nominal_safemppi_levels(trace, *, gamma=None, H=10):
         outer_polygon=outer, base_faces=16,
         detected_faces=max(0, int(len(A)) - 16),
         contains_robot=bool(np.all(A @ state[:2] <= b + 1.0e-7)),
-        velocity_used=False,
+        velocity_used=velocity_used,
     )
 
 
@@ -510,10 +520,17 @@ def draw_method_panel(axis, method, run, gamma, step, *, verifier_result=None,
     if method not in METHOD_KEYS:
         raise ValueError(f"unknown method {method!r}")
     trace = _run_trace(run, step)
-    colors = {"r0": BV.BLUE, "selected": "#333333", "kazuki": "#7F3C8D"}
+    colors = {"expert": BV.BLUE, "selected": "#333333", "kazuki": "#7F3C8D"}
     _draw_robot_and_pedestrians(axis, run, trace, step, colors[method])
     metadata = dict(method=method, gamma=float(gamma), step=int(trace["step"]))
-    if method == "r0":
+    if method == "expert":
+        controls = np.asarray(trace["controls"], float)
+        if controls.shape != (10, 2):
+            raise ValueError("SafeMPPI expert trace must carry one H=10 reward-weighted sequence")
+        if trace.get("sequence_kind") != "reward_weighted_mean":
+            raise ValueError("SafeMPPI expert trace does not identify the executed MPPI mean sequence")
+        if not np.allclose(np.asarray(trace["action"], float), controls[0], atol=1.0e-7, rtol=0.0):
+            raise ValueError("SafeMPPI plotted sequence does not begin with the executed action")
         plan = np.asarray(trace["planned_states"], float)[:, :2]
         axis.plot(plan[:, 0], plan[:, 1], color=BV.BLUE, lw=.82, marker="o", ms=2.2)
         nominal = nominal_safemppi_levels(trace, gamma=gamma, H=10)
@@ -522,7 +539,10 @@ def draw_method_panel(axis, method, run, gamma, step, *, verifier_result=None,
         _draw_outer_polygon(axis, nominal["outer_polygon"], color=BV.BLUE)
         metadata.update(nominal_levels=len(nominal["polygons"]),
                         nominal_contains_robot=nominal["contains_robot"],
-                        nominal_outer_faces=nominal["base_faces"])
+                        nominal_outer_faces=nominal["base_faces"],
+                        nominal_detected_faces=nominal["detected_faces"],
+                        nominal_velocity_used=nominal["velocity_used"],
+                        expert_sequence_kind=trace["sequence_kind"])
     elif method == "selected":
         plan = np.asarray(trace["planned_states"], float)[:, :2]
         # Green is reserved for a complete H=10 certificate, not method identity.
@@ -593,7 +613,7 @@ def _validate_method_runs(runs_by_method, gammas):
 def render_method_gamma_comparison(
         runs_by_method, output_png, *, snapshot_step, output_mp4=None,
         gammas=DISPLAY_GAMMAS, fps=8, frame_stride=2, report_path=None):
-    """Render rows=(r0, selected, Kazuki), columns=(gamma .1,.5,1)."""
+    """Render rows=(SafeMPPI expert, selected, Kazuki), columns=(gamma .1,.5,1)."""
     gammas = tuple(map(float, gammas))
     if gammas != DISPLAY_GAMMAS:
         raise ValueError(f"comparison requires gammas={DISPLAY_GAMMAS}")
@@ -614,7 +634,7 @@ def render_method_gamma_comparison(
         figure.subplots_adjust(left=.015, right=.78, bottom=.015, top=.985, wspace=.02, hspace=.02)
         figure.legend(
             handles=[
-                Line2D([], [], color=BV.BLUE, lw=1.5, label="r0 raw + nominal levels"),
+                Line2D([], [], color=BV.BLUE, lw=1.5, label="SafeMPPI expert + nominal levels"),
                 Line2D([], [], color="#333333", lw=1.2, label="Arm-A r10 learned raw / planned window"),
                 Line2D([], [], color=BV.GREEN, lw=.55, label="offline exact-SOCP h=1..10 (learned row)"),
                 Line2D([], [], color=BV.GREEN, lw=1.25, label="offline exact-SOCP outer set (K=16)"),
@@ -625,8 +645,9 @@ def render_method_gamma_comparison(
         )
         figure.text(
             .79, .38,
-            "columns\ngamma 0.1 | 0.5 | 1.0\n\nrows\nHp10 r0 raw\nArm-A r10 learned raw\n"
-            "default Kazuki\n\ngreen appears only when the learned\nraw H=10 window passes exact SOCP",
+            "columns\ngamma 0.1 | 0.5 | 1.0\n\nrows\nSafeMPPI expert\nArm-A r10 learned raw\n"
+            "Kazuki generate-guide-refine\n\ngreen appears only when the learned\n"
+            "raw H=10 window passes exact SOCP",
             ha="left", va="top", fontsize=8,
         )
         return figure, axes
@@ -664,7 +685,8 @@ def render_method_gamma_comparison(
         plt.close(figure)
     report = dict(
         semantics={
-            "r0": "raw temp=1 rollout; blue nominal set is diagnostic and did not select the action",
+            "expert": ("SafeMPPI demonstration expert; blue levels are its actual velocity-aware "
+                       "nominal proposal polytope"),
             "selected": ("Arm-A r10 learned raw temp=1 rollout; green exact-K16 SOCP is an "
                          "offline audit and did not select the action"),
             "kazuki": "generate-guide-refine comparator; magenta is guided minus unguided first action for one latent",
@@ -697,11 +719,11 @@ def select_comparison_episode(episode_runs, *, gammas=DISPLAY_GAMMAS):
         contrasts = sum(
             bool(runs["selected"][float(gamma)]["success"])
             and (not bool(runs[baseline][float(gamma)]["success"]))
-            for baseline in ("r0", "kazuki") for gamma in gammas
+            for baseline in ("expert", "kazuki") for gamma in gammas
         )
         baseline_failures = sum(
             not bool(runs[baseline][float(gamma)]["success"])
-            for baseline in ("r0", "kazuki") for gamma in gammas
+            for baseline in ("expert", "kazuki") for gamma in gammas
         )
         selected_clearances = [
             float(runs["selected"][float(gamma)].get("min_clearance",
@@ -716,13 +738,13 @@ def select_comparison_episode(episode_runs, *, gammas=DISPLAY_GAMMAS):
         ))
     eligible = [row for row in rows if row["selected_all_gammas"] and row["contrasts"] >= 1]
     if not eligible:
-        raise RuntimeError("no episode has selected success at all gammas and at least one r0/Kazuki failure")
+        raise RuntimeError("no episode has selected success at all gammas and at least one expert/Kazuki failure")
     eligible.sort(key=lambda row: (
         -row["contrasts"], -row["baseline_failures"],
         -row["selected_min_clearance"], row["episode"],
     ))
     return dict(
-        rule=("exhaustive fixed bank: require selected success at all displayed gammas and >=1 paired r0/Kazuki "
+        rule=("exhaustive fixed bank: require selected success at all displayed gammas and >=1 paired expert/Kazuki "
               "failure; maximize selected-vs-baseline contrasts, then baseline failures, then selected minimum "
               "clearance; tie-break by episode ID"),
         chosen=eligible[0], candidates=rows,
@@ -945,7 +967,7 @@ def render_bundle(
 def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--method-runs", required=True,
-                        help="torch bundle of already-run r0/selected/Kazuki traces keyed by gamma")
+                        help="torch bundle of already-run expert/selected/Kazuki traces keyed by gamma")
     parser.add_argument("--query-traces", required=True,
                         help="torch list from diagnostic-only max-margin gathering")
     parser.add_argument("--scenario", required=True, type=int)

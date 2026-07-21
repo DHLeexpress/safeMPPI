@@ -1,4 +1,11 @@
-"""Moving-pedestrian full-H verifier used by every selected B1 query."""
+"""Canonical exact moving-pedestrian full-H verifier for every B1 query.
+
+For each real pedestrian and each artificial sensing-boundary disk, the face
+normal is solved exactly in two-dimensional angle space.  There is no angular
+grid.  The outer sensing boundary always uses exactly 16 canonical anchors.
+Visualization imports this module, so rendered certificates and training
+labels cannot silently use different solvers.
+"""
 from __future__ import annotations
 
 import math
@@ -7,6 +14,20 @@ import numpy as np
 import _paths  # noqa: F401
 import verifier_polytope as VP
 import sfm_scene as SS
+
+
+ARTIFICIAL_FACES = 16
+ANGLE_TOL = 2.0e-10
+
+
+def verifier_manifest():
+    return dict(
+        solver="exact_2d_angular_interval_socp", angular_grid=False,
+        K_artificial=ARTIFICIAL_FACES, horizon=10, rho_art=0.16,
+        m_min=1.0e-4, r_pad=1.3,
+        effective_radius="max(sensing_radius, r_pad * max candidate displacement)",
+        pedestrian_prediction="constant velocity over t=0..H",
+    )
 
 
 def predict_pedestrians(ped_xy, ped_vel, H=10, dt=SS.DT):
@@ -45,24 +66,93 @@ def collision_free_time_indexed(segment, pedestrians, radius=SS.R_PED):
     return bool(float(distance.min()) >= float(radius) - 1.0e-9)
 
 
-def _moving_face(robot_centered, ped_centered, radius, beta, label, n_theta=180, m_min=1.0e-4):
-    theta = np.linspace(-math.pi, math.pi, int(n_theta), endpoint=False)
-    normals = np.stack([np.cos(theta), np.sin(theta)], axis=1)
-    upper = (normals @ ped_centered.T).min(axis=1) - float(radius)
-    if len(robot_centered) > 1:
-        lower = ((normals @ robot_centered[1:].T) / beta[1:][None]).max(axis=1)
-    else:
-        lower = np.full(len(normals), -np.inf)
-    lower = np.maximum(lower, float(m_min))
-    feasible = lower <= upper + 1.0e-8
-    if not feasible.any():
-        return VP.Face(np.array([1.0, 0.0]), 0.0, "real-moving", label, feasible=False)
-    index = int(np.argmax(np.where(feasible, upper, -np.inf)))
-    return VP.Face(normals[index], float(upper[index]), "real-moving", label, feasible=True)
+def _wrap(theta):
+    return float(theta) % (2.0 * math.pi)
 
 
-def certify_moving_window(segment, pedestrians, gamma, *, n_theta=180, K=12,
+def _angular_constraint(vector, threshold):
+    """Closed arc endpoints for ``unit(theta)^T vector >= threshold``."""
+    vector = np.asarray(vector, dtype=float).reshape(2)
+    norm = float(np.linalg.norm(vector))
+    threshold = float(threshold)
+    if norm <= ANGLE_TOL:
+        return () if threshold <= ANGLE_TOL else None
+    if threshold > norm + ANGLE_TOL:
+        return None
+    if threshold <= -norm + ANGLE_TOL:
+        return ()
+    halfwidth = math.acos(float(np.clip(threshold / norm, -1.0, 1.0)))
+    center = math.atan2(float(vector[1]), float(vector[0]))
+    return _wrap(center - halfwidth), _wrap(center + halfwidth)
+
+
+def _is_feasible(theta, inequalities, tol=2.0e-9):
+    normal = np.array([math.cos(theta), math.sin(theta)], dtype=float)
+    return all(float(normal @ vector) >= float(threshold) - float(tol)
+               for vector, threshold in inequalities)
+
+
+def solve_moving_face(robot_centered, pedestrian_centered, radius, beta, label,
+                      *, m_min=1.0e-4, kind="real-moving"):
+    """Solve one independent positive max-margin moving-disk SOCP block."""
+    robot = np.asarray(robot_centered, dtype=float).reshape(-1, 2)
+    pedestrian = np.asarray(pedestrian_centered, dtype=float).reshape(-1, 2)
+    beta = np.asarray(beta, dtype=float).reshape(-1)
+    if len(robot) != len(pedestrian) or len(robot) != len(beta):
+        raise ValueError("moving face horizons do not align")
+    if len(robot) < 2 or np.any(beta[1:] <= 0.0):
+        raise ValueError("moving face needs at least one positive-beta horizon")
+
+    inequalities = [(center, float(radius) + float(m_min)) for center in pedestrian]
+    for horizon in range(1, len(robot)):
+        for center in pedestrian:
+            inequalities.append((
+                float(beta[horizon]) * center - robot[horizon],
+                float(beta[horizon]) * float(radius),
+            ))
+
+    endpoints = []
+    for vector, threshold in inequalities:
+        arc = _angular_constraint(vector, threshold)
+        if arc is None:
+            return VP.Face(np.array([1.0, 0.0]), 0.0, kind, label, feasible=False)
+        endpoints.extend(arc)
+
+    candidates = list(endpoints)
+    ordered = sorted(set([0.0] + [_wrap(value) for value in endpoints]))
+    cyclic = ordered + [ordered[0] + 2.0 * math.pi]
+    candidates.extend(_wrap(0.5 * (left + right)) for left, right in zip(cyclic, cyclic[1:]))
+    for center in pedestrian:
+        angle = math.atan2(float(center[1]), float(center[0]))
+        candidates.extend((_wrap(angle), _wrap(angle + math.pi)))
+    for first in range(len(pedestrian)):
+        for second in range(first + 1, len(pedestrian)):
+            delta = pedestrian[first] - pedestrian[second]
+            if float(np.linalg.norm(delta)) <= ANGLE_TOL:
+                continue
+            angle = math.atan2(float(delta[1]), float(delta[0])) + 0.5 * math.pi
+            candidates.extend((_wrap(angle), _wrap(angle + math.pi)))
+
+    feasible = []
+    for theta in candidates:
+        theta = _wrap(theta)
+        if _is_feasible(theta, inequalities):
+            normal = np.array([math.cos(theta), math.sin(theta)], dtype=float)
+            margin = float(np.min(pedestrian @ normal) - float(radius))
+            feasible.append((margin, theta, normal))
+    if not feasible:
+        return VP.Face(np.array([1.0, 0.0]), 0.0, kind, label, feasible=False)
+    margin, theta, normal = max(feasible, key=lambda row: (row[0], -row[1]))
+    return VP.Face(
+        normal, float(margin), kind, label, coefficient=1.0,
+        feasible=bool(margin >= float(m_min) - 2.0e-8), interval=None,
+    )
+
+
+def certify_moving_window(segment, pedestrians, gamma, *, K=ARTIFICIAL_FACES,
                           rho_art=0.16, m_min=1.0e-4, r_pad=1.3):
+    if int(K) != ARTIFICIAL_FACES:
+        raise ValueError(f"faithful B1 verifier requires K={ARTIFICIAL_FACES}")
     robot = np.asarray(segment, float)
     peds = np.asarray(pedestrians, float)
     if robot.ndim != 2 or robot.shape[1] != 2 or peds.ndim != 3 or peds.shape[2] != 2:
@@ -72,27 +162,46 @@ def certify_moving_window(segment, pedestrians, gamma, *, n_theta=180, K=12,
     center = robot[0]
     robot_c = robot - center
     radius = max(float(SS.R_SENSE), float(r_pad) * float(np.linalg.norm(robot_c, axis=1).max()))
+    if len(robot) == 1:
+        # Reaching the goal at the current state creates an absorbing empty
+        # verification horizon.  It is valid but never replay-eligible.
+        return True, [], dict(
+            solver="exact_2d_angular_interval_socp", angular_grid=False,
+            slack=float("inf"), worst_t=0, R_eff=float(radius),
+            n_real=0, n_real_feasible=0, n_artificial=0,
+            n_artificial_feasible=0, K_artificial=ARTIFICIAL_FACES,
+            empty_terminal_prefix=True,
+        )
     alpha = (1.0 - float(gamma)) ** np.arange(len(robot), dtype=float)
     beta = 1.0 - alpha
     faces = []
     for index in range(peds.shape[1]):
         ped_c = peds[:, index] - center
         if float((np.linalg.norm(ped_c, axis=1) - SS.R_PED).min()) <= radius:
-            faces.append(_moving_face(robot_c, ped_c, SS.R_PED, beta, f"ped{index}", n_theta, m_min))
-    artificial, _ = VP.build_faces(
-        robot_c, [], float(gamma), R=radius, K=K, rho_art=rho_art,
-        m_min=m_min, n_theta=n_theta,
-    )
-    faces.extend(artificial)
+            faces.append(solve_moving_face(
+                robot_c, ped_c, SS.R_PED, beta, f"ped{index}", m_min=m_min,
+            ))
+    for index, (x, y, obstacle_radius) in enumerate(
+            VP.artificial_obstacles(radius, ARTIFICIAL_FACES, float(rho_art))):
+        repeated = np.repeat(np.array([[x, y]], dtype=float), len(robot_c), axis=0)
+        faces.append(solve_moving_face(
+            robot_c, repeated, obstacle_radius, beta, f"art{index}",
+            m_min=m_min, kind="artificial",
+        ))
     ok, slack, worst_t = VP.check_certificate(faces, robot_c, alpha, include_start=False)
     real = [face for face in faces if face.kind == "real-moving"]
+    artificial = [face for face in faces if face.kind == "artificial"]
     return bool(ok), faces, dict(
-        slack=float(slack), worst_t=int(worst_t), R_eff=radius,
+        solver="exact_2d_angular_interval_socp", angular_grid=False,
+        slack=float(slack), worst_t=int(worst_t), R_eff=float(radius),
         n_real=len(real), n_real_feasible=sum(bool(face.feasible) for face in real),
+        n_artificial=len(artificial),
+        n_artificial_feasible=sum(bool(face.feasible) for face in artificial),
+        K_artificial=ARTIFICIAL_FACES,
     )
 
 
-def verify_query(state, controls, ped_xy, ped_vel, gamma, *, reach=0.5, n_theta=180):
+def verify_query(state, controls, ped_xy, ped_vel, gamma, *, reach=0.5):
     """Resolve y without performance/cost terms; errors are explicit and non-storable."""
     try:
         controls = np.asarray(controls, np.float32).reshape(-1, 2)
@@ -109,7 +218,7 @@ def verify_query(state, controls, ped_xy, ped_vel, gamma, *, reach=0.5, n_theta=
         task = taskspace_ok(prefix_robot)
         collision = collision_free_time_indexed(prefix_robot, prefix_pedestrian)
         certificate, faces, diagnostics = certify_moving_window(
-            prefix_robot, prefix_pedestrian, gamma, n_theta=n_theta,
+            prefix_robot, prefix_pedestrian, gamma,
         )
         y = bool(task and collision and certificate)
         return dict(
@@ -125,6 +234,6 @@ def verify_query(state, controls, ped_xy, ped_vel, gamma, *, reach=0.5, n_theta=
 
 
 def verify_in_worker(payload):
-    context_id, candidate_id, state, controls, ped_xy, ped_vel, gamma, n_theta = payload
-    result = verify_query(state, controls, ped_xy, ped_vel, gamma, n_theta=n_theta)
+    context_id, candidate_id, state, controls, ped_xy, ped_vel, gamma = payload
+    result = verify_query(state, controls, ped_xy, ped_vel, gamma)
     return int(context_id), int(candidate_id), result

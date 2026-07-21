@@ -18,6 +18,7 @@ GAMMAS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0)
 LEGACY_PED_SPEED_RANGE = (0.8, 1.3)
 ID_PED_SPEED_RANGE = (0.5, 1.0)
 OOD_PED_SPEED_RANGE = (1.0, 1.5)
+DOUBLE_OOD_PED_SPEED_RANGE = (1.0, 2.0)
 
 # These names are part of the evaluation contract written into every result.
 # The requested ``id`` benchmark matches the training speed range, but uses
@@ -30,6 +31,12 @@ SCENE_PROFILES = {
         role="pretraining_data_distribution",
         shift_from_training="none",
     ),
+    "matched_id": dict(
+        n_ped=20,
+        ped_speed_range=ID_PED_SPEED_RANGE,
+        role="matched_in_distribution_benchmark",
+        shift_from_training="none; evaluation-only alias with the training density and speed range",
+    ),
     "id": dict(
         n_ped=10,
         ped_speed_range=ID_PED_SPEED_RANGE,
@@ -41,6 +48,13 @@ SCENE_PROFILES = {
         ped_speed_range=OOD_PED_SPEED_RANGE,
         role="requested_density_and_velocity_ood_benchmark",
         shift_from_training="higher pedestrian count (30 versus 20) and speed range 1.0-1.5 versus 0.5-1.0 m/s",
+    ),
+    "double_density_velocity_ood": dict(
+        n_ped=40,
+        ped_speed_range=DOUBLE_OOD_PED_SPEED_RANGE,
+        role="twofold_density_and_velocity_ood_benchmark",
+        shift_from_training=("pedestrian count 40 versus 20 and speed range 1.0-2.0 "
+                             "versus 0.5-1.0 m/s"),
     ),
     "density_ood": dict(
         n_ped=50,
@@ -55,7 +69,10 @@ SCENE_PROFILES = {
         shift_from_training="pedestrian count unchanged; speed range 1.0-1.5 versus 0.5-1.0 m/s",
     ),
 }
-SCIENTIFIC_EVAL_PROFILES = ("id", "density_ood", "requested_ood", "legacy_velocity_ood")
+SCIENTIFIC_EVAL_PROFILES = (
+    "matched_id", "id", "density_ood", "requested_ood", "double_density_velocity_ood",
+    "legacy_velocity_ood",
+)
 
 
 def scene_profile(name):

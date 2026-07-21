@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 import sfm_b1_density_viz as V
+import sfm_b1_expert as X
 
 
 SQUARE = tuple(
@@ -130,9 +131,9 @@ def _run(success, episode=11, clearance=.2):
                 min_clearance=clearance, trace=[dict(step=0)], states=np.zeros((1, 4)))
 
 
-def _method_runs(episode, *, selected=True, r0=False, kazuki=False, clearance=.2):
+def _method_runs(episode, *, selected=True, expert=False, kazuki=False, clearance=.2):
     return {
-        "r0": {gamma: _run(r0, episode, clearance) for gamma in V.DISPLAY_GAMMAS},
+        "expert": {gamma: _run(expert, episode, clearance) for gamma in V.DISPLAY_GAMMAS},
         "selected": {gamma: _run(selected, episode, clearance) for gamma in V.DISPLAY_GAMMAS},
         "kazuki": {gamma: _run(kazuki, episode, clearance) for gamma in V.DISPLAY_GAMMAS},
     }
@@ -157,9 +158,30 @@ def test_clean_axis_has_no_subplot_title_or_labels():
     plt.close(figure)
 
 
+def test_expert_config_and_stored_nominal_geometry_are_faithful(monkeypatch):
+    config = X.demonstration_config()
+    assert config.horizon == 10 and config.num_samples == 2048
+    assert config.temperature == .1 and config.polytope_nbase == 16
+    assert config.centroid_gain == .2 and config.centroid_smooth == .25
+    assert config.centroid_eps == .15 and config.smooth_weight == .12
+    assert config.predict_gain == .25 and config.warm_start
+    trace = dict(
+        state=np.zeros(4), gamma=.5, ped_xy=np.zeros((0, 2)),
+        nominal_polytope=dict(
+            A=np.asarray([row.a for row in SQUARE]),
+            b=np.ones(16), margins=np.ones(16),
+            n_base=16, velocity_used=True,
+        ),
+    )
+    monkeypatch.setattr(V, "polytope_HP", lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("stored expert geometry must not be recomputed")))
+    nominal = V.nominal_safemppi_levels(trace)
+    assert nominal["base_faces"] == 16 and nominal["velocity_used"] is True
+
+
 def test_method_bundle_accepts_density_diagnostic_aliases():
     bundle = dict(scenario_id=11, shared_snapshot=dict(step=0), runs={
-        "hp10_r0_raw": {gamma: _run(False) for gamma in V.DISPLAY_GAMMAS},
+        "safemppi_expert": {gamma: _run(False) for gamma in V.DISPLAY_GAMMAS},
         "arm_a_r10_raw": {str(gamma): _run(True) for gamma in V.DISPLAY_GAMMAS},
         "default_kazuki": {f"{gamma:g}": _run(False) for gamma in V.DISPLAY_GAMMAS},
     })
@@ -173,7 +195,7 @@ def test_render_bundle_is_render_only_and_writes_manifest(tmp_path, monkeypatch)
     trace_path = tmp_path / "traces.pt"
     snapshot_path = tmp_path / "snapshot.pt"
     bundle = dict(scenario_id=7, shared_snapshot=dict(step=6, rule="test shared step"), runs={
-        "r0": {gamma: _run(False, 7) for gamma in V.DISPLAY_GAMMAS},
+        "expert": {gamma: _run(False, 7) for gamma in V.DISPLAY_GAMMAS},
         "selected": {gamma: _run(True, 7) for gamma in V.DISPLAY_GAMMAS},
         "kazuki": {gamma: _run(False, 7) for gamma in V.DISPLAY_GAMMAS},
     })

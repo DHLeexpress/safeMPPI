@@ -1,6 +1,13 @@
 import numpy as np
 
 import sfm_b1_viz_socp as V
+import sfm_metrics2 as M
+
+
+def test_visualization_and_runtime_import_the_same_verifier_functions():
+    assert V.verify_query is M.verify_query
+    assert V.verify_in_worker is M.verify_in_worker
+    assert V.certify_moving_window is M.certify_moving_window
 
 
 def test_free_space_exact_socp_uses_sixteen_artificial_faces_without_grid():
