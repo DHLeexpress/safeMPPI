@@ -42,7 +42,10 @@ def render(method_runs_path, output_dir, *, scenario):
     manifest = dict(
         status="SFM_B1_METHOD_VISUALIZATION_COMPLETE",
         controllers_rerun_by_renderer=False,
-        source=os.path.abspath(method_runs_path),
+        source=dict(
+            path=os.path.abspath(method_runs_path),
+            sha256=_sha256(method_runs_path),
+        ),
         scenario_id=int(scenario), shared_snapshot=shared,
         report=report,
         artifacts={

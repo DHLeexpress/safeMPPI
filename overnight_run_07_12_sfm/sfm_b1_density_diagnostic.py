@@ -335,6 +335,11 @@ def run_methods(r0, selected, *, scenario, device, sample_seed, outdir,
         if int(sample_seed) != int(search_payload["bank"]["sample_seed"]):
             raise RuntimeError("method trace sample seed differs from the finite diagnostic search")
     environment = visual_environment(scene_profile)
+    kazuki_variant = (
+        "default" if np.isclose(kazuki_safe_coef, .3) and np.isclose(kazuki_goal_coef, .5)
+        else "goal_stress" if np.isclose(kazuki_safe_coef, .3) and np.isclose(kazuki_goal_coef, 1.0)
+        else "declared_custom"
+    )
     r0_policy, _ = GPS.load_sfm_policy(r0, device=device)
     selected_policy, _ = GPS.load_sfm_policy(selected, device=device)
     r0_policy.eval(); selected_policy.eval()
@@ -370,6 +375,7 @@ def run_methods(r0, selected, *, scenario, device, sample_seed, outdir,
         diagnostic_only=True, scenario_id=int(scenario), gammas=list(DISPLAY_GAMMAS),
         sample_seed=int(sample_seed), environment=environment,
         kazuki_coefficients=dict(
+            variant=kazuki_variant,
             safe_coef=float(kazuki_safe_coef), goal_coef=float(kazuki_goal_coef),
         ),
         shared_snapshot=shared_snapshot, runs=methods,
@@ -387,6 +393,10 @@ def run_methods(r0, selected, *, scenario, device, sample_seed, outdir,
         diagnostic_only=True, unbiased_evaluation=False,
         scenario_id=int(scenario), gammas=list(DISPLAY_GAMMAS),
         sample_seed=int(sample_seed), environment=environment, checkpoints=checkpoints,
+        kazuki_comparator=dict(
+            variant=kazuki_variant,
+            safe_coef=float(kazuki_safe_coef), goal_coef=float(kazuki_goal_coef),
+        ),
         rows=rows, rerun_matches_search=rerun_matches_search,
         shared_snapshot=shared_snapshot, trace_bundle="method_traces.pt",
         trace_bundle_source_path=os.path.abspath(bundle_path),
@@ -405,10 +415,11 @@ def run_methods(r0, selected, *, scenario, device, sample_seed, outdir,
         )),
     )
     manifest["contract_sha256"] = _canonical_sha256({
-        key: manifest[key] for key in (
-            "scenario_id", "gammas", "sample_seed", "environment", "checkpoints",
-            "shared_snapshot", "trace_bundle_sha256", "trace_contract", "finite_search",
-        )
+            key: manifest[key] for key in (
+                "scenario_id", "gammas", "sample_seed", "environment", "checkpoints",
+                "kazuki_comparator", "shared_snapshot", "trace_bundle_sha256",
+                "trace_contract", "finite_search",
+            )
     })
     _write_json(os.path.join(outdir, "method_traces.json"), manifest)
     return manifest

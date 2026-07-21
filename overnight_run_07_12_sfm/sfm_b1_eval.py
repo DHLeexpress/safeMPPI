@@ -141,6 +141,7 @@ def raw_rollout(policy, episode, gamma, *, device="cpu", T=180, n_ped=20, temp=1
         steps=len(controls), time_to_goal=(len(controls) * SS.DT if reached and not collision else None),
         min_clearance=float(minimum_clearance), successful_clearance=successful_clearance,
         states=states, controls=np.asarray(controls, np.float32), peds=np.asarray(pedestrian_rows, np.float32),
+        n_ped=int(n_ped), ped_speed_range=tuple(map(float, ped_speed_range)),
         trace=trace if collect_trace else None, mode_counts=dict(episode_modes),
         raw_semantics="temp=1,NFE=8,one generated window per context,execute first action,plain flow only",
     )

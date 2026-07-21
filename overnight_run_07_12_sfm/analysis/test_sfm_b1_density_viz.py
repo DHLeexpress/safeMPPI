@@ -8,6 +8,7 @@ import torch
 
 import sfm_b1_density_viz as V
 import sfm_b1_expert as X
+import sfm_b1_method_viz as MV
 
 
 SQUARE = tuple(
@@ -188,6 +189,24 @@ def test_method_bundle_accepts_density_diagnostic_aliases():
     normalized = V.normalize_method_bundle(bundle, scenario_id=11)
     assert tuple(normalized) == V.METHOD_KEYS
     assert all(normalized["selected"][gamma]["success"] for gamma in V.DISPLAY_GAMMAS)
+
+
+def test_method_only_manifest_authenticates_trace_bundle(tmp_path, monkeypatch):
+    method_path = tmp_path / "methods.pt"
+    torch.save(dict(shared_snapshot=dict(step=0), runs={}), method_path)
+    monkeypatch.setattr(MV.V, "normalize_method_bundle", lambda *args, **kwargs: {})
+
+    def fake_render(_runs, png, *, snapshot_step, output_mp4, report_path):
+        for path in (png, output_mp4, report_path):
+            __import__("pathlib").Path(path).write_bytes(b"render")
+        return dict(explicit_snapshot_step=snapshot_step)
+
+    monkeypatch.setattr(MV.V, "render_method_gamma_comparison", fake_render)
+    manifest = MV.render(method_path, tmp_path / "method-render", scenario=7)
+    assert manifest["source"] == {
+        "path": str(method_path.resolve()),
+        "sha256": MV._sha256(method_path),
+    }
 
 
 def test_render_bundle_is_render_only_and_writes_manifest(tmp_path, monkeypatch):

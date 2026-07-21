@@ -66,6 +66,8 @@ def test_raw_support_is_counted_without_render_trace(monkeypatch):
     row = E.raw_rollout(policy, 1, .5, T=1, n_ped=1, collect_trace=False)
     assert row["trace"] is None
     assert sum(row["mode_counts"].values()) == 1
+    assert row["n_ped"] == 1
+    assert row["ped_speed_range"] == SS.OOD_PED_SPEED_RANGE
 
 
 def test_scene_profiles_make_training_shift_explicit():
