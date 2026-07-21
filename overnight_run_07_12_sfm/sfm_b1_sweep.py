@@ -50,15 +50,26 @@ def write_json(path, payload):
 
 
 def git_frozen_source():
-    status = subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True).strip()
+    # Child scientific jobs need the conda CUDA library path, but system Git/
+    # SSH on Helios must not inherit it (otherwise libssl versions conflict).
+    git_environment = os.environ.copy()
+    git_environment.pop("LD_LIBRARY_PATH", None)
+    status = subprocess.check_output(
+        ["git", "status", "--porcelain"], cwd=ROOT, text=True, env=git_environment,
+    ).strip()
     if status:
         raise RuntimeError("source worktree must be clean before a frozen run")
-    branch = subprocess.check_output(["git", "branch", "--show-current"], cwd=ROOT, text=True).strip()
+    branch = subprocess.check_output(
+        ["git", "branch", "--show-current"], cwd=ROOT, text=True, env=git_environment,
+    ).strip()
     if not branch:
         raise RuntimeError("frozen runs require a named, pushed branch")
-    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, env=git_environment,
+    ).strip()
     remote = subprocess.check_output(
-        ["git", "ls-remote", "--heads", "origin", branch], cwd=ROOT, text=True
+        ["git", "ls-remote", "--heads", "origin", branch], cwd=ROOT, text=True,
+        env=git_environment,
     ).split()
     if not remote or remote[0] != head:
         raise RuntimeError("reviewed source HEAD has not been pushed")
