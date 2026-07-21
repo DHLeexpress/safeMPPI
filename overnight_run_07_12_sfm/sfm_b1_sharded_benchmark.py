@@ -1,8 +1,8 @@
-"""Process-isolated, fail-closed density-OOD M100 benchmark.
+"""Process-isolated, fail-closed ID/double-shift-OOD M100 benchmark.
 
 Each raw/Kazuki method--gamma cell runs in its own Python process.  This is
 important because the rollout implementations seed PyTorch globally.  The
-aggregate is produced only after the exact declared 3 x 7 cell set has been
+aggregate is produced only after the exact declared 4 x 7 cell set has been
 authenticated.
 """
 from __future__ import annotations
@@ -26,18 +26,24 @@ import sfm_scene as SS
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, ".."))
-PROFILE = "density_ood"
+PROFILES = ("matched_id", "double_density_velocity_ood")
 M_PER_GAMMA = 100
-METHODS = ("r0_raw", "selected_raw", "kazuki")
+METHODS = ("r0_raw", "selected_raw", "kazuki_default", "kazuki_goal_stress")
 METHOD_LABELS = {
     "r0_raw": "Hp10 r0 raw",
     "selected_raw": "selected B1 raw",
-    "kazuki": "default Kazuki",
+    "kazuki_default": "default Kazuki (safe=0.3, goal=0.5)",
+    "kazuki_goal_stress": "goal-stress Kazuki (safe=0.3, goal=1.0)",
 }
 METHOD_RESULT_NAMES = {
     "r0_raw": "raw temperature-1 generative policy",
     "selected_raw": "raw temperature-1 generative policy",
-    "kazuki": "default Kazuki generate-guide-refine",
+    "kazuki_default": "default Kazuki generate-guide-refine",
+    "kazuki_goal_stress": "predeclared goal-stress Kazuki generate-guide-refine",
+}
+KAZUKI_CONFIGS = {
+    "kazuki_default": dict(safe_coef=0.3, goal_coef=0.5),
+    "kazuki_goal_stress": dict(safe_coef=0.3, goal_coef=1.0),
 }
 
 
@@ -84,13 +90,13 @@ def _checkpoint_auth(r0, selected, expected_r0_sha256, expected_selected_sha256)
 
 
 def _validate_fixed_bank(scene_profile, ep0, M):
-    if scene_profile != PROFILE:
-        raise ValueError(f"this benchmark is fixed to scene_profile={PROFILE}")
+    if scene_profile not in PROFILES:
+        raise ValueError(f"scene_profile must be one of {PROFILES}")
     if int(M) != M_PER_GAMMA:
         raise ValueError(f"this benchmark is fixed to M={M_PER_GAMMA} per gamma")
-    if int(ep0) != int(SP.DEPLOY_DENSITY_OOD_EP0):
+    if int(ep0) != int(SP.DEPLOY_DOUBLE_SHIFT_EP0):
         raise ValueError(
-            f"this benchmark is fixed to ep0={SP.DEPLOY_DENSITY_OOD_EP0}"
+            f"this benchmark is fixed to ep0={SP.DEPLOY_DOUBLE_SHIFT_EP0}, shared across profiles"
         )
 
 
@@ -129,7 +135,7 @@ def _cell_contract(base, method, gamma):
         raise ValueError(f"unknown method: {method}")
     gamma = _canonical_gamma(gamma)
     used_checkpoint = "selected" if method == "selected_raw" else "r0"
-    return dict(
+    value = dict(
         **base,
         method=method,
         method_label=METHOD_LABELS[method],
@@ -137,6 +143,9 @@ def _cell_contract(base, method, gamma):
         episodes=list(range(base["ep0"], base["ep0"] + base["M_per_gamma"])),
         used_checkpoint=used_checkpoint,
     )
+    if method in KAZUKI_CONFIGS:
+        value["kazuki_config"] = dict(KAZUKI_CONFIGS[method])
+    return value
 
 
 def _gamma_slug(gamma):
@@ -168,11 +177,16 @@ def _evaluate_raw_cell(checkpoint, episodes, gamma, *, scene_profile, device):
     )
 
 
-def _evaluate_kazuki_cell(checkpoint, episodes, gamma, *, scene_profile, device):
-    """Exact default Kazuki semantics, restricted to one declared gamma."""
+def _evaluate_kazuki_cell(checkpoint, episodes, gamma, *, method, scene_profile, device):
+    """Exact declared Kazuki semantics, restricted to one gamma."""
+    if method not in KAZUKI_CONFIGS:
+        raise ValueError(f"unknown Kazuki method: {method}")
     policy, _ = BB.GPS.load_sfm_policy(checkpoint, device=device)
     environment = SS.scene_profile(scene_profile)
-    config = BB.KZ.KazukiConfig(safe_coefs=(0.3,), goal_coef=0.5).validate()
+    values = KAZUKI_CONFIGS[method]
+    config = BB.KZ.KazukiConfig(
+        safe_coefs=(values["safe_coef"],), goal_coef=values["goal_coef"],
+    ).validate()
     rows = []
     for episode in episodes:
         rollout = BB.KZ.kazuki_sfm_deploy(
@@ -193,9 +207,9 @@ def _evaluate_kazuki_cell(checkpoint, episodes, gamma, *, scene_profile, device)
             mode_counts={},
         ))
     return dict(
-        method=METHOD_RESULT_NAMES["kazuki"],
+        method=METHOD_RESULT_NAMES[method],
         checkpoint=os.path.abspath(checkpoint), checkpoint_sha256=BE.sha256_file(checkpoint),
-        safe_coef=0.3, goal_coef=0.5,
+        safe_coef=values["safe_coef"], goal_coef=values["goal_coef"],
         comparator_semantics="learned prior plus reward guidance and MPPI refinement; not raw flow",
         rows=rows,
     )
@@ -209,6 +223,14 @@ def _validate_cell(payload, expected_contract):
     result = payload.get("result", {})
     if result.get("method") != METHOD_RESULT_NAMES[expected_contract["method"]]:
         raise RuntimeError("cell result method mismatch")
+    if expected_contract["method"] in KAZUKI_CONFIGS:
+        expected_config = KAZUKI_CONFIGS[expected_contract["method"]]
+        observed_config = {
+            "safe_coef": result.get("safe_coef"),
+            "goal_coef": result.get("goal_coef"),
+        }
+        if observed_config != expected_config:
+            raise RuntimeError("cell Kazuki configuration mismatch")
     checkpoint = expected_contract["checkpoints"][expected_contract["used_checkpoint"]]
     if (result.get("checkpoint") != checkpoint["path"]
             or result.get("checkpoint_sha256") != checkpoint["sha256"]):
@@ -239,10 +261,10 @@ def run_cell(*, r0, selected, scene_profile, ep0, M, method, gamma, device, outd
     if os.path.exists(output):
         with open(output) as stream:
             return _validate_cell(json.load(stream), contract)
-    if method == "kazuki":
+    if method in KAZUKI_CONFIGS:
         result = _evaluate_kazuki_cell(
             r0, contract["episodes"], contract["gamma"],
-            scene_profile=scene_profile, device=device,
+            method=method, scene_profile=scene_profile, device=device,
         )
     else:
         checkpoint = selected if method == "selected_raw" else r0
@@ -512,8 +534,8 @@ def run_driver(args):
 def _add_contract_arguments(parser):
     parser.add_argument("--r0", required=True)
     parser.add_argument("--selected", required=True)
-    parser.add_argument("--scene-profile", default=PROFILE, choices=(PROFILE,))
-    parser.add_argument("--ep0", type=int, default=SP.DEPLOY_DENSITY_OOD_EP0)
+    parser.add_argument("--scene-profile", required=True, choices=PROFILES)
+    parser.add_argument("--ep0", type=int, default=SP.DEPLOY_DOUBLE_SHIFT_EP0)
     parser.add_argument("--M", type=int, default=M_PER_GAMMA)
     parser.add_argument("--outdir", required=True)
     parser.add_argument("--expected-source-commit", required=True)

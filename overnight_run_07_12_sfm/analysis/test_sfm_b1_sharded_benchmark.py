@@ -9,7 +9,7 @@ import sfm_protocol as SP
 import sfm_scene as SS
 
 
-def _base(tmp_path, M=2):
+def _base(tmp_path, M=2, scene_profile="double_density_velocity_ood"):
     r0 = tmp_path / "r0.pt"
     selected = tmp_path / "selected.pt"
     r0.write_bytes(b"r0")
@@ -25,8 +25,8 @@ def _base(tmp_path, M=2):
             "r0": dict(path=str(r0.resolve()), sha256=S.BE.sha256_file(r0)),
             "selected": dict(path=str(selected.resolve()), sha256=S.BE.sha256_file(selected)),
         },
-        scene_profile="density_ood", environment=SS.scene_profile("density_ood"),
-        ep0=1200, M_per_gamma=M, gpu=gpu,
+        scene_profile=scene_profile, environment=SS.scene_profile(scene_profile),
+        ep0=SP.DEPLOY_DOUBLE_SHIFT_EP0, M_per_gamma=M, gpu=gpu,
     )
 
 
@@ -48,8 +48,8 @@ def _payload(base, method, gamma):
         method=S.METHOD_RESULT_NAMES[method], checkpoint=checkpoint["path"],
         checkpoint_sha256=checkpoint["sha256"], summary={}, rows=rows,
     )
-    if method == "kazuki":
-        result.update(safe_coef=.3, goal_coef=.5,
+    if method in S.KAZUKI_CONFIGS:
+        result.update(**S.KAZUKI_CONFIGS[method],
                       comparator_semantics="learned prior plus reward guidance and MPPI refinement; not raw flow")
     else:
         result["raw_semantics"] = (
@@ -81,20 +81,23 @@ def test_cell_runs_only_declared_gamma_and_publishes_atomically(tmp_path, monkey
     monkeypatch.setattr(S, "_base_contract", lambda **kwargs: base)
     monkeypatch.setattr(S, "_evaluate_raw_cell", fake_evaluate)
     result = S.run_cell(
-        r0="r0", selected="selected", scene_profile="density_ood", ep0=1200, M=2,
+        r0="r0", selected="selected", scene_profile=base["scene_profile"],
+        ep0=base["ep0"], M=2,
         method="selected_raw", gamma="0.3", device="cuda:0", outdir=tmp_path,
         expected_source_commit="a" * 40, expected_r0_sha256="r", expected_selected_sha256="s",
         expected_gpu_uuid="GPU-test",
     )
     assert result["contract"]["gamma"] == .3
-    assert seen["episodes"] == [1200, 1201] and seen["gamma"] == .3
+    assert seen["episodes"] == [
+        SP.DEPLOY_DOUBLE_SHIFT_EP0, SP.DEPLOY_DOUBLE_SHIFT_EP0 + 1,
+    ] and seen["gamma"] == .3
     output = Path(S.cell_path(tmp_path, "selected_raw", .3))
     assert output.exists()
     assert not list(output.parent.glob("*.tmp.*"))
     assert json.loads(output.read_text())["status"] == "SFM_B1_BENCHMARK_CELL_COMPLETE"
 
 
-def test_aggregate_requires_exact_21_unique_authenticated_cells(tmp_path, monkeypatch):
+def test_aggregate_requires_exact_28_unique_authenticated_cells(tmp_path, monkeypatch):
     base = _base(tmp_path)
     cells = tmp_path / "cells"
     cells.mkdir()
@@ -111,21 +114,22 @@ def test_aggregate_requires_exact_21_unique_authenticated_cells(tmp_path, monkey
 
     monkeypatch.setattr(S.BB, "_render_benchmark", fake_render)
     values = dict(
-        r0="r0", selected="selected", scene_profile="density_ood", ep0=1200, M=2,
+        r0="r0", selected="selected", scene_profile=base["scene_profile"],
+        ep0=base["ep0"], M=2,
         outdir=tmp_path, expected_source_commit="a" * 40,
         expected_r0_sha256="r", expected_selected_sha256="s",
         expected_gpu_uuid="GPU-test",
     )
     payload = S.aggregate(**values)
     assert list(payload["methods"]) == [S.METHOD_LABELS[value] for value in S.METHODS]
-    assert len(payload["cell_order"]) == 21
+    assert len(payload["cell_order"]) == 28
     assert payload["cell_order"][0] == dict(
         method="r0_raw", gamma=.1, file=S.cell_filename("r0_raw", .1),
     )
-    assert json.loads((tmp_path / "COMPLETE.json").read_text())["cell_count"] == 21
+    assert json.loads((tmp_path / "COMPLETE.json").read_text())["cell_count"] == 28
 
     (cells / "duplicate.json").write_text((cells / S.cell_filename("r0_raw", .1)).read_text())
-    with pytest.raises(RuntimeError, match="exactly 21"):
+    with pytest.raises(RuntimeError, match="exactly 28"):
         S.aggregate(**values)
 
 
@@ -158,13 +162,16 @@ def test_driver_declares_one_gpu_and_cells_are_subprocess_isolated(tmp_path):
         S._driver_environment("1,3")
     args = S.build_parser().parse_args([
         "driver", "--r0", "r0", "--selected", "selected", "--outdir", str(tmp_path),
+        "--scene-profile", "double_density_velocity_ood",
         "--expected-source-commit", "a" * 40, "--expected-r0-sha256", "r",
         "--expected-selected-sha256", "s", "--expected-gpu-uuid", "GPU-test",
         "--cuda-visible-device", "3",
     ])
-    command = S._cell_command(args, "kazuki", .5)
+    command = S._cell_command(args, "kazuki_goal_stress", .5)
     assert command[1:3] == [str(Path(S.__file__).resolve()), "cell"]
-    assert command[-6:] == ["--method", "kazuki", "--gamma", "0.5", "--device", "cuda:0"]
+    assert command[-6:] == [
+        "--method", "kazuki_goal_stress", "--gamma", "0.5", "--device", "cuda:0",
+    ]
     source = Path(S.__file__).read_text()
     imports = [node for node in ast.walk(ast.parse(source))
                if isinstance(node, (ast.Import, ast.ImportFrom))]
@@ -186,7 +193,53 @@ def test_gpu_provenance_resolves_declared_index_and_rejects_wrong_uuid(monkeypat
         S._gpu_snapshot("3", "GPU-one", source)
 
 
+@pytest.mark.parametrize("profile", S.PROFILES)
+def test_fixed_bank_accepts_both_profiles_with_shared_episode_range(profile):
+    S._validate_fixed_bank(profile, SP.DEPLOY_DOUBLE_SHIFT_EP0, 100)
+
+
 def test_fixed_bank_rejects_an_alternate_episode_range():
-    S._validate_fixed_bank("density_ood", SP.DEPLOY_DENSITY_OOD_EP0, 100)
     with pytest.raises(ValueError, match="fixed to ep0"):
-        S._validate_fixed_bank("density_ood", SP.DEPLOY_DENSITY_OOD_EP0 + 1, 100)
+        S._validate_fixed_bank(
+            "double_density_velocity_ood", SP.DEPLOY_DOUBLE_SHIFT_EP0 + 1, 100,
+        )
+
+
+def test_kazuki_arms_are_predeclared_and_distinct():
+    assert S.KAZUKI_CONFIGS == {
+        "kazuki_default": dict(safe_coef=.3, goal_coef=.5),
+        "kazuki_goal_stress": dict(safe_coef=.3, goal_coef=1.0),
+    }
+    assert S.METHODS == (
+        "r0_raw", "selected_raw", "kazuki_default", "kazuki_goal_stress",
+    )
+
+
+def test_goal_stress_cell_uses_and_authenticates_declared_coefficients(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "r0.pt"
+    checkpoint.write_bytes(b"r0")
+    seen = {}
+    monkeypatch.setattr(S.BB.GPS, "load_sfm_policy", lambda *args, **kwargs: (object(), {}))
+
+    def fake_deploy(policy, episode, gamma, *, cfg, **kwargs):
+        seen.update(safe_coefs=cfg.safe_coefs, goal_coef=cfg.goal_coef)
+        return dict(
+            success=True, collision=False, reached=True, steps=3, min_clear=.2,
+        )
+
+    monkeypatch.setattr(S.BB.KZ, "kazuki_sfm_deploy", fake_deploy)
+    result = S._evaluate_kazuki_cell(
+        checkpoint, [SP.DEPLOY_DOUBLE_SHIFT_EP0], .1,
+        method="kazuki_goal_stress", scene_profile="double_density_velocity_ood",
+        device="cuda:0",
+    )
+    assert seen == dict(safe_coefs=(.3,), goal_coef=1.0)
+    assert (result["safe_coef"], result["goal_coef"]) == (.3, 1.0)
+
+    contract_dir = tmp_path / "contract"
+    contract_dir.mkdir()
+    base = _base(contract_dir)
+    payload = _payload(base, "kazuki_goal_stress", .1)
+    payload["result"]["goal_coef"] = .5
+    with pytest.raises(RuntimeError, match="configuration mismatch"):
+        S._validate_cell(payload, S._cell_contract(base, "kazuki_goal_stress", .1))
