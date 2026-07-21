@@ -74,6 +74,17 @@ def test_b1_screen_and_holdout_have_the_declared_sizes_and_disjoint_banks():
     assert EV.B1_SCREEN_PROFILE.checkpoint_stride == 1
 
 
+def test_b1_margin50_reuses_the_b1_holdout_crn_for_direct_comparison():
+    original, original_meta = EV.holdout_noise_bank(
+        EV.SCENE, 20, profile=EV.B1_HOLDOUT_PROFILE, study="b1"
+    )
+    margin50, margin50_meta = EV.holdout_noise_bank(
+        EV.SCENE, 20, profile=EV.B1_HOLDOUT_PROFILE, study="b1_margin50"
+    )
+    assert np.array_equal(margin50, original)
+    assert margin50_meta["sha256"] == original_meta["sha256"]
+
+
 def test_successful_route_coverage_uses_all_attempts_as_denominator():
     rows = [
         {"success": True, "route_mode_closest": 1},

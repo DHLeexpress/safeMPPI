@@ -99,8 +99,9 @@ def holdout_noise_bank(
     profile: EV.EvaluationProfile = HOLDOUT_PROFILE,
     study: str = "support",
 ):
+    seed_study = "b1" if study in B1_STUDIES else study
     raw = (
-        f"afe-rbf-{study}|genuinely-disjoint-M50-holdout|"
+        f"afe-rbf-{seed_study}|genuinely-disjoint-M50-holdout|"
         f"{scene_profile}|temperature-1"
     ).encode()
     seed = int.from_bytes(hashlib.sha256(raw).digest()[:8], "big") % (2**63 - 1)
