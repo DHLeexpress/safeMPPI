@@ -199,6 +199,8 @@ manifest contains 113 independently rehashed artifacts.
 - `sfm_b1_expand.py`: B1 gathering and update
 - `sfm_b1_eval.py`: raw evaluation
 - `sfm_b1_benchmark.py`: matched deployment and checkpoint curves
+- `sfm_b1_sharded_benchmark.py`: process-isolated 3-method x 7-gamma fixed
+  M100 deployment with exact cell authentication and episode-cluster pooled CIs
 - `sfm_b1_query_diagnostic.py`: paired closed-loop selector diagnostics
 - `sfm_b1_viz.py`: gallery, query paths, and ten-level polytopes
 - `sfm_b1_density_diagnostic.py`: disjoint finite case search, traced method
