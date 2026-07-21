@@ -139,8 +139,10 @@ def test_verifier_timing_counts_attempts_errors_and_amortized_parallel_wall_time
     assert value["resolved"] == 7
     assert value["errors"] == 1
     assert value["mean_amortized_verifier_wall_ms_per_query"] == 2.0
-    assert value["n_theta"] == 180
-    assert "not a generic cvxpy" in value["verifier_implementation"]
+    assert value["n_theta"] is None
+    assert value["angular_grid"] is False
+    assert value["K_artificial"] == 16
+    assert "exact 2-D angular-interval" in value["verifier_implementation"]
 
 
 def test_parser_defaults_to_cuda_and_declared_rbf_preflight_values():

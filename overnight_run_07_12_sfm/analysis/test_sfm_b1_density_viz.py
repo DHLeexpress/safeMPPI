@@ -9,11 +9,12 @@ import torch
 import sfm_b1_density_viz as V
 
 
-SQUARE = (
-    SimpleNamespace(a=np.array([1.0, 0.0]), m=1.0, feasible=True, kind="artificial"),
-    SimpleNamespace(a=np.array([-1.0, 0.0]), m=1.0, feasible=True, kind="artificial"),
-    SimpleNamespace(a=np.array([0.0, 1.0]), m=1.0, feasible=True, kind="artificial"),
-    SimpleNamespace(a=np.array([0.0, -1.0]), m=1.0, feasible=True, kind="artificial"),
+SQUARE = tuple(
+    SimpleNamespace(
+        a=np.array([np.cos(2.0 * np.pi * index / 16), np.sin(2.0 * np.pi * index / 16)]),
+        m=1.0, feasible=True, kind="artificial",
+    )
+    for index in range(16)
 )
 
 
@@ -26,7 +27,9 @@ def _result(positive, scale=1.0):
     return dict(
         resolved=True, y=int(positive), full_h=True, terminal_step=10,
         segment=_segment(scale), faces=list(SQUARE),
-        diagnostics=dict(worst_t=4),
+        diagnostics=dict(
+            worst_t=4, solver="exact_2d_angular_interval_socp", K_artificial=16,
+        ),
     )
 
 

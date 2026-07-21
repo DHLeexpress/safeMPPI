@@ -220,7 +220,7 @@ def nvp_fail_closed(replica):
 
 
 def gather_macro_round(policy, phi_policy, gp, beta, replicas, cfg, shard, device, executor, generator,
-                       *, record_all_traces=False):
+                       *, record_all_traces=False, verifier_worker=None):
     """Freeze all acquisition state and gather one complete 8x7 macro-round."""
     timers = Counter()
     sigma_all, sigma_selected, ess_values = [], [], []
@@ -267,7 +267,8 @@ def gather_macro_round(policy, phi_policy, gp, beta, replicas, cfg, shard, devic
                     prepared["ped_xy"], prepared["ped_vel"], replica.gamma, cfg.n_theta,
                 ))
         start = time.perf_counter()
-        results = list(executor.map(SM.verify_in_worker, tasks))
+        worker = SM.verify_in_worker if verifier_worker is None else verifier_worker
+        results = list(executor.map(worker, tasks))
         timers["verifier"] += time.perf_counter() - start
         by_context = defaultdict(list)
         for context_index, candidate_id, result in results:

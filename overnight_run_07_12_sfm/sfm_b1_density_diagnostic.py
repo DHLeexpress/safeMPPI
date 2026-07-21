@@ -26,6 +26,7 @@ import sfm_b1_eval as BE
 import sfm_b1_expand as BX
 import sfm_b1_rbf as BR
 import sfm_b1_store as BS
+import sfm_b1_viz_socp as VS
 import sfm_kazuki as KZ
 import sfm_protocol as SP
 import sfm_scene as SS
@@ -481,10 +482,10 @@ def verifier_timing(traces, gather):
             "the per-query value is amortized wall time, not summed single-core solver latency"
         ),
         verifier_implementation=(
-            "compact moving-face fit plus n_theta=180 angular search and direct certificate check; "
-            "not a generic cvxpy optimization solve"
+            "exact 2-D angular-interval solution of each moving-disk positive max-margin "
+            "SOCP block; 16 canonical artificial sensing-boundary anchors; no theta grid"
         ),
-        n_theta=180,
+        n_theta=None, angular_grid=False, K_artificial=VS.ARTIFICIAL_FACES,
     )
 
 
@@ -526,7 +527,7 @@ def run_collect(checkpoint, recent_dir, round_i, *, scenario, ell, cap, device,
     with ProcessPoolExecutor(max_workers=int(verifier_workers)) as executor:
         gather = BX.gather_macro_round(
             policy, phi_policy, gp, beta, replicas, cfg, shard, device, executor, generator,
-            record_all_traces=True,
+            record_all_traces=True, verifier_worker=VS.verify_in_worker,
         )
     traces = gather.pop("traces")
     selected_snapshot, snapshot_scores = choose_snapshot(traces)

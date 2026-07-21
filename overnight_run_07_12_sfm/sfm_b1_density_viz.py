@@ -24,10 +24,9 @@ import numpy as np
 import torch
 
 import _paths  # noqa: F401
-from cfm_mppi.safegpc_adapter.polytope_v2 import build_polytope_v2
-import sfm_b1_cost as BC
+from polar_grid import polytope_HP
 import sfm_b1_viz as BV
-import sfm_metrics2 as SM
+import sfm_b1_viz_socp as VS
 import sfm_scene as SS
 
 
@@ -35,7 +34,7 @@ DISPLAY_GAMMAS = (0.1, 0.5, 1.0)
 METHOD_KEYS = ("r0", "selected", "kazuki")
 METHOD_LABELS = {
     "r0": "Hp10 r0 raw",
-    "selected": "selected raw expansion",
+    "selected": "Arm-A r10 learned raw",
     "kazuki": "default Kazuki generate-guide-refine",
 }
 MAGENTA = "#CC79A7"
@@ -71,10 +70,14 @@ def _query_handles(*, include_nominal=False, include_guidance=False):
                label="terminal-prefix y=1 (not full-H)"),
         Line2D([], [], color=BV.RED, lw=2.0, marker="x", label="rejected"),
         Line2D([], [], color=BV.BLUE, lw=3.2, label="executed first action"),
-        Line2D([], [], color=BV.GREEN, lw=.9, label="candidate-specific verifier h=1..10"),
+        Line2D([], [], color=BV.GREEN, lw=.55, label="exact SOCP h=1..10"),
+        Line2D([], [], color=BV.GREEN, lw=1.25, label="exact SOCP outer set (K=16)"),
     ]
     if include_nominal:
-        handles.append(Line2D([], [], color=BV.BLUE, lw=.9, label="nominal h=1..10"))
+        handles.extend([
+            Line2D([], [], color=BV.BLUE, lw=.5, label="nominal h=1..10"),
+            Line2D([], [], color=BV.BLUE, lw=1.25, label="nominal outer set (16 faces)"),
+        ])
     if include_guidance:
         handles.append(Line2D([], [], color=MAGENTA, lw=2.5, label="Kazuki net guidance"))
     return handles
@@ -115,10 +118,20 @@ def checked_verifier_levels(trace, query_row, *, H=10):
     polygons = BV.verifier_level_polygons(trace, query_row, H=H)
     result = query_row["result"]
     faces = [face for face in result["faces"] if bool(face.feasible)]
+    diagnostics = result.get("diagnostics", {})
+    if diagnostics.get("solver") != "exact_2d_angular_interval_socp":
+        raise ValueError("green verifier geometry requires the exact 2-D SOCP solver")
+    if int(diagnostics.get("K_artificial", -1)) != VS.ARTIFICIAL_FACES:
+        raise ValueError("green verifier geometry requires exactly 16 artificial outer faces")
+    if sum(face.kind == "artificial" for face in faces) != VS.ARTIFICIAL_FACES:
+        raise ValueError("resolved verifier face list does not contain 16 feasible artificial faces")
     A = np.stack([np.asarray(face.a, float) for face in faces])
     margins = np.asarray([float(face.m) for face in faces])
     center = np.asarray(result["segment"], float)[0]
     b = A @ center + margins
+    outer = BV.halfspace_polygon(A, b)
+    if outer is None:
+        raise ValueError("faithful verifier faces do not form a bounded outer polytope")
     overlaps = [
         index for index, pedestrian in enumerate(np.asarray(trace["ped_xy"], float))
         if not _disk_is_separated(A, b, pedestrian)
@@ -126,50 +139,80 @@ def checked_verifier_levels(trace, query_row, *, H=10):
     return dict(
         polygons=([] if overlaps else polygons), requested_levels=int(H),
         rendered_levels=(0 if overlaps else len(polygons)),
+        outer_polygon=(None if overlaps else outer),
         current_disk_overlap_indices=overlaps,
         locally_clear=not overlaps,
+        artificial_faces=sum(face.kind == "artificial" for face in faces),
+        solver=result.get("diagnostics", {}).get("solver"),
     )
 
 
-def nominal_safemppi_levels(trace, *, gamma=None, H=10, config=None):
-    """Velocity-aware nominal SafeMPPI levels at one raw-policy context."""
-    config = BC.frozen_expert_config() if config is None else config
+def nominal_safemppi_levels(trace, *, gamma=None, H=10):
+    """Position-only nominal SafeMPPI geometry with a 16-sided outer set."""
     state = np.asarray(trace["state"], np.float32)
     ped_xy = np.asarray(trace["ped_xy"], np.float32)
-    ped_vel = np.asarray(trace["ped_vel"], np.float32)
     obstacles = np.concatenate([
         ped_xy, np.full((len(ped_xy), 1), SS.R_PED, np.float32),
     ], axis=1)
-    polytope, info = build_polytope_v2(
-        state[:2], obstacles,
-        sensing_range=float(config.barrier_activation_radius),
-        n_base=int(config.polytope_nbase), margin=0.0,
-        obstacle_velocities=ped_vel, robot_velocity=state[2:4],
-        predict_gain=float(config.predict_gain),
-        predict_tau=float(config.horizon) * float(config.dt),
+    _, (A, b, margins) = polytope_HP(
+        state[:2], obstacles, sensing=SS.R_SENSE, n_base=16,
     )
-    A = polytope.A.detach().cpu().numpy()
-    b = polytope.b.detach().cpu().numpy()
-    margins = np.maximum(b - A @ state[:2], 1.0e-9)
+    A = np.asarray(A, float); b = np.asarray(b, float)
+    margins = np.asarray(margins, float)
+    outer = BV.halfspace_polygon(A, b)
+    if outer is None:
+        raise ValueError("nominal K=16 faces do not form a bounded outer polytope")
     value = float(trace.get("gamma", gamma) if gamma is None else gamma)
     return dict(
         polygons=BV._level_polygons(A, margins, state[:2], value, H=H),
-        detected_faces=int(info["n_detected"]),
+        outer_polygon=outer, base_faces=16,
+        detected_faces=max(0, int(len(A)) - 16),
         contains_robot=bool(np.all(A @ state[:2] <= b + 1.0e-7)),
+        velocity_used=False,
     )
 
 
-def draw_margin_query_frame(axis, trace, *, executed_levels=True):
-    """Draw one max-margin acquisition context without a nominal blue set."""
+def _draw_outer_polygon(axis, polygon, *, color, linewidth=1.25, alpha=.95, zorder=2.7):
+    axis.plot(
+        np.r_[polygon[:, 0], polygon[0, 0]],
+        np.r_[polygon[:, 1], polygon[0, 1]],
+        color=color, lw=linewidth, alpha=alpha, zorder=zorder,
+    )
+
+
+def _draw_nominal_geometry(axis, trace):
+    nominal = nominal_safemppi_levels(trace, H=10)
+    BV._draw_level_polygons(
+        axis, nominal["polygons"], color=BV.BLUE,
+        linewidth=.48, alpha=.62, zorder=2,
+    )
+    _draw_outer_polygon(axis, nominal["outer_polygon"], color=BV.BLUE)
+    return nominal
+
+
+def _draw_verifier_geometry(axis, audit):
+    if not audit or not audit["polygons"]:
+        return
+    BV._draw_level_polygons(
+        axis, audit["polygons"], color=BV.GREEN,
+        linewidth=.52, alpha=.68, zorder=2.5,
+    )
+    _draw_outer_polygon(axis, audit["outer_polygon"], color=BV.GREEN)
+
+
+def draw_margin_query_frame(axis, trace, *, executed_levels=True, nominal_levels=False):
+    """Draw one exact-K16 max-margin acquisition context."""
     BV._draw_common(axis, trace, nominal_levels=False)
+    nominal = _draw_nominal_geometry(axis, trace) if nominal_levels else None
     selected = list(map(int, trace["selected_ids"]))
     for row in trace["all_K"]:
         path = np.asarray(row["segment"])
-        axis.plot(path[:, 0], path[:, 1], color=BV.GRAY, lw=.65, alpha=.32, zorder=3)
+        axis.plot(path[:, 0], path[:, 1], color=BV.GRAY, lw=.48,
+                  marker=".", ms=1.5, alpha=.27, zorder=3)
     for candidate_id in selected:
         path = np.asarray(BV._trace_candidate(trace, candidate_id)["segment"])
-        axis.plot(path[:, 0], path[:, 1], color=BV.ORANGE, lw=1.3,
-                  marker=".", ms=1.9, alpha=.9, zorder=4)
+        axis.plot(path[:, 0], path[:, 1], color=BV.ORANGE, lw=.72,
+                  marker="o", ms=1.9, alpha=.9, zorder=4)
     rejected = []
     positives = []
     terminal_prefixes = []
@@ -180,24 +223,22 @@ def draw_margin_query_frame(axis, trace, *, executed_levels=True):
         path = np.asarray(BV._trace_candidate(trace, candidate_id)["segment"])
         color = (BV.GREEN if status == "positive_full_h" else
                  BV.ORANGE if status == "positive_terminal_prefix" else BV.RED)
-        axis.plot(path[:, 0], path[:, 1], color=color, lw=1.85,
+        axis.plot(path[:, 0], path[:, 1], color=color, lw=.92,
                   ls=("--" if status == "positive_terminal_prefix" else "-"),
-                  marker=".", ms=2.1, alpha=.96, zorder=5)
+                  marker="o", ms=2.1, alpha=.96, zorder=5)
         if status == "positive_full_h":
             positives.append(candidate_id)
         elif status == "positive_terminal_prefix":
             terminal_prefixes.append(candidate_id)
         else:
-            worst = int(query["result"].get("diagnostics", {}).get("worst_t", len(path) - 1))
-            worst = min(max(worst, 1), len(path) - 1)
-            axis.plot(path[worst, 0], path[worst, 1], "x", color=BV.RED,
+            axis.plot(path[-1, 0], path[-1, 1], "x", color=BV.RED,
                       ms=6, mew=1.4, zorder=8)
             rejected.append(candidate_id)
     level_audit = None
     executed = trace.get("executed_id")
     if executed is not None:
         path = np.asarray(BV._trace_candidate(trace, executed)["segment"])
-        axis.plot(path[:2, 0], path[:2, 1], color=BV.BLUE, lw=3.2, zorder=9)
+        axis.plot(path[:2, 0], path[:2, 1], color=BV.BLUE, lw=2.6, zorder=9)
         axis.annotate("", xy=path[1], xytext=path[0],
                       arrowprops=dict(arrowstyle="->", color=BV.BLUE, lw=2.8))
         status, query = _query_result(trace, executed)
@@ -205,18 +246,19 @@ def draw_margin_query_frame(axis, trace, *, executed_levels=True):
             raise ValueError("the executed candidate must be a resolved positive query")
         if executed_levels and status == "positive_full_h":
             level_audit = checked_verifier_levels(trace, query, H=10)
-            if level_audit["polygons"]:
-                BV._draw_level_polygons(
-                    axis, level_audit["polygons"], color=BV.GREEN,
-                    linewidth=.85, alpha=.78, zorder=2.5,
-                )
+            _draw_verifier_geometry(axis, level_audit)
     _set_clean_axis(axis)
     return dict(
-        nominal_drawn=False, selected_ids=selected, positive_ids=positives,
+        nominal_drawn=bool(nominal is not None), selected_ids=selected, positive_ids=positives,
+        nominal=(None if nominal is None else {
+            key: value for key, value in nominal.items()
+            if key not in ("polygons", "outer_polygon")
+        }),
         terminal_prefix_positive_ids=terminal_prefixes, rejected_ids=rejected,
         executed_id=(None if executed is None else int(executed)),
         executed_verifier=(None if level_audit is None else {
-            key: value for key, value in level_audit.items() if key != "polygons"
+            key: value for key, value in level_audit.items()
+            if key not in ("polygons", "outer_polygon")
         }),
     )
 
@@ -257,7 +299,8 @@ def render_margin_gathering_video(
     figure.legend(handles=_query_handles(), loc="center left", bbox_to_anchor=(.79, .55),
                   fontsize=8, frameon=False)
     figure.text(.79, .30, f"scenario {int(scenario_id)}\ncolumns: gamma 0.1 | 0.5 | 1.0\n"
-                "green set: executed candidate only", ha="left", va="top", fontsize=8)
+                "green set: executed exact-SOCP candidate only\nK=16 artificial outer faces",
+                ha="left", va="top", fontsize=8)
 
     def trace_at(gamma, step):
         rows = index[round(float(gamma), 6)]
@@ -282,13 +325,24 @@ def render_margin_gathering_video(
     if output_snapshot is not None:
         if snapshot_step is None:
             raise ValueError("output_snapshot requires an explicit snapshot_step")
-        update(int(snapshot_step))
+        rendered.clear()
+        for column, gamma in enumerate(gammas):
+            axes[column].clear()
+            trace = trace_at(gamma, int(snapshot_step))
+            rendered[str(gamma)] = draw_margin_query_frame(
+                axes[column], trace, nominal_levels=True,
+            )
+        figure.legends.clear()
+        figure.legend(handles=_query_handles(include_nominal=True), loc="center left",
+                      bbox_to_anchor=(.79, .55), fontsize=8, frameon=False)
         os.makedirs(os.path.dirname(os.path.abspath(output_snapshot)), exist_ok=True)
         figure.savefig(output_snapshot, dpi=180, bbox_inches="tight")
         snapshot_metadata = dict(step=int(snapshot_step), cells=dict(rendered))
     plt.close(figure)
     return dict(
-        semantics="diagnostic-only max-margin gather; no nominal overlay; only executed full-H positive may own green levels",
+        semantics=("diagnostic-only max-margin gather rerun with exact K16 SOCP; animation has no "
+                   "nominal overlay; static snapshot adds position-only nominal h=1..10 and outer set; "
+                   "only an executed full-H positive may own green levels"),
         scenario_id=int(scenario_id), gammas=list(gammas), frame_steps=frame_steps,
         mp4=os.path.abspath(output_mp4),
         snapshot=(None if output_snapshot is None else os.path.abspath(output_snapshot)),
@@ -373,34 +427,31 @@ def render_candidate_query_snapshot(traces, output_png, *, selection=None, repor
     candidate_metadata = []
     for axis, candidate_id in zip(axes.flat, candidate_ids):
         BV._draw_common(axis, trace, nominal_levels=False)
+        nominal = _draw_nominal_geometry(axis, trace)
         status, query = _query_result(trace, candidate_id)
         path = np.asarray(BV._trace_candidate(trace, candidate_id)["segment"])
         color = BV.GREEN if status == "positive_full_h" else BV.RED if status == "negative" else BV.ORANGE
-        axis.plot(path[:, 0], path[:, 1], color=color, lw=2.2,
+        axis.plot(path[:, 0], path[:, 1], color=color, lw=.92,
                   ls=("--" if status == "positive_terminal_prefix" else "-"),
-                  marker=".", ms=2.2, zorder=7)
+                  marker="o", ms=2.3, zorder=7)
         level_audit = None
         rejected_x = None
         if status == "positive_full_h":
             level_audit = checked_verifier_levels(trace, query, H=10)
-            if level_audit["polygons"]:
-                BV._draw_level_polygons(
-                    axis, level_audit["polygons"], color=BV.GREEN,
-                    linewidth=.85, alpha=.78, zorder=2.5,
-                )
+            _draw_verifier_geometry(axis, level_audit)
         elif status == "negative":
-            worst = int(query["result"].get("diagnostics", {}).get("worst_t", len(path) - 1))
-            worst = min(max(worst, 1), len(path) - 1)
-            rejected_x = path[worst].astype(float).tolist()
-            axis.plot(*path[worst], "x", color=BV.RED, ms=7, mew=1.6, zorder=9)
+            rejected_x = path[-1].astype(float).tolist()
+            axis.plot(*path[-1], "x", color=BV.RED, ms=7, mew=1.6, zorder=9)
         if trace.get("executed_id") is not None and int(trace["executed_id"]) == candidate_id:
             axis.plot(path[:2, 0], path[:2, 1], color=BV.BLUE, lw=3.2, zorder=10)
         _set_clean_axis(axis)
         candidate_metadata.append(dict(
             candidate_id=candidate_id, status=status,
+            nominal_outer_faces=nominal["base_faces"],
             full_h=bool(query and query["result"].get("full_h", False)),
             verifier=(None if level_audit is None else {
-                key: value for key, value in level_audit.items() if key != "polygons"
+                key: value for key, value in level_audit.items()
+                if key not in ("polygons", "outer_polygon")
             }),
             rejected_x=rejected_x,
             executed=bool(trace.get("executed_id") is not None
@@ -408,7 +459,7 @@ def render_candidate_query_snapshot(traces, output_png, *, selection=None, repor
         ))
     for axis in axes.flat[len(candidate_ids):]:
         axis.set_visible(False)
-    figure.legend(handles=_query_handles(), loc="center left", bbox_to_anchor=(.77, .58),
+    figure.legend(handles=_query_handles(include_nominal=True), loc="center left", bbox_to_anchor=(.77, .58),
                   fontsize=8, frameon=False)
     chosen = selection["chosen"]
     figure.text(
@@ -422,7 +473,9 @@ def render_candidate_query_snapshot(traces, output_png, *, selection=None, repor
     figure.savefig(output_png, dpi=180, bbox_inches="tight")
     plt.close(figure)
     report = dict(
-        semantics="each panel is one B query; green levels are candidate-specific and full-H only",
+        semantics=("each panel is one B query rerun with exact moving-disk SOCP and K=16 artificial "
+                   "outer faces; green levels are candidate-specific and full-H only; blue is the "
+                   "position-only nominal polytope"),
         output=os.path.abspath(output_png), selection=selection,
         candidates=candidate_metadata,
     )
@@ -445,12 +498,14 @@ def _draw_robot_and_pedestrians(axis, run, trace, step, color):
     for pedestrian, velocity in zip(np.asarray(trace["ped_xy"]), np.asarray(trace["ped_vel"])):
         future = pedestrian[None] + np.arange(11)[:, None] * SS.DT * velocity[None]
         axis.plot(future[:, 0], future[:, 1], ".--", color=BV.GRAY, ms=1.8, lw=.55, alpha=.5)
-    axis.plot(states[:state_index + 1, 0], states[:state_index + 1, 1], color=color, lw=1.8)
+    axis.plot(states[:state_index + 1, 0], states[:state_index + 1, 1],
+              color=color, lw=1.25, marker=".", ms=1.6)
     axis.plot(states[state_index, 0], states[state_index, 1], "o", color=color, ms=6, zorder=9)
     axis.plot(SS.GOAL[0], SS.GOAL[1], "*", color="#F0E442", mec="#333333", ms=8)
 
 
-def draw_method_panel(axis, method, run, gamma, step, *, guidance_scale=3.0, guidance_cap=1.8):
+def draw_method_panel(axis, method, run, gamma, step, *, verifier_result=None,
+                      guidance_scale=3.0, guidance_cap=1.8):
     """Draw one cell of the method-by-gamma comparison without titles/labels."""
     if method not in METHOD_KEYS:
         raise ValueError(f"unknown method {method!r}")
@@ -460,30 +515,28 @@ def draw_method_panel(axis, method, run, gamma, step, *, guidance_scale=3.0, gui
     metadata = dict(method=method, gamma=float(gamma), step=int(trace["step"]))
     if method == "r0":
         plan = np.asarray(trace["planned_states"], float)[:, :2]
-        axis.plot(plan[:, 0], plan[:, 1], color=BV.BLUE, lw=1.6, marker=".", ms=2)
+        axis.plot(plan[:, 0], plan[:, 1], color=BV.BLUE, lw=.82, marker="o", ms=2.2)
         nominal = nominal_safemppi_levels(trace, gamma=gamma, H=10)
         BV._draw_level_polygons(axis, nominal["polygons"], color=BV.BLUE,
-                                linewidth=.78, alpha=.74, zorder=2)
+                                linewidth=.48, alpha=.62, zorder=2)
+        _draw_outer_polygon(axis, nominal["outer_polygon"], color=BV.BLUE)
         metadata.update(nominal_levels=len(nominal["polygons"]),
-                        nominal_contains_robot=nominal["contains_robot"])
+                        nominal_contains_robot=nominal["contains_robot"],
+                        nominal_outer_faces=nominal["base_faces"])
     elif method == "selected":
         plan = np.asarray(trace["planned_states"], float)[:, :2]
         # Green is reserved for a complete H=10 certificate, not method identity.
-        axis.plot(plan[:, 0], plan[:, 1], color="#333333", lw=1.8, marker=".", ms=2)
-        result = SM.verify_query(
+        axis.plot(plan[:, 0], plan[:, 1], color="#333333", lw=.82, marker="o", ms=2.2)
+        result = verifier_result if verifier_result is not None else VS.verify_query(
             trace["state"], trace["controls"], trace["ped_xy"], trace["ped_vel"], gamma,
         )
         query = dict(candidate_id=0, controls=np.asarray(trace["controls"]), result=result)
         level_audit = None
         if result.get("resolved") and int(result.get("y", 0)) == 1 and bool(result.get("full_h")):
             level_audit = checked_verifier_levels(dict(trace, gamma=float(gamma)), query, H=10)
-            if level_audit["polygons"]:
-                BV._draw_level_polygons(axis, level_audit["polygons"], color=BV.GREEN,
-                                        linewidth=.85, alpha=.78, zorder=2.5)
+            _draw_verifier_geometry(axis, level_audit)
         elif result.get("resolved"):
-            worst = int(result.get("diagnostics", {}).get("worst_t", len(plan) - 1))
-            worst = min(max(worst, 1), len(plan) - 1)
-            axis.plot(*plan[worst], "x", color=BV.RED, ms=7, mew=1.5, zorder=9)
+            axis.plot(*plan[-1], "x", color=BV.RED, ms=7, mew=1.5, zorder=9)
         metadata.update(
             verifier_positive=bool(result.get("resolved") and int(result.get("y", 0)) == 1),
             verifier_full_h_positive=bool(
@@ -493,10 +546,12 @@ def draw_method_panel(axis, method, run, gamma, step, *, guidance_scale=3.0, gui
             verifier_levels=(0 if level_audit is None else level_audit["rendered_levels"]),
             verifier_local_overlap=([] if level_audit is None else level_audit["current_disk_overlap_indices"]),
             verifier_runtime_authority=False,
+            verifier_solver=result.get("diagnostics", {}).get("solver"),
+            verifier_artificial_faces=result.get("diagnostics", {}).get("K_artificial"),
         )
     else:
         plan = np.asarray(trace["selected_plan_positions"], float)
-        axis.plot(plan[:, 0], plan[:, 1], color="#7F3C8D", lw=1.8, marker=".", ms=2)
+        axis.plot(plan[:, 0], plan[:, 1], color="#7F3C8D", lw=.82, marker="o", ms=2.2)
         guidance = trace.get("accumulated_guidance")
         if guidance:
             vector = float(guidance_scale) * np.asarray(guidance["net_guidance_action"], float)
@@ -543,6 +598,16 @@ def render_method_gamma_comparison(
     if gammas != DISPLAY_GAMMAS:
         raise ValueError(f"comparison requires gammas={DISPLAY_GAMMAS}")
     episode = _validate_method_runs(runs_by_method, gammas)
+    verifier_cache = {}
+
+    def selected_verifier(gamma, step):
+        trace = _run_trace(runs_by_method["selected"][gamma], step)
+        key = (float(gamma), int(trace["step"]))
+        if key not in verifier_cache:
+            verifier_cache[key] = VS.verify_query(
+                trace["state"], trace["controls"], trace["ped_xy"], trace["ped_vel"], gamma,
+            )
+        return verifier_cache[key]
 
     def make_figure():
         figure, axes = plt.subplots(3, 3, figsize=(13.7, 12.0))
@@ -550,8 +615,9 @@ def render_method_gamma_comparison(
         figure.legend(
             handles=[
                 Line2D([], [], color=BV.BLUE, lw=1.5, label="r0 raw + nominal levels"),
-                Line2D([], [], color="#333333", lw=1.7, label="selected raw trajectory / planned window"),
-                Line2D([], [], color=BV.GREEN, lw=.9, label="offline full-H verifier (selected row only)"),
+                Line2D([], [], color="#333333", lw=1.2, label="Arm-A r10 learned raw / planned window"),
+                Line2D([], [], color=BV.GREEN, lw=.55, label="offline exact-SOCP h=1..10 (learned row)"),
+                Line2D([], [], color=BV.GREEN, lw=1.25, label="offline exact-SOCP outer set (K=16)"),
                 Line2D([], [], color="#7F3C8D", lw=1.5, label="Kazuki refined plan"),
                 Line2D([], [], color=MAGENTA, lw=2.5, label="Kazuki net guidance"),
             ],
@@ -559,8 +625,8 @@ def render_method_gamma_comparison(
         )
         figure.text(
             .79, .38,
-            "columns\ngamma 0.1 | 0.5 | 1.0\n\nrows\nHp10 r0 raw\nselected raw expansion\n"
-            "default Kazuki\n\nselected green set is\noffline diagnostic only",
+            "columns\ngamma 0.1 | 0.5 | 1.0\n\nrows\nHp10 r0 raw\nArm-A r10 learned raw\n"
+            "default Kazuki\n\ngreen appears only when the learned\nraw H=10 window passes exact SOCP",
             ha="left", va="top", fontsize=8,
         )
         return figure, axes
@@ -572,6 +638,7 @@ def render_method_gamma_comparison(
                 axes[row, column].clear()
                 cells.append(draw_method_panel(
                     axes[row, column], method, runs_by_method[method][gamma], gamma, step,
+                    verifier_result=(selected_verifier(gamma, step) if method == "selected" else None),
                 ))
         return cells
 
@@ -598,11 +665,13 @@ def render_method_gamma_comparison(
     report = dict(
         semantics={
             "r0": "raw temp=1 rollout; blue nominal set is diagnostic and did not select the action",
-            "selected": "raw temp=1 rollout; green verifier is an offline audit and did not select the action",
+            "selected": ("Arm-A r10 learned raw temp=1 rollout; green exact-K16 SOCP is an "
+                         "offline audit and did not select the action"),
             "kazuki": "generate-guide-refine comparator; magenta is guided minus unguided first action for one latent",
         },
         explicit_episode=int(episode), explicit_snapshot_step=int(snapshot_step),
         gammas=list(gammas), rows=list(METHOD_KEYS), cells=cells,
+        verifier_cache_entries=len(verifier_cache),
         png=os.path.abspath(output_png),
         mp4=(None if output_mp4 is None else os.path.abspath(output_mp4)),
         video_frames=video_frames,
@@ -718,10 +787,30 @@ def _explicit_snapshot_selection(trace, source):
     )
 
 
+def _validate_exact_query_traces(traces):
+    """Fail closed instead of painting legacy K12/angular traces as faithful."""
+    resolved = 0
+    for trace in traces:
+        for row in trace.get("query_rows", []):
+            result = row.get("result", {})
+            if not result.get("resolved"):
+                continue
+            resolved += 1
+            diagnostics = result.get("diagnostics", {})
+            if diagnostics.get("solver") != "exact_2d_angular_interval_socp":
+                raise ValueError("query traces were not collected with the exact 2-D SOCP")
+            if int(diagnostics.get("K_artificial", -1)) != VS.ARTIFICIAL_FACES:
+                raise ValueError("query traces do not use 16 artificial outer faces")
+    if resolved == 0:
+        raise ValueError("query traces contain no resolved exact-SOCP queries")
+    return resolved
+
+
 def render_bundle(
         method_runs_path, query_traces_path, scenario_id, output_dir, *,
         snapshot_trace_path=None, snapshot_metadata_path=None,
-        snapshot_step=None, snapshot_gamma=None):
+        snapshot_step=None, snapshot_gamma=None,
+        success_method_runs_path=None, success_scenario_id=None):
     """Render the complete density-OOD handoff without running controllers."""
     sources = [snapshot_trace_path is not None, snapshot_metadata_path is not None, snapshot_step is not None]
     if sum(sources) != 1:
@@ -734,9 +823,12 @@ def render_bundle(
         raise ValueError("method-runs bundle requires driver-declared shared_snapshot.step")
     method_snapshot_step = int(method_snapshot["step"])
     method_runs = normalize_method_bundle(method_bundle, scenario_id=scenario_id)
+    if (success_method_runs_path is None) != (success_scenario_id is None):
+        raise ValueError("success method runs and scenario must be supplied together")
     traces = torch.load(query_traces_path, map_location="cpu", weights_only=False)
     if not isinstance(traces, list) or not traces:
         raise ValueError("query-traces must contain a nonempty trace list")
+    exact_resolved_queries = _validate_exact_query_traces(traces)
     if snapshot_trace_path is not None:
         snapshot = torch.load(snapshot_trace_path, map_location="cpu", weights_only=False)
         if not isinstance(snapshot, dict):
@@ -753,6 +845,7 @@ def render_bundle(
         source = dict(source="explicit", key=key)
     if int(snapshot["scenario_id"]) != int(scenario_id):
         raise ValueError("snapshot scenario does not match --scenario")
+    _validate_exact_query_traces([snapshot])
 
     os.makedirs(output_dir, exist_ok=False)
     paths = {
@@ -762,6 +855,11 @@ def render_bundle(
         "gathering_snapshot": os.path.join(output_dir, "max_margin_gathering_snapshot.png"),
         "candidate_snapshot": os.path.join(output_dir, "candidate_specific_B.png"),
     }
+    if success_method_runs_path is not None:
+        paths.update(
+            success_comparison_png=os.path.join(output_dir, "method_gamma_3x3_all_success.png"),
+            success_comparison_mp4=os.path.join(output_dir, "method_gamma_3x3_all_success.mp4"),
+        )
     comparison = render_method_gamma_comparison(
         method_runs, paths["comparison_png"], snapshot_step=method_snapshot_step,
         output_mp4=paths["comparison_mp4"],
@@ -774,6 +872,30 @@ def render_bundle(
         [snapshot], paths["candidate_snapshot"],
         selection=_explicit_snapshot_selection(snapshot, source["source"]),
     )
+    success_comparison = None
+    success_source = None
+    if success_method_runs_path is not None:
+        success_bundle = torch.load(success_method_runs_path, map_location="cpu", weights_only=False)
+        success_snapshot = success_bundle.get("shared_snapshot") if isinstance(success_bundle, dict) else None
+        if not isinstance(success_snapshot, dict) or "step" not in success_snapshot:
+            raise ValueError("success method-runs bundle requires shared_snapshot.step")
+        success_runs = normalize_method_bundle(
+            success_bundle, scenario_id=int(success_scenario_id),
+        )
+        if not all(bool(success_runs[method][gamma]["success"])
+                   for method in METHOD_KEYS for gamma in DISPLAY_GAMMAS):
+            raise ValueError("the declared all-success episode does not have nine successes")
+        success_comparison = render_method_gamma_comparison(
+            success_runs, paths["success_comparison_png"],
+            snapshot_step=int(success_snapshot["step"]),
+            output_mp4=paths["success_comparison_mp4"],
+        )
+        success_source = dict(
+            path=os.path.abspath(success_method_runs_path),
+            sha256=_sha256(success_method_runs_path), scenario_id=int(success_scenario_id),
+            selection_rule="lowest scenario ID in the fixed finite bank with all 3 methods x 3 gammas successful",
+            shared_snapshot=success_snapshot,
+        )
     artifacts = {
         name: dict(path=os.path.abspath(path), bytes=os.path.getsize(path), sha256=_sha256(path))
         for name, path in paths.items()
@@ -786,12 +908,14 @@ def render_bundle(
     manifest = dict(
         status="DENSITY_OOD_VISUALIZATION_BUNDLE_COMPLETE",
         diagnostic_only=True, controllers_rerun_by_renderer=False,
+        exact_socp_resolved_queries=int(exact_resolved_queries),
         scenario_id=int(scenario_id), gammas=list(DISPLAY_GAMMAS),
         source_files={
             "method_runs": dict(path=os.path.abspath(method_runs_path), sha256=_sha256(method_runs_path),
                                 shared_snapshot=method_snapshot),
             "query_traces": dict(path=os.path.abspath(query_traces_path), sha256=_sha256(query_traces_path)),
             "snapshot": source,
+            "all_success_method_runs": success_source,
         },
         terminal_prefix_audit=dict(
             count=len(terminal_prefixes), green_paths=0, green_polytopes=0,
@@ -809,7 +933,8 @@ def render_bundle(
                 source=source["source"],
             ),
         ),
-        comparison=comparison, gathering=gathering, candidate_snapshot=candidate,
+        comparison=comparison, all_success_comparison=success_comparison,
+        gathering=gathering, candidate_snapshot=candidate,
         artifacts=artifacts,
     )
     manifest_path = os.path.join(output_dir, "render_manifest.json")
@@ -830,6 +955,8 @@ def build_parser():
     source.add_argument("--snapshot-step", type=int)
     parser.add_argument("--snapshot-gamma", type=float)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--success-method-runs")
+    parser.add_argument("--success-scenario", type=int)
     return parser
 
 
@@ -840,6 +967,8 @@ def main(argv=None):
         snapshot_trace_path=args.snapshot_trace,
         snapshot_metadata_path=args.snapshot_metadata,
         snapshot_step=args.snapshot_step, snapshot_gamma=args.snapshot_gamma,
+        success_method_runs_path=args.success_method_runs,
+        success_scenario_id=args.success_scenario,
     )
 
 
