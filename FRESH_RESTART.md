@@ -102,3 +102,40 @@ The companion `sfm_b1_full_episode_viz.py` renders:
 
 The resulting movie is a **pretrained-generator round-1 gathering diagnostic**,
 not a pure raw-policy rollout and not a safety-certified deployment.
+
+## Authenticated round-1 diagnostic result
+
+The diagnostic was run from clean commit
+`bf53dee110f885b28a7783db432085e7d75f15ff` on Helios GPU 3 using episodes
+250001, 250003, and 250007 for every gamma.  Collection took 2 min 57 s.
+
+- B queries: 5,198 verifier-positive and 2,410 verifier-negative;
+- executed windows: 1,459 verifier-positive and 443 verifier-negative;
+- finite-B NVP contexts: 454;
+- NVP continuations: 11 certified raw rescues and 443 uncertified raw actions;
+- episode outcomes: 18 success and 3 collision;
+- first ten-step trap entries: 3.
+
+This is the central pre-expansion observation: a fail-closed controller would
+have hidden 454 post-NVP states.  Only 11 independently sampled raw windows at
+those states were both full-H positive and nominal-Hp admissible.  Continuing
+the other 443 states exposes unsafe data, but does not make it certified data.
+
+Because this is round 1, the GP history buffer is empty.  The RBF length scale
+does not change the equal marginal prior variance; it affects only
+pending-point conditioning among the K candidates.  Therefore the reported
+negative selected-versus-marginal uplift is not a round-2 novelty result and
+must not be used to judge the historical RBF buffer.
+
+Server artifacts:
+
+`/data3/research1/sfm_fresh_b27df76_full_episode_audit_bf53dee`
+
+Mac artifacts:
+
+`/Users/dhl/Documents/SFM_HP10_FRESH_RESTART_B27DF76_BF53DEE`
+
+The video is H.264, 2436x1060, 75 frames, 15 s.  Its SHA-256 is
+`e2abc447ced326ebdfe6be155989ac2dae3f0fb856e6ba426c59fbd9163319d8`.
+The full trace SHA-256 is
+`eba53f8d389e6caf30569b31749ab4bb66e88d7e805e831623bf8f8589a392bb`.
