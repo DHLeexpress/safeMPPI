@@ -297,9 +297,8 @@ def validate_training_arm(
         "expected_checkpoint_sha256": CHECKPOINT_SHA256,
         "replay_window_rounds": 1,
         "gp_quota_semantics": (
-            "73 executed D+ rows per gamma plus one rotating extra when "
-            "support permits; any support shortage is logged and the "
-            "unused capacity is deterministically redistributed"
+            "exactly 73 executed D+ rows per gamma plus one rotating "
+            "extra; any support shortage aborts the scientific round"
         ),
         "ess_target_semantics": (
             "mean normalized ESS over each sequential remaining pool"
@@ -342,10 +341,7 @@ def validate_training_arm(
         if row.get("checkpoint_sha256") != checkpoints[round_i]["sha256"]:
             raise RuntimeError(f"round checkpoint digest mismatch: {marker}")
         gp_selection = row.get("gp_selection", {})
-        expected_gp_count = (
-            0 if round_i == 1
-            else min(CAP, int(history[round_i - 2]["shard"]["Dplus"]))
-        )
+        expected_gp_count = 0 if round_i == 1 else CAP
         per_gamma_gp = gp_selection.get("per_gamma", {})
         if (
             int(gp_selection.get("requested_cap", -1)) != CAP
@@ -361,6 +357,18 @@ def validate_training_arm(
             raise RuntimeError(f"previous-round GP contract mismatch in round {round_i}")
         if round_i > 1 and gp_selection.get("unique") is not True:
             raise RuntimeError(f"GP buffer is not unique in round {round_i}")
+        if round_i > 1:
+            extra_gamma = (
+                0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0
+            )[(round_i - 2) % 7]
+            expected_per_gamma = {
+                str(gamma): 73 + int(gamma == extra_gamma)
+                for gamma in (0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0)
+            }
+            if per_gamma_gp != expected_per_gamma:
+                raise RuntimeError(
+                    f"strict gamma GP quota mismatch in round {round_i}"
+                )
         if "outcomes" in row:
             raise RuntimeError("outcomes must be stored only inside gather")
         shard = row.get("shard", {})

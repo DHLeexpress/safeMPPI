@@ -180,28 +180,26 @@ def _gamma_balanced_records(previous, *, cap, round_i, seed):
             records, int(seed) + gamma_index,
         )
     quota = int(cap) // len(SP.GAMMAS)
-    selected = []
-    remaining = {}
-    shortfall = {}
-    for gamma in SP.GAMMAS:
-        values = groups[float(gamma)]
-        take = min(quota, len(values))
-        selected.extend(values[:take])
-        remaining[float(gamma)] = values[take:]
-        shortfall[str(gamma)] = quota - take
     rotation = (int(round_i) - 2) % len(SP.GAMMAS)
-    order = [
-        float(SP.GAMMAS[(rotation + offset) % len(SP.GAMMAS)])
-        for offset in range(len(SP.GAMMAS))
+    extra_gamma = float(SP.GAMMAS[rotation])
+    required = {
+        float(gamma): quota + int(float(gamma) == extra_gamma)
+        for gamma in SP.GAMMAS
+    }
+    shortfall = {
+        str(gamma): max(0, required[float(gamma)] - len(groups[float(gamma)]))
+        for gamma in SP.GAMMAS
+    }
+    if any(shortfall.values()):
+        raise RuntimeError(
+            "strict gamma-balanced GP quota is unavailable; "
+            f"required={required}, shortfall={shortfall}"
+        )
+    selected = [
+        record
+        for gamma in SP.GAMMAS
+        for record in groups[float(gamma)][:required[float(gamma)]]
     ]
-    while len(selected) < int(cap) and any(remaining.values()):
-        progressed = False
-        for gamma in order:
-            if remaining[gamma] and len(selected) < int(cap):
-                selected.append(remaining[gamma].pop(0))
-                progressed = True
-        if not progressed:
-            break
     per_gamma = Counter(
         str(previous.contexts[int(row["context_id"])]["gamma"])
         for _, row in selected
@@ -211,16 +209,15 @@ def _gamma_balanced_records(previous, *, cap, round_i, seed):
     ]
     if len(identities) != len(set(identities)):
         raise RuntimeError("GP buffer selection contains duplicates")
-    expected = min(int(cap), len(previous.Dplus))
-    if len(selected) != expected:
+    if len(selected) != int(cap):
         raise RuntimeError(
-            f"expected {expected} GP records, selected {len(selected)}"
+            f"expected {cap} GP records, selected {len(selected)}"
         )
     return selected, dict(
         requested_cap=int(cap),
         selected=len(selected),
         quota=quota,
-        rotating_extra_gamma=float(order[0]),
+        rotating_extra_gamma=extra_gamma,
         per_gamma={str(gamma): int(per_gamma[str(gamma)]) for gamma in SP.GAMMAS},
         shortfall=shortfall,
         unique=True,
@@ -790,9 +787,8 @@ def run(checkpoint, outdir, cfg, *, device):
             expected_checkpoint_sha256=EXPECTED_CHECKPOINT_SHA256,
             replay_window_rounds=1,
             gp_quota_semantics=(
-                "73 executed D+ rows per gamma plus one rotating extra when "
-                "support permits; any support shortage is logged and the "
-                "unused capacity is deterministically redistributed"
+                "exactly 73 executed D+ rows per gamma plus one rotating "
+                "extra; any support shortage aborts the scientific round"
             ),
             ess_target_semantics=(
                 "mean normalized ESS over each sequential remaining pool"

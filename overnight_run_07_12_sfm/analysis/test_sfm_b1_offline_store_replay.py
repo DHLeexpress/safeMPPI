@@ -300,3 +300,21 @@ def test_gp_cap_512_has_equal_gamma_quota_and_rotating_extra():
         expected_round_3 = 74 if gamma == 0.2 else 73
         assert report_round_2["per_gamma"][str(gamma)] == expected_round_2
         assert report_round_3["per_gamma"][str(gamma)] == expected_round_3
+
+
+def test_gp_quota_fails_closed_instead_of_redistributing_gamma_shortfall():
+    shard = OS.ExecutedRoundShard(1)
+    for gamma_index, gamma in enumerate(OE.SP.GAMMAS):
+        count = 72 if gamma == 0.1 else 74
+        for sample_index in range(count):
+            _add_window(
+                shard,
+                scenario=2_000 + gamma_index,
+                gamma=gamma,
+                step=sample_index,
+                y=1,
+            )
+    with pytest.raises(RuntimeError, match="strict gamma-balanced GP quota"):
+        OE._gamma_balanced_records(
+            shard, cap=512, round_i=2, seed=21,
+        )
