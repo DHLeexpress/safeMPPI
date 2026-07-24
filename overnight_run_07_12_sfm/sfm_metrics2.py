@@ -202,6 +202,41 @@ def certify_moving_window(segment, pedestrians, gamma, *, K=ARTIFICIAL_FACES,
     )
 
 
+def _verify_window(state, controls, ped_xy, ped_vel, gamma):
+    robot = rollout_positions(state, controls)
+    pedestrian = predict_pedestrians(ped_xy, ped_vel, H=len(controls))
+    task = taskspace_ok(robot)
+    collision = collision_free_time_indexed(robot, pedestrian)
+    certificate, faces, diagnostics = certify_moving_window(
+        robot, pedestrian, gamma,
+    )
+    y = bool(task and collision and certificate)
+    return dict(
+        resolved=True, error=None, y=int(y), taskspace=bool(task),
+        collision_free=bool(collision), certificate=bool(certificate),
+        segment=robot, pedestrian_prediction=pedestrian, faces=faces,
+        diagnostics=diagnostics,
+    )
+
+
+def verify_executed_window(state, controls, ped_xy, ped_vel, gamma):
+    """Certify one terminal-truncated executed window of length 1 through 10.
+
+    This API is for offline trajectory evaluation.  A short window is complete
+    relative to the executed trajectory; it is not a B1 terminal-prefix query
+    and therefore deliberately has no ``full_h`` or ``train_eligible`` field.
+    """
+    try:
+        controls = np.asarray(controls, np.float32).reshape(-1, 2)
+        if not 1 <= len(controls) <= 10:
+            raise ValueError("executed-window verifier requires 1 <= H_t <= 10")
+        result = _verify_window(state, controls, ped_xy, ped_vel, gamma)
+        result.update(window_horizon=len(controls))
+        return result
+    except Exception as error:
+        return dict(resolved=False, error=f"{type(error).__name__}: {error}")
+
+
 def verify_query(state, controls, ped_xy, ped_vel, gamma):
     """Certify every queried plan over all H=10 transitions.
 
@@ -212,21 +247,12 @@ def verify_query(state, controls, ped_xy, ped_vel, gamma):
         controls = np.asarray(controls, np.float32).reshape(-1, 2)
         if len(controls) != 10:
             raise ValueError("B1 verifier requires H=10")
-        robot = rollout_positions(state, controls)
-        pedestrian = predict_pedestrians(ped_xy, ped_vel, H=len(controls))
-        task = taskspace_ok(robot)
-        collision = collision_free_time_indexed(robot, pedestrian)
-        certificate, faces, diagnostics = certify_moving_window(
-            robot, pedestrian, gamma,
+        result = _verify_window(state, controls, ped_xy, ped_vel, gamma)
+        result.update(
+            full_h=True, terminal_step=len(controls),
+            train_eligible=bool(result["y"]),
         )
-        y = bool(task and collision and certificate)
-        return dict(
-            resolved=True, error=None, y=int(y), taskspace=bool(task),
-            collision_free=bool(collision), certificate=bool(certificate),
-            full_h=True, terminal_step=len(controls), train_eligible=bool(y),
-            segment=robot, pedestrian_prediction=pedestrian, faces=faces,
-            diagnostics=diagnostics,
-        )
+        return result
     except Exception as error:  # worker boundary: a failed solver/query enters no store.
         return dict(resolved=False, error=f"{type(error).__name__}: {error}")
 

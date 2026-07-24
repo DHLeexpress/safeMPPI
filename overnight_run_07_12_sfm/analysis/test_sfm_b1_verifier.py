@@ -40,3 +40,38 @@ def test_worker_contract_has_no_legacy_theta_grid_argument():
     assert (context, candidate) == (3, 7)
     assert result["diagnostics"]["solver"] == "exact_2d_angular_interval_socp"
     assert result["diagnostics"]["K_artificial"] == 16
+
+
+def test_executed_window_api_accepts_terminal_truncation_only():
+    state = np.zeros(4, np.float32)
+    no_pedestrians = np.zeros((0, 2), np.float32)
+    for horizon in (1, 10):
+        result = M.verify_executed_window(
+            state, np.zeros((horizon, 2), np.float32),
+            no_pedestrians, no_pedestrians, .5,
+        )
+        assert result["resolved"] and result["y"] == 1
+        assert result["window_horizon"] == horizon
+        assert "full_h" not in result
+        assert "train_eligible" not in result
+    for horizon in (0, 11):
+        result = M.verify_executed_window(
+            state, np.zeros((horizon, 2), np.float32),
+            no_pedestrians, no_pedestrians, .5,
+        )
+        assert not result["resolved"]
+
+
+def test_full_h_query_contract_remains_exactly_ten():
+    no_pedestrians = np.zeros((0, 2), np.float32)
+    short = M.verify_query(
+        np.zeros(4), np.zeros((9, 2)),
+        no_pedestrians, no_pedestrians, .5,
+    )
+    full = M.verify_query(
+        np.zeros(4), np.zeros((10, 2)),
+        no_pedestrians, no_pedestrians, .5,
+    )
+    assert not short["resolved"]
+    assert full["resolved"] and full["full_h"]
+    assert full["terminal_step"] == 10 and full["train_eligible"]
