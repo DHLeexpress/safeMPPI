@@ -101,11 +101,12 @@ class OfflineConfig:
     @property
     def arm_name(self):
         alpha = str(float(self.alpha)).replace(".", "p")
-        prefix = (
-            "offline_exec"
-            if self.selector == "margin"
-            else "offline_exec_safemppi_cost"
-        )
+        prefixes = {
+            "margin": "offline_exec",
+            "safemppi_cost": "offline_exec_safemppi_cost",
+            "balanced_rank": "offline_exec_balanced_rank",
+        }
+        prefix = prefixes[self.selector]
         return (
             f"{prefix}_alpha{alpha}_"
             f"exposures{int(self.exposure_epochs):03d}"

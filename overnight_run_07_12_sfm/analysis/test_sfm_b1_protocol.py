@@ -17,6 +17,9 @@ def test_frozen_arm_matrix_and_macro_round_ids():
     assert len(first) == len(set(first)) == 8
     assert set(first).isdisjoint(second)
     assert 8 * len(P.GAMMAS) == 56
+    X.ArmConfig(
+        name="diagnostic", selector="balanced_rank", alpha=0.0,
+    ).validate()
 
 
 def test_expansion_has_no_forbidden_legacy_or_expert_path():
