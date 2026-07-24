@@ -7,8 +7,8 @@ The two phases are deliberately separate:
 2. evaluate every r0--r10 checkpoint with the same raw temperature-one
    M=50/gamma bank and terminal-truncated executed-window Validity.
 
-All nine jobs in a phase start concurrently on four exclusive GPUs with a
-deterministic 3/2/2/2 allocation.  Any child failure stops its peers.  The
+All nine jobs in a phase start concurrently on two exclusive GPUs with a
+deterministic 5/4 allocation.  Any child failure stops its peers.  The
 output root must not exist, so a partial study can never be mistaken for a
 resumed or complete scientific run.
 """
@@ -122,28 +122,21 @@ def _validated_output_root(value: str | os.PathLike[str]) -> Path:
 def allocate_arms(
     arms: list[Arm], gpus: list[BASE.GPU],
 ) -> dict[str, list[Arm]]:
-    """Use all four GPUs with the intended 3/2/2/2 workload split."""
-    if len(gpus) != 4:
-        raise RuntimeError(f"exactly four idle GPUs are required, got {len(gpus)}")
+    """Use both requested GPUs with a deterministic 5/4 workload split."""
+    if len(gpus) != 2:
+        raise RuntimeError(f"exactly two idle GPUs are required, got {len(gpus)}")
     if set(arms) != set(arm_grid()):
         raise ValueError("offline launcher requires the complete declared arm grid")
     ordered_gpus = sorted(gpus, key=lambda gpu: int(gpu.index))
-    by_epochs = {
-        epochs: sorted(
-            [arm for arm in arms if arm.exposure_epochs == epochs],
-            key=lambda arm: arm.alpha,
-        )
-        for epochs in EXPOSURE_EPOCHS
-    }
     allocation = {gpu.uuid: [] for gpu in ordered_gpus}
-    allocation[ordered_gpus[0].uuid].extend(by_epochs[1])
-    for gpu, ten, hundred in zip(
-        ordered_gpus[1:], by_epochs[10], by_epochs[100]
-    ):
-        allocation[gpu.uuid].extend((ten, hundred))
+    ordered_arms = sorted(
+        arms, key=lambda arm: (-arm.exposure_epochs, arm.alpha),
+    )
+    for index, arm in enumerate(ordered_arms):
+        allocation[ordered_gpus[index % 2].uuid].append(arm)
     counts = sorted(len(values) for values in allocation.values())
-    if counts != [2, 2, 2, 3] or any(not values for values in allocation.values()):
-        raise RuntimeError(f"invalid four-GPU allocation: {counts}")
+    if counts != [4, 5] or any(not values for values in allocation.values()):
+        raise RuntimeError(f"invalid two-GPU allocation: {counts}")
     return allocation
 
 
@@ -684,7 +677,7 @@ def aggregate(evaluations: dict[str, dict], output: Path) -> dict:
     return result
 
 
-def _select_exactly_four_gpus(args):
+def _select_exactly_two_gpus(args):
     gpus, processes, topology = BASE.gpu_snapshot()
     selected = BASE.select_idle_gpus(
         gpus,
@@ -693,9 +686,9 @@ def _select_exactly_four_gpus(args):
         max_memory_mib=args.idle_memory_mib,
         max_utilization=args.idle_utilization_percent,
     )
-    if len(selected) != 4:
+    if len(selected) != 2:
         raise RuntimeError(
-            f"the declared study requires four exclusive GPUs, got "
+            f"the declared study requires two exclusive GPUs, got "
             f"{[gpu.index for gpu in selected]}"
         )
     return gpus, processes, topology, selected
@@ -741,7 +734,7 @@ def _parser() -> argparse.ArgumentParser:
         "--expected-checkpoint-sha256", default=CHECKPOINT_SHA256,
     )
     parser.add_argument("--outdir", required=True)
-    parser.add_argument("--gpu-indices", default="0,1,2,3")
+    parser.add_argument("--gpu-indices", default="1,3")
     parser.add_argument("--verifier-workers", type=int, default=8)
     parser.add_argument("--seed", type=int, default=20260724)
     parser.add_argument("--eval-ep0", type=int, default=260000)
@@ -773,7 +766,7 @@ def run(args) -> dict:
     outdir = _validated_output_root(args.outdir)
     source = BASE.source_provenance()
     arms = list(arm_grid())
-    all_gpus, processes, topology, selected = _select_exactly_four_gpus(args)
+    all_gpus, processes, topology, selected = _select_exactly_two_gpus(args)
     allocation = allocate_arms(arms, selected)
     pools = BASE.allocate_cpu_pools(arms, int(args.verifier_workers))
     training_jobs = _phase_jobs(
@@ -876,7 +869,7 @@ def run(args) -> dict:
 
     # Recheck exclusivity between phases.  A foreign job that appeared while
     # training ran must not be silently shared with the common-bank evaluator.
-    _, _, _, evaluation_gpus = _select_exactly_four_gpus(args)
+    _, _, _, evaluation_gpus = _select_exactly_two_gpus(args)
     if [gpu.uuid for gpu in evaluation_gpus] != [
         gpu.uuid for gpu in selected
     ]:

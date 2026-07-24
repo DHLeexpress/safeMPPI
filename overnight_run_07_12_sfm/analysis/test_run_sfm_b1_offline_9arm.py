@@ -26,7 +26,7 @@ def _gpu(index: int) -> L.BASE.GPU:
     )
 
 
-def test_arm_grid_and_four_gpu_allocation():
+def test_arm_grid_and_two_gpu_allocation():
     arms = list(L.arm_grid())
     assert len(arms) == 9
     assert len({arm.name for arm in arms}) == 9
@@ -37,12 +37,12 @@ def test_arm_grid_and_four_gpu_allocation():
         for alpha in L.ALPHAS
         for epochs in L.EXPOSURE_EPOCHS
     }
-    allocation = L.allocate_arms(arms, [_gpu(i) for i in range(4)])
-    assert sorted(map(len, allocation.values())) == [2, 2, 2, 3]
+    allocation = L.allocate_arms(arms, [_gpu(1), _gpu(3)])
+    assert sorted(map(len, allocation.values())) == [4, 5]
     assert set().union(*map(set, allocation.values())) == set(arms)
-    assert {
-        arm.exposure_epochs for arm in allocation["GPU-0"]
-    } == {1}
+    assert {arm.exposure_epochs for arm in allocation["GPU-1"]} == {
+        1, 10, 100,
+    }
 
 
 def test_output_root_must_be_new_and_under_research1(tmp_path, monkeypatch):

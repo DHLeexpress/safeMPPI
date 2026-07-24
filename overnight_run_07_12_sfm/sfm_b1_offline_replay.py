@@ -56,17 +56,48 @@ def _proportional_interleave(positive, negative):
 
 
 def stratified_batches(shard, *, batch, seed):
+    batch = int(batch)
+    if batch < 1:
+        raise ValueError("batch must be positive")
     positives = BS.hierarchical_order(OS.positive_records(shard), int(seed))
     negatives = BS.hierarchical_order(OS.negative_records(shard), int(seed) + 1)
-    merged = _proportional_interleave(positives, negatives)
-    batches = [
-        merged[start:start + int(batch)]
-        for start in range(0, len(merged), int(batch))
-    ]
+    total = len(positives) + len(negatives)
+    batch_count = math.ceil(total / batch) if total else 0
+    if positives and len(positives) < batch_count:
+        raise RuntimeError(
+            "cannot place a positive in every fixed-capacity minibatch: "
+            f"{len(positives)} positives for {batch_count} batches"
+        )
+    if not positives:
+        batches = [
+            negatives[start:start + batch]
+            for start in range(0, len(negatives), batch)
+        ]
+    else:
+        # Signed replay needs a positive objective in every Adam step.  Seed
+        # every fixed-capacity batch with one positive, then distribute the
+        # remaining deterministic sign orders without duplicating support.
+        batches = [[positives[index]] for index in range(batch_count)]
+        remaining = _proportional_interleave(
+            positives[batch_count:], negatives,
+        )
+        batch_index = 0
+        for record in remaining:
+            while len(batches[batch_index]) >= batch:
+                batch_index = (batch_index + 1) % batch_count
+            batches[batch_index].append(record)
+            batch_index = (batch_index + 1) % batch_count
     identities = [_identity(record) for values in batches for record in values]
     expected = [_identity(record) for record in positives + negatives]
     if len(identities) != len(set(identities)) or set(identities) != set(expected):
         raise RuntimeError("offline minibatch replay duplicated or omitted support")
+    if positives and any(
+        not any(int(record[1]["y"]) == 1 for record in values)
+        for values in batches
+    ):
+        raise RuntimeError("offline replay produced a positive-free minibatch")
+    if any(len(values) > batch for values in batches):
+        raise RuntimeError("offline replay exceeded the fixed minibatch capacity")
     return batches, positives, negatives
 
 

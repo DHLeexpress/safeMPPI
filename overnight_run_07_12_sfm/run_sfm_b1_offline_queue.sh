@@ -47,19 +47,19 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 idle_polls=0
 while (( idle_polls < IDLE_POLLS_REQUIRED )); do
   process_count="$(
-    nvidia-smi --query-compute-apps=pid --format=csv,noheader |
+    nvidia-smi -i 1,3 --query-compute-apps=pid --format=csv,noheader |
       sed '/^[[:space:]]*$/d' | wc -l
   )"
   bad_gpu_count="$(
-    nvidia-smi \
+    nvidia-smi -i 1,3 \
       --query-gpu=memory.used,utilization.gpu \
       --format=csv,noheader,nounits |
       awk -F, '{if ($1+0 > 1024 || $2+0 > 5) bad++} END {print bad+0}'
   )"
   gpu_count="$(
-    nvidia-smi --query-gpu=index --format=csv,noheader,nounits | wc -l
+    nvidia-smi -i 1,3 --query-gpu=index --format=csv,noheader,nounits | wc -l
   )"
-  if [[ "$gpu_count" -eq 4 && "$process_count" -eq 0 && "$bad_gpu_count" -eq 0 ]]; then
+  if [[ "$gpu_count" -eq 2 && "$process_count" -eq 0 && "$bad_gpu_count" -eq 0 ]]; then
     idle_polls=$((idle_polls + 1))
     echo "$(date -Is) IDLE_CONFIRMATION ${idle_polls}/${IDLE_POLLS_REQUIRED}"
   else
@@ -73,7 +73,7 @@ done
 
 cd "$HERE"
 echo "$(date -Is) SMOKE_START"
-CUDA_VISIBLE_DEVICES=0 "$PYTHON" sfm_b1_offline_exec.py \
+CUDA_VISIBLE_DEVICES=1 "$PYTHON" sfm_b1_offline_exec.py \
   --checkpoint "$CHECKPOINT" \
   --outdir "$SMOKE_OUTDIR" \
   --alpha 0.01 \
@@ -121,7 +121,7 @@ echo "$(date -Is) SMOKE_VALIDATED_FULL_START"
   --checkpoint "$CHECKPOINT" \
   --expected-checkpoint-sha256 "$EXPECTED_SHA" \
   --outdir "$FULL_OUTDIR" \
-  --gpu-indices 0,1,2,3 \
+  --gpu-indices 1,3 \
   --verifier-workers 8 \
   --seed 20260724 \
   --eval-ep0 260000 \

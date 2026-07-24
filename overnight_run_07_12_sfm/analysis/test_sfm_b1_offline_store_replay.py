@@ -251,6 +251,23 @@ def test_stratified_batches_are_deterministic_and_exact_once():
     assert all(any(record[1]["y"] == 1 for record in batch) for batch in left)
 
 
+def test_stratified_batches_prevent_negative_only_tail():
+    shard = _mixed_shard(positive=5, negative=8)
+    batches, positives, negatives = OR.stratified_batches(
+        shard, batch=4, seed=74,
+    )
+    assert len(batches) == math.ceil((len(positives) + len(negatives)) / 4)
+    assert all(len(values) <= 4 for values in batches)
+    assert all(any(record[1]["y"] == 1 for record in values) for values in batches)
+    assert sum(len(values) for values in batches) == len(shard.D)
+
+
+def test_stratified_batches_fail_when_sign_safe_partition_is_impossible():
+    shard = _mixed_shard(positive=1, negative=8)
+    with pytest.raises(RuntimeError, match="positive in every"):
+        OR.stratified_batches(shard, batch=4, seed=75)
+
+
 @pytest.mark.parametrize("exposure_epochs", (1, 10, 100))
 def test_replay_exact_exposure_counts_and_adam_step_formula(exposure_epochs):
     torch.manual_seed(14)
