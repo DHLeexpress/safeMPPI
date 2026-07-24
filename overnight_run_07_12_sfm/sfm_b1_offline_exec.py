@@ -48,7 +48,7 @@ GP_LAMBDA = 1.0e-2
 ALPHAS = (0.0, 0.01, 0.1)
 EXPOSURE_EPOCHS = (1, 10, 100)
 SCENE_PROFILE = "double_density_velocity_ood"
-EXECUTION_SELECTORS = ("margin", "safemppi_cost")
+EXECUTION_SELECTORS = ("margin", "safemppi_cost", "balanced_rank")
 
 
 @dataclass(frozen=True)

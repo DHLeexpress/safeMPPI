@@ -84,9 +84,80 @@ def _draw_executed_trajectory(
     )
 
 
+def _robot_frame(path, trace):
+    position = np.asarray(trace["state"], float)[:2]
+    direction = np.asarray(trace["state"], float)[2:4]
+    if np.linalg.norm(direction) < 1.0e-6:
+        direction = np.asarray(SS.GOAL, float)[:2] - position
+    direction = direction / max(np.linalg.norm(direction), 1.0e-12)
+    normal = np.array([-direction[1], direction[0]])
+    delta = np.asarray(path, float) - position
+    return np.stack([delta @ direction, delta @ normal], axis=1)
+
+
+def _draw_candidate_inset(axis, trace):
+    for child in list(axis.child_axes):
+        if getattr(child, "_sfm_candidate_inset", False):
+            child.remove()
+    inset = axis.inset_axes((.035, .675, .30, .29), zorder=30)
+    inset._sfm_candidate_inset = True
+    inset.set_facecolor((1., 1., 1., .68))
+    selected_id = trace.get("executed_id")
+    local_paths = []
+    for query_index, row in enumerate(trace["query_rows"], start=1):
+        path = np.asarray(
+            BV._trace_candidate(trace, int(row["candidate_id"]))["segment"],
+            float,
+        )
+        local = _robot_frame(path, trace)
+        local_paths.append(local)
+        status, _ = BV._candidate_status(trace, int(row["candidate_id"]))
+        color = (
+            BV.GREEN if status == "positive"
+            else BV.RED if status == "negative"
+            else BV.GRAY
+        )
+        is_selected = (
+            selected_id is not None
+            and int(row["candidate_id"]) == int(selected_id)
+        )
+        if is_selected:
+            inset.plot(
+                local[:, 0], local[:, 1], color="#111111",
+                lw=3.3, alpha=.82, zorder=3,
+            )
+        inset.plot(
+            local[:, 0], local[:, 1], color=color,
+            lw=2.25 if is_selected else 1.05,
+            alpha=.98 if is_selected else .72,
+            zorder=4 if is_selected else 2,
+        )
+        inset.text(
+            local[-1, 0], local[-1, 1], str(query_index),
+            fontsize=4.8, color=color, ha="center", va="center", zorder=5,
+        )
+    inset.plot(0., 0., marker=">", color="#111111", ms=3.2, zorder=6)
+    if local_paths:
+        joined = np.concatenate(local_paths)
+        span = max(.18, 1.08 * float(np.max(np.abs(joined))))
+        inset.set_xlim(-.08 * span, span)
+        inset.set_ylim(-span, span)
+    inset.set_aspect("equal")
+    inset.set_xticks([])
+    inset.set_yticks([])
+    inset.set_title(
+        "robot-frame B=4" if selected_id is not None else "robot-frame B=4 · NVP",
+        fontsize=5.1, pad=1.2,
+    )
+    for spine in inset.spines.values():
+        spine.set_alpha(.34)
+        spine.set_linewidth(.55)
+
+
 def draw_cell(
         axis, rows, step, *, branch_line_scale=1.0,
         trajectory_linewidth=2.8, trajectory_marker_size=2.1,
+        candidate_inset=False,
 ):
     available = [value for value in rows if value <= int(step)]
     current_step = max(available) if available else min(rows)
@@ -101,6 +172,8 @@ def draw_cell(
         axis, rows, current_step, linewidth=trajectory_linewidth,
         marker_size=trajectory_marker_size,
     )
+    if candidate_inset:
+        _draw_candidate_inset(axis, trace)
     DV._set_clean_axis(axis)
     return trace
 

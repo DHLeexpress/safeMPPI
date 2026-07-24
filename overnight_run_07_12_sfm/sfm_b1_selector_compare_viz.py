@@ -17,7 +17,7 @@ import sfm_b1_full_episode_viz as FV
 
 
 STATUS = "SFM_B1_SELECTOR_COMPARISON_COMPLETE"
-SELECTORS = ("margin", "safemppi_cost")
+SELECTORS = ("margin", "safemppi_cost", "balanced_rank")
 
 
 def _load(path, selector):
@@ -32,23 +32,32 @@ def _load(path, selector):
     return bundle
 
 
-def _validate_pair(margin, cost):
-    for key in (
-        "scenarios", "gammas", "environment", "sample_seed", "audit_seed",
-    ):
-        if margin[key] != cost[key]:
-            raise ValueError(f"selector comparison contract differs at {key}")
-    if margin.get("checkpoint_sha256") != cost.get("checkpoint_sha256"):
-        raise ValueError("selector comparison requires one pretrained checkpoint")
-    if len(margin["scenarios"]) != 3 or len(margin["gammas"]) != 7:
+def _validate_bundles(bundles):
+    reference = bundles[0][1]
+    for _, bundle in bundles[1:]:
+        for key in (
+            "scenarios", "gammas", "environment", "sample_seed", "audit_seed",
+        ):
+            if reference[key] != bundle[key]:
+                raise ValueError(
+                    f"selector comparison contract differs at {key}"
+                )
+        if (
+            reference.get("checkpoint_sha256")
+            != bundle.get("checkpoint_sha256")
+        ):
+            raise ValueError(
+                "selector comparison requires one pretrained checkpoint"
+            )
+    if len(reference["scenarios"]) != 3 or len(reference["gammas"]) != 7:
         raise ValueError("selector comparison requires 3 episodes x 7 gammas")
 
 
-def _layout(margin, cost):
-    scenarios = tuple(map(int, margin["scenarios"]))
-    gammas = tuple(map(float, margin["gammas"]))
-    bundles = (("max one-step margin", margin), ("SafeMPPI cost", cost))
-    figure, axes = plt.subplots(6, 7, figsize=(23.5, 18.0))
+def _layout(bundles):
+    scenarios = tuple(map(int, bundles[0][1]["scenarios"]))
+    gammas = tuple(map(float, bundles[0][1]["gammas"]))
+    rows = len(bundles) * len(scenarios)
+    figure, axes = plt.subplots(rows, 7, figsize=(23.5, 3.0 * rows))
     figure.subplots_adjust(
         left=.055, right=.82, bottom=.025, top=.96, wspace=.025, hspace=.04,
     )
@@ -64,7 +73,7 @@ def _layout(margin, cost):
         for scenario_index, scenario in enumerate(scenarios):
             row = selector_index * len(scenarios) + scenario_index
             figure.text(
-                .018, .96 - (.935 / 6) * (row + .5),
+                .018, .96 - (.935 / rows) * (row + .5),
                 f"{label}\nepisode {scenario}",
                 ha="center", va="center", rotation=90, fontsize=8,
             )
@@ -84,19 +93,29 @@ def _draw(axes, scenarios, gammas, bundles, indices, step):
                     branch_line_scale=2.7,
                     trajectory_linewidth=1.05,
                     trajectory_marker_size=1.25,
+                    candidate_inset=True,
                 )
 
 
 def render(
         margin_trace, cost_trace, output_png, output_mp4, output_json,
-        *, fps=5, frame_stride=2,
+        *, balanced_trace=None, fps=5, frame_stride=2,
 ):
     margin = _load(margin_trace, "margin")
     cost = _load(cost_trace, "safemppi_cost")
-    _validate_pair(margin, cost)
+    bundles = [
+        ("max one-step margin", margin),
+        ("SafeMPPI cost", cost),
+    ]
+    if balanced_trace is not None:
+        bundles.append((
+            "balanced safety + performance rank",
+            _load(balanced_trace, "balanced_rank"),
+        ))
+    _validate_bundles(bundles)
     (
         figure, axes, scenarios, gammas, bundles, indices,
-    ) = _layout(margin, cost)
+    ) = _layout(tuple(bundles))
 
     reports = {label: BC.summarize(bundle) for label, bundle in bundles}
     maximum = max(
@@ -123,7 +142,7 @@ def render(
     summary.extend([
         "Same pretrained checkpoint, episodes,",
         "gammas, proposal-noise contract.",
-        "Only the admissible-B execution rank differs.",
+        "Only the admissible-B execution ranking differs.",
         "Branches: planned H10 D samples.",
         "Thin black: executed first-action path.",
     ])
@@ -154,13 +173,19 @@ def render(
         "status": STATUS,
         "margin_trace": os.path.abspath(margin_trace),
         "safemppi_cost_trace": os.path.abspath(cost_trace),
+        "balanced_rank_trace": (
+            None if balanced_trace is None
+            else os.path.abspath(balanced_trace)
+        ),
         "checkpoint_sha256": margin.get("checkpoint_sha256"),
         "scenarios": list(scenarios),
         "gammas": list(gammas),
         "comparison": reports,
         "controlled_difference": (
             "rank the same SOCP-positive and nominal-Hp-admissible B queries "
-            "by max one-step Hp margin versus minimum frozen native SafeMPPI cost"
+            "by max one-step Hp margin, minimum frozen native SafeMPPI cost, "
+            "or the sum of ordinal safety/performance ranks with safety-first "
+            "tie-breaking"
         ),
         "frames": frames,
         "png": os.path.abspath(output_png),
@@ -177,6 +202,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--margin-trace", required=True)
     parser.add_argument("--safemppi-cost-trace", required=True)
+    parser.add_argument("--balanced-rank-trace")
     parser.add_argument("--output-png", required=True)
     parser.add_argument("--output-mp4", required=True)
     parser.add_argument("--output-json", required=True)
@@ -186,6 +212,7 @@ def main(argv=None):
     render(
         args.margin_trace, args.safemppi_cost_trace,
         args.output_png, args.output_mp4, args.output_json,
+        balanced_trace=args.balanced_rank_trace,
         fps=args.fps, frame_stride=args.frame_stride,
     )
 

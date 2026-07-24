@@ -85,11 +85,12 @@ class Arm:
     @property
     def name(self) -> str:
         alpha = str(float(self.alpha)).replace(".", "p")
-        prefix = (
-            "offline_exec"
-            if self.selector == "margin"
-            else "offline_exec_safemppi_cost"
-        )
+        prefixes = {
+            "margin": "offline_exec",
+            "safemppi_cost": "offline_exec_safemppi_cost",
+            "balanced_rank": "offline_exec_balanced_rank",
+        }
+        prefix = prefixes[self.selector]
         return (
             f"{prefix}_alpha{alpha}_"
             f"exposures{int(self.exposure_epochs):03d}"
@@ -102,7 +103,7 @@ class PhaseName:
 
 
 def arm_grid(selector="margin") -> tuple[Arm, ...]:
-    if selector not in ("margin", "safemppi_cost"):
+    if selector not in ("margin", "safemppi_cost", "balanced_rank"):
         raise ValueError(f"unknown execution selector: {selector}")
     return tuple(
         Arm(alpha, epochs, selector)
@@ -752,7 +753,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--outdir", required=True)
     parser.add_argument("--gpu-indices", default="1,3")
     parser.add_argument(
-        "--selector", choices=("margin", "safemppi_cost"), default="margin",
+        "--selector",
+        choices=("margin", "safemppi_cost", "balanced_rank"),
+        default="margin",
     )
     parser.add_argument("--verifier-workers", type=int, default=8)
     parser.add_argument("--seed", type=int, default=20260724)

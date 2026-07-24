@@ -35,3 +35,35 @@ def test_gate_precedes_selector_and_nvp_when_none():
         rows, selector="margin", state=np.zeros(4), ped_xy=np.array([[3., 3.]]),
         ped_vel=np.zeros((1, 2)), gamma=.5,
     ) is None
+
+
+def test_balanced_rank_uses_rank_sum_with_safety_first_tie(monkeypatch):
+    rows = []
+    for candidate_id in range(3):
+        controls = np.zeros((10, 2), np.float32)
+        controls[0, 0] = candidate_id + 1
+        rows.append({
+            "candidate_id": candidate_id,
+            "controls": controls,
+            "result": {"resolved": True, "y": 1},
+        })
+    monkeypatch.setattr(
+        C, "nominal_hp_margin",
+        lambda state, action, ped_xy, gamma: (
+            4.0 - float(action[0]), 1.0, 1.0,
+        ),
+    )
+    monkeypatch.setattr(
+        C, "safemppi_proposal_cost",
+        lambda state, controls, goal, ped_xy, ped_vel: torch.tensor(
+            [4.0 - float(value) for value in controls[:, 0, 0]]
+        ),
+    )
+    chosen = C.select_admissible(
+        rows, selector="balanced_rank", state=np.zeros(4),
+        ped_xy=np.array([[3., 3.]]), ped_vel=np.zeros((1, 2)), gamma=.5,
+    )
+    assert chosen["candidate_id"] == 0
+    assert chosen["safety_rank"] == 1
+    assert chosen["performance_rank"] == 3
+    assert chosen["rank_sum"] == 4

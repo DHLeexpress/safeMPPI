@@ -211,7 +211,7 @@ def collect(
         raise ValueError(f"the requested audit requires all gammas={SS.GAMMAS}")
     if scene_profile != "double_density_velocity_ood":
         raise ValueError("this audit is pinned to the authenticated double-shift OOD")
-    if selector not in ("margin", "safemppi_cost"):
+    if selector not in ("margin", "safemppi_cost", "balanced_rank"):
         raise ValueError(f"unknown execution selector: {selector}")
     if os.path.exists(outdir):
         raise FileExistsError(f"refusing to reuse audit output: {outdir}")
@@ -536,7 +536,7 @@ def main(argv=None):
     parser.add_argument("--T", type=int, default=SP.T)
     parser.add_argument(
         "--selector",
-        choices=("margin", "safemppi_cost"),
+        choices=("margin", "safemppi_cost", "balanced_rank"),
         default="margin",
     )
     args = parser.parse_args(argv)

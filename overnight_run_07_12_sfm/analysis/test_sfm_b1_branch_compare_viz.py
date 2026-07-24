@@ -1,5 +1,7 @@
 import sfm_b1_branch_compare_viz as V
+import sfm_b1_d_branch_viz as D
 import sfm_b1_selector_compare_viz as S
+import numpy as np
 
 
 def test_summary_separates_window_labels_from_episode_outcomes():
@@ -33,11 +35,18 @@ def test_selector_pair_requires_same_checkpoint_and_bank():
         "audit_seed": 9,
         "checkpoint_sha256": "a" * 64,
     }
-    S._validate_pair(common, dict(common))
+    S._validate_bundles((("margin", common), ("cost", dict(common))))
     different = dict(common, checkpoint_sha256="b" * 64)
     try:
-        S._validate_pair(common, different)
+        S._validate_bundles((("margin", common), ("cost", different)))
     except ValueError as error:
         assert "one pretrained checkpoint" in str(error)
     else:
         raise AssertionError("checkpoint mismatch must be rejected")
+
+
+def test_robot_frame_uses_velocity_direction():
+    trace = {"state": np.array([2., 3., 0., 2.])}
+    path = np.array([[2., 3.], [2., 4.], [3., 4.]])
+    local = D._robot_frame(path, trace)
+    np.testing.assert_allclose(local, [[0., 0.], [1., 0.], [1., -1.]])

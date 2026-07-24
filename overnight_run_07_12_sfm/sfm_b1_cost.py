@@ -111,13 +111,38 @@ def select_admissible(query_rows, *, selector, state, ped_xy, ped_vel, gamma):
         return None
     if selector == "margin":
         return max(admissible, key=lambda row: (row["hp_margin"], -int(row["candidate_id"])))
-    if selector != "safemppi_cost":
+    if selector not in ("safemppi_cost", "balanced_rank"):
         raise ValueError(f"unknown selector: {selector}")
     controls = torch.as_tensor(np.stack([row["controls"] for row in admissible]), dtype=torch.float32)
     costs = safemppi_proposal_cost(state, controls, SS.GOAL, ped_xy, ped_vel).cpu().numpy()
     for row, cost in zip(admissible, costs):
         row["expert_cost"] = float(cost)
-    return min(admissible, key=lambda row: (row["expert_cost"], int(row["candidate_id"])))
+    if selector == "safemppi_cost":
+        return min(admissible, key=lambda row: (row["expert_cost"], int(row["candidate_id"])))
+    safety_order = sorted(
+        admissible,
+        key=lambda row: (-row["hp_margin"], int(row["candidate_id"])),
+    )
+    performance_order = sorted(
+        admissible,
+        key=lambda row: (row["expert_cost"], int(row["candidate_id"])),
+    )
+    for rank, row in enumerate(safety_order, start=1):
+        row["safety_rank"] = rank
+    for rank, row in enumerate(performance_order, start=1):
+        row["performance_rank"] = rank
+    for row in admissible:
+        row["rank_sum"] = row["safety_rank"] + row["performance_rank"]
+    return min(
+        admissible,
+        key=lambda row: (
+            row["rank_sum"],
+            row["safety_rank"],
+            -row["hp_margin"],
+            row["expert_cost"],
+            int(row["candidate_id"]),
+        ),
+    )
 
 
 def scorer_manifest():

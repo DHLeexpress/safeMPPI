@@ -47,6 +47,9 @@ def test_arm_grid_and_two_gpu_allocation():
     assert len(cost_arms) == 9
     assert all("safemppi_cost" in arm.name for arm in cost_arms)
     assert all(arm.selector == "safemppi_cost" for arm in cost_arms)
+    balanced = list(L.arm_grid("balanced_rank"))
+    assert len(balanced) == 9
+    assert all("balanced_rank" in arm.name for arm in balanced)
 
 
 def test_output_root_must_be_new_and_under_research1(tmp_path, monkeypatch):
