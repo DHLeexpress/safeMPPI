@@ -42,7 +42,7 @@ import sfm_scene as SS
 EXPECTED_CHECKPOINT_SHA256 = (
     "1b5179c935d3eeff8824967d707d64cc9bab273949ee1f0e4f190172bab1b215"
 )
-ELL = 0.24210826720721101
+ELL_MULTIPLIER = 0.5
 CAP = 512
 GP_LAMBDA = 1.0e-2
 ALPHAS = (0.0, 0.01, 0.1)
@@ -79,10 +79,10 @@ class OfflineConfig:
         if (
             int(self.K), int(self.B), int(self.T), int(self.H),
             int(self.batch), float(self.lr), float(self.ess_target),
-            float(self.gp_lam), self.scene_profile,
+            float(self.gp_lam), float(self.temp), self.scene_profile,
         ) != (
             16, 4, 180, 10, 128, 1.0e-4, 0.5,
-            GP_LAMBDA, SCENE_PROFILE,
+            GP_LAMBDA, 1.0, SCENE_PROFILE,
         ):
             raise ValueError("offline executed-window scientific contract changed")
         expected_rounds = 1 if self.smoke else 10
@@ -146,18 +146,71 @@ def _keyed_windows(
         latent_parts.append(generator.standard_normal(
             (int(K), int(policy.d)), dtype=np.float32,
         ))
-    latents = torch.as_tensor(
+    x0 = torch.as_tensor(
         np.stack(latent_parts),
         device=contexts.device,
         dtype=contexts.dtype,
-    ) * float(temp)
+    )
+    latents = x0 * float(temp)
     expanded = contexts.repeat_interleave(int(K), dim=0)
     windows = BE.integrate_latents(
         policy, latents.reshape(-1, policy.d), expanded, nfe=int(nfe),
     )
     return windows.reshape(
         len(live), int(K), int(policy.H_pred), 2,
-    ), contexts
+    ), contexts, x0
+
+
+@torch.no_grad()
+def _features_from_x0(phi_policy, windows, contexts, x0, s):
+    if windows.shape[:2] != x0.shape[:2]:
+        raise ValueError("window and x0 candidate axes disagree")
+    K = int(windows.shape[1])
+    controls = windows.reshape(-1, windows.shape[-2], 2)
+    expanded_contexts = contexts.repeat_interleave(K, dim=0)
+    features = phi_policy.phi_s_from_x0(
+        controls,
+        expanded_contexts,
+        x0.reshape(-1, phi_policy.d),
+        s=float(s),
+    )
+    return BR.l2_normalize(features).reshape(len(contexts), K, -1)
+
+
+@torch.no_grad()
+def _initial_lengthscale(policy, replicas, cfg, device):
+    """Mean pairwise distance of 50 balanced pretrained proposals."""
+    live, batch = BX._stack_prepared(replicas, device)
+    windows, contexts, x0 = _keyed_windows(
+        policy, live, batch, K=1, round_i=0, step=-2,
+        source="ell_preflight", seed=cfg.seed, nfe=cfg.nfe, temp=cfg.temp,
+    )
+    features = _features_from_x0(
+        policy, windows, contexts, x0, cfg.phi_s,
+    )[:, 0]
+    groups = {
+        float(gamma): [
+            index for index, replica in enumerate(live)
+            if round(float(replica.gamma), 8) == round(float(gamma), 8)
+        ]
+        for gamma in SP.GAMMAS
+    }
+    selected = [
+        index
+        for gamma in SP.GAMMAS
+        for index in groups[float(gamma)][:7]
+    ]
+    selected.append(groups[float(SP.GAMMAS[0])][7])
+    if len(selected) != 50 or len(set(selected)) != 50:
+        raise RuntimeError("ell preflight requires 50 unique balanced proposals")
+    ell0 = BR.mean_pairwise_lengthscale(features[selected])
+    return float(ell0), float(ell0 * ELL_MULTIPLIER), dict(
+        count=50,
+        balance="7 per gamma plus one extra gamma=0.1",
+        proposal_source="pretrained policy at round-1 initial OOD contexts",
+        representation="stored proposal x0 at s=0.9",
+        multiplier=ELL_MULTIPLIER,
+    )
 
 
 def _gamma_balanced_records(previous, *, cap, round_i, seed):
@@ -238,9 +291,13 @@ def gp_from_previous(
             hp10, low, hist, controls = BX._record_batch(
                 selected[start:start + 256], device,
             )
-            feature_parts.append(phi_policy.phi_s(
+            x0 = torch.as_tensor(np.stack([
+                row["x0"] for _, row in selected[start:start + 256]
+            ]), device=device).float()
+            feature_parts.append(phi_policy.phi_s_from_x0(
                 controls,
                 phi_policy.ctx_from(hp10, low, hist),
+                x0,
                 s=float(phi_s),
             ))
         gp.set_buffer(torch.cat(feature_parts))
@@ -255,11 +312,13 @@ def _calibrate_beta(
     phi_policy, gp, replicas, cfg, device, *, round_i,
 ):
     live, batch = BX._stack_prepared(replicas, device)
-    windows, _ = _keyed_windows(
+    windows, contexts, x0 = _keyed_windows(
         phi_policy, live, batch, K=cfg.K, round_i=round_i, step=-1,
         source="beta_calibration", seed=cfg.seed, nfe=cfg.nfe, temp=cfg.temp,
     )
-    features = BX._features(phi_policy, windows, batch, cfg.phi_s)
+    features = _features_from_x0(
+        phi_policy, windows, contexts, x0, cfg.phi_s,
+    )
     vectors = []
     for index, (replica, values) in enumerate(zip(live, features)):
         generator = torch.Generator(device=values.device).manual_seed(
@@ -319,25 +378,30 @@ def gather_offline_round(
 
         start = time.perf_counter()
         with torch.no_grad():
-            windows, contexts = _keyed_windows(
+            windows, contexts, x0 = _keyed_windows(
                 policy, live, batch, K=cfg.K, round_i=round_i, step=step,
                 source="K", seed=cfg.seed, nfe=cfg.nfe, temp=cfg.temp,
             )
-            raw_windows, _ = _keyed_windows(
+            raw_windows, _, raw_x0 = _keyed_windows(
                 policy, live, batch, K=1, round_i=round_i, step=step,
                 source="raw_continuation", seed=cfg.seed,
                 nfe=cfg.nfe, temp=cfg.temp,
             )
             raw_windows = raw_windows[:, 0]
+            raw_x0 = raw_x0[:, 0]
             windows_np = windows.detach().cpu().numpy()
             raw_windows_np = raw_windows.detach().cpu().numpy()
+            x0_np = x0.detach().cpu().numpy()
+            raw_x0_np = raw_x0.detach().cpu().numpy()
         timers["flow_proposal"] += time.perf_counter() - start
 
         start = time.perf_counter()
         with torch.no_grad():
-            features = BX._features(phi_policy, windows, batch, cfg.phi_s)
-            raw_features = BR.l2_normalize(phi_policy.phi_s(
-                raw_windows, contexts, s=cfg.phi_s,
+            features = _features_from_x0(
+                phi_policy, windows, contexts, x0, cfg.phi_s,
+            )
+            raw_features = BR.l2_normalize(phi_policy.phi_s_from_x0(
+                raw_windows, contexts, raw_x0, s=cfg.phi_s,
             ))
         selected_by_context = []
         acquisitions = []
@@ -473,6 +537,7 @@ def gather_offline_round(
             nvp_context = chosen is None
             if nvp_context:
                 controls = raw_windows_np[context_index]
+                selected_x0 = raw_x0_np[context_index]
                 result = by_context[context_index][-1]
                 margin, _, _ = BC.nominal_hp_margin(
                     prepared["state"], controls[0], prepared["ped_xy"],
@@ -503,6 +568,7 @@ def gather_offline_round(
                 counts["NVP_contexts"] += 1
             else:
                 controls = np.asarray(chosen["controls"], np.float32)
+                selected_x0 = x0_np[context_index, int(chosen["candidate_id"])]
                 result = chosen["result"]
                 margin = float(chosen["hp_margin"])
                 execution_source = "verified_max_margin"
@@ -522,6 +588,7 @@ def gather_offline_round(
             window_id = shard.add_executed_window(
                 context_id,
                 controls,
+                selected_x0,
                 result,
                 execution_source=execution_source,
                 nvp_context=nvp_context,
@@ -661,6 +728,19 @@ def run(checkpoint, outdir, cfg, *, device):
     ))
     history = []
     previous_shard = None
+    preflight_scenarios = SP.expansion_scenarios(1, smoke=cfg.smoke)
+    preflight_replicas = [
+        BX.Replica(
+            scenario_id,
+            gamma,
+            n_ped=environment["n_ped"],
+            ped_speed_range=tuple(environment["ped_speed_range"]),
+        )
+        for scenario_id in preflight_scenarios for gamma in SP.GAMMAS
+    ]
+    ell0, ell, ell_preflight = _initial_lengthscale(
+        policy, preflight_replicas, cfg, device,
+    )
     with ProcessPoolExecutor(max_workers=cfg.verifier_workers) as executor:
         for round_i in range(1, cfg.rounds + 1):
             round_start = time.perf_counter()
@@ -684,7 +764,7 @@ def run(checkpoint, outdir, cfg, *, device):
                 phi_policy,
                 previous_shard,
                 round_i=round_i,
-                ell=ELL,
+                ell=ell,
                 cap=CAP,
                 lam=cfg.gp_lam,
                 phi_s=cfg.phi_s,
@@ -735,7 +815,8 @@ def run(checkpoint, outdir, cfg, *, device):
                 source_sha256=checkpoint_sha,
                 encoder_sha256=visual_encoder_sha,
                 recipe=asdict(cfg),
-                ell=ELL,
+                ell=ell,
+                ell0=ell0,
                 cap=CAP,
                 beta=float(beta),
             ))
@@ -781,7 +862,9 @@ def run(checkpoint, outdir, cfg, *, device):
         scientific_role="offline_expansion_data_collector_not_safe_controller",
         recipe=asdict(cfg),
         constants=dict(
-            ell=ELL,
+            ell=ell,
+            ell0=ell0,
+            ell_preflight=ell_preflight,
             gp_buffer_cap=CAP,
             gp_lambda=GP_LAMBDA,
             expected_checkpoint_sha256=EXPECTED_CHECKPOINT_SHA256,

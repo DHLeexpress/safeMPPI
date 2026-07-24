@@ -15,7 +15,7 @@ import torch
 
 
 class ExecutedRoundShard:
-    VERSION = 1
+    VERSION = 2
 
     def __init__(self, round_i):
         self.round_i = int(round_i)
@@ -50,7 +50,7 @@ class ExecutedRoundShard:
         return context_id
 
     def add_executed_window(
-        self, context_id, controls, result, *, execution_source, nvp_context,
+        self, context_id, controls, x0, result, *, execution_source, nvp_context,
         candidate_id=None, acquisition_step=None, sigma=None, hp_margin=None,
         mode=None,
     ):
@@ -63,6 +63,9 @@ class ExecutedRoundShard:
         controls = np.asarray(controls, np.float32)
         if tuple(controls.shape) != (10, 2) or not np.isfinite(controls).all():
             raise ValueError("offline training D requires finite controls [10,2]")
+        x0 = np.asarray(x0, np.float32)
+        if tuple(x0.shape) != (20,) or not np.isfinite(x0).all():
+            raise ValueError("offline training D requires finite original x0 [20]")
         components = (
             bool(result.get("taskspace")),
             bool(result.get("collision_free")),
@@ -82,6 +85,7 @@ class ExecutedRoundShard:
             query_id=window_id,
             context_id=context_id,
             controls=controls,
+            x0=x0,
             y=int(result["y"]),
             taskspace=bool(result["taskspace"]),
             collision_free=bool(result["collision_free"]),
@@ -141,6 +145,9 @@ class ExecutedRoundShard:
             seen.add(context_id)
             if not window["full_h"] or int(window["terminal_step"]) != 10:
                 raise AssertionError("non-H10 window entered training D")
+            x0 = np.asarray(window.get("x0"), np.float32)
+            if tuple(x0.shape) != (20,) or not np.isfinite(x0).all():
+                raise AssertionError("window is missing its finite original x0 [20]")
         if len(self.Dplus) + len(self.Dminus) != len(self.D):
             raise AssertionError("D+/D- must exactly partition resolved executed D")
         return dict(

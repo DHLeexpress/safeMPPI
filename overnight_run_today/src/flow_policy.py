@@ -98,6 +98,21 @@ class FlowPolicy(nn.Module):
         return U
 
     @torch.no_grad()
+    def phi_s_from_x0(
+        self, U_controls: torch.Tensor, ctx: torch.Tensor,
+        x0: torch.Tensor, s: float = 0.9,
+    ) -> torch.Tensor:
+        """Noised-flow representation using each proposal's original base noise."""
+        B = U_controls.shape[0]
+        x1 = (U_controls / self.u_max).reshape(B, self.d)
+        if tuple(x0.shape) != (B, self.d):
+            raise ValueError(f"x0 shape {tuple(x0.shape)} != {(B, self.d)}")
+        x0 = x0.to(device=x1.device, dtype=x1.dtype)
+        x_s = (1 - float(s)) * x0 + float(s) * x1
+        tau = torch.full((B,), float(s), device=x1.device)
+        return self.features(x_s, tau, self._expand_ctx(ctx, B))
+
+    @torch.no_grad()
     def phi_s(self, U_controls: torch.Tensor, ctx: torch.Tensor, s: float = 0.9) -> torch.Tensor:
         """Noised-flow representation at level s, averaged over fixed noise templates -> [B, width]."""
         B = U_controls.shape[0]

@@ -44,9 +44,11 @@ def _add_window(shard, *, scenario, gamma, step, y):
         shard, scenario=scenario, gamma=gamma, step=step,
     )
     controls = np.full((10, 2), scenario + step / 100.0, np.float32)
+    x0 = np.full(20, scenario - step / 100.0, np.float32)
     shard.add_executed_window(
         context_id,
         controls,
+        x0,
         _result(y),
         execution_source="selected_B" if y else "raw_continuation",
         nvp_context=not bool(y),
@@ -125,6 +127,7 @@ def test_executed_store_has_one_window_per_context_and_exact_partition(tmp_path)
         shard.add_executed_window(
             positive_context,
             np.zeros((10, 2), np.float32),
+            np.zeros(20, np.float32),
             _result(1),
             execution_source="selected_B",
             nvp_context=False,
@@ -136,6 +139,7 @@ def test_executed_store_has_one_window_per_context_and_exact_partition(tmp_path)
         shard.add_executed_window(
             context_id,
             np.zeros((10, 2), np.float32),
+            np.zeros(20, np.float32),
             _result(1, full_h=False),
             execution_source="selected_B",
             nvp_context=False,
@@ -147,6 +151,19 @@ def test_executed_store_has_one_window_per_context_and_exact_partition(tmp_path)
         shard.add_executed_window(
             context_id,
             np.zeros((9, 2), np.float32),
+            np.zeros(20, np.float32),
+            _result(1),
+            execution_source="selected_B",
+            nvp_context=False,
+        )
+    with pytest.raises(ValueError, match=r"original x0 \[20\]"):
+        context_id = _context(
+            shard, scenario=15, gamma=0.5, step=6,
+        )
+        shard.add_executed_window(
+            context_id,
+            np.zeros((10, 2), np.float32),
+            np.zeros(19, np.float32),
             _result(1),
             execution_source="selected_B",
             nvp_context=False,
@@ -159,12 +176,12 @@ def test_executed_store_has_one_window_per_context_and_exact_partition(tmp_path)
     assert {row["context_id"] for row in shard.D} == {0, 1}
     assert shard.validate() == {
         "round": 3,
-        "contexts": 4,
+        "contexts": 5,
         "D": 2,
         "Dplus": 1,
         "Dminus": 1,
         "errors": 0,
-        "unresolved_contexts": 2,
+        "unresolved_contexts": 3,
     }
 
     path = tmp_path / "round_003.pt"
@@ -182,6 +199,33 @@ def test_executed_store_has_one_window_per_context_and_exact_partition(tmp_path)
     ]
     np.testing.assert_array_equal(
         restored.Dminus[0]["controls"], shard.Dminus[0]["controls"],
+    )
+    np.testing.assert_array_equal(
+        restored.Dminus[0]["x0"], shard.Dminus[0]["x0"],
+    )
+
+
+def test_phi_s_from_x0_is_the_exact_noised_representation():
+    from flow_policy import FlowPolicy
+
+    torch.manual_seed(8)
+    policy = FlowPolicy(T=10, ctx_dim=3, width=12, depth=2, u_max=2.0)
+    controls = torch.randn(2, 10, 2)
+    context = torch.randn(2, 3)
+    x0 = torch.randn(2, 20)
+    s = 0.9
+
+    actual = policy.phi_s_from_x0(controls, context, x0, s=s)
+    x1 = (controls / policy.u_max).reshape(2, 20)
+    expected = policy.features(
+        (1 - s) * x0 + s * x1,
+        torch.full((2,), s),
+        context,
+    )
+    torch.testing.assert_close(actual, expected)
+    assert not torch.equal(
+        actual,
+        policy.phi_s_from_x0(controls, context, x0.flip(0), s=s),
     )
 
 

@@ -41,7 +41,7 @@ CHECKPOINT_SHA256 = (
     "1b5179c935d3eeff8824967d707d64cc9bab273949ee1f0e4f190172bab1b215"
 )
 SCENE_PROFILE = "double_density_velocity_ood"
-ELL = 0.24210826720721101
+ELL_MULTIPLIER = 0.5
 CAP = 512
 GP_LAMBDA = 1.0e-2
 K = 16
@@ -290,8 +290,24 @@ def validate_training_arm(
     }
     if payload.get("recipe") != expected_recipe:
         raise RuntimeError(f"training recipe mismatch: {marker}")
+    constants = payload.get("constants", {})
+    ell0 = float(constants.get("ell0", -1.0))
+    ell = float(constants.get("ell", -1.0))
+    if (
+        not math.isfinite(ell0)
+        or ell0 <= 0.0
+        or not math.isclose(
+            ell, ell0 * ELL_MULTIPLIER, rel_tol=1.0e-12, abs_tol=1.0e-12,
+        )
+        or constants.get("ell_preflight", {}).get("count") != 50
+        or constants.get("ell_preflight", {}).get("representation")
+        != "stored proposal x0 at s=0.9"
+    ):
+        raise RuntimeError(f"invalid x0-aware ell preflight: {marker}")
     expected_constants = {
-        "ell": ELL,
+        "ell": ell,
+        "ell0": ell0,
+        "ell_preflight": constants["ell_preflight"],
         "gp_buffer_cap": CAP,
         "gp_lambda": GP_LAMBDA,
         "expected_checkpoint_sha256": CHECKPOINT_SHA256,
@@ -779,7 +795,11 @@ def run(args) -> dict:
         "B": B,
         "T": T,
         "H": H,
-        "ell": ELL,
+        "ell_initialization": {
+            "count": 50,
+            "multiplier": ELL_MULTIPLIER,
+            "representation": "stored proposal x0 at s=0.9",
+        },
         "cap": CAP,
         "gp_lambda": GP_LAMBDA,
         "batch": BATCH,
