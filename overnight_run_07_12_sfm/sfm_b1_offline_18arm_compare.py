@@ -14,7 +14,8 @@ import matplotlib.pyplot as plt
 import run_sfm_b1_offline_9arm as RUN
 
 
-STATUS = "SFM_B1_OFFLINE_18ARM_COMPARISON_COMPLETE"
+STATUS = "SFM_B1_OFFLINE_SELECTOR_COMPARISON_COMPLETE"
+SELECTOR_ORDER = ("margin", "safemppi_cost", "balanced_rank")
 
 
 def _read_json(path):
@@ -56,6 +57,10 @@ def _paired_r0(rows):
 
 
 def _plot(rows, output):
+    selectors = tuple(
+        selector for selector in SELECTOR_ORDER
+        if any(row["selector"] == selector for row in rows)
+    )
     combinations = [
         (float(alpha), int(exposure))
         for alpha in RUN.ALPHAS for exposure in RUN.EXPOSURE_EPOCHS
@@ -65,7 +70,11 @@ def _plot(rows, output):
         combination: colors(index)
         for index, combination in enumerate(combinations)
     }
-    linestyles = {"margin": "-", "safemppi_cost": "--"}
+    linestyles = {
+        "margin": "-",
+        "safemppi_cost": "--",
+        "balanced_rank": ":",
+    }
     specs = (
         ("CR", "Collision rate", (-.03, 1.03)),
         ("Validity", "Validity", (-.03, 1.03)),
@@ -74,7 +83,7 @@ def _plot(rows, output):
     )
     figure, axes = plt.subplots(2, 2, figsize=(15.5, 10.5))
     for axis, (key, title, ylim) in zip(axes.flat, specs):
-        for selector in ("margin", "safemppi_cost"):
+        for selector in selectors:
             for alpha, exposure in combinations:
                 values = [
                     row for row in rows
@@ -106,16 +115,18 @@ def _plot(rows, output):
         )
         for alpha, exposure in combinations
     ]
-    handles.extend([
+    selector_labels = {
+        "margin": "max one-step margin",
+        "safemppi_cost": "native SafeMPPI cost",
+        "balanced_rank": "balanced safety + performance rank",
+    }
+    handles.extend(
         plt.Line2D(
-            [0], [0], color="black", lw=2.4, linestyle="-",
-            label="max one-step margin",
-        ),
-        plt.Line2D(
-            [0], [0], color="black", lw=2.4, linestyle="--",
-            label="native SafeMPPI cost",
-        ),
-    ])
+            [0], [0], color="black", lw=2.4,
+            linestyle=linestyles[selector], label=selector_labels[selector],
+        )
+        for selector in selectors
+    )
     figure.legend(
         handles=handles, ncol=4, loc="upper center",
         frameon=False, fontsize=8,
@@ -123,23 +134,25 @@ def _plot(rows, output):
     figure.tight_layout(rect=(0, 0, 1, .89))
     artifacts = []
     for suffix in ("png", "pdf"):
-        path = output / f"paired_18arm_raw_m50.{suffix}"
+        path = output / f"paired_{9 * len(selectors)}arm_raw_m50.{suffix}"
         figure.savefig(path, dpi=300, bbox_inches="tight")
         artifacts.append(str(path.resolve()))
     plt.close(figure)
     return artifacts
 
 
-def compare(margin_root, cost_root, output_dir):
+def compare(margin_root, cost_root, output_dir, *, balanced_root=None):
     output = Path(output_dir).resolve()
     output.mkdir(parents=True, exist_ok=False)
-    loaded = (
+    loaded = [
         _load(margin_root, "margin"),
         _load(cost_root, "safemppi_cost"),
-    )
+    ]
+    if balanced_root is not None:
+        loaded.append(_load(balanced_root, "balanced_rank"))
     rows = [row for item in loaded for row in item[-1]]
     r0 = _paired_r0(rows)
-    csv_path = output / "paired_18arm_raw_m50.csv"
+    csv_path = output / f"paired_{9 * len(loaded)}arm_raw_m50.csv"
     fields = (
         "selector", "arm", "alpha", "exposure_epochs", "round",
         "SR", "CR", "timeout", "Validity", "clearance", "time_to_goal",
@@ -150,7 +163,8 @@ def compare(margin_root, cost_root, output_dir):
         writer.writerows({key: row[key] for key in fields} for row in rows)
     figures = _plot(rows, output)
     best_by_selector = {}
-    for selector in ("margin", "safemppi_cost"):
+    selectors = tuple(item[-1][0]["selector"] for item in loaded)
+    for selector in selectors:
         candidates = [
             row for row in rows
             if row["selector"] == selector and int(row["round"]) > 0
@@ -164,6 +178,9 @@ def compare(margin_root, cost_root, output_dir):
         ),
         "margin_root": str(loaded[0][0]),
         "safemppi_cost_root": str(loaded[1][0]),
+        "balanced_rank_root": (
+            None if len(loaded) == 2 else str(loaded[2][0])
+        ),
         "paired_r0": r0,
         "best_screening_cell_by_selector": best_by_selector,
         "rows": len(rows),
@@ -182,9 +199,13 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--margin-root", required=True)
     parser.add_argument("--safemppi-cost-root", required=True)
+    parser.add_argument("--balanced-rank-root")
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args(argv)
-    compare(args.margin_root, args.safemppi_cost_root, args.output_dir)
+    compare(
+        args.margin_root, args.safemppi_cost_root, args.output_dir,
+        balanced_root=args.balanced_rank_root,
+    )
 
 
 if __name__ == "__main__":
