@@ -77,17 +77,84 @@ def _source():
     return dict(commit=commit, tracked_worktree_clean=not dirty)
 
 
-def _raw_windows(policy, live, batch, generators):
-    """One raw latent per live cell, preserving raw-evaluator per-cell streams."""
-    context = policy.ctx_from(batch["hp10"], batch["low"], batch["hist"])
-    latents = torch.stack([
-        torch.randn(
-            policy.d, generator=generators[(replica.scenario_id, replica.gamma)],
-            device=context.device, dtype=context.dtype,
+def _keyed_seed(base, *parts):
+    payload = json.dumps(
+        [int(base), *parts], separators=(",", ":"), sort_keys=False,
+    ).encode()
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "little") % (
+        2 ** 63 - 1
+    )
+
+
+@torch.no_grad()
+def _keyed_windows(
+    policy, live, batch, *, K, round_i, step, source, seed, nfe, temp,
+):
+    """Generate proposals and retain their exact Gaussian flow bases."""
+    contexts = policy.ctx_from(batch["hp10"], batch["low"], batch["hist"])
+    latent_parts = []
+    for replica in live:
+        generator = np.random.default_rng(_keyed_seed(
+            seed, int(round_i), int(replica.scenario_id),
+            f"{float(replica.gamma):.8f}", int(step), str(source),
+        ))
+        latent_parts.append(generator.standard_normal(
+            (int(K), int(policy.d)), dtype=np.float32,
+        ))
+    x0 = torch.as_tensor(
+        np.stack(latent_parts),
+        device=contexts.device,
+        dtype=contexts.dtype,
+    )
+    windows = BE.integrate_latents(
+        policy,
+        (x0 * float(temp)).reshape(-1, policy.d),
+        contexts.repeat_interleave(int(K), dim=0),
+        nfe=int(nfe),
+    )
+    return (
+        windows.reshape(len(live), int(K), int(policy.H_pred), 2),
+        contexts,
+        x0,
+    )
+
+
+@torch.no_grad()
+def _features_from_x0(phi_policy, windows, contexts, x0, s):
+    K = int(windows.shape[1])
+    features = phi_policy.phi_s_from_x0(
+        windows.reshape(-1, windows.shape[-2], 2),
+        contexts.repeat_interleave(K, dim=0),
+        x0.reshape(-1, phi_policy.d),
+        s=float(s),
+    )
+    return BR.l2_normalize(features).reshape(len(contexts), K, -1)
+
+
+@torch.no_grad()
+def _calibrate_empty_gp_beta(phi_policy, gp, replicas, cfg, device):
+    live, batch = BX._stack_prepared(replicas, device)
+    windows, contexts, x0 = _keyed_windows(
+        phi_policy, live, batch, K=cfg.K, round_i=1, step=-1,
+        source="beta_calibration", seed=cfg.seed,
+        nfe=cfg.nfe, temp=cfg.temp,
+    )
+    features = _features_from_x0(
+        phi_policy, windows, contexts, x0, cfg.phi_s,
+    )
+    vectors = []
+    for replica, values in zip(live, features):
+        generator = torch.Generator(device=values.device).manual_seed(
+            _keyed_seed(
+                cfg.seed, 1, replica.scenario_id,
+                f"{replica.gamma:.8f}", "beta_order",
+            )
         )
-        for replica in live
-    ])
-    return BE.integrate_latents(policy, latents, context, nfe=8)
+        order = torch.randperm(
+            len(values), generator=generator, device=values.device,
+        )
+        vectors.extend(gp.sequential_score_vectors(values, order, cfg.B))
+    return BR.solve_beta(vectors, target=cfg.ess_target)
 
 
 def _trap(states, *, horizon=TRAP_HORIZON, displacement=TRAP_DISPLACEMENT):
@@ -165,17 +232,9 @@ def collect(
         seed=int(audit_seed),
     ).validate()
     gp = BR.RBFGP(float(ell), cfg.gp_lam)
-    beta, calibrated_ess = BX._initial_beta(
-        phi_policy, gp, replicas, cfg, device, int(audit_seed) + 1009,
+    beta, calibrated_ess = _calibrate_empty_gp_beta(
+        phi_policy, gp, replicas, cfg, device,
     )
-    audit_generator = torch.Generator(device=device).manual_seed(int(audit_seed) + 2003)
-    raw_generators = {
-        (replica.scenario_id, replica.gamma):
-            torch.Generator(device=device).manual_seed(
-                int(sample_seed) + replica.scenario_id * 1000
-            )
-        for replica in replicas
-    }
 
     traces = []
     counts = Counter()
@@ -189,19 +248,34 @@ def collect(
             if not live:
                 break
             with torch.no_grad():
-                audit_windows = BE.generate_windows(
-                    policy, batch["hp10"], batch["low"], batch["hist"],
-                    K=cfg.K, nfe=cfg.nfe, temp=cfg.temp,
-                    generator=audit_generator,
+                audit_windows, contexts, x0 = _keyed_windows(
+                    policy, live, batch, K=cfg.K, round_i=1, step=step,
+                    source="K", seed=int(sample_seed),
+                    nfe=cfg.nfe, temp=cfg.temp,
                 )
-                raw_windows = _raw_windows(policy, live, batch, raw_generators)
-                features = BX._features(phi_policy, audit_windows, batch, cfg.phi_s)
+                raw_windows, _, raw_x0 = _keyed_windows(
+                    policy, live, batch, K=1, round_i=1, step=step,
+                    source="raw_continuation", seed=int(sample_seed),
+                    nfe=cfg.nfe, temp=cfg.temp,
+                )
+                raw_windows = raw_windows[:, 0]
+                raw_x0 = raw_x0[:, 0]
+                features = _features_from_x0(
+                    phi_policy, audit_windows, contexts, x0, cfg.phi_s,
+                )
 
             selected_by_context = []
             acquisition_by_context = []
-            for context_index in range(len(live)):
+            for context_index, replica in enumerate(live):
+                acquisition_generator = torch.Generator(
+                    device=features.device,
+                ).manual_seed(_keyed_seed(
+                    int(audit_seed), 1, replica.scenario_id,
+                    f"{replica.gamma:.8f}", step, "acquisition",
+                ))
                 selected, acquisition = gp.sequential_acquire(
-                    features[context_index], cfg.B, beta, generator=audit_generator,
+                    features[context_index], cfg.B, beta,
+                    generator=acquisition_generator,
                 )
                 selected_by_context.append(selected)
                 acquisition_by_context.append(acquisition)
@@ -240,6 +314,7 @@ def collect(
                     segment = SM.rollout_positions(prepared["state"], controls)
                     all_rows.append(dict(
                         candidate_id=candidate_id, controls=controls, segment=segment,
+                        x0=x0[context_index, candidate_id].detach().cpu().numpy(),
                         mode=BE.classify_candidate(segment, pedestrian_prediction),
                     ))
                 query_rows = []
@@ -280,6 +355,7 @@ def collect(
                 all_rows, query_rows, chosen = prepared_contexts[context_index]
 
                 raw_controls = raw_windows[context_index].detach().cpu().numpy()
+                raw_base = raw_x0[context_index].detach().cpu().numpy()
                 nvp_context = chosen is None
                 if chosen is None:
                     raw_result = by_context[context_index][-1]
@@ -304,16 +380,20 @@ def collect(
                     counts[f"raw_continuation_{_result_label(raw_result)}"] += 1
                     raw_candidate = dict(
                         controls=np.asarray(raw_controls, np.float32),
+                        x0=np.asarray(raw_base, np.float32),
                         result=raw_result, hp_margin=float(raw_margin),
                         hp_old=float(raw_hp_old), hp_new=float(raw_hp_new),
                         admissible=raw_admissible,
                     )
                 else:
                     executed_controls = chosen["controls"]
+                    executed_x0 = all_rows[int(chosen["candidate_id"])]["x0"]
                     executed_result = chosen["result"]
                     executed_id = int(chosen["candidate_id"])
                     execution_source = "verified_max_margin"
                     raw_candidate = None
+                if chosen is None:
+                    executed_x0 = raw_base
                 executed_label = _result_label(executed_result)
                 counts[f"executed_{executed_label}"] += 1
                 counts[f"source_{execution_source}"] += 1
@@ -362,6 +442,7 @@ def collect(
                     query_rows=query_rows, acquisition=acquisition_by_context[context_index],
                     executed_id=executed_id,
                     executed_controls=np.asarray(executed_controls, np.float32),
+                    executed_x0=np.asarray(executed_x0, np.float32),
                     executed_result=executed_result,
                     executed_label=executed_label,
                     execution_source=execution_source,
@@ -391,7 +472,7 @@ def collect(
 
     source = _source()
     bundle = dict(
-        version=1, status="SFM_B1_FULL_EPISODE_LABEL_AUDIT_COMPLETE",
+        version=2, status="SFM_B1_FULL_EPISODE_LABEL_AUDIT_COMPLETE",
         diagnostic_only=True, enters_training_or_gp=False,
         certified_deployment=False,
         continuation_semantics=(
@@ -415,6 +496,10 @@ def collect(
         protocol=dict(
             K=cfg.K, B=cfg.B, H=cfg.H, T=int(T), selector="margin",
             ell=float(ell), gp_buffer=0, beta=float(beta),
+            representation=(
+                "normalize(phi_theta((1-s)*x0+s*U/u_max,s,c)); "
+                "stored proposal-specific x0; s=0.9"
+            ),
             calibrated_ess_over_K=float(calibrated_ess),
             realized_ess_over_K=float(np.mean(ess_values)),
             acquisition=BR.acquisition_diagnostics(sigma_pool, sigma_selected),
