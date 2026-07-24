@@ -43,6 +43,10 @@ def test_arm_grid_and_two_gpu_allocation():
     assert {arm.exposure_epochs for arm in allocation["GPU-1"]} == {
         1, 10, 100,
     }
+    cost_arms = list(L.arm_grid("safemppi_cost"))
+    assert len(cost_arms) == 9
+    assert all("safemppi_cost" in arm.name for arm in cost_arms)
+    assert all(arm.selector == "safemppi_cost" for arm in cost_arms)
 
 
 def test_output_root_must_be_new_and_under_research1(tmp_path, monkeypatch):
@@ -72,6 +76,11 @@ def test_commands_cover_declared_rounds_and_raw_common_bank(tmp_path):
     train = L._trainer_command(args, arm, tmp_path / "train")
     assert train[train.index("--rounds") + 1] == "10"
     assert train[train.index("--exposure-epochs") + 1] == "10"
+    assert train[train.index("--selector") + 1] == "margin"
+    cost_train = L._trainer_command(
+        args, L.Arm(0.01, 10, "safemppi_cost"), tmp_path / "cost",
+    )
+    assert cost_train[cost_train.index("--selector") + 1] == "safemppi_cost"
     evaluate = L._evaluation_command(
         args,
         arm,

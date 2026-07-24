@@ -38,7 +38,7 @@ def _branch(trace):
     return path
 
 
-def _draw_D_branches(axis, rows, step):
+def _draw_D_branches(axis, rows, step, *, line_scale=1.0):
     available = sorted(value for value in rows if value <= int(step))
     for context_step in available:
         trace = rows[context_step]
@@ -48,18 +48,22 @@ def _draw_D_branches(axis, rows, step):
         axis.plot(
             path[:, 0], path[:, 1],
             color=color,
-            lw=1.25 if is_current else .55,
-            marker=".", ms=1.3 if is_current else .75,
+            lw=(1.25 if is_current else .55) * float(line_scale),
+            marker=".",
+            ms=(1.3 if is_current else .75) * np.sqrt(float(line_scale)),
             alpha=.9 if is_current else .32,
             zorder=7 if is_current else 3,
         )
         axis.plot(
             path[0, 0], path[0, 1], marker=".", color=color,
-            ms=2.7 if is_current else 1.5, zorder=8,
+            ms=(2.7 if is_current else 1.5) * np.sqrt(float(line_scale)),
+            zorder=8,
         )
 
 
-def _draw_executed_trajectory(axis, rows, step):
+def _draw_executed_trajectory(
+        axis, rows, step, *, linewidth=2.8, marker_size=2.1,
+):
     available = sorted(value for value in rows if value <= int(step))
     if not available:
         return
@@ -67,25 +71,36 @@ def _draw_executed_trajectory(axis, rows, step):
     states.append(np.asarray(rows[available[-1]]["next_state"], float)[:2])
     states = np.asarray(states)
     axis.plot(
-        states[:, 0], states[:, 1], color="#111111", lw=2.8,
-        marker=".", ms=2.1, alpha=.97, zorder=11,
+        states[:, 0], states[:, 1], color="#111111", lw=float(linewidth),
+        marker=".", ms=float(marker_size), alpha=.97, zorder=11,
     )
     axis.annotate(
         "", xy=states[-1], xytext=states[-2],
-        arrowprops=dict(arrowstyle="->", color="#111111", lw=2.2),
+        arrowprops=dict(
+            arrowstyle="->", color="#111111",
+            lw=max(.8, .78 * float(linewidth)),
+        ),
         zorder=12,
     )
 
 
-def draw_cell(axis, rows, step):
+def draw_cell(
+        axis, rows, step, *, branch_line_scale=1.0,
+        trajectory_linewidth=2.8, trajectory_marker_size=2.1,
+):
     available = [value for value in rows if value <= int(step)]
     current_step = max(available) if available else min(rows)
     trace = rows[current_step]
     BV._draw_common(axis, trace, nominal_levels=False)
-    _draw_D_branches(axis, rows, current_step)
+    _draw_D_branches(
+        axis, rows, current_step, line_scale=branch_line_scale,
+    )
     FV._draw_candidates(axis, trace)
     FV._draw_executed(axis, trace)
-    _draw_executed_trajectory(axis, rows, current_step)
+    _draw_executed_trajectory(
+        axis, rows, current_step, linewidth=trajectory_linewidth,
+        marker_size=trajectory_marker_size,
+    )
     DV._set_clean_axis(axis)
     return trace
 

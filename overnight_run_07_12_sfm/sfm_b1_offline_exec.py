@@ -48,12 +48,14 @@ GP_LAMBDA = 1.0e-2
 ALPHAS = (0.0, 0.01, 0.1)
 EXPOSURE_EPOCHS = (1, 10, 100)
 SCENE_PROFILE = "double_density_velocity_ood"
+EXECUTION_SELECTORS = ("margin", "safemppi_cost")
 
 
 @dataclass(frozen=True)
 class OfflineConfig:
     alpha: float
     exposure_epochs: int
+    selector: str = "margin"
     rounds: int = 10
     K: int = 16
     B: int = 4
@@ -72,6 +74,8 @@ class OfflineConfig:
     smoke: bool = False
 
     def validate(self):
+        if self.selector not in EXECUTION_SELECTORS:
+            raise ValueError(f"selector must be one of {EXECUTION_SELECTORS}")
         if float(self.alpha) not in ALPHAS:
             raise ValueError(f"alpha must be one of {ALPHAS}")
         if int(self.exposure_epochs) not in EXPOSURE_EPOCHS:
@@ -97,8 +101,13 @@ class OfflineConfig:
     @property
     def arm_name(self):
         alpha = str(float(self.alpha)).replace(".", "p")
+        prefix = (
+            "offline_exec"
+            if self.selector == "margin"
+            else "offline_exec_safemppi_cost"
+        )
         return (
-            f"offline_exec_alpha{alpha}_"
+            f"{prefix}_alpha{alpha}_"
             f"exposures{int(self.exposure_epochs):03d}"
         )
 
@@ -488,7 +497,7 @@ def gather_offline_round(
                     ))
             chosen = BC.select_admissible(
                 query_rows,
-                selector="margin",
+                selector=cfg.selector,
                 state=prepared["state"],
                 ped_xy=prepared["ped_xy"],
                 ped_vel=prepared["ped_vel"],
@@ -571,7 +580,7 @@ def gather_offline_round(
                 selected_x0 = x0_np[context_index, int(chosen["candidate_id"])]
                 result = chosen["result"]
                 margin = float(chosen["hp_margin"])
-                execution_source = "verified_max_margin"
+                execution_source = f"verified_{cfg.selector}"
                 candidate_id = int(chosen["candidate_id"])
                 acquisition_step = int(chosen["acquisition_step"])
                 sigma = float(chosen["sigma"])
@@ -662,7 +671,7 @@ def gather_offline_round(
     return dict(
         collector_role="offline_expansion_data_collector_not_safe_controller",
         continuation_semantics=(
-            "verified max-margin B action when available; otherwise an "
+            f"verified {cfg.selector} B action when available; otherwise an "
             "independent raw temperature-one H10 plan is exact-verified and "
             "its first action is executed even when y=0"
         ),
@@ -895,6 +904,9 @@ def main(argv=None):
     parser.add_argument("--outdir", required=True)
     parser.add_argument("--alpha", type=float, choices=ALPHAS, required=True)
     parser.add_argument(
+        "--selector", choices=EXECUTION_SELECTORS, default="margin",
+    )
+    parser.add_argument(
         "--exposure-epochs",
         type=int,
         choices=EXPOSURE_EPOCHS,
@@ -909,6 +921,7 @@ def main(argv=None):
     cfg = OfflineConfig(
         alpha=args.alpha,
         exposure_epochs=args.exposure_epochs,
+        selector=args.selector,
         rounds=args.rounds,
         verifier_workers=args.verifier_workers,
         seed=args.seed,

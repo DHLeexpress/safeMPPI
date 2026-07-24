@@ -14,6 +14,9 @@ PYTHON="${PYTHON:-python}"
 EXPECTED_SHA="1b5179c935d3eeff8824967d707d64cc9bab273949ee1f0e4f190172bab1b215"
 POLL_SECONDS="${POLL_SECONDS:-20}"
 IDLE_POLLS_REQUIRED="${IDLE_POLLS_REQUIRED:-3}"
+GPU_INDICES="${GPU_INDICES:-1,3}"
+SMOKE_GPU="${GPU_INDICES%%,*}"
+EXECUTION_SELECTOR="${EXECUTION_SELECTOR:-margin}"
 LOG="${QUEUE_LOG:-${FULL_OUTDIR}.queue.log}"
 
 mkdir -p "$(dirname "$LOG")"
@@ -24,6 +27,8 @@ echo "source=$(git -C "$HERE/.." rev-parse HEAD)"
 echo "checkpoint=$CHECKPOINT"
 echo "smoke_outdir=$SMOKE_OUTDIR"
 echo "full_outdir=$FULL_OUTDIR"
+echo "gpu_indices=$GPU_INDICES"
+echo "execution_selector=$EXECUTION_SELECTOR"
 
 if [[ ! -f "$CHECKPOINT" ]]; then
   echo "checkpoint does not exist: $CHECKPOINT" >&2
@@ -47,17 +52,17 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 idle_polls=0
 while (( idle_polls < IDLE_POLLS_REQUIRED )); do
   process_count="$(
-    nvidia-smi -i 1,3 --query-compute-apps=pid --format=csv,noheader |
+    nvidia-smi -i "$GPU_INDICES" --query-compute-apps=pid --format=csv,noheader |
       sed '/^[[:space:]]*$/d' | wc -l
   )"
   bad_gpu_count="$(
-    nvidia-smi -i 1,3 \
+    nvidia-smi -i "$GPU_INDICES" \
       --query-gpu=memory.used,utilization.gpu \
       --format=csv,noheader,nounits |
       awk -F, '{if ($1+0 > 1024 || $2+0 > 5) bad++} END {print bad+0}'
   )"
   gpu_count="$(
-    nvidia-smi -i 1,3 --query-gpu=index --format=csv,noheader,nounits | wc -l
+    nvidia-smi -i "$GPU_INDICES" --query-gpu=index --format=csv,noheader,nounits | wc -l
   )"
   if [[ "$gpu_count" -eq 2 && "$process_count" -eq 0 && "$bad_gpu_count" -eq 0 ]]; then
     idle_polls=$((idle_polls + 1))
@@ -73,11 +78,12 @@ done
 
 cd "$HERE"
 echo "$(date -Is) SMOKE_START"
-CUDA_VISIBLE_DEVICES=1 "$PYTHON" sfm_b1_offline_exec.py \
+CUDA_VISIBLE_DEVICES="$SMOKE_GPU" "$PYTHON" sfm_b1_offline_exec.py \
   --checkpoint "$CHECKPOINT" \
   --outdir "$SMOKE_OUTDIR" \
   --alpha 0.01 \
   --exposure-epochs 1 \
+  --selector "$EXECUTION_SELECTOR" \
   --rounds 1 \
   --verifier-workers 32 \
   --seed 20260724 \
@@ -121,7 +127,8 @@ echo "$(date -Is) SMOKE_VALIDATED_FULL_START"
   --checkpoint "$CHECKPOINT" \
   --expected-checkpoint-sha256 "$EXPECTED_SHA" \
   --outdir "$FULL_OUTDIR" \
-  --gpu-indices 1,3 \
+  --gpu-indices "$GPU_INDICES" \
+  --selector "$EXECUTION_SELECTOR" \
   --verifier-workers 8 \
   --seed 20260724 \
   --eval-ep0 260000 \

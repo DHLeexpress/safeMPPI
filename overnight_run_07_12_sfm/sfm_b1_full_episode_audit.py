@@ -1,10 +1,11 @@
 """Diagnostic-only full-episode B1 gathering with explicit post-NVP continuation.
 
 This module does not alter the fail-closed B1 trainer.  It starts from the
-pretrained policy, runs the ordinary K=16/B=4 RBF acquisition and max-margin
-selector, and records every resolved query.  When the selected B queries contain
-no admissible action, an independently sampled raw temperature-one window is
-verified and its first action is executed so the simulator can continue.
+pretrained policy, runs the ordinary K=16/B=4 RBF acquisition and the requested
+execution selector, and records every resolved query.  When the selected B
+queries contain no admissible action, an independently sampled raw
+temperature-one window is verified and its first action is executed so the
+simulator can continue.
 
 That post-NVP transition is evidence gathering, not certified deployment.  The
 trace keeps the full-H verifier label, nominal-Hp gate, NVP event, progress/trap
@@ -198,7 +199,8 @@ def collect(
         checkpoint, *, scenarios=DEFAULT_SCENARIOS, gammas=SS.GAMMAS,
         scene_profile="double_density_velocity_ood", device="cuda",
         verifier_workers=32, sample_seed=DEFAULT_SAMPLE_SEED,
-        audit_seed=DEFAULT_AUDIT_SEED, ell=DEFAULT_ELL, T=SP.T, outdir,
+        audit_seed=DEFAULT_AUDIT_SEED, ell=DEFAULT_ELL, T=SP.T,
+        selector="margin", outdir,
 ):
     """Collect a fixed scenario-by-gamma full-episode diagnostic bundle."""
     scenarios = tuple(map(int, scenarios))
@@ -209,6 +211,8 @@ def collect(
         raise ValueError(f"the requested audit requires all gammas={SS.GAMMAS}")
     if scene_profile != "double_density_velocity_ood":
         raise ValueError("this audit is pinned to the authenticated double-shift OOD")
+    if selector not in ("margin", "safemppi_cost"):
+        raise ValueError(f"unknown execution selector: {selector}")
     if os.path.exists(outdir):
         raise FileExistsError(f"refusing to reuse audit output: {outdir}")
 
@@ -227,7 +231,7 @@ def collect(
         for scenario in scenarios for gamma in gammas
     ]
     cfg = BX.ArmConfig(
-        name="A", selector="margin", alpha=0.0, rounds=1,
+        name="diagnostic", selector=selector, alpha=0.0, rounds=1,
         scene_profile=scene_profile, verifier_workers=int(verifier_workers),
         seed=int(audit_seed),
     ).validate()
@@ -334,7 +338,7 @@ def collect(
                     ))
                     counts[f"B_{_result_label(result)}"] += 1
                 chosen = BC.select_admissible(
-                    query_rows, selector="margin", state=prepared["state"],
+                    query_rows, selector=selector, state=prepared["state"],
                     ped_xy=prepared["ped_xy"], ped_vel=prepared["ped_vel"],
                     gamma=replica.gamma,
                 )
@@ -390,7 +394,7 @@ def collect(
                     executed_x0 = all_rows[int(chosen["candidate_id"])]["x0"]
                     executed_result = chosen["result"]
                     executed_id = int(chosen["candidate_id"])
-                    execution_source = "verified_max_margin"
+                    execution_source = f"verified_{selector}"
                     raw_candidate = None
                 if chosen is None:
                     executed_x0 = raw_base
@@ -423,7 +427,7 @@ def collect(
                     negative_reasons.append("executed_verifier_error")
                 if (
                     executed_label == "verifier_positive"
-                    and execution_source != "verified_max_margin"
+                    and not execution_source.startswith("verified_")
                 ):
                     if raw_margin < -1.0e-9:
                         negative_reasons.append("executed_nominal_Hp_gate_failure")
@@ -476,7 +480,7 @@ def collect(
         diagnostic_only=True, enters_training_or_gp=False,
         certified_deployment=False,
         continuation_semantics=(
-            "verified max-margin B action when available; otherwise independently "
+            f"verified {selector} B action when available; otherwise independently "
             "sampled raw temp=1 action is executed after being labeled, even when "
             "uncertified, solely to continue the offline simulator diagnostic"
         ),
@@ -494,7 +498,7 @@ def collect(
         environment=environment, scenarios=list(scenarios), gammas=list(gammas),
         sample_seed=int(sample_seed), audit_seed=int(audit_seed),
         protocol=dict(
-            K=cfg.K, B=cfg.B, H=cfg.H, T=int(T), selector="margin",
+            K=cfg.K, B=cfg.B, H=cfg.H, T=int(T), selector=selector,
             ell=float(ell), gp_buffer=0, beta=float(beta),
             representation=(
                 "normalize(phi_theta((1-s)*x0+s*U/u_max,s,c)); "
@@ -530,13 +534,18 @@ def main(argv=None):
     parser.add_argument("--audit-seed", type=int, default=DEFAULT_AUDIT_SEED)
     parser.add_argument("--ell", type=float, default=DEFAULT_ELL)
     parser.add_argument("--T", type=int, default=SP.T)
+    parser.add_argument(
+        "--selector",
+        choices=("margin", "safemppi_cost"),
+        default="margin",
+    )
     args = parser.parse_args(argv)
     collect(
         args.checkpoint, scenarios=args.scenarios,
         scene_profile=args.scene_profile, device=args.device,
         verifier_workers=args.verifier_workers,
         sample_seed=args.sample_seed, audit_seed=args.audit_seed,
-        ell=args.ell, T=args.T, outdir=args.outdir,
+        ell=args.ell, T=args.T, selector=args.selector, outdir=args.outdir,
     )
 
 

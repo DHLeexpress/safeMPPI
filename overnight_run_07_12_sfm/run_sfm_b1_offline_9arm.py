@@ -80,12 +80,18 @@ def _sha256_json(payload) -> str:
 class Arm:
     alpha: float
     exposure_epochs: int
+    selector: str = "margin"
 
     @property
     def name(self) -> str:
         alpha = str(float(self.alpha)).replace(".", "p")
+        prefix = (
+            "offline_exec"
+            if self.selector == "margin"
+            else "offline_exec_safemppi_cost"
+        )
         return (
-            f"offline_exec_alpha{alpha}_"
+            f"{prefix}_alpha{alpha}_"
             f"exposures{int(self.exposure_epochs):03d}"
         )
 
@@ -95,9 +101,11 @@ class PhaseName:
     name: str
 
 
-def arm_grid() -> tuple[Arm, ...]:
+def arm_grid(selector="margin") -> tuple[Arm, ...]:
+    if selector not in ("margin", "safemppi_cost"):
+        raise ValueError(f"unknown execution selector: {selector}")
     return tuple(
-        Arm(alpha, epochs)
+        Arm(alpha, epochs, selector)
         for alpha in ALPHAS
         for epochs in EXPOSURE_EPOCHS
     )
@@ -125,7 +133,8 @@ def allocate_arms(
     """Use both requested GPUs with a deterministic 5/4 workload split."""
     if len(gpus) != 2:
         raise RuntimeError(f"exactly two idle GPUs are required, got {len(gpus)}")
-    if set(arms) != set(arm_grid()):
+    selectors = {arm.selector for arm in arms}
+    if len(selectors) != 1 or set(arms) != set(arm_grid(next(iter(selectors)))):
         raise ValueError("offline launcher requires the complete declared arm grid")
     ordered_gpus = sorted(gpus, key=lambda gpu: int(gpu.index))
     allocation = {gpu.uuid: [] for gpu in ordered_gpus}
@@ -152,6 +161,8 @@ def _trainer_command(args, arm: Arm, output: Path) -> list[str]:
         str(arm.alpha),
         "--exposure-epochs",
         str(arm.exposure_epochs),
+        "--selector",
+        arm.selector,
         "--rounds",
         str(ROUNDS),
         "--verifier-workers",
@@ -264,6 +275,7 @@ def validate_training_arm(
     expected_recipe = {
         "alpha": float(arm.alpha),
         "exposure_epochs": int(arm.exposure_epochs),
+        "selector": arm.selector,
         "rounds": ROUNDS,
         "K": K,
         "B": B,
@@ -561,7 +573,9 @@ def _screening_key(row: dict) -> tuple:
     )
 
 
-def _render_aggregate(rows: list[dict], output: Path) -> list[dict]:
+def _render_aggregate(
+    rows: list[dict], output: Path, *, selector: str,
+) -> list[dict]:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -577,7 +591,7 @@ def _render_aggregate(rows: list[dict], output: Path) -> list[dict]:
     )
     figure, axes = plt.subplots(2, 2, figsize=(14.5, 10.0), squeeze=False)
     for axis, (key, title, ylim) in zip(axes.flat, specs):
-        for arm in arm_grid():
+        for arm in arm_grid(selector):
             values = [
                 row for row in rows if row["arm"] == arm.name
             ]
@@ -629,10 +643,12 @@ def _render_aggregate(rows: list[dict], output: Path) -> list[dict]:
     return artifacts
 
 
-def aggregate(evaluations: dict[str, dict], output: Path) -> dict:
+def aggregate(
+    evaluations: dict[str, dict], output: Path, *, selector: str,
+) -> dict:
     output.mkdir(parents=True, exist_ok=False)
     rows = []
-    for arm in arm_grid():
+    for arm in arm_grid(selector):
         rows.extend(
             _cell_row(arm, record)
             for record in evaluations[arm.name]["records"]
@@ -648,7 +664,7 @@ def aggregate(evaluations: dict[str, dict], output: Path) -> dict:
         writer.writerows(rows)
     candidates = [row for row in rows if int(row["round"]) > 0]
     best = min(candidates, key=_screening_key)
-    figures = _render_aggregate(rows, output)
+    figures = _render_aggregate(rows, output, selector=selector)
     result = {
         "status": "SFM_B1_OFFLINE_9ARM_AGGREGATE_COMPLETE",
         "selection_role": (
@@ -735,6 +751,9 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--outdir", required=True)
     parser.add_argument("--gpu-indices", default="1,3")
+    parser.add_argument(
+        "--selector", choices=("margin", "safemppi_cost"), default="margin",
+    )
     parser.add_argument("--verifier-workers", type=int, default=8)
     parser.add_argument("--seed", type=int, default=20260724)
     parser.add_argument("--eval-ep0", type=int, default=260000)
@@ -765,7 +784,7 @@ def run(args) -> dict:
             raise FileNotFoundError(module)
     outdir = _validated_output_root(args.outdir)
     source = BASE.source_provenance()
-    arms = list(arm_grid())
+    arms = list(arm_grid(args.selector))
     all_gpus, processes, topology, selected = _select_exactly_two_gpus(args)
     allocation = allocate_arms(arms, selected)
     pools = BASE.allocate_cpu_pools(arms, int(args.verifier_workers))
@@ -781,6 +800,7 @@ def run(args) -> dict:
         "checkpoint": str(checkpoint),
         "checkpoint_sha256": observed_checkpoint_sha,
         "scene_profile": SCENE_PROFILE,
+        "execution_selector": args.selector,
         "rounds": ROUNDS,
         "alphas": list(ALPHAS),
         "exposure_epochs": list(EXPOSURE_EPOCHS),
@@ -937,6 +957,7 @@ def run(args) -> dict:
         )
     aggregate_result = aggregate(
         evaluations, outdir / "evaluation" / "aggregate",
+        selector=args.selector,
     )
     manifest = {
         "status": "SFM_B1_OFFLINE_9ARM_DELIVERY_COMPLETE",
