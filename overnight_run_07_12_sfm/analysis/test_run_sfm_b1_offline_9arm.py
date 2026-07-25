@@ -174,3 +174,12 @@ def test_recovery_refuses_delivery_overwrite(tmp_path, monkeypatch):
             idle_memory_mib=1024,
             idle_utilization_percent=5,
         ))
+
+
+def test_legacy_margin_recipe_normalization_is_margin_only():
+    recipe = {"alpha": 0.0}
+    assert L._normalized_training_recipe(recipe, "margin") == {
+        "alpha": 0.0,
+        "selector": "margin",
+    }
+    assert L._normalized_training_recipe(recipe, "safemppi_cost") == recipe

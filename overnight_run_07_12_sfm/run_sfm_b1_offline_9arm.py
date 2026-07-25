@@ -255,6 +255,16 @@ def _validate_sidecar(path: Path) -> dict:
     }
 
 
+def _normalized_training_recipe(recipe, selector: str):
+    if (
+        selector == "margin"
+        and isinstance(recipe, dict)
+        and "selector" not in recipe
+    ):
+        return {**recipe, "selector": "margin"}
+    return recipe
+
+
 def validate_training_arm(
     arm_dir: Path,
     arm: Arm,
@@ -294,7 +304,10 @@ def validate_training_arm(
         "scene_profile": SCENE_PROFILE,
         "smoke": False,
     }
-    if payload.get("recipe") != expected_recipe:
+    observed_recipe = _normalized_training_recipe(
+        payload.get("recipe"), arm.selector,
+    )
+    if observed_recipe != expected_recipe:
         raise RuntimeError(f"training recipe mismatch: {marker}")
     constants = payload.get("constants", {})
     ell0 = float(constants.get("ell0", -1.0))
