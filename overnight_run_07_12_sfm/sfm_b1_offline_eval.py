@@ -1,6 +1,6 @@
 """Raw SFM evaluation with terminal-truncated executed-window Validity.
 
-Every checkpoint uses one fixed M=50/scenario/gamma seed and latent bank.  The
+Every checkpoint uses one fixed M/scenario/gamma seed and latent bank.  The
 controller is the unguided raw flow at temperature one: it samples one H=10
 plan per context and executes only its first action.  Acquisition, verifier
 selection, fallback, guidance, and temperature search are absent.
@@ -41,7 +41,8 @@ import sfm_scene as SS
 
 
 VERSION = "sfm_b1_offline_executed_window_v1"
-M_PER_GAMMA = 50
+DEFAULT_M_PER_GAMMA = 50
+M_PER_GAMMA = DEFAULT_M_PER_GAMMA
 T = int(SP.T)
 H = int(SP.H)
 NFE = 8
@@ -55,6 +56,14 @@ PLOT_SPECS = (
     ("clearance", "Min. clearance [m]", None),
     ("time", "Time-to-goal [s]", None),
 )
+
+
+def _artifact_prefix() -> str:
+    return f"raw_m{M_PER_GAMMA}_offline"
+
+
+def _status() -> str:
+    return f"SFM_B1_OFFLINE_RAW_M{M_PER_GAMMA}_COMPLETE"
 
 
 def _sha256_file(path: str | os.PathLike[str]) -> str:
@@ -699,11 +708,15 @@ def render(records: list[dict], output_dir: str) -> list[str]:
     os.makedirs(output_dir, exist_ok=True)
     outputs = []
     for suffix in ("png", "pdf"):
-        path = os.path.join(output_dir, f"raw_m50_offline_curves.{suffix}")
+        path = os.path.join(
+            output_dir, f"{_artifact_prefix()}_curves.{suffix}"
+        )
         figure.savefig(path, dpi=300, bbox_inches="tight")
         outputs.append(path)
     plt.close(figure)
-    manifest = os.path.join(output_dir, "raw_m50_offline_curves.figure.json")
+    manifest = os.path.join(
+        output_dir, f"{_artifact_prefix()}_curves.figure.json"
+    )
     _write_json(manifest, {
         "status": "SFM_B1_OFFLINE_FIGURE_COMPLETE",
         "rounds": rounds,
@@ -725,6 +738,10 @@ def render(records: list[dict], output_dir: str) -> list[str]:
 
 
 def run(args) -> dict:
+    global M_PER_GAMMA
+    M_PER_GAMMA = int(args.m_per_gamma)
+    if M_PER_GAMMA <= 0:
+        raise ValueError("--m-per-gamma must be positive")
     specs = _checkpoint_specs(args.checkpoints, args.labels)
     output_dir = os.path.abspath(args.output_dir)
     cache_dir = os.path.abspath(
@@ -762,7 +779,7 @@ def run(args) -> dict:
 
     outputs = render(records, output_dir)
     result = {
-        "status": "SFM_B1_OFFLINE_RAW_M50_COMPLETE",
+        "status": _status(),
         "version": VERSION,
         "scene_profile": args.scene_profile,
         "environment": SS.scene_profile(args.scene_profile),
@@ -778,7 +795,9 @@ def run(args) -> dict:
         "records": records,
         "outputs": outputs,
     }
-    result_path = os.path.join(output_dir, "raw_m50_offline_metrics.json")
+    result_path = os.path.join(
+        output_dir, f"{_artifact_prefix()}_metrics.json"
+    )
     _write_json(result_path, result)
     result["metrics_json"] = result_path
     return result
@@ -795,6 +814,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ep0", type=int, default=DEFAULT_EP0)
     parser.add_argument("--noise-seed", type=int, default=DEFAULT_NOISE_SEED)
+    parser.add_argument(
+        "--m-per-gamma", type=int, default=DEFAULT_M_PER_GAMMA
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--workers", type=int, default=32)
     parser.add_argument("--cache-dir")
