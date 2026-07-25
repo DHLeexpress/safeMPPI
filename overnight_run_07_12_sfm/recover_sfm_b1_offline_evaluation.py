@@ -122,6 +122,31 @@ def _load_frozen_training(run_root: Path, recovery_source: dict) -> tuple:
     )
 
 
+def _select_recovery_gpus(args):
+    gpus, processes, topology = BASE.gpu_snapshot()
+    selected = BASE.select_idle_gpus(
+        gpus,
+        processes,
+        args.gpu_indices,
+        max_memory_mib=args.idle_memory_mib,
+        max_utilization=args.idle_utilization_percent,
+    )
+    if len(selected) not in (1, 2):
+        raise RuntimeError(
+            "evaluation recovery requires one or two exclusive GPUs, got "
+            f"{[gpu.index for gpu in selected]}"
+        )
+    return gpus, processes, topology, selected
+
+
+def _recovery_allocation(arms, gpus):
+    if len(gpus) == 2:
+        return RUN.allocate_arms(arms, gpus)
+    if len(gpus) == 1:
+        return {gpus[0].uuid: list(arms)}
+    raise RuntimeError("evaluation recovery requires one or two GPUs")
+
+
 def recover(args) -> dict:
     started = time.perf_counter()
     run_root = Path(args.run_root).resolve()
@@ -156,8 +181,8 @@ def recover(args) -> dict:
         idle_memory_mib=int(args.idle_memory_mib),
         idle_utilization_percent=int(args.idle_utilization_percent),
     )
-    _, _, _, gpus = RUN._select_exactly_two_gpus(runtime)
-    allocation = RUN.allocate_arms(arms, gpus)
+    _, _, _, gpus = _select_recovery_gpus(runtime)
+    allocation = _recovery_allocation(arms, gpus)
     pools = BASE.allocate_cpu_pools(
         arms, int(contract["verifier_workers_per_arm"])
     )

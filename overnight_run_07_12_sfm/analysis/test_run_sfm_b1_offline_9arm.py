@@ -183,3 +183,11 @@ def test_legacy_margin_recipe_normalization_is_margin_only():
         "selector": "margin",
     }
     assert L._normalized_training_recipe(recipe, "safemppi_cost") == recipe
+
+
+def test_recovery_allocation_supports_one_or_two_idle_gpus():
+    arms = list(L.arm_grid("balanced_rank"))
+    one = R._recovery_allocation(arms, [_gpu(1)])
+    assert one == {"GPU-1": arms}
+    two = R._recovery_allocation(arms, [_gpu(1), _gpu(3)])
+    assert sorted(map(len, two.values())) == [4, 5]
