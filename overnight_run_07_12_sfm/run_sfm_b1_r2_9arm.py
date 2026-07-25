@@ -394,10 +394,12 @@ def _child_environment(gpu: GPU) -> dict[str, str]:
 def _launch_pending(jobs: list[dict], log_dir: Path) -> list[str]:
     taskset = shutil.which("taskset")
     running = []
+    log_paths = []
     log_dir.mkdir(parents=True, exist_ok=True)
     try:
         for job in jobs:
             log_path = log_dir / f"{job['arm'].name}.log"
+            log_paths.append(str(log_path.resolve()))
             stream = log_path.open("w")
             command = list(job["command"])
             if taskset:
@@ -452,7 +454,7 @@ def _launch_pending(jobs: list[dict], log_dir: Path) -> list[str]:
         for item in running:
             if not item["stream"].closed:
                 item["stream"].close()
-    return [job["log_path"] for job in jobs]
+    return log_paths
 
 
 def _parser() -> argparse.ArgumentParser:

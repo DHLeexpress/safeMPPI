@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import run_sfm_b1_offline_9arm as L  # noqa: E402
+import recover_sfm_b1_offline_evaluation as R  # noqa: E402
 
 
 def _gpu(index: int) -> L.BASE.GPU:
@@ -145,3 +147,30 @@ def test_validate_sidecar_authenticates_digest(tmp_path):
     }))
     with pytest.raises(RuntimeError):
         L._validate_sidecar(artifact)
+
+
+def test_launch_pending_returns_generated_log_path(tmp_path):
+    job = {
+        "arm": L.PhaseName("common_r0"),
+        "gpu": _gpu(1),
+        "cpu_pool": [0],
+        "command": [sys.executable, "-c", "print('ok')"],
+    }
+    logs = L.BASE._launch_pending([job], tmp_path / "logs")
+    assert logs == [str((tmp_path / "logs" / "common_r0.log").resolve())]
+    assert Path(logs[0]).read_text().strip() == "ok"
+
+
+def test_recovery_refuses_delivery_overwrite(tmp_path, monkeypatch):
+    root = tmp_path / "research1"
+    run_root = root / "run"
+    run_root.mkdir(parents=True)
+    (run_root / "DELIVERY_COMPLETE.json").write_text("{}")
+    monkeypatch.setattr(L, "RESEARCH_ROOT", root)
+    with pytest.raises(FileExistsError):
+        R.recover(SimpleNamespace(
+            run_root=str(run_root),
+            gpu_indices="1,3",
+            idle_memory_mib=1024,
+            idle_utilization_percent=5,
+        ))
