@@ -17,5 +17,17 @@
     "no_changes_after_reading": true
   },
   "contamination_note": "The iteration-1 M50 bank (ep0 320000) was read for B9 r1/r2 as declared diagnostic companions and is therefore NOT used for iteration-2 selection. Banks 300000/305000/310000 are tuning banks. Bank 330000 has never been read by anything.",
-  "iteration_1_disposition": "reported in full as the rule-selected null result (frozen cost/hard recipe, winner r7), with its four-metric paper plot and all checkpoints; nothing about iteration 1 is hidden or reselected"
+  "iteration_1_disposition": "reported in full as the rule-selected null result (frozen cost/hard recipe, winner r7), with its four-metric paper plot and all checkpoints; nothing about iteration 1 is hidden or reselected",
+  "freeze_criterion_applied": {
+    "applied_at": "2026-07-26T13:55:00-07:00",
+    "U_reads_combined_diag_anchor_n140": {
+      "r0":  {"SR": 0.614, "CR": 0.386, "Validity": 0.571, "clearance": 0.129, "time": 8.19},
+      "U12_v1_e100": {"SR": 0.614, "CR": 0.350, "Validity": 0.706, "clearance": 0.104, "time": 10.92},
+      "U10_v2_e100": {"SR": 0.679, "CR": 0.264, "Validity": 0.723, "clearance": 0.109, "time": 11.22},
+      "U11_v2_e10":  {"SR": 0.564, "CR": 0.393, "Validity": 0.663, "clearance": 0.109, "time": 10.17}
+    },
+    "evaluation": "U10 vs U12: SR improved (+.065) and CR improved (-.086), but successful time did NOT improve (+0.30 s). The declared criterion required BOTH SR and time improvements; v2 did not show its designed no-slowdown signature. Individual deltas are also within 95% noise at n=140.",
+    "decision": "R_A frozen (B9 knobs; existing checkpoints r1-r4 trained from exact r0 before any selection-bank read)",
+    "v2_disposition": "documented as a promising follow-up (goal-directed certified escapes raised single-update SR/CR at matched dose on tuning banks) — not selected, not confirmed, not claimed"
+  }
 }
