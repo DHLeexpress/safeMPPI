@@ -91,6 +91,26 @@ Per arm r1..r4 (SR/CR/V):
 - B8 cost origrec ess.3: ≈B4
 Verdict: no cost-selector composition materially improves CR or Validity on this bank; the lower ESS target (0.3) is not beneficial. The strongest known pattern (margin/original/e100 — codex arm, r1 CR .237/V .739 on the M100 280k baseline) was absent from the set.
 
+## 2026-07-26 13:00–15:00 — Stage D result, mechanism deep-dive, iteration 2
+
+**Stage D (frozen cost/hard recipe, M50 bank 320000): honest null.** Rule-selected r7: CR .263 vs r0 .269 but Validity .571 vs .638. Full 11-round curve + paper-contract plot at `stageD/paper_trends/`. Recorded in STAGE_D_SELECTION.json with Pareto frontier.
+
+**Mechanism figures** (user request; artifact https://claude.ai/code/artifact/3c16fe2a-1450-4a8c-addf-466beaea1111, PNGs in `~/claude_sfm_figs/` and `mechanism/`): the closing certifiability window quantified on stored contexts — onset−2: 10–13/16 flow candidates certify, escapes 14–24/24; onset: flow 1–2/16, escapes 5–15/24; onset+4–7: 0 everywhere including both deterministic families. Closed-loop replays: B9-r1 converts both collision lineages to successes (s20005 γ.1 clearance .236; s20004 γ.5 clearance .139).
+
+**Recovery family v2** (user hypothesis: v1 escapes too conservative): dodge-then-cruise family implemented + declared; single-update head-to-head at matched dose (n=140): U10 v2 SR .679/CR .264/V .723/t 11.22 vs U12 v1 SR .614/CR .350/V .706/t 10.92. v2 did NOT remove the slowdown (the declared signature), so per the pre-registered criterion iteration 2 froze R_A (v1); the v2 SR/CR edge (within noise) is documented as follow-up.
+
+**Iteration 2 (pre-registered):** recipe = margin/orig_plus_recovery-v1/α.01/e100/lr1e-4/ess.5/rounds4 (B9; checkpoints trained from exact r0 before any selection-bank read). Fresh M50 selection bank 340000: r0 = SR .563/CR .434/V .574; **r1 = only eligible round: SR .654 (+.091), CR .311 (−.123), V .715 (+.141), clearance flat, time +2.36 s**; r2 fails gate (timeout .163), r3–r4 collapse. Selected checkpoint: B9 round_01.pt. Population counts + per-row certificate audits in `iteration2/population_counts_B9.json` and `iteration2/recovery_certificate_audit_B9.json` (280–407 exact-certified recovery positives/round from 8.3–12.3k exact queries).
+
+**Stage E launched** on untouched M100 bank 330000: r0 + selected + locked Kazuki.
+
+## 2026-07-26 18:20 — FINAL: Stage E confirmation + delivery
+
+M100 confirmation (untouched bank 330000, 700 CRN rollouts/method): r0 SR .643/CR .353/V .603/clr .108/t 8.76 → **selected (margin+orig∪recovery-v1, e100, round 1): SR .723 / CR .253 / V .736 / clr .122 / t 10.84**; locked Kazuki SR .827/CR .173/**V .353**/clr .168/t 4.17. Paired scenario-cluster 95% CIs (selected − r0): ΔCR −.100 [−.157,−.043], ΔV +.133 [+.114,+.153], Δclr +.014 [+.005,+.023], Δt +2.08 [1.84,2.32] — all exclude zero. γ=0.1 keeps the largest clearance (.148) and longest time (13.4 s). Stability honestly reported: round-1 phenomenon; r2+ collapse. Full record in DELIVERY_COMPLETE.json; 33-artifact SHA manifest.
+
+## 2026-07-26 16:20+ — MPC distillation follow-up study (separate branch)
+
+Pre-registered in MPC_STUDY_PREREGISTRATION.json (banks M10 350000 / M50 360000 / M100 370000). Smoke round: 172 D_MPC+ records; dedicated block doubled the local SOCP-positive rate at MPC contexts (.161→.313) — a visible raw-policy change; M10 CR moved adversely at that dose (smoke bank). 4-arm sweep (lr_d × epochs_d) running.
+
 ### Stage B extension (declared 07:55 before reading its results)
 
 - B0: codex margin/original/α.01/e100 checkpoints r1–r4 evaluated on the SAME M25 qual bank (matched-round control; identical recipe lineage, same commit and seeds).

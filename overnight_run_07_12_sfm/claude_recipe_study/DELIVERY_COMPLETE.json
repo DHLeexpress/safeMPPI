@@ -1,0 +1,54 @@
+{
+  "status": "CLAUDE_SFM_BEST_RECIPE_DELIVERY_COMPLETE",
+  "completed_at": "2026-07-26T18:20:00-07:00",
+  "headline": "A fixed Safe Flow Expansion recipe genuinely beat r0 on the disjoint M100 confirmation: CR -.100 [-.157,-.043], window Validity +.133 [+.114,+.153], successful clearance +.014 [+.005,+.023], SR +.080, at time +2.08 s [1.84,2.32] (paired scenario-cluster 95% CIs, 700 CRN rollouts/method, temperature 1.0, no tilt/fallback).",
+  "selected_recipe": {
+    "name": "margin_origrec_e100 (iteration 2, R_A)",
+    "execution_selector": "margin (max one-step nominal H_P margin among exact-certified B queries)",
+    "replay": "orig_plus_recovery: full executed D+ and D- plus exact-certified deterministic recovery positives (family v1) appended at hard contexts",
+    "alpha": 0.01, "exposure_epochs": 100, "lr": 1e-4, "ess_target": 0.5,
+    "rounds": 4, "seed": 20260724,
+    "selected_round": 1,
+    "selected_checkpoint": "/data3/research1/claude_sfm_best_recipe_f06e8dd/stageB/B9_margin_origrec_e100/round_01.pt",
+    "selected_checkpoint_sha256_prefix": "141e4ae6592bf73f"
+  },
+  "provenance_chain": [
+    "iteration 1 (frozen by predeclared Stage-B rule): cost/hard — honest NULL on its own M50 bank (STAGE_D_SELECTION.json); fully reported, nothing hidden",
+    "iteration 2 pre-registered BEFORE reading its selection bank (ITERATION2_PREREGISTRATION.json); recipe R_A chosen over v2 family by the declared U10-vs-U12 criterion",
+    "M50 selection on fresh bank 340000: r1 the only eligible round (ITERATION2_SELECTION.json)",
+    "M100 confirmation on untouched bank 330000: r0 / selected / locked Kazuki (stageE/)"
+  ],
+  "m100_confirmation_pooled": {
+    "r0":       {"SR": 0.643, "CR": 0.353, "timeout": 0.004, "Validity": 0.603, "clearance": 0.108, "time": 8.76},
+    "selected": {"SR": 0.723, "CR": 0.253, "timeout": 0.024, "Validity": 0.736, "clearance": 0.122, "time": 10.84},
+    "kazuki":   {"SR": 0.827, "CR": 0.173, "timeout": 0.000, "Validity": 0.353, "clearance": 0.168, "time": 4.17}
+  },
+  "kazuki_note": "locked comparator (safe .3 / goal .5, Hp10 prior, native MPPI, no retuning): lower CR and faster via guidance+refinement, but its executed windows satisfy the exact GREEN certificate only 35% of the time versus 74% for our raw selected policy; it is a guided controller, not a raw flow",
+  "gamma_trend": "gamma=0.1 keeps the largest successful clearance (.148) and the longest time (13.4 s) for the selected checkpoint; mid-gamma flat within noise (per-gamma table stageE/m100_per_gamma_table.csv)",
+  "stability": "the recipe's gain is a round-1 phenomenon: round 2 fails the liveness gate (timeout .163 on the selection bank) and rounds 3-4 collapse to timeout; reported plainly, no monotonic-learning claim",
+  "local_repairs": "certified-recovery data demonstrably repairs the targeted failure modes: NVP contexts -25% and B-positive fraction .71->.84 on identical keyed latents; both diagnosed collision lineages became closed-loop successes under the selected checkpoint (mechanism/ figures)",
+  "integrity": [
+    "temperature 1.0 everywhere, no per-gamma or global temperature tuning",
+    "no deterministic controller executed at evaluation; recovery data is replay-only",
+    "Kazuki untouched after declaration; checkpoint never selected from M100",
+    "iteration-1 null result and all failed arms reported (Stage-B table, Stage-D curve)",
+    "every synthetic positive carries an exact-verifier certificate audit row (iteration2/recovery_certificate_audit_B9.json)"
+  ],
+  "artifacts": {
+    "four_metric_plot_selected_recipe": "iteration2/paper_trends/b1_margin50_metric_trends.{png,pdf} (+ numeric SEs in margin_origrec_e100_trends_rows.jsonl)",
+    "four_metric_plot_iteration1": "stageD/paper_trends/b1_margin50_metric_trends.{png,pdf}",
+    "m50_selection": "iteration2/m50/", "m100_confirmation": "stageE/",
+    "paired_cis": "stageE/CONFIRMATION_ANALYSIS.json",
+    "per_gamma_tables": "stageE/m100_per_gamma_table.{csv,json}",
+    "population_counts": "iteration2/population_counts_B9.json",
+    "certificate_audit": "iteration2/recovery_certificate_audit_B9.json",
+    "mechanism_figures": "mechanism/ (+ artifact https://claude.ai/code/artifact/3c16fe2a-1450-4a8c-addf-466beaea1111)",
+    "baselines": "baselines/",
+    "manifest": "SHA256_MANIFEST.json (33 rehashed artifacts)",
+    "all_checkpoints": "stageB/B9_margin_origrec_e100/ (r0-r4), stageD/final_cost_hard/ (r0-r10)"
+  },
+  "branches": {
+    "recipe_study": "agent/claude-sfm-best-recipe-20260726 (pushed)",
+    "mpc_distillation_followup": "agent/claude-sfm-mpc-distill-20260726 (superset; pushed; study running)"
+  }
+}
