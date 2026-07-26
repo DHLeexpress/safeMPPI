@@ -226,12 +226,23 @@ def _summary(rollouts):
     )
 
 
-def _closest_step(trace):
-    """Declared snapshot: minimum current robot-to-pedestrian clearance."""
+def _closest_step(trace, kind):
+    """Minimum-clearance context among rows that actually selected a branch."""
     if not trace:
         return None
-    values = []
+    eligible = []
     for index, row in enumerate(trace):
+        if kind == "claude":
+            selected = row["pool"].get("best") is not None
+        else:
+            pool = (row.get("output_filter") or {}).get("candidate_pool", ())
+            selected = any(candidate.get("selected") for candidate in pool)
+        if selected:
+            eligible.append((index, row))
+    if not eligible:
+        eligible = list(enumerate(trace))
+    values = []
+    for index, row in eligible:
         state = np.asarray(row["state"], float)
         ped_xy = np.asarray(row["ped_xy"], float)
         clearance = (
@@ -273,7 +284,7 @@ def _codex_branches(row):
 def _draw_cell(axis, rollout, kind):
     path = np.asarray(rollout["path"], float)
     trace = list(rollout.get("trace") or ())
-    snapshot = _closest_step(trace)
+    snapshot = _closest_step(trace, kind)
     if snapshot is None:
         axis.plot(path[:, 0], path[:, 1], color="#111111", lw=1.6)
         return
@@ -303,6 +314,11 @@ def _draw_cell(axis, rollout, kind):
         path[:, 0], path[:, 1], color="#111111", lw=1.35,
         marker=".", ms=1.2, zorder=7,
     )
+    if rollout["status"] == "nvp":
+        axis.plot(
+            path[-1, 0], path[-1, 1], marker="x", ms=5.0,
+            mew=1.2, color="#d62728", zorder=10,
+        )
     axis.plot(
         state[0], state[1], marker="o", ms=3.2,
         color="#111111", zorder=9,
@@ -405,8 +421,8 @@ def render(result, output_png):
         "Green has different semantics:\n"
         "Claude = exact full-H10 SOCP positive\n"
         "Codex = privileged SFM-lookahead hard-margin feasible\n\n"
-        "Snapshot rule: minimum current\n"
-        "robot–pedestrian clearance.\n"
+        "Snapshot rule: minimum current clearance\n"
+        "among contexts with a selected branch.\n"
         "No checkpoint update or replay.",
         ha="left", va="top", fontsize=8,
     )
