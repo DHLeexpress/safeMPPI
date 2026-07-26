@@ -204,7 +204,8 @@ def test_recovery_records_are_exactly_certified_with_provenance():
         assert record["execution_source"] == "synthetic_certified_recovery"
         prov = record["recovery_provenance"]
         assert prov["parent_context_id"] == record["context_id"]
-        assert "generator" in prov and "objective_goal_distance" in prov
+        assert "generator" in prov and "objective" in prov
+        assert prov["family"] == "v1"
 
 
 def test_orig_plus_recovery_keeps_full_population_and_appends():
@@ -221,6 +222,52 @@ def test_orig_plus_recovery_keeps_full_population_and_appends():
         if w["execution_source"] == "synthetic_certified_recovery"
     ]
     assert len(synthetic) == added
+
+
+def test_v2_family_is_deterministic_goal_directed_and_certifiable():
+    state = [1.0, 1.0, 0.4, -0.6]
+    first = AUG.recovery_candidates_v2(state)
+    second = AUG.recovery_candidates_v2(state)
+    assert len(first) == len(second) == (
+        len(AUG.CRUISE_SPEEDS)
+        + 2 * AUG.K_DIR * len(AUG.V2_ACCELS) * len(AUG.CRUISE_SPEEDS)
+    )
+    import sfm_metrics2 as SM2
+    for (ca, pa), (cb, pb) in zip(first, second):
+        assert np.array_equal(ca, cb) and pa == pb
+        assert ca.shape == (10, 2)
+        assert float(np.abs(ca).max()) <= 2.0 + 1e-6
+    # pure-cruise candidate ends moving toward the goal
+    controls = first[0][0]
+    seg = SM2.rollout_positions(state, controls)
+    velocity = np.asarray(state, np.float32)[2:4].copy()
+    for action in controls:
+        velocity = velocity + 0.1 * action
+    toward = velocity @ ((np.array([6.0, 6.0]) - seg[-1])
+                         / np.linalg.norm(np.array([6.0, 6.0]) - seg[-1]))
+    assert toward > 0.5
+
+
+def test_v2_recovery_records_certified_and_tagged():
+    shard = OS.ExecutedRoundShard(4)
+    # pedestrian behind the robot, receding: a goal-directed certified
+    # escape clearly exists
+    _add(shard, scenario=9, gamma=0.5, step=4, y=0,
+         state=[2.0, 2.0, 0.6, 0.6], ped_xy=[[1.2, 2.0]],
+         ped_vel=[[-0.6, 0.0]], controls=STILL, trap=True)
+    records, audit = AUG.build_recovery_records(
+        shard, shard.Dminus, _InlineExecutor(), family="v2",
+    )
+    assert audit["family"] == "v2"
+    assert records
+    for record in records:
+        assert record["recovery_provenance"]["family"] == "v2"
+        context = shard.contexts[record["context_id"]]
+        recheck = SM.verify_query(
+            context["state"], record["controls"], context["ped_xy"],
+            context["ped_vel"], context["gamma"],
+        )
+        assert recheck["resolved"] and int(recheck["y"]) == 1
 
 
 def test_hard_recovery_replay_respects_exact_once_accounting():

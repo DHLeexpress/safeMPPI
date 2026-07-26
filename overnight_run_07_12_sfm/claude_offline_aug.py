@@ -71,7 +71,29 @@ K_DIR = 16
 ACCELS = (0.7, 1.4, 2.0)
 PREVERIFY_CAP = 24
 RECOVERY_KEEP = 2
-REPLAY_MODES = ("original", "hard", "hard_recovery", "orig_plus_recovery")
+REPLAY_MODES = (
+    "original", "hard", "hard_recovery", "orig_plus_recovery",
+    "orig_plus_recovery_v2",
+)
+
+# --- Recovery family v2 ("dodge-then-cruise"), declared 2026-07-26 before
+# any evaluation of its effect.  Motivation (user hypothesis + Stage-A
+# measurement): the v1 brake/bang-bang family certifies CONSERVATIVE escapes
+# that end near-stationary; training on them creates slowdown.  v2 candidates
+# end moving TOWARD the goal at cruise speed:
+#   phase 1 (d in {0,2,3} steps): dodge with u = a*(cos t_k, sin t_k),
+#     a in {1.4, 2.0}, t_k over K_DIR world directions (d=0 skips the dodge);
+#   phase 2 (remaining steps): deterministic saturated velocity servo
+#     u_t = clip(KP_CRUISE * (v_des(p_t) - v_t), +/-U_MAX),
+#     v_des(p) = v_c * unit(GOAL - p), v_c in {1.0, 1.5}.
+# Objective (v2): J2 = ||p_10 - GOAL|| - 0.5 * (v_10 . unit(GOAL - p_10)) —
+# prefer end states that are close to AND moving toward the goal.  The same
+# cheap exact prefilter, PREVERIFY_CAP, RECOVERY_KEEP, and the exact full-H10
+# SOCP certificate gate apply unchanged.
+DODGE_STEPS = (0, 2, 3)
+CRUISE_SPEEDS = (1.0, 1.5)
+KP_CRUISE = 4.0
+V2_ACCELS = (1.4, 2.0)
 
 
 def declared_rules():
@@ -193,6 +215,88 @@ def recovery_candidates(state):
     return candidates
 
 
+def _cruise_controls(position, velocity, steps, v_cruise):
+    """Deterministic saturated velocity servo toward the goal."""
+    position = np.asarray(position, np.float32).copy()
+    velocity = np.asarray(velocity, np.float32).copy()
+    controls = []
+    for _ in range(steps):
+        offset = SS.GOAL - position
+        norm = float(np.linalg.norm(offset))
+        v_des = (
+            v_cruise * offset / norm if norm > 1e-6
+            else np.zeros(2, np.float32)
+        )
+        action = np.clip(
+            KP_CRUISE * (v_des - velocity), -SS.U_MAX, SS.U_MAX,
+        ).astype(np.float32)
+        controls.append(action)
+        position = position + SS.DT * velocity + 0.5 * SS.DT ** 2 * action
+        velocity = velocity + SS.DT * action
+    return controls
+
+
+def recovery_candidates_v2(state, ped_xy=None, ped_vel=None):
+    """Goal-directed dodge-then-cruise family (state-only, deterministic)."""
+    del ped_xy, ped_vel  # verifier inputs; unused by this state-only family
+    state = np.asarray(state, np.float32).reshape(4)
+    candidates = []
+    for v_cruise in CRUISE_SPEEDS:
+        controls = _cruise_controls(state[:2], state[2:4], 10, v_cruise)
+        candidates.append((
+            np.asarray(controls, np.float32),
+            dict(kind="cruise", dodge=0, theta=None, accel=None,
+                 v_cruise=v_cruise),
+        ))
+    for dodge in DODGE_STEPS:
+        if dodge == 0:
+            continue
+        for k in range(K_DIR):
+            theta = 2.0 * math.pi * k / K_DIR
+            direction = np.array(
+                [math.cos(theta), math.sin(theta)], np.float32,
+            )
+            for accel in V2_ACCELS:
+                prefix = [
+                    np.clip(accel * direction, -SS.U_MAX, SS.U_MAX)
+                    .astype(np.float32)
+                ] * dodge
+                position = np.asarray(state[:2], np.float32).copy()
+                velocity = np.asarray(state[2:4], np.float32).copy()
+                for action in prefix:
+                    position = (
+                        position + SS.DT * velocity
+                        + 0.5 * SS.DT ** 2 * action
+                    )
+                    velocity = velocity + SS.DT * action
+                for v_cruise in CRUISE_SPEEDS:
+                    controls = prefix + _cruise_controls(
+                        position, velocity, 10 - dodge, v_cruise,
+                    )
+                    controls = np.asarray(controls, np.float32)
+                    if controls.shape != (10, 2):
+                        raise AssertionError("v2 candidate must be H=10")
+                    candidates.append((
+                        controls,
+                        dict(kind="dodge_cruise", dodge=dodge,
+                             theta=round(theta, 6), accel=accel,
+                             v_cruise=v_cruise),
+                    ))
+    return candidates
+
+
+def _objective_v2(context, controls):
+    segment = SM.rollout_positions(context["state"], controls)
+    state = np.asarray(context["state"], np.float32).reshape(4)
+    velocity = state[2:4].copy()
+    for action in np.asarray(controls, np.float32):
+        velocity = velocity + SS.DT * action
+    offset = SS.GOAL - segment[-1]
+    norm = float(np.linalg.norm(offset))
+    toward = float(velocity @ (offset / norm)) if norm > 1e-6 else 0.0
+    return norm - 0.5 * toward
+
+
 def _prefilter(context, controls):
     """Cheap exact numpy feasibility check + objective J."""
     segment = SM.rollout_positions(context["state"], controls)
@@ -206,23 +310,37 @@ def _prefilter(context, controls):
     return float(np.linalg.norm(segment[-1] - SS.GOAL))
 
 
-def build_recovery_records(shard, hard_windows, executor):
+def build_recovery_records(shard, hard_windows, executor, family="v1"):
     """Exact-certified recovery positives for the given hard windows.
 
     Returns (records, audit).  Every returned record passed the exact
     full-H10 verifier inside ``executor`` (the same worker pool and
-    ``SM.verify_in_worker`` entry as B1 queries).
+    ``SM.verify_in_worker`` entry as B1 queries).  ``family`` selects the
+    declared deterministic candidate family and ranking objective:
+    v1 = brake/bang-bang, J = final goal distance;
+    v2 = dodge-then-cruise, J2 = goal distance - 0.5 * toward-goal speed.
     """
+    if family not in ("v1", "v2"):
+        raise ValueError("recovery family must be v1 or v2")
     context_ids = sorted({int(w["context_id"]) for w in hard_windows})
     tasks, meta = [], []
     per_context_pool = {}
     for context_id in context_ids:
         context = shard.contexts[context_id]
+        generator_fn = (
+            recovery_candidates if family == "v1"
+            else recovery_candidates_v2
+        )
         scored = []
-        for controls, provenance in recovery_candidates(context["state"]):
-            objective = _prefilter(context, controls)
-            if objective is not None:
-                scored.append((objective, controls, provenance))
+        for controls, provenance in generator_fn(context["state"]):
+            feasible = _prefilter(context, controls)
+            if feasible is None:
+                continue
+            objective = (
+                feasible if family == "v1"
+                else _objective_v2(context, controls)
+            )
+            scored.append((objective, controls, provenance))
         scored.sort(key=lambda row: (row[0], str(row[2])))
         pool = scored[:PREVERIFY_CAP]
         per_context_pool[context_id] = len(pool)
@@ -268,8 +386,9 @@ def build_recovery_records(shard, hard_windows, executor):
                 recovery_provenance=dict(
                     parent_round=int(shard.round_i),
                     parent_context_id=int(context_id),
+                    family=str(family),
                     generator=provenance,
-                    objective_goal_distance=float(objective),
+                    objective=float(objective),
                     prefilter_rank=int(rank),
                 ),
             ))
@@ -294,6 +413,7 @@ def build_recovery_records(shard, hard_windows, executor):
             float(np.mean(list(per_context_pool.values())))
             if per_context_pool else 0.0
         ),
+        family=str(family),
         rows=audit_rows,
     )
     return records, audit
@@ -339,13 +459,17 @@ def build_replay_view(shard, mode, executor=None):
         return shard, dict(mode=mode, note="untouched ExecutedRoundShard")
     pop_a, pop_b, stats = tag_populations(shard)
     report = dict(mode=mode, populations=stats)
-    if mode == "orig_plus_recovery":
+    if mode in ("orig_plus_recovery", "orig_plus_recovery_v2"):
         # Declared BEFORE evaluation (Stage-A log 2026-07-26): keep the FULL
         # original positive and negative populations and only APPEND the
         # exact-certified recovery positives at their parent (hard) contexts.
+        # The _v2 variant uses the declared dodge-then-cruise family.
         if executor is None:
             raise ValueError("orig_plus_recovery needs the verifier executor")
-        recovery, audit = build_recovery_records(shard, pop_b, executor)
+        recovery, audit = build_recovery_records(
+            shard, pop_b, executor,
+            family="v2" if mode.endswith("_v2") else "v1",
+        )
         report["recovery_audit"] = audit
         windows = list(shard.windows) + recovery
     else:
