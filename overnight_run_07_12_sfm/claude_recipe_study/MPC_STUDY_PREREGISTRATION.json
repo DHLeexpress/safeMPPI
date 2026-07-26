@@ -1,0 +1,27 @@
+{
+  "status": "PREDECLARED_BEFORE_ANY_MPC_ARM_RUN",
+  "declared_at": "2026-07-26T16:20:00-07:00",
+  "branch": "agent/claude-sfm-mpc-distill-20260726 (Codex branch agent/sfm-adhoc-controller-overlay-20260726@0e0eca2 kept read-only; nothing written to it)",
+  "pipeline": "claude_mpc_pool.py + claude_mpc_exec.py: ordinary B1 expansion round (margin selector, original replay, alpha .01, exposures 10, lr 1e-4, ESS .5) followed by a dedicated D_MPC+ distillation block per round",
+  "d_mpc_plus": {
+    "separation": "per-round buffer; never enters D/D+, GP buffer, or acquisition; privileged controller never used at evaluation; no x0 stored (cfm_loss draws fresh Gaussian bases)",
+    "hard_contexts": "population-B windows (declared rules in claude_offline_aug.py) UNION all NVP contexts of the round shard; capped at 400/round by even stride",
+    "pool": "original Codex privileged pool regenerated at the stored context after exact prefix replay of the live SFM crowd (fail-closed on reconstruction mismatch): guided flow (n_sample 200) + MPPI refinement + brake + 12 goal plans + 18 avoidance plans + 25 constant-acceleration escapes",
+    "filter": "privileged exact-SFM look-ahead feasible (recoverable AND clearance >= per-gamma hard margin .22-.24) AND exact full-H10 SOCP y=1; intersection ranked by frozen native SafeMPPI proposal cost; keep top 2 per context"
+  },
+  "sweep_arms_rounds_4_each": {
+    "M1": {"lr_dedicated": 1e-4, "epochs_dedicated": 2},
+    "M2": {"lr_dedicated": 1e-4, "epochs_dedicated": 8},
+    "M3": {"lr_dedicated": 1e-5, "epochs_dedicated": 8},
+    "M4": {"lr_dedicated": 3e-4, "epochs_dedicated": 2}
+  },
+  "control": "the identical ordinary recipe WITHOUT distillation = codex arm offline_exec_alpha0p01_exposures010 (same seeds, rounds 1-4 checkpoints already archived); its cells are evaluated on the same M10 bank for the comparison",
+  "banks": {
+    "m10_audit_and_selection": {"ep0": 350000, "noise_seed": 20260733, "m_per_gamma": 10, "role": "before/after audit of every dedicated block AND checkpoint/arm selection"},
+    "m50_confirmation": {"ep0": 360000, "noise_seed": 20260734, "m_per_gamma": 50, "role": "disjoint confirmation of the single M10-selected winner vs r0"},
+    "m100_final": {"ep0": 370000, "noise_seed": 20260735, "m_per_gamma": 100, "role": "disjoint final confirmation of the M50-confirmed winner vs r0; only if M50 confirms a real effect"}
+  },
+  "selection_rule": "on the M10 bank over all saved checkpoints (pre-block and post-block, every arm): liveness gate SR >= SR(r0)-0.02 and timeout <= timeout(r0)+0.05; among eligible minimize CR, then maximize Validity, then clearance, then minimize time; the winner must be a POST-BLOCK checkpoint to count as a distillation effect, and its pre-block sibling is always reported alongside for the marginal-attribution claim",
+  "primary_question": "does the dedicated D_MPC+ block produce a VISIBLE raw-policy change (SOCP-positive rate / progress / clearance / target recovery at MPC contexts, and fixed-bank M10 deltas) beyond lowering its own training loss?",
+  "prohibitions": ["no temperature tuning", "no test-bank tuning", "no hidden fallback", "no silent rollback (every pre/post checkpoint kept and reported)", "no modification of any Codex artifact"]
+}
