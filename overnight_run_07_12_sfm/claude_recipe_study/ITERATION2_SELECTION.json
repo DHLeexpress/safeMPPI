@@ -1,0 +1,22 @@
+{
+  "status": "ITERATION2_SELECTION_APPLIED",
+  "applied_at": "2026-07-26T15:05:00-07:00",
+  "recipe": "R_A frozen per ITERATION2_PREREGISTRATION.json: margin selector, orig_plus_recovery (family v1), alpha 0.01, exposure_epochs 100, lr 1e-4, ess_target 0.5, rounds 4, seed 20260724, expansion bank ep 20000+",
+  "bank": {"ep0": 340000, "noise_seed": 20260732, "m_per_gamma": 50},
+  "rule": "SELECTION_RULE.json applied verbatim",
+  "per_round_pooled": {
+    "r0": {"SR": 0.563, "CR": 0.434, "timeout": 0.003, "Validity": 0.574, "clearance": 0.117, "time": 8.46},
+    "r1": {"SR": 0.654, "CR": 0.311, "timeout": 0.034, "Validity": 0.715, "clearance": 0.117, "time": 10.82},
+    "r2": {"SR": 0.537, "CR": 0.300, "timeout": 0.163, "Validity": 0.789, "clearance": 0.132, "time": 13.17},
+    "r3": {"SR": 0.020, "CR": 0.329, "timeout": 0.651, "Validity": 0.816, "clearance": 0.209, "time": 14.46},
+    "r4": {"SR": 0.000, "CR": 0.331, "timeout": 0.669, "Validity": 0.821, "clearance": null, "time": null}
+  },
+  "liveness_gate": {"SR_min": 0.543, "timeout_max": 0.053},
+  "eligible_rounds": ["r1"],
+  "selected_round": "r1",
+  "selected_checkpoint": "/data3/research1/claude_sfm_best_recipe_f06e8dd/stageB/B9_margin_origrec_e100/round_01.pt",
+  "selected_vs_r0_on_selection_bank": {"dSR": 0.091, "dCR": -0.123, "dValidity": 0.141, "dclearance": 0.000, "dtime": 2.36},
+  "stability_note": "r2 fails the gate (timeout .163) and r3-r4 collapse: the recipe's gains are a one-round phenomenon; this is reported plainly (not claimed as monotonic learning).",
+  "paper_plot": "/data3/research1/claude_sfm_best_recipe_f06e8dd/iteration2/paper_trends/b1_margin50_metric_trends.{png,pdf} + numeric SEs in margin_origrec_e100_trends_rows.jsonl",
+  "next": "M100 confirmation on untouched bank 330000 (r0 + selected r1 + locked Kazuki); no changes after reading"
+}
