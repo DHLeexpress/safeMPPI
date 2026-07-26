@@ -47,3 +47,51 @@ Stages A–E per task spec; banks in `EPISODE_BANKS.json`. Interventions impleme
 - Arm score = its best eligible round ordered by (min CR, then max Validity, then max successful clearance, then min successful time-to-goal). Arms with no eligible round are disqualified (collapse).
 - Stability tie-break: among arms whose best-round CR are within 0.03 of the leader, prefer the arm whose round-4 checkpoint is still eligible; among those, the better round-4 CR. Rationale: the frozen Stage-C/D recipe must hold 10 round-invariant macro-rounds.
 - The frozen recipe = the winning arm's knobs verbatim; final study rounds fixed at 10; Stage-D checkpoint selection governed solely by SELECTION_RULE.json on the disjoint M50 bank (ep0 320000).
+
+## 2026-07-26 05:30 — Stage A results (complete)
+
+**Mechanism (r0 branch trace, 24 gathering lineages, all-K exact verification):** 2117 contexts, 456 NVP (21.5%); only 49 (2.3%) had a positive in K that B missed → the flow itself lacks certifiable support at hard contexts; B=4 is not binding. NVP concentrates at episode start (43–51% in steps 0–39 → ~0 after step 60): origin-corner congestion with 40 fast pedestrians. Every collision episode dies through a terminal run of K+=0 NVP contexts with negative predicted clearance (uncertified raw execution). Selector disagreement at 59% of contexts. Certified deterministic escapes exist at ~53% of hard contexts (269/506 margin shard, 202/501 cost shard).
+
+**Single-update raw reads (diag M8 + anchor M12, n=140/ckpt):** r0 SR .614 / CR .386 / V .571.
+- U6 cost-shard original: SR .714 / CR .286 / V .566, faster — only arm improving SR/CR/time; Validity flat.
+- U1–U5 margin-shard arms: Validity +.08–.13 (U5 hard+recovery best, .698) but SR −.03–.07 and slower — conservative drift visible after ONE update.
+- U7 cost-shard hard-only: WORSE than U6 across the board — discarding the goal-directed mass hurts.
+- U8 lowdose hardrec: mild moves, dose too small per round.
+
+**Local repair (before/after branch traces, identical keyed latents):** U5 hard+recovery cut NVP 456→341 (−25%), raised B-positive fraction .712→.844, repaired the three hardest collision lineages (s20005 γ.1/γ.5, s20004 γ.5 → success), introduced slowdown timeouts elsewhere. U6 sped the policy up but *lowered* gathering certifiability (B+ frac .592, NVP 483). Conclusion: recovery data provides certifiable support exactly where the flow lacks it; the composition question (keep goal-seeking mass + add recovery) is what Stage B arms B4/B5/B8 test (`orig_plus_recovery`, declared before evaluation).
+
+**Kazuki locked baseline (M100 ep0 280000):** SR .779 / CR .217 / **Validity .350** / clearance .181 / time 4.36 s — fast and lower-CR than r0 but far below r0 on exact-certificate Validity (.35 vs .59).
+
+## Baseline reproduction complete (M100, ep0 280000, seed 20260725)
+
+| method | SR | CR | timeout | Validity | succ. clearance | succ. time |
+|---|---:|---:|---:|---:|---:|---:|
+| r0 raw (repro) | .6586 | .3386 | .0029 | .5944 | .1176 | 8.664 |
+| r0 raw (codex funnel) | .6600 | .3371 | .0029 | .5945 | .1179 | 8.646 |
+| B1 control: margin α.01 e100 **r1** | .7314 | .2371 | .0314 | .7390 | .1336 | 10.733 |
+| B1 control: cost α.01 e10 **r8** (codex global winner) | .6900 | .3100 | .0000 | .5311 | .1169 | 7.520 |
+| locked Kazuki (.3/.5) | .7786 | .2171 | .0043 | .3495 | .1809 | 4.355 |
+
+r0 reproduces codex within 1–2 flipped episodes (GPU FP nondeterminism). The margin-r1 control dominates the codex-selected cost-r8 on this bank — but it is a pre-collapse snapshot (SR→0 by r3–4 in that arm). Bar for the new fixed recipe: margin-r1-level CR/Validity gains with multi-round stability.
+
+## Stage B launched 05:20 — 8 arms × 4 rounds from exact r0
+
+B1 cost/original, B2 cost/hard, B3 cost/hard_recovery, B4 cost/orig_plus_recovery (all α.01 e10 lr1e-4 ess.5); B5 cost/orig_plus_recovery lowdose (e1 lr1e-5); B6 margin/hard_recovery lowdose; B7 cost/original ess.3; B8 cost/orig_plus_recovery ess.3. Qualification: predeclared rule on M25 bank ep0 310000 (see above).
+
+### Stage B qualification (M25, ep0 310000; r0 = SR .669 / CR .320 / V .576 / clr .106 / t 8.58)
+
+Per arm r1..r4 (SR/CR/V):
+- B1 cost orig: .60/.39/.54, .67/.33/.53, .64/.35/.53, .64/.36/.51 — no gain, V drifts down
+- B2 cost hard: .71/.29/.59 then degrades to .62/.38/.52
+- B3 cost hardrec: .68/.32/.60 then degrades to .55/.45/.55
+- B4 cost origrec: ≈flat (.60–.66 SR, V .57–.59)
+- B5 cost origrec lowdose: flat
+- B6 margin hardrec lowdose: V .58→.65 climbing, CR .34–.40 (no CR gain), t 8.9→10.2 — slow conservative drift
+- B7 cost orig ess.3: worse than B1 (lower-ESS acquisition does not help)
+- B8 cost origrec ess.3: ≈B4
+Verdict: no cost-selector composition materially improves CR or Validity on this bank; the lower ESS target (0.3) is not beneficial. The strongest known pattern (margin/original/e100 — codex arm, r1 CR .237/V .739 on the M100 280k baseline) was absent from the set.
+
+### Stage B extension (declared 07:55 before reading its results)
+
+- B0: codex margin/original/α.01/e100 checkpoints r1–r4 evaluated on the SAME M25 qual bank (matched-round control; identical recipe lineage, same commit and seeds).
+- B9: margin/orig_plus_recovery/α.01/e100/lr1e-4/ess.5, rounds 1–4 from exact r0 — tests the marginal contribution of certified recovery positives ON TOP of the strongest known recipe. Comparison B0 vs B9 at matched rounds on the same bank is the pre-registered arm-2/arm-3 style contrast for the final freeze decision; freeze criterion remains the predeclared Stage-B rule.

@@ -1,0 +1,39 @@
+{
+  "status": "FROZEN_BEFORE_FINAL_STUDY",
+  "declared_at": "2026-07-26T09:35:00-07:00",
+  "selected_by": "predeclared Stage-B qualification rule on the private M25 bank (ep0 310000, seed 20260728); winner = arm B2 best eligible round; no gathering-controller SR or training loss used",
+  "recipe": {
+    "name": "cost_hard_a0p01_e010_lr1em04_ess0p5",
+    "execution_selector": "safemppi_cost",
+    "replay_mode": "hard",
+    "replay_mode_semantics": "positives = population A only (certified windows with predicted min clearance <= 0.35 m AND window displacement >= 0.2 m); negatives = population B only (y=0 with actual collision, predicted window collision, declared trap rule, or displacement < 0.2 m); rules fixed in claude_offline_aug.py and declared before evaluation",
+    "alpha": 0.01,
+    "exposure_epochs": 10,
+    "lr": 1e-4,
+    "ess_target": 0.5,
+    "batch": 128,
+    "rounds": 10,
+    "seed": 20260724,
+    "K": 16, "B": 4, "T": 180, "H": 10, "nfe": 8, "temperature_gathering": 1.0,
+    "phi_s": 0.9, "gp_lambda": 0.01, "gp_cap": 512,
+    "scene_profile": "double_density_velocity_ood",
+    "expansion_bank_ep0": 20000,
+    "source_checkpoint_sha256": "1b5179c935d3eeff8824967d707d64cc9bab273949ee1f0e4f190172bab1b215",
+    "trainer": "claude_offline_exec_ext.py (reuses immutable gather/GP/beta core of sfm_b1_offline_exec.py)"
+  },
+  "round_invariant": true,
+  "synthetic_recovery_mixture": "none in the frozen recipe (population C evaluated in Stage A/B: it repairs local NVP/collision contexts and raises Validity but does not preserve the liveness gate at any tested dose; B0-vs-B9 matched-round contrast showed no measurable marginal effect on top of margin/e100)",
+  "hard_data_mixture": "population A positives + population B negatives only, per replay_mode above",
+  "stage_b_evidence": {
+    "qual_bank_r0": {"SR": 0.669, "CR": 0.320, "Validity": 0.576, "clearance": 0.106, "time": 8.58},
+    "winner_cell_B2_r1": {"SR": 0.714, "CR": 0.286, "Validity": 0.586, "clearance": 0.109, "time": 8.94},
+    "eligible_runner_ups": [
+      {"arm": "B3 cost/hard_recovery r1", "CR": 0.32},
+      {"arm": "B8 cost/orig_plus_recovery ess.3 r1", "CR": 0.32},
+      {"arm": "B1 cost/original r2", "CR": 0.33},
+      {"arm": "B6 margin/hard_recovery lowdose r2", "CR": 0.34}
+    ],
+    "ineligible_high_validity_direction": "margin/original|orig_plus_recovery e100: V .69-.82, clearance up to .18, but SR fails the liveness gate at r1 and collapses to timeout from r2-r3 on the clean bank; reported as Pareto alternative, not selected"
+  },
+  "checkpoint_selection": "SELECTION_RULE.json on the disjoint M50 bank (ep0 320000, seed 20260729) ONLY"
+}

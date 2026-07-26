@@ -1,0 +1,35 @@
+{
+  "status": "PREDECLARED_BEFORE_FINAL_STUDY",
+  "declared_at": "2026-07-26T05:05:00-07:00",
+  "applies_to": "Stage D fixed-recipe per-round raw M50 evaluation ONLY",
+  "bank": {"ep0": 320000, "noise_seed": 20260729, "m_per_gamma": 50, "temperature": 1.0, "scene_profile": "double_density_velocity_ood"},
+  "evaluator": "sfm_b1_offline_eval.py (executed sliding-window Validity, exact GREEN verifier)",
+  "rule": {
+    "candidates": "rounds r >= 1 of the single frozen recipe run",
+    "liveness_gate": [
+      "pooled SR(r) >= pooled SR(r0) - 0.02 on the same M50 CRN bank",
+      "pooled timeout(r) <= pooled timeout(r0) + 0.05"
+    ],
+    "objective_order_among_eligible": [
+      "1. minimize pooled CR",
+      "2. maximize pooled window Validity (mean of per-trajectory fractions)",
+      "3. maximize pooled successful minimum clearance",
+      "4. minimize pooled successful time-to-goal",
+      "5. smallest round index"
+    ],
+    "four_user_metrics_operationalization": {
+      "collision_rate": "objective 1 (primary)",
+      "validity": "objective 2",
+      "successful_min_clearance": "objective 3",
+      "time_to_goal": "objective 4; a slower checkpoint is acceptable only if it strictly wins an earlier objective, which is exactly what the lexicographic order encodes"
+    },
+    "if_no_round_passes_gate": "report honestly that the fixed recipe did not produce an eligible improvement; publish the full Pareto frontier over (CR, Validity, clearance, time) for all rounds and do NOT promote a collapsed checkpoint",
+    "pareto_reporting": "alongside the winner, all non-dominated rounds on (CR down, Validity up, clearance up, time down) are listed in the delivery"
+  },
+  "prohibitions": [
+    "no per-gamma or global temperature tuning (temperature fixed 1.0)",
+    "no gathering-controller SR or training-loss in selection",
+    "no checkpoint selection from the M100 confirmation bank",
+    "no recipe or Kazuki changes after reading confirmation"
+  ]
+}
