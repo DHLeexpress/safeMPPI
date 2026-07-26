@@ -146,6 +146,7 @@ def run_comparison(
                 collect_diagnostics=True,
             )
             result["controller"] = "codex_privileged_sfm"
+            result["scenario_id"] = int(scenario)
             result["status"] = (
                 "success" if result["success"]
                 else "collision" if result["collision"]
