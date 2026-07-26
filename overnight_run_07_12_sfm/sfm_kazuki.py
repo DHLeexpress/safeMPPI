@@ -582,7 +582,8 @@ def exact_sfm_horizon_filter_action(humans, state, nominal_plan, candidate_plans
                                     viability_goal_weight=0.0, viability_escalate=False,
                                     viability_escalation_band=.05,
                                     viability_escalation_min_progress=0.0,
-                                    clearance_target=None, clearance_target_weight=0.0):
+                                    clearance_target=None, clearance_target_weight=0.0,
+                                    diagnostic_candidates=False):
     """Select a candidate whose full short-horizon rollout is safe under the known SFM transition."""
     state = np.asarray(state, np.float32)
     nominal_plan = np.asarray(nominal_plan, np.float32)
@@ -613,14 +614,41 @@ def exact_sfm_horizon_filter_action(humans, state, nominal_plan, candidate_plans
     reached = reach_step <= H
     recoverable = inside & (reached | ((stop_hi <= 6.5).all(axis=1) & (stop_lo >= -0.5).all(axis=1)))
     nominal_clear = float(clear[0])
+
+    def candidate_diagnostics(selected_index):
+        if not diagnostic_candidates:
+            return {}
+        return dict(
+            selected_candidate_index=int(selected_index),
+            candidate_pool=[
+                dict(
+                    candidate_index=int(index),
+                    controls=np.asarray(plan[:H], np.float32).tolist(),
+                    min_predicted_clearance=float(clear[index]),
+                    inside=bool(inside[index]),
+                    recoverable=bool(recoverable[index]),
+                    hard_margin_feasible=bool(
+                        recoverable[index] and float(clear[index]) >= float(margin)),
+                    terminal=np.asarray(terminal[index], np.float32).tolist(),
+                    reach_step=int(reach_step[index]),
+                    predicted_arrival_step=(
+                        int(reach_step[index]) if int(reach_step[index]) <= H else None),
+                    selected=bool(index == selected_index),
+                )
+                for index, plan in enumerate(unique)
+            ],
+        )
+
     if not bool(always_select) and bool(recoverable[0]) and nominal_clear >= float(margin):
-        return unique[0][0].copy(), dict(
+        diag = dict(
             filter_solver="exact_sfm_horizon", filter_feasible=True, horizon=H,
             nominal_recoverable=True,
             nominal_terminal=terminal[0].tolist(),
             nominal_stop_lo=stop_lo[0].tolist(), nominal_stop_hi=stop_hi[0].tolist(),
             nominal_horizon_clear=float(nominal_clear), selected_horizon_clear=float(nominal_clear),
-            correction_magnitude=0.0, candidates_checked=1), unique[0][:base_len].copy()
+            correction_magnitude=0.0, candidates_checked=1)
+        diag.update(candidate_diagnostics(0))
+        return unique[0][0].copy(), diag, unique[0][:base_len].copy()
     evaluated = [(plan, float(clear[i]), bool(inside[i]), bool(recoverable[i]), terminal[i], int(reach_step[i]))
                  for i, plan in enumerate(unique)]
     feasible = [x for x in evaluated if x[3] and x[1] >= float(margin)]
@@ -694,7 +722,8 @@ def exact_sfm_horizon_filter_action(humans, state, nominal_plan, candidate_plans
                         viability_escalation_band=viability_escalation_band,
                         viability_escalation_min_progress=viability_escalation_min_progress,
                         clearance_target=clearance_target,
-                        clearance_target_weight=clearance_target_weight)
+                        clearance_target_weight=clearance_target_weight,
+                        diagnostic_candidates=diagnostic_candidates)
                     escalation_progress_floor = max(
                         float(min_progress), float(viability_escalation_min_progress))
                     if (e_diag.get("filter_feasible")
@@ -761,10 +790,11 @@ def exact_sfm_horizon_filter_action(humans, state, nominal_plan, candidate_plans
         selection_reason = "margin_unavailable"
         ok = False
     selected_plan, selected_clear, _, selected_recoverable, _, selected_arrival = selected
+    selected_index = next(index for index, row in enumerate(evaluated) if row is selected)
     selected_progress = (float(np.linalg.norm(state[:2] - SS.GOAL)) if selected_arrival <= H else
                          float(np.linalg.norm(state[:2] - SS.GOAL)
                                - np.linalg.norm(selected[4][:2] - SS.GOAL)))
-    return selected_plan[0].copy(), dict(
+    diag = dict(
         filter_solver="exact_sfm_horizon", filter_feasible=bool(ok), horizon=H,
         nominal_recoverable=bool(recoverable[0]),
         nominal_terminal=terminal[0].tolist(),
@@ -783,7 +813,9 @@ def exact_sfm_horizon_filter_action(humans, state, nominal_plan, candidate_plans
         predicted_arrival_step=(int(selected_arrival) if selected_arrival <= H else None),
         nominal_horizon_clear=float(nominal_clear), selected_horizon_clear=float(selected_clear),
         correction_magnitude=float(np.linalg.norm(selected_plan[0] - nominal_plan[0])),
-        candidates_checked=len(evaluated)), selected_plan[:base_len].copy()
+        candidates_checked=len(evaluated))
+    diag.update(candidate_diagnostics(selected_index))
+    return selected_plan[0].copy(), diag, selected_plan[:base_len].copy()
 
 
 def guided_generate(policy, ctx, state, goal, ped_pred, ped_vel, r_col, z_init, taus, cfg,
@@ -1033,7 +1065,8 @@ def kazuki_sfm_deploy(policy, episode, gamma, cfg=None, n_ped=20, T=180, reach=0
                 viability_escalation_band=cfg.step_filter_viability_escalation_band,
                 viability_escalation_min_progress=escalation_progress_floor,
                 clearance_target=clearance_target,
-                clearance_target_weight=cfg.step_filter_clearance_target_weight)
+                clearance_target_weight=cfg.step_filter_clearance_target_weight,
+                diagnostic_candidates=collect_diagnostics)
             if t < int(cfg.step_filter_release_steps):
                 hold_plan = _brake_control_plan(state, H)
                 hclear, hinside, hterminal, _, _ = _simulate_sfm_plans(
