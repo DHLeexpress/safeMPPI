@@ -32,6 +32,11 @@
     "m100_final_confirmation": {
       "ep0": 330000, "m_per_gamma": 100, "noise_seed": 20260730,
       "role": "Stage E disjoint confirmation of r0 vs selected expanded checkpoint vs locked Kazuki; never read before the checkpoint is frozen"
+    },
+    "iteration2_m50_selection": {
+      "ep0": 340000, "m_per_gamma": 50, "noise_seed": 20260732,
+      "declared_at": "2026-07-26T13:15:00-07:00",
+      "role": "iteration-2 M50 checkpoint selection (see ITERATION2_PREREGISTRATION.json); declared because the iteration-1 selection bank (320000) was read for two declared diagnostic companion cells (B9 r1/r2) and is therefore retired for selection purposes"
     }
   },
   "disjointness_note": "All new ep0 ranges (300000-330099) are disjoint from every historical bank listed in sfm_protocol.py (12000, 20000+, 50000, 80000, 90000, 110000, 130000, 150000, 170000, 190000, 210000, 230000, 250000) and from the codex funnel banks (260000, 270000, 280000). Noise seeds 20260726-20260730 are new.",

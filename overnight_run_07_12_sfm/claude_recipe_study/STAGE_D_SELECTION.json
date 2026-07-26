@@ -1,0 +1,32 @@
+{
+  "status": "STAGE_D_SELECTION_APPLIED",
+  "applied_at": "2026-07-26T13:05:00-07:00",
+  "rule": "SELECTION_RULE.json (predeclared 2026-07-26 05:05 PT, before the final run)",
+  "bank": {"ep0": 320000, "noise_seed": 20260729, "m_per_gamma": 50},
+  "recipe": "FIXED_RECIPE.json (cost/hard, alpha .01, exposures 10, lr 1e-4, ESS .5, rounds 10)",
+  "r0": {"SR": 0.720, "CR": 0.269, "timeout": 0.011, "Validity": 0.638, "clearance": 0.134, "time": 8.31},
+  "per_round_pooled": {
+    "r1": {"SR": 0.720, "CR": 0.280, "timeout": 0.000, "Validity": 0.603, "clearance": 0.132, "time": 8.51},
+    "r2": {"SR": 0.683, "CR": 0.317, "timeout": 0.000, "Validity": 0.593, "clearance": 0.139, "time": 8.06},
+    "r3": {"SR": 0.683, "CR": 0.317, "timeout": 0.000, "Validity": 0.573, "clearance": 0.137, "time": 7.66},
+    "r4": {"SR": 0.683, "CR": 0.317, "timeout": 0.000, "Validity": 0.571, "clearance": 0.138, "time": 7.53},
+    "r5": {"SR": 0.686, "CR": 0.314, "timeout": 0.000, "Validity": 0.577, "clearance": 0.138, "time": 7.45},
+    "r6": {"SR": 0.677, "CR": 0.323, "timeout": 0.000, "Validity": 0.564, "clearance": 0.144, "time": 7.29},
+    "r7": {"SR": 0.737, "CR": 0.263, "timeout": 0.000, "Validity": 0.571, "clearance": 0.140, "time": 7.35},
+    "r8": {"SR": 0.694, "CR": 0.306, "timeout": 0.000, "Validity": 0.558, "clearance": 0.137, "time": 7.27},
+    "r9": {"SR": 0.634, "CR": 0.366, "timeout": 0.000, "Validity": 0.560, "clearance": 0.144, "time": 7.35},
+    "r10": {"SR": 0.603, "CR": 0.397, "timeout": 0.000, "Validity": 0.559, "clearance": 0.143, "time": 7.44}
+  },
+  "liveness_gate": {"SR_min": 0.700, "timeout_max": 0.061},
+  "eligible_rounds": ["r1", "r7"],
+  "selected_round": "r7",
+  "selected_checkpoint": "/data3/research1/claude_sfm_best_recipe_f06e8dd/stageD/final_cost_hard/round_07.pt",
+  "honest_assessment": "The rule-selected r7 lowers CR by only 0.006 versus r0 while losing 0.067 Validity; the frozen recipe does NOT deliver the desired joint improvement (substantially lower CR + higher Validity + higher clearance). This is reported as a null result for iteration 1.",
+  "pareto_frontier_on_m50_bank": [
+    {"cell": "r0", "why": "highest Validity among liveness-eligible cells (.638), CR .269"},
+    {"cell": "frozen r7", "why": "lowest CR among eligible frozen-recipe rounds (.263), fastest time (7.35), but Validity .571"},
+    {"cell": "companion B9-r1 (margin + orig-plus-recovery-v1, e100) — diagnostic cells, not the frozen recipe", "why": "SR .729 / CR .246 / Validity .750 / clearance .162 / time 10.51: dominates r0 on CR, Validity, clearance while passing the liveness gate; motivates the pre-registered iteration 2"},
+    {"cell": "companion B9-r2", "why": "Validity .816 / clearance .151 / CR .249 but SR .643 fails the gate (timeout collapse begins)"}
+  ],
+  "paper_plot": "/data3/research1/claude_sfm_best_recipe_f06e8dd/stageD/paper_trends/b1_margin50_metric_trends.{png,pdf} via safe_flow_expansion@87063d3 contract; per-cell SEs stored in cost_hard_frozen_trends_rows.jsonl"
+}

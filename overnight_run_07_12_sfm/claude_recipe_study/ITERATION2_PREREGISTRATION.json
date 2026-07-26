@@ -1,0 +1,21 @@
+{
+  "status": "PREREGISTERED_BEFORE_READING_U10_U12",
+  "declared_at": "2026-07-26T13:15:00-07:00",
+  "motivation": "Iteration-1 frozen recipe (cost/hard) is a null result under its own predeclared rule (STAGE_D_SELECTION.json). The diagnostic companion cells on the M50 selection bank show B9-r1 (margin selector, original-plus-certified-recovery-v1 data, alpha .01, exposures 100, lr 1e-4, ESS .5) dominating r0 on CR/Validity/clearance while passing the liveness gate. Iteration 2 pre-registers that direction with fresh, unread banks.",
+  "candidate_recipes": {
+    "R_A": {"selector": "margin", "replay_mode": "orig_plus_recovery", "recovery_family": "v1", "alpha": 0.01, "exposure_epochs": 100, "lr": 1e-4, "ess_target": 0.5, "rounds": 4, "note": "checkpoints r1-r4 already exist (arm B9, trained from exact r0 BEFORE any selection-bank read)"},
+    "R_B": {"selector": "margin", "replay_mode": "orig_plus_recovery_v2", "recovery_family": "v2 dodge-then-cruise (declared in claude_offline_aug.py)", "alpha": 0.01, "exposure_epochs": 100, "lr": 1e-4, "ess_target": 0.5, "rounds": 4}
+  },
+  "freeze_criterion_declared_before_reading_U10_U12": "Compare single-update mirrors on the combined diag (ep0 300000, M8) + anchor (ep0 305000, M12) tuning banks: U10 = one r0 update with orig_plus_recovery_v2/e100/lr1e-4; U12 = identical with v1. Choose R_B iff U10 improves BOTH pooled SR and pooled successful time-to-goal versus U12 AND does not raise pooled CR by more than 0.01; otherwise choose R_A. Rationale: the v2 family exists to remove the conservative-escape slowdown; if it does not show that signature at matched dose on tuning banks, the extra novelty is not justified.",
+  "rounds_rationale": "rounds=4 is part of the recipe (a declared recipe variable): every e100 margin arm measured so far collapses to timeout from round 2-3; rounds beyond 4 are known-dominated and cost compute without adding selectable checkpoints.",
+  "selection": {
+    "bank": {"ep0": 340000, "noise_seed": 20260732, "m_per_gamma": 50, "role": "iteration-2 M50 checkpoint selection; NEVER read before this declaration"},
+    "rule": "SELECTION_RULE.json applied verbatim (liveness gate SR >= SR(r0)-0.02, timeout <= timeout(r0)+0.05; then min CR, max Validity, max clearance, min time, smallest round) over r0..r4 of the chosen recipe"
+  },
+  "confirmation": {
+    "bank": {"ep0": 330000, "noise_seed": 20260730, "m_per_gamma": 100, "role": "UNTOUCHED final confirmation: r0 + iteration-2 selected checkpoint + locked Kazuki; paired scenario-cluster CIs via claude_confirm_analysis.py"},
+    "no_changes_after_reading": true
+  },
+  "contamination_note": "The iteration-1 M50 bank (ep0 320000) was read for B9 r1/r2 as declared diagnostic companions and is therefore NOT used for iteration-2 selection. Banks 300000/305000/310000 are tuning banks. Bank 330000 has never been read by anything.",
+  "iteration_1_disposition": "reported in full as the rule-selected null result (frozen cost/hard recipe, winner r7), with its four-metric paper plot and all checkpoints; nothing about iteration 1 is hidden or reselected"
+}
