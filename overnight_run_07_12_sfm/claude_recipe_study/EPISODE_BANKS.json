@@ -1,0 +1,39 @@
+{
+  "status": "PREDECLARED_BEFORE_ANY_NEW_RUN",
+  "declared_at": "2026-07-26T02:33:00-07:00",
+  "declared_by": "claude agent/claude-sfm-best-recipe-20260726 @ f06e8ddc11fc7a1f5bada2cb2a587bff3ba4e424",
+  "scene_profile": "double_density_velocity_ood",
+  "environment": {"n_ped": 40, "ped_speed_range": [1.0, 2.0]},
+  "gammas": [0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0],
+  "raw_evaluation": {"temperature": 1.0, "NFE": 8, "T": 180, "H": 10},
+  "historical_banks_not_reused_for_selection": {
+    "expansion_training": {"ep0": 20000, "note": "8 scenarios/round; rounds 1-10 use 20000-20079; PRESERVED as the training expansion bank for all new training runs"},
+    "codex_m10_screen": {"ep0": 260000, "noise_seed": 20260723, "role": "historical"},
+    "codex_m50_selector_confirm": {"ep0": 270000, "noise_seed": 20260724, "role": "historical"},
+    "codex_m100_final": {"ep0": 280000, "noise_seed": 20260725, "role": "historical; also reused here ONLY as the pre-registered baseline-reproduction bank (section 1 of the task), never for tuning or selection of the new recipe"}
+  },
+  "new_private_banks_mutually_disjoint": {
+    "local_diagnosis": {
+      "ep0": 300000, "m_per_gamma": 8, "noise_seed": 20260726,
+      "role": "Stage A hard-episode mining and before/after single-update local checks (gathering-side); plus round-1 expansion episodes 20000-20007 which are training data"
+    },
+    "anchor_raw": {
+      "ep0": 305000, "m_per_gamma": 12, "noise_seed": 20260727,
+      "role": "Stage A anchor bank: small fixed raw bank to detect global regressions caused by local repairs; never used for final selection"
+    },
+    "qualification_raw": {
+      "ep0": 310000, "m_per_gamma": 25, "noise_seed": 20260728,
+      "role": "Stage B short-qualification fixed raw screening bank; candidate recipes are compared ONLY on this bank's raw policy metrics"
+    },
+    "m50_checkpoint_selection": {
+      "ep0": 320000, "m_per_gamma": 50, "noise_seed": 20260729,
+      "role": "Stage D per-round fixed raw M50 CRN bank for the frozen final recipe; checkpoint selection uses ONLY this bank via the predeclared SELECTION_RULE.json"
+    },
+    "m100_final_confirmation": {
+      "ep0": 330000, "m_per_gamma": 100, "noise_seed": 20260730,
+      "role": "Stage E disjoint confirmation of r0 vs selected expanded checkpoint vs locked Kazuki; never read before the checkpoint is frozen"
+    }
+  },
+  "disjointness_note": "All new ep0 ranges (300000-330099) are disjoint from every historical bank listed in sfm_protocol.py (12000, 20000+, 50000, 80000, 90000, 110000, 130000, 150000, 170000, 190000, 210000, 230000, 250000) and from the codex funnel banks (260000, 270000, 280000). Noise seeds 20260726-20260730 are new.",
+  "rule": "No episode or noise bank used to choose hyperparameters appears in final confirmation."
+}
