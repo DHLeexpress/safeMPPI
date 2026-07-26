@@ -207,6 +207,22 @@ def test_recovery_records_are_exactly_certified_with_provenance():
         assert "generator" in prov and "objective_goal_distance" in prov
 
 
+def test_orig_plus_recovery_keeps_full_population_and_appends():
+    shard = _mixed_shard()
+    view, report = AUG.build_replay_view(
+        shard, "orig_plus_recovery", executor=_InlineExecutor(),
+    )
+    added = report["recovery_audit"]["certified_kept"]
+    assert len(view.windows) == len(shard.windows) + added
+    assert len(view.Dminus) == len(shard.Dminus)
+    assert len(view.Dplus) == len(shard.Dplus) + added
+    synthetic = [
+        w for w in view.windows
+        if w["execution_source"] == "synthetic_certified_recovery"
+    ]
+    assert len(synthetic) == added
+
+
 def test_hard_recovery_replay_respects_exact_once_accounting():
     shard = _mixed_shard()
     policy = _TinyPolicy()

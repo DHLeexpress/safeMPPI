@@ -71,7 +71,7 @@ K_DIR = 16
 ACCELS = (0.7, 1.4, 2.0)
 PREVERIFY_CAP = 24
 RECOVERY_KEEP = 2
-REPLAY_MODES = ("original", "hard", "hard_recovery")
+REPLAY_MODES = ("original", "hard", "hard_recovery", "orig_plus_recovery")
 
 
 def declared_rules():
@@ -339,7 +339,17 @@ def build_replay_view(shard, mode, executor=None):
         return shard, dict(mode=mode, note="untouched ExecutedRoundShard")
     pop_a, pop_b, stats = tag_populations(shard)
     report = dict(mode=mode, populations=stats)
-    windows = list(pop_a) + list(pop_b)
+    if mode == "orig_plus_recovery":
+        # Declared BEFORE evaluation (Stage-A log 2026-07-26): keep the FULL
+        # original positive and negative populations and only APPEND the
+        # exact-certified recovery positives at their parent (hard) contexts.
+        if executor is None:
+            raise ValueError("orig_plus_recovery needs the verifier executor")
+        recovery, audit = build_recovery_records(shard, pop_b, executor)
+        report["recovery_audit"] = audit
+        windows = list(shard.windows) + recovery
+    else:
+        windows = list(pop_a) + list(pop_b)
     if mode == "hard_recovery":
         if executor is None:
             raise ValueError("hard_recovery needs the verifier executor")

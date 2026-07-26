@@ -30,3 +30,20 @@ Working hypothesis (to be tested in Stage A): replay trains the flow toward the 
 ## Plan
 
 Stages A–E per task spec; banks in `EPISODE_BANKS.json`. Interventions implemented as opt-in modules, default OFF, original behavior preserved with existing tests.
+
+## 2026-07-26 03:20 — modules, tests, baselines launched
+
+- New additive modules (commit 779d2de): `claude_offline_aug.py` (declared pop-A/B rules + deterministic certified-recovery generator; family = 145 candidates/context, prefilter cap 24, keep ≤2, exact `SM.verify_query` gate), `claude_offline_exec_ext.py` (opt-in lr/ESS/rounds/replay-mode; immutable core reused), `claude_stageA.py` (mine/branch/update/compare), `claude_kazuki_eval.py` (locked comparator + executed-window Validity), `claude_paper_trends.py` (evaluator → paper plot contract).
+- Existing tests: 43 passed. New tests: 6 passed, incl. bitwise default-OFF equivalence of `replay_with_mode("original")` vs `OR.replay`, no-relabel guarantee, and independent exact recertification of every synthetic recovery record.
+- Baselines launched on the pre-registered codex M100 bank (ep0 280000, seed 20260725): raw r0 + margin winner (α.01 exp100 r1) + cost winner (α.01 exp10 r8) on GPU1; locked Kazuki on GPU3.
+- Stage A mining (codex round-1 shards): margin arm — 1034/4014 NVP contexts, 22 collision windows, 310 trap windows; cost arm — 1102 NVP, 19 collisions, only 32 traps. D+ plan-geometry drift r1→r3 (median displacement 0.95→0.70 m) supports the composition-drift hypothesis.
+- Stage A single-update candidates U1–U8 launched (one replay round on r0 from archived round-1 shards; margin + cost shards × {control, lr1e-5, exp1, hard, hard_recovery, lowdose-hardrec}).
+
+## PREDECLARED Stage-B qualification rule (written before any Stage-B run)
+
+- Bank: qualification raw bank ep0 310000, noise seed 20260728, M=25/γ, temperature 1.0, via `sfm_b1_offline_eval.py` only. No gathering-controller SR, no training loss.
+- Every candidate arm trains rounds 1–4 from the exact r0 checkpoint (seed 20260724, expansion bank ep 20000+, identical gather semantics).
+- Eligibility per round r ∈ {1..4}: SR(r) ≥ SR(r0) − 0.02 AND timeout(r) ≤ timeout(r0) + 0.05 on the qualification bank (liveness gate; r0 evaluated on the same bank/noise).
+- Arm score = its best eligible round ordered by (min CR, then max Validity, then max successful clearance, then min successful time-to-goal). Arms with no eligible round are disqualified (collapse).
+- Stability tie-break: among arms whose best-round CR are within 0.03 of the leader, prefer the arm whose round-4 checkpoint is still eligible; among those, the better round-4 CR. Rationale: the frozen Stage-C/D recipe must hold 10 round-invariant macro-rounds.
+- The frozen recipe = the winning arm's knobs verbatim; final study rounds fixed at 10; Stage-D checkpoint selection governed solely by SELECTION_RULE.json on the disjoint M50 bank (ep0 320000).
