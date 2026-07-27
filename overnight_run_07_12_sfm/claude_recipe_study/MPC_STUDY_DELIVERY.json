@@ -1,0 +1,38 @@
+{
+  "status": "MPC_DISTILLATION_STUDY_COMPLETE_FAIL_CLOSED_AT_M10",
+  "completed_at": "2026-07-26T21:35:00-07:00",
+  "branch": "agent/claude-sfm-mpc-distill-20260726 (Codex branch @0e0eca2 untouched, read-only)",
+  "primary_question": "does dedicated D_MPC+ distillation produce a VISIBLE raw-policy change, rather than merely lowering its training loss?",
+  "answer": "YES — visible and consistent, but not globally beneficial at any swept dose.",
+  "evidence_visible_change": {
+    "socp_positive_rate_at_mpc_contexts": "rose after 15 of 16 dedicated blocks (e.g. .106->.457 at lr 1e-4 x8 epochs, .106->.482 at lr 3e-4 x2; only M4 round-4 fell .319->.278), measured by 16 fresh temperature-1 raw samples per held gamma-balanced MPC context against the exact full-H10 SOCP verifier",
+    "target_recovery_rmse": "fell after 16 of 16 blocks (policy samples move toward the stored MPC targets)",
+    "loss_vs_policy": "distill_block_loss_vs_policy_change.json: policy-side movement occurs even in blocks where the CFM loss barely moved or rose (M1 r1: loss 1.248->1.266 while SOCP rate .106->.216), so the change is not a loss artifact"
+  },
+  "evidence_not_beneficial": {
+    "m10_selection": "MPC_M10_SELECTION.json: 0 of 32 pre/post cells pass the pre-registered liveness gate (SR >= r0-0.02 = .637, timeout <= .079); r0 on the bank: SR .657 / CR .314 / V .628",
+    "immediate_liveness_cost": "round-1 post-block SR: .629 -> .471 (lr1e-4x2), .257 (lr1e-4x8), .243 (lr3e-4x2), .600 (lr1e-5x8 — gentlest, also smallest local gain)",
+    "no_collapse_rescue": "the base ordinary recipe (margin/original/e10) collapses by rounds 2-3 with or without distillation (control_no_distill: SR .686 -> .457 -> .000)",
+    "funnel": "per the pre-registration, the M50 (360000) and M100 (370000) confirmations are NOT triggered because M10 selects no eligible winner; stopping fail-closed rather than promoting an ineligible cell"
+  },
+  "dedicated_recipe_sweep_reported": {
+    "M1": {"lr_dedicated": 1e-4, "epochs": 2}, "M2": {"lr_dedicated": 1e-4, "epochs": 8},
+    "M3": {"lr_dedicated": 1e-5, "epochs": 8}, "M4": {"lr_dedicated": 3e-4, "epochs": 2},
+    "rounds": 4, "base_ordinary_recipe": "margin selector, original replay, alpha .01, exposures 10, lr 1e-4, ESS .5, seed 20260724",
+    "checkpoints": "every pre-block and post-block checkpoint kept under mpc_distill/M*/",
+    "exact_choice": "none selected — no cell eligible under the pre-registered rule"
+  },
+  "d_mpc_plus_accounting": {
+    "kept_per_round_range": [61, 222],
+    "intersection_semantics": "privileged exact-SFM look-ahead feasible AND exact full-H10 SOCP y=1, ranked by frozen native SafeMPPI cost, top-2 per hard context",
+    "separation_verified": "records live in per-round d_mpc_plus_round_*.pt only; ordinary D/D+/GP/acquisition untouched (code path in claude_mpc_exec.py); prefix-replay reconstruction fail-closed (0 mismatches in all arms)"
+  },
+  "synthesis_with_recipe_study": "Across three target families (deterministic v1 escapes, goal-directed v2, privileged Codex MPC pool), concentrated hard-context-only distillation always trades global liveness for local certifiable support. The confirmed winning recipe embedded certified hard-context targets INSIDE the full original replay mixture (~5% mass) — composition, not target quality, is the binding constraint.",
+  "artifacts": {
+    "selection": "mpc_distill/MPC_M10_SELECTION.json (all 37 cells incl. control and r0)",
+    "audits": "mpc_distill/M*/metrics.jsonl (per-block before/after local + M10 audits)",
+    "loss_vs_change": "mpc_distill/distill_block_loss_vs_policy_change.json",
+    "buffers": "mpc_distill/M*/d_mpc_plus_round_*.pt (with per-record provenance and verifier diagnostics)",
+    "control": "mpc_distill/m10_r0_and_control/"
+  }
+}
