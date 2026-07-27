@@ -125,9 +125,14 @@ def _recoverable(inside, terminal, reach_step, horizon):
     )
 
 
-@torch.no_grad()
 def build_codex_pool(policy, context, humans, *, device, seed_step):
-    """Regenerate the original Codex MPC pool at one stored context."""
+    """Regenerate the original Codex MPC pool at one stored context.
+
+    Deliberately NOT wrapped in ``torch.no_grad``: the Codex guidance
+    differentiates its CBF/goal rewards with respect to the latent inside
+    ``guided_generate`` (policy weights are only evaluated under its own
+    internal ``no_grad`` and are never modified here).
+    """
     gamma = float(context["gamma"])
     base = privileged_sfm_config()
     cfg = KZ._gamma_controller_config(base, gamma).validate()
@@ -138,13 +143,13 @@ def build_codex_pool(policy, context, humans, *, device, seed_step):
     hp10 = torch.as_tensor(context["hp10"], device=device)[None].float()
     low = torch.as_tensor(context["low5"], device=device)[None].float()
     hist = torch.as_tensor(context["hist"], device=device)[None].float()
-    ctx = policy.ctx_from(hp10, low, hist)
+    ctx = policy.ctx_from(hp10, low, hist).squeeze(0)
     goal = torch.tensor(SS.GOAL, dtype=torch.float32, device=device)
     torch.manual_seed(
         POOL_SEED + int(context["scenario_id"]) * 1000 + int(seed_step)
     )
     z = torch.randn(int(cfg.n_sample), int(policy.d), device=device)
-    taus = torch.tensor(cfg.ode_times, dtype=torch.float32, device=device)
+    taus = cfg.ode_times
     ped_pred = KZ.predict_pedestrians_t(ped_xy, ped_vel, H, SS.DT, device)
     ped_vel_t = torch.tensor(ped_vel, dtype=torch.float32, device=device)
     z1, _, _ = KZ.guided_generate(
