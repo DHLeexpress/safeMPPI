@@ -564,6 +564,7 @@ def run(args):
                 ckpt = os.path.join(
                     outdir, f"round_{round_k:02d}", f"{name}.pt",
                 )
+                os.makedirs(os.path.dirname(ckpt), exist_ok=True)
                 BX._save_checkpoint(policy, ckpt, dict(
                     round=round_k, combo=combo, accepted_parent=accepted_path,
                     accepted_parent_sha256=accepted_sha,
