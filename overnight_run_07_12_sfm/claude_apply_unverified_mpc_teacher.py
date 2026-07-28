@@ -114,7 +114,9 @@ def _gradient_cosine(left, right):
 
 def _conflict_probe(policy, shard, teachers, *, device, seed):
     was_training = policy.training
-    policy.eval()
+    # cuDNN GRU backward is unavailable in eval mode.  Keep the probe in
+    # seeded train mode; the same seed and records are reused before/after.
+    policy.train()
     positive_loss, positive_gradient = _probe_objective(
         policy, shard, shard.Dplus, teacher=False,
         device=device, seed=seed,
