@@ -1,0 +1,22 @@
+{
+  "status": "UNVERIFIED_MPC_TEACHER_STUDY_COMPLETE_FAIL_CLOSED_AT_ROUND_1",
+  "completed_at": "2026-07-28T05:30:00-07:00",
+  "branch": "agent/claude-sfm-unverified-teacher-run-20260728 @ pinned 2a873327 (+3 additive commits: pre-registration, authenticated default-off --reuse-buffer, canonical-content assertion; teacher tool semantics untouched)",
+  "headline": "The teacher never got a viable substrate: one UNCHANGED ordinary e10 replay round from r1 (theta_half, before any teacher) already collapses liveness on the dev bank (SR .77->.44, timeout .04->.43) while CR falls to .129 and Validity rises to .836; the nine pre-registered teacher doses (lr 1e-6..1e-5 x 1..4 epochs) move the policy by epsilon on top and repair nothing. 0/10 candidates admissible; loop stopped at round 1 per pre-registration; M50 (420000) and M100 (430000) banks remain untouched; no Kazuki-win claim.",
+  "mechanistic_finding": "conflict probes (tool-native, identical seeds/records before/after): cos(teacher gradient, ordinary D+ gradient) = 0.034 before the block, drifting to -0.07 as the teacher fits; cos(teacher, D-) = 0.377 throughout. The unverified privileged-MPC teacher's plans resemble the policy's REJECTED executed windows (fast raw plans at hard contexts) far more than its certified ones — distilling it pushes against the alpha-signed ordinary update. This is direct gradient-level evidence for why unverified MPC distillation cannot rescue this lineage.",
+  "d_mpc_integrity": {
+    "identical_across_arms": "canonical content hash cee3ad65e962473a... identical across all 9 arms (file-SHA equality is NOT a valid check: torch.save bytes differ across fresh-vs-reloaded object graphs for deep-equal payloads — verified and documented)",
+    "separation": "D_MPC never entered D/D+, GP, acquisition, or validity; SOCP audit-only; control bounds + privileged exact-SFM feasibility enforced by the pinned tool",
+    "harvest": "400 hard contexts, prefix-replay authenticated, 0 reconstruction mismatches"
+  },
+  "round_1_table": "teacher_rounds/develop/metrics.jsonl (all 10 rows incl. no-teacher control, admissibility checks, probes; nothing hidden)",
+  "artifacts": {
+    "theta_half_and_arm_checkpoints": "teacher_rounds/develop/round_01/",
+    "d_mpc_buffers": "teacher_rounds/develop/round_01/arm_*/D_MPC.pt",
+    "branch_viz": "teacher_rounds/viz/teacher_branches_{lr1em06_ep1,lr1em05_ep4}.{png,json} (single shared buffer, two dose exemplars)",
+    "winner_paper_plot": "none — no admissible candidate exists to promote; rendering a winner plot would misrepresent the result",
+    "crashed_attempts_preserved": ["teacher_rounds/develop_crashed_buffer_sha (provenance-field byte divergence)", "teacher_rounds/develop_crashed2 (led to the canonical-hash correction; its 9 buffers verify content-identical)"]
+  },
+  "prohibitions_respected": ["Codex branch untouched", "immutable r1 untouched", "ordinary gathering/replay/verifier/GP/raw evaluator unmodified", "no temperature tuning", "M50/M100 banks never read"],
+  "synthesis": "Fourth independent line of evidence that the r1 checkpoint sits on a hard liveness-safety frontier: (1) e100 continuation collapses at r2; (2) anchored low-dose continuation fails the timeout gate at every dose; (3) verified-MPC distillation visibly moves the policy but never passes liveness; (4) the ordinary e10 update alone now shows the same collapse in one round, and the unverified teacher gradient is anti-aligned with certified behavior. Any further push on this axis needs a different mechanism (e.g., longer evaluation horizon T, or liveness-constrained objectives), not a different data source."
+}
