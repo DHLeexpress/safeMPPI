@@ -125,7 +125,25 @@ def _recoverable(inside, terminal, reach_step, horizon):
     )
 
 
-def build_codex_pool(policy, context, humans, *, device, seed_step):
+def _deduplicate_plans_with_sources(plans):
+    """Extend, bound, and de-duplicate plans while preserving first provenance."""
+    unique, sources = [], []
+    for plan, source in plans:
+        plan = KZ._extend_plan_with_goal(
+            np.asarray(source["state"], np.float32), plan, H,
+        )
+        plan = np.clip(np.asarray(plan, np.float32)[:H], -SS.U_MAX, SS.U_MAX)
+        if not any(np.allclose(plan, old, atol=1e-7) for old in unique):
+            unique.append(plan)
+            sources.append({
+                key: value for key, value in source.items() if key != "state"
+            })
+    return unique, sources
+
+
+def build_codex_pool(
+    policy, context, humans, *, device, seed_step, track_sources=False,
+):
     """Regenerate the original Codex MPC pool at one stored context.
 
     Deliberately NOT wrapped in ``torch.no_grad``: the Codex guidance
@@ -167,24 +185,42 @@ def build_codex_pool(policy, context, humans, *, device, seed_step):
     )
     refined_pool = refine_diag.pop("_refined_controls")
     nominal = u_best.detach().cpu().numpy().astype(np.float32)
-    plans = [nominal]
-    plans.extend(np.asarray(refined_pool, np.float32))
-    plans.append(KZ._brake_control_plan(state, H))
-    plans.extend(KZ._goal_control_plans(
+    plans = [(
+        nominal,
+        dict(family="nominal", source_index=0, state=state),
+    )]
+    plans.extend((
+        plan,
+        dict(family="refined", source_index=index, state=state),
+    ) for index, plan in enumerate(np.asarray(refined_pool, np.float32)))
+    plans.append((
+        KZ._brake_control_plan(state, H),
+        dict(family="brake", source_index=0, state=state),
+    ))
+    plans.extend((
+        plan,
+        dict(family="goal", source_index=index, state=state),
+    ) for index, plan in enumerate(KZ._goal_control_plans(
         state, int(cfg.step_filter_goal_plans), H,
-    ))
-    plans.extend(KZ._avoidance_control_plans(
+    )))
+    plans.extend((
+        plan,
+        dict(family="avoidance", source_index=index, state=state),
+    ) for index, plan in enumerate(KZ._avoidance_control_plans(
         humans, state, int(cfg.step_filter_avoid_plans), H,
-    ))
+    )))
+    const_index = 0
     for ux in np.linspace(-SS.U_MAX, SS.U_MAX, 5):
         for uy in np.linspace(-SS.U_MAX, SS.U_MAX, 5):
-            plans.append(np.repeat(np.array([[ux, uy]], np.float32), H, axis=0))
-    unique = []
-    for plan in plans:
-        plan = KZ._extend_plan_with_goal(state, plan, H)
-        plan = np.clip(np.asarray(plan, np.float32)[:H], -SS.U_MAX, SS.U_MAX)
-        if not any(np.allclose(plan, old, atol=1e-7) for old in unique):
-            unique.append(plan)
+            plans.append((
+                np.repeat(np.array([[ux, uy]], np.float32), H, axis=0),
+                dict(
+                    family="constant_acceleration",
+                    source_index=const_index, state=state,
+                ),
+            ))
+            const_index += 1
+    unique, sources = _deduplicate_plans_with_sources(plans)
     stacked = np.stack(unique)
     clear, inside, terminal, _, reach_step = KZ._simulate_sfm_plans(
         humans, state, stacked, H,
@@ -193,7 +229,7 @@ def build_codex_pool(policy, context, humans, *, device, seed_step):
     privileged = _recoverable(inside, terminal, reach_step, H) & (
         clear >= float(margin)
     )
-    return dict(
+    result = dict(
         plans=stacked,
         privileged_feasible=privileged,
         privileged_clearance=clear,
@@ -205,6 +241,11 @@ def build_codex_pool(policy, context, humans, *, device, seed_step):
             const_accel=25, unique=len(unique),
         ),
     )
+    if track_sources:
+        result["candidate_sources"] = sources
+        result["nominal_plan"] = np.asarray(nominal, np.float32).copy()
+        result["refined_pool"] = np.asarray(refined_pool, np.float32).copy()
+    return result
 
 
 def harvest_round(
