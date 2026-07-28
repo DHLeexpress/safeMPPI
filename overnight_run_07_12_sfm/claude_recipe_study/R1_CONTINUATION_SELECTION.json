@@ -1,0 +1,27 @@
+{
+  "status": "R1_CONTINUATION_SELECTION_FROZEN_BEFORE_FINAL_M100_READ",
+  "declared_at": "2026-07-27T03:05:00-07:00",
+  "development_outcome": {
+    "rounds_run": 1,
+    "rounds_accepted": 0,
+    "stop_reason": "pre-registered rule: no admissible candidate at round 1; procedure stops, no forced rounds",
+    "dominant_failure": "TIMEOUT gate (candidates .129-.229 vs gate .093): every continuation dose, including the smallest (E=1, lr=1e-5, trunk drift 0.0018), immediately trades liveness for safety at the T=180 horizon",
+    "secondary_observations": [
+      "CR improves monotonically with dose down to .129 and Validity to .789 (E25/lr1e-5/anchor.50 fails ONLY the timeout gate)",
+      "anchor mass .50 consistently preserves more SR than .25 (goal-seeking anchor works directionally)",
+      "all 16 candidate rows, replay logs, route-diversity and drift diagnostics published in r1_continuation/develop/metrics.jsonl; nothing hidden"
+    ]
+  },
+  "fixed_recipe": "none exists — zero accepted rounds means there is no (E, lr, anchor_mass) continuation recipe to confirm; the fixed-recipe rerun degenerates to zero rounds",
+  "frozen_winner": {
+    "checkpoint": "/data3/research1/claude_sfm_best_recipe_f06e8dd/stageB/B9_margin_origrec_e100/round_01.pt",
+    "sha256_prefix": "141e4ae6592bf73f",
+    "identity": "the immutable r1 selected and confirmed in the prior study; unchanged"
+  },
+  "final_m100": {
+    "bank": {"ep0": 410000, "noise_seed": 20260742, "m_per_gamma": 100},
+    "methods": ["r0", "r1 (frozen winner)", "locked Kazuki (.3/.5)"],
+    "read_only_after_this_declaration": true,
+    "verdict_rule": "full Pareto dominance over Kazuki (lower CR AND higher Validity AND higher clearance AND shorter time, SR/liveness preserved, gamma ordering intact) or a metric-by-metric behind-report; no relabeling"
+  }
+}
