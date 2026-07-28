@@ -1,0 +1,52 @@
+{
+  "status": "PREDECLARED_BEFORE_ANY_CONTINUATION_RUN",
+  "declared_at": "2026-07-27T00:15:00-07:00",
+  "branch": "agent/claude-sfm-r1-stable-continuation-20260727 (all prior branches/checkpoints/artifacts preserved untouched)",
+  "start_checkpoint": {
+    "path": "/data3/research1/claude_sfm_best_recipe_f06e8dd/stageB/B9_margin_origrec_e100/round_01.pt",
+    "sha256_prefix": "141e4ae6592bf73f",
+    "immutable": true
+  },
+  "prohibitions": ["no e100 continuation", "no MPC distillation", "no Kazuki retuning", "no temperature tuning", "final M100 bank (ep0 410000) never read before the single winner is frozen"],
+  "fixed_mechanism": {
+    "selector": "margin", "replay": "original D+ and D- of the new shard, plus exact-SOCP-certified deterministic recovery positives (family v1), plus the frozen r1 self-anchor buffer",
+    "recovery_positive_mass_share": 0.05,
+    "alpha": 0.01, "ess_target": 0.5,
+    "gp_verifier_scene_gammas_encoder_gathering_eval": "identical to the confirmed study; frozen encoder SHA-checked; raw evaluation temperature 1.0 NFE 8",
+    "free_variables_only": ["effective exposures E in {1,4,10,25}", "lr in {1e-5, 3e-5}", "r1-anchor positive mass share in {0.25, 0.50}"]
+  },
+  "positive_mass_composition": "anchor_mass*anchor + 0.05*recovery + (0.95 - anchor_mass)*new-shard D+; within each population the standard hierarchy mass (gamma -> episode -> context -> record); negatives = new-shard D- with the unchanged alpha=.01 signed-gradient scheme",
+  "anchor_buffer": {
+    "definition": "r1 raw temperature-1 rollouts on the private anchor bank; only SUCCESSFUL episodes; only executed sliding windows with full H_t=10 that are exact-verifier y=1; contexts recorded exactly as the gathering store (hp10/low5/hist/state/ped_xy/ped_vel)",
+    "bank": {"ep0": 380000, "m_per_gamma": 12, "noise_seed": 20260739},
+    "cap": "200 windows per gamma, deterministic selection: order by (episode, step), take first 200",
+    "semantics": "self-replay of the accepted policy's own certified successful behavior; not expert data; frozen once before round 1 and never regenerated"
+  },
+  "continuation_procedure": {
+    "rounds_max": 10,
+    "gather": "one shard per round from the CURRENTLY ACCEPTED checkpoint; continuation round k uses expansion_scenarios(1+k) (scenarios 20008..20087), preserving the original bank progression; GP previous-shard chain starts from the archived B9 round-1 shard; ell = 0.3259987743470518 (B9 manifest)",
+    "shared_across_candidates": "identical shard, identical recovery records, identical replay seed and deterministic batch ordering; only (E, lr, anchor_mass) differ; every candidate forks from the accepted checkpoint",
+    "candidates_per_round": 16,
+    "logged_per_candidate": ["unique sample exposure", "gradient norms (positive/negative)", "parameter drift per module", "penultimate-representation drift on a fixed probe batch", "new-shard positive loss", "anchor loss", "recovery loss", "route diversity (mode distribution + entropy of 16 raw samples at 32 fixed gamma-balanced probe contexts)"],
+    "rejected_candidates": "all 16 rows published every round; nothing hidden"
+  },
+  "development_bank": {"ep0": 390000, "noise_seed": 20260740, "m_per_gamma": 10, "role": "fixed raw M10/gamma development screening; r1 evaluated once on it as the admissibility baseline"},
+  "admissibility_vs_r1_dev_values": {
+    "SR": "SR >= SR_r1 - 0.05 (predeclared tolerance)",
+    "timeout": "timeout <= timeout_r1 + 0.05 (predeclared tolerance)",
+    "CR": "CR <= CR_r1 (hard, no tolerance)",
+    "Validity": "V >= V_r1 (hard)",
+    "clearance": "successful clearance >= clr_r1 (hard)",
+    "gamma_trend": "clearance(gamma=0.1) >= clearance(gamma=1.0) AND successful time(gamma=0.1) >= successful time(gamma=1.0); a gamma cell with zero successes fails the check",
+    "note": "hard inequalities exactly as directed; if no candidate is admissible the procedure stops (no forced rounds)"
+  },
+  "selection_among_admissible": "lexicographic: lowest CR, then highest Validity, then highest clearance, then shortest successful time; winner becomes the accepted checkpoint",
+  "fixed_recipe_choice_rule": "after development stops: the (E, lr, anchor_mass) combo accepted most often; ties broken by better mean lexicographic rank across its accepted rounds, then by smaller E, then smaller lr, then smaller anchor_mass; rerun ALL continuation rounds from immutable r1 with that single combo (no round-dependent tuning); stability requirement = at least three consecutive rerun checkpoints admissible on the development bank",
+  "funnel": {
+    "screening": "fixed raw M10/gamma (development bank) for every rerun round",
+    "m50": {"ep0": 400000, "noise_seed": 20260741, "m_per_gamma": 50, "role": "fresh disjoint eligibility for admissible rerun checkpoints"},
+    "m100": {"ep0": 410000, "noise_seed": 20260742, "m_per_gamma": 100, "role": "UNTOUCHED final: exactly one frozen winner vs r0, r1, and locked Kazuki, paired scenario-cluster CIs"}
+  },
+  "win_criterion": "full Pareto dominance over locked Kazuki on final M100: lower CR AND higher window Validity AND higher successful clearance AND shorter successful time, with SR/liveness preserved and the gamma ordering intact; anything less is reported metric-by-metric and NOT relabeled a win",
+  "compute": "GPU3 only (GPU1 now occupied by another user; exclusivity rule); exact SOCP verification remains CPU"
+}
