@@ -187,8 +187,10 @@ def run(args):
                 "reused buffer does not authenticate against this round shard"
             )
         records = list(payload["records"])
+        # The audit is kept byte-identical so the re-saved buffer hashes
+        # exactly like the source buffer; reuse provenance goes into the
+        # COMPLETE.json report instead.
         harvest = dict(payload["audit"])
-        harvest["reused_from"] = reuse_path
     else:
         with ProcessPoolExecutor(
             max_workers=args.verifier_workers,
@@ -272,6 +274,7 @@ def run(args):
         "ordinary_replay_precedes_this_command": True,
         "teacher_is_not_a_safety_label": True,
         "teacher_used_at_evaluation": False,
+        "reused_buffer_from": getattr(args, "reuse_buffer", None),
         "population_stats": population_stats,
         "harvest": harvest,
         "update": update,
