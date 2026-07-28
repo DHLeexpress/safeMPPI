@@ -38,6 +38,40 @@ import sfm_scene as SS
 
 TEACHER_LRS = (1e-6, 3e-6, 1e-5)
 TEACHER_EPOCHS = (1, 2, 4)
+
+
+def canonical_records_sha(buffer_path):
+    """Content hash of a D_MPC buffer's records, independent of the
+    torch.save byte stream (which is not deterministic across fresh-vs-
+    reloaded object graphs even for deep-equal payloads)."""
+    import hashlib
+
+    import numpy as np
+
+    payload = torch.load(buffer_path, map_location="cpu", weights_only=False)
+    digest = hashlib.sha256()
+
+    def feed(value):
+        if isinstance(value, dict):
+            for key in sorted(value):
+                digest.update(str(key).encode())
+                feed(value[key])
+        elif isinstance(value, (list, tuple)):
+            digest.update(f"#{len(value)}".encode())
+            for item in value:
+                feed(item)
+        elif isinstance(value, np.ndarray):
+            digest.update(str(value.dtype).encode())
+            digest.update(str(value.shape).encode())
+            digest.update(np.ascontiguousarray(value).tobytes())
+        elif isinstance(value, float):
+            digest.update(repr(value).encode())
+        else:
+            digest.update(str(value).encode())
+
+    digest.update(payload["round_shard_sha256"].encode())
+    feed(payload["records"])
+    return digest.hexdigest()
 ORDINARY = dict(alpha=0.01, exposure_epochs=10, lr=1e-4, batch=128)
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -176,11 +210,17 @@ def run(args):
                         probe_before=report["conflict_probe_before"],
                         probe_after=report["conflict_probe_after"],
                     ))
-            buffer_shas = {arm["buffer_sha"] for arm in arms}
-            if len(buffer_shas) != 1:
+            canonical = {
+                canonical_records_sha(os.path.join(
+                    round_dir, f"arm_{arm['name']}", "D_MPC.pt",
+                ))
+                for arm in arms
+            }
+            if len(canonical) != 1:
                 raise RuntimeError(
-                    f"D_MPC buffers diverged across arms: {buffer_shas}"
+                    f"D_MPC records diverged across arms: {canonical}"
                 )
+            buffer_shas = {next(iter(canonical))}
             specs = [(half_path, os.path.join(round_dir, "eval_theta_half"))]
             specs += [
                 (arm["checkpoint"],
