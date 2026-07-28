@@ -30,6 +30,8 @@ import sfm_scene as SS
 
 TEACHER_STATUS = "SFM_UNVERIFIED_MPC_TEACHER_BUFFER_COMPLETE"
 TEACHER_SOURCE = "codex_privileged_sfm_mpc"
+D_POS_COLOR = "#0067C5"
+D_NEG_COLOR = "#C62828"
 TEACHER_COLOR = "#7B2CBF"
 CONTEXT_FIELDS = ("scenario_id", "gamma", "step", "state", "ped_xy", "ped_vel")
 
@@ -225,7 +227,7 @@ def draw_cell(axis, rows, teachers_by_context, through_step):
 
     for _, context, window in available:
         path = SM.rollout_positions(context["state"], window["controls"])
-        color = BV.BLUE if int(window["y"]) == 1 else BV.RED
+        color = D_POS_COLOR if int(window["y"]) == 1 else D_NEG_COLOR
         axis.plot(
             path[:, 0], path[:, 1], color=color, lw=.62,
             marker=".", ms=.85, alpha=.36, zorder=3,
@@ -251,9 +253,9 @@ def draw_cell(axis, rows, teachers_by_context, through_step):
 
 def _legend():
     return [
-        Line2D([], [], color=BV.BLUE, lw=1.2,
+        Line2D([], [], color=D_POS_COLOR, lw=1.2,
                label=r"ordinary $D^+$ · exact full-H positive"),
-        Line2D([], [], color=BV.RED, lw=1.2,
+        Line2D([], [], color=D_NEG_COLOR, lw=1.2,
                label=r"ordinary $D^-$ · exact full-H negative"),
         Line2D([], [], color="#111111", lw=2.2,
                label="ordinary executed first-action trajectory"),
