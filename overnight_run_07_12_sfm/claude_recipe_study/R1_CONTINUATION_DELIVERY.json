@@ -1,0 +1,44 @@
+{
+  "status": "R1_STABLE_CONTINUATION_DELIVERY_COMPLETE",
+  "completed_at": "2026-07-27T05:40:00-07:00",
+  "branch": "agent/claude-sfm-r1-stable-continuation-20260727",
+  "headline": "No stable multi-round improvement exists under the pre-registered hard gates: 0/16 round-1 candidates admissible (timeout gate binds at every dose, including E=1/lr=1e-5/drift 0.0018). Frozen winner = immutable r1. Final M100 verdict: NOT a win over Kazuki — Validity decisively ahead (+.384 [+.354,+.412], more than double), CR (+.089), clearance (-.055) and time (+6.49 s) remain behind.",
+  "development": {
+    "rounds_run": 1, "rounds_accepted": 0,
+    "all_candidate_rows": "r1_continuation/develop/metrics.jsonl (16 combos x replay logs, route diversity, drift, admissibility checks; nothing hidden)",
+    "diagnostics_figure": "r1_continuation/diagnostics/round1_candidates.png",
+    "key_numbers": {
+      "timeout_gate": 0.093, "candidate_timeouts": [0.129, 0.229],
+      "best_CR_seen": 0.129, "best_Validity_seen": 0.789,
+      "route_entropy_range": [0.973, 1.008],
+      "representation_cosine_range": [0.9879, 0.9982]
+    },
+    "anchor_buffer": "r1_continuation/r1_anchor_buffer.pt (1400 records, 200/gamma, all exact-certified, from 57/84 successful r1 raw rollouts on bank 380000)"
+  },
+  "final_m100": {
+    "bank": {"ep0": 410000, "noise_seed": 20260742, "m_per_gamma": 100, "first_read": "after R1_CONTINUATION_SELECTION.json was committed"},
+    "pooled": {
+      "r0":     {"SR": 0.696, "CR": 0.299, "timeout": 0.006, "Validity": 0.619, "clearance": 0.119, "time": 8.62},
+      "r1":     {"SR": 0.690, "CR": 0.277, "timeout": 0.033, "Validity": 0.736, "clearance": 0.129, "time": 10.81},
+      "kazuki": {"SR": 0.810, "CR": 0.189, "timeout": 0.001, "Validity": 0.353, "clearance": 0.183, "time": 4.32}
+    },
+    "paired_r1_minus_kazuki": {
+      "CR": [0.0886, 0.0186, 0.1571], "validity": [0.3839, 0.3542, 0.4122],
+      "clearance": [-0.0547, -0.0705, -0.0389], "time": [6.4910, 6.1666, 6.8141]
+    },
+    "paired_r1_minus_r0": {
+      "CR": [-0.0214, -0.0714, 0.0257], "validity": [0.1177, 0.0997, 0.1358],
+      "clearance": [0.0097, -0.0030, 0.0224], "time": [2.1974, 1.9731, 2.4241]
+    },
+    "gamma_trend_r1": "gamma=0.1: clearance .144 (largest), time 13.79 s (longest) — ordering intact",
+    "verdict": "FULL PARETO DOMINANCE OVER KAZUKI NOT ACHIEVED; metrics behind: CR, successful clearance, successful time. Metric ahead: window Validity (raw flow certificate-conformance is 2.1x Kazuki's). Reported exactly; not relabeled."
+  },
+  "mechanism_synthesis": "Every continuation gradient step along the safety axis pays in time-to-goal at T=180; the self-anchor (mass .50 > .25 on SR) slows but does not stop the trade. Kazuki's advantage is runtime computation (goal/CBF guidance + MPPI refinement per step), which the raw temperature-1 flow cannot amortize into weights on this OOD profile without losing liveness. The raw policy's one decisive edge is exact-certificate Validity.",
+  "artifacts": {
+    "final_metrics": "r1_continuation/final_m100/ + r1_continuation/final_kazuki_m100/",
+    "paired_cis": "r1_continuation/FINAL_CONFIRMATION_ANALYSIS.json",
+    "four_metric_curves": "r1_continuation/final_m100/raw_m100_offline_curves.{png,pdf}",
+    "prereg_chain": ["R1_CONTINUATION_PREREGISTRATION.json", "R1_CONTINUATION_SELECTION.json (frozen pre-read)"],
+    "checkpoints": "r1 (immutable) + all 16 round-1 candidate checkpoints under r1_continuation/develop/round_01/"
+  }
+}
