@@ -170,17 +170,39 @@ def run(args):
     hard, population_stats = _hard_windows(shard)
     environment = SS.scene_profile(args.scene_profile)
     os.makedirs(output_dir)
-    with ProcessPoolExecutor(max_workers=args.verifier_workers) as executor:
-        records, harvest = T.harvest_round(
-            policy,
-            shard,
-            hard,
-            device=args.device,
-            environment=environment,
-            max_contexts=args.max_contexts,
-            executor=executor if args.audit_socp else None,
-            audit_socp=args.audit_socp,
-        )
+    if getattr(args, "reuse_buffer", None):
+        # Additive, default-off: reuse a previously harvested D_MPC buffer.
+        # Valid ONLY when it authenticates against the identical round shard;
+        # the harvest is deterministic given (checkpoint, shard), so this is
+        # byte-equivalent to re-harvesting and is unit-tested as such.
+        reuse_path = os.path.abspath(args.reuse_buffer)
+        payload = torch.load(reuse_path, map_location="cpu",
+                             weights_only=False)
+        if payload.get("status") != T.BUFFER_STATUS:
+            raise ValueError("reused buffer is not a complete teacher buffer")
+        if payload.get("round_shard_sha256") != OS.sha256_file(
+            round_shard_path,
+        ):
+            raise ValueError(
+                "reused buffer does not authenticate against this round shard"
+            )
+        records = list(payload["records"])
+        harvest = dict(payload["audit"])
+        harvest["reused_from"] = reuse_path
+    else:
+        with ProcessPoolExecutor(
+            max_workers=args.verifier_workers,
+        ) as executor:
+            records, harvest = T.harvest_round(
+                policy,
+                shard,
+                hard,
+                device=args.device,
+                environment=environment,
+                max_contexts=args.max_contexts,
+                executor=executor if args.audit_socp else None,
+                audit_socp=args.audit_socp,
+            )
     buffer_path = os.path.join(output_dir, "D_MPC.pt")
     T.save_buffer(
         buffer_path,
@@ -276,6 +298,11 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=20260728)
     parser.add_argument("--max-contexts", type=int, default=400)
     parser.add_argument("--audit-socp", action="store_true")
+    parser.add_argument(
+        "--reuse-buffer", default=None,
+        help="path to a D_MPC.pt from an identical (checkpoint, shard) run; "
+             "skips the deterministic harvest after authenticating the shard",
+    )
     parser.add_argument("--verifier-workers", type=int, default=32)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args(argv)

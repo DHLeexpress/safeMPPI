@@ -1,0 +1,24 @@
+{
+  "status": "PREDECLARED_BEFORE_ANY_TEACHER_ROUND",
+  "declared_at": "2026-07-28T00:40:00-07:00",
+  "branch": "agent/claude-sfm-unverified-teacher-run-20260728 pinned at 2a873327c8afd7dffa9a8e10e2bf957bf5203489 (teacher tooling used as-is; Codex branch, immutable r1, ordinary gathering/replay, verifier, GP, raw evaluator untouched)",
+  "start_checkpoint": {"path": "/data3/research1/claude_sfm_best_recipe_f06e8dd/stageB/B9_margin_origrec_e100/round_01.pt", "sha256_prefix": "141e4ae6592bf73f"},
+  "round_structure": {
+    "ordinary_update": "unchanged executed D+/D- gathering (margin selector, contract seeds, continuation round k gathers expansion_scenarios(1+k), GP chain from archived B9 round-1 shard, ell 0.3259987743470518) followed by unchanged sfm_b1_offline_replay.replay with alpha .01, exposure_epochs 10, lr 1e-4, batch 128 -> theta_(n+1/2)",
+    "teacher_block": "claude_apply_unverified_mpc_teacher.py on theta_(n+1/2) with --audit-socp (audit-only), --max-contexts 400, seed 20260728; D_MPC kept separate from D/D+/GP/acquisition/validity; control bounds and the privileged controller's own exact-SFM feasibility enforced by the pinned tool",
+    "dose_arms": "teacher lr {1e-6, 3e-6, 1e-5} x epochs {1, 2, 4} = 9 arms per round, all applied to the SAME theta_(n+1/2) and the SAME round shard; identical deterministic D_MPC across arms is guaranteed by construction and ASSERTED via teacher_buffer_sha256 equality (arms 2-9 reuse arm 1's buffer through an additive default-off --reuse-buffer flag whose equivalence to fresh harvest is unit-tested)",
+    "no_teacher_control": "theta_(n+1/2) itself is evaluated alongside the 9 arms every round and competes in acceptance"
+  },
+  "development_bank": {"ep0": 390000, "noise_seed": 20260740, "m_per_gamma": 10, "note": "same fixed-CRN M10 development bank and r1 baseline as the R1-continuation study (r1: SR .771, CR .186, timeout .043, V .752, clr .144); development-only, never confirmation"},
+  "admissibility_gates_identical_to_R1_continuation_prereg": {
+    "SR": ">= .721 (r1_dev - .05)", "timeout": "<= .093 (r1_dev + .05)",
+    "CR": "<= .186 (hard)", "Validity": ">= .752 (hard)", "clearance": ">= .144 (hard)",
+    "gamma_trend": "clearance(g0.1) >= clearance(g1.0) AND time(g0.1) >= time(g1.0)"
+  },
+  "acceptance": "lexicographic (lowest CR, highest Validity, highest clearance, shortest time) among admissible candidates INCLUDING the no-teacher control; accepted checkpoint seeds the next round; if nothing admissible the loop stops",
+  "rounds_max": 6,
+  "m50_promotion": {"bank": {"ep0": 420000, "noise_seed": 20260745, "m_per_gamma": 50}, "rule": "accepted-round candidates whose dose arm was admissible in >= 2 consecutive rounds (stability) are promoted; if the loop stops before any dose repeats, the single best admissible candidate (by the lexicographic rule) is promoted alone; r0 and r1 evaluated on the same bank for reference"},
+  "final_m100": {"bank": {"ep0": 430000, "noise_seed": 20260746, "m_per_gamma": 100}, "rule": "exactly one candidate (best on M50 by the same lexicographic rule with the same liveness gates measured against r1's M50 values) vs r0, accepted r1, and locked Kazuki; paired scenario-cluster CIs; UNTOUCHED until that candidate is frozen; no Kazuki-win claim unless the CIs support it"},
+  "diagnostics": "teacher-vs-D+/D- gradient cosines before/after every block (tool-native), harvest/audit counts, buffer SHAs, per-round M10 rows for all arms (nothing hidden), sfm_b1_teacher_branch_viz.py render per accepted candidate, paper_b1_margin50_trends.py for the winner",
+  "compute": "GPU3 only unless GPU1 is verifiably idle; SOCP audit on CPU"
+}
