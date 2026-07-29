@@ -1,0 +1,40 @@
+{
+  "status": "PREDECLARED_BEFORE_ANY_RUN",
+  "declared_at": "2026-07-28T09:10:00-07:00",
+  "branch": "agent/claude-sfm-corrected-privileged-distill-20260728 (code pushed before running; master/Codex branches/PR3/prior checkpoints and artifacts untouched)",
+  "artifact_root": "/data3/research1/claude_sfm_corrected_privileged_distill_<FROZEN_SHA>/ where FROZEN_SHA = the pushed source commit that launches the runs",
+  "disclosed_prior_bug": "the last two studies' admissibility gates read records[0] (= r0) instead of the r1 record from the dev-baseline metrics file; re-checking the archived tables against the CORRECT r1 gates still yields zero admissible candidates in both studies (timeout/SR/clearance still fail), so no conclusion flips, but the bar actually applied was r0's (CR<=.300/V>=.638/clr>=.119 with timeout<=.050) rather than r1's (CR<=.186/V>=.752/clr>=.144 with timeout<=.093); fixed here by a label-based reader",
+  "phase1_online_qualification": {
+    "controller": "EXACT historical privileged deterministic SFM controller: sfm_adhoc_controller_compare.privileged_sfm_config() (verbatim import @0e0eca2) driving sfm_kazuki.kazuki_sfm_deploy with exact_sfm_horizon_filter_action and its full candidate family (flow/guidance/MPPI nominal pool + brake + 12 goal + 18 avoidance + 25 constant-acceleration), privileged candidate-specific SFM simulation, H10 hard-margin/recoverability, H20 viability/escalation, stagnation/escape, always_select=True, execute-one-action-and-replan; compact SOCP audit-only, never execution authority",
+    "prior": "immutable r1 checkpoint (the policy the study intends to improve); the historical 98% figure belonged to a different scene and prior and is NOT claimed to transfer",
+    "bank": {"ep0": 440000, "m_per_gamma": 10, "role": "fixed CRN M10/gamma qualification AND phase-2 teacher generation (same fixed scenarios); disjoint from every evaluation bank"},
+    "report": "raw r1 and online controller separately: SR, CR, timeout, executed-window Validity, successful clearance, successful time-to-goal"
+  },
+  "phase2_teacher_dataset": {
+    "retention": "successful controller episodes only; every context + the actually executed first action; H10 windows reconstructed post-episode from consecutive EXECUTED actions only (never the nine unexecuted actions of a proposed plan); terminal prefixes < H10 omitted",
+    "contexts": "reconstructed offline exactly as evaluation-time contexts (HpHistory over axis_grid of deterministically replayed pedestrians; hist from executed controls; low5 from states+gamma) and verified against the rollout's stored pedestrian arrays (fail-closed on mismatch)",
+    "provenance_per_window": ["privileged-state/step-filter diagnostics of the executed step", "candidate family / selection_reason", "horizon clearance", "compact-SOCP audit label (audit-only)"],
+    "separation": "D_MPC never enters D, D+/D-, GP, acquisition, or beta calibration",
+    "render": "episode 250003, gamma=0.1, around t=55: all controller branches, feasible/rejected, selected, executed trajectory, raw r1 branches, post-distillation raw branches (PNG + MP4); explanatory evidence only"
+  },
+  "phase3_fixes": {
+    "ordinary": "original B1 semantics via BS.signed_update on a fail-closed W=2 holder over BOTH declared recent shards (archived B9 round-1 shard + the newly gathered round-2 shard); one full-dataset accumulated gradient and exactly one Adam step per epoch; e10 would mean 10 Adam steps; abort rather than W=1",
+    "teacher": "L_T = sum_i m_i L_CFM(i) with normalized hierarchy masses; per chunk of size b pass weights=b*m_i to the production FlowPolicy.cfm_loss and SUM returned chunk losses (never multiply by chunk mass again); one accumulated Adam step per epoch; per-chunk deterministic seeding",
+    "test": "production GridSFMFlowPolicy test: chunked accumulated loss/gradient must numerically match an independent direct implementation that replays the identical per-chunk CFM noise (torch.randn then torch.rand, CPU) and computes sum_i m_i L_i analytically; gradient max-abs-diff tolerance 1e-5",
+    "baseline_reader": "label-based record selection; r1 reads the r1 record"
+  },
+  "phase4_bounded_causal_study": {
+    "shared": "identical seeds, latents, ordering; evaluation bank = fixed raw temperature-1 M10/gamma ep0 390000 seed 20260740 (no guidance, no verifier acquisition, no controller templates, no temperature tuning)",
+    "arms": {
+      "A": "immutable r1, no update",
+      "B": "corrected ordinary B1 only: alpha=.01, ONE replay epoch (one accumulated Adam step) on W=2 {B9 r1 shard, new round-2 shard gathered from r1 with unchanged protocol}",
+      "C": "corrected teacher only, applied directly to r1 (before any ordinary continuation): lr in {1e-5, 3e-5} x epochs in {1, 4} = 4 arms",
+      "D": "best teacher dose (chosen from C on the M10 screening by the lexicographic safety rule among liveness-preserving rows) THEN one corrected ordinary epoch (B's exact settings)"
+    },
+    "no_hard_gate_termination": "the complete Pareto table over (CR down, Validity up, clearance up, time down, SR, timeout) is reported for all arms",
+    "promotion_rule": "non-dominated candidates on (CR, -Validity, -clearance) that strictly improve at least one of CR/Validity/clearance versus r1 AND avoid catastrophic liveness loss, declared as SR >= SR_r1 - 0.15 and timeout <= timeout_r1 + 0.15 on the same bank, are promoted to the disjoint M50",
+    "m50": {"ep0": 450000, "noise_seed": 20260748, "m_per_gamma": 50, "role": "confirmation of promoted candidates vs r1 and r0"}
+  },
+  "diagnostics_required": ["exact Adam-step count per arm", "parameter drift by module", "fixed-context first-action and H10 output RMSE (fixed probe contexts + fixed latents)", "teacher/ordinary-positive/D- gradient cosines", "controller-success lineage count", "teacher sample count and gamma balance", "compact-SOCP-positive fraction (audit only)", "raw control spread and route entropy"],
+  "scientific_rules": ["privileged teacher never called certified", "no transfer claim for the historical 98%", "no deterministic-distillation-failure claim unless the corrected teacher produces measurable parameter/output change", "stop and report on weighting mismatch, wrong Adam-step count, missing W=2 shard, provenance mismatch, or evaluation leakage"]
+}
