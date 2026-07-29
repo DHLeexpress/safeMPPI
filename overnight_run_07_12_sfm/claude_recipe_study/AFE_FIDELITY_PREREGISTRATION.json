@@ -1,0 +1,25 @@
+{
+  "status": "PREDECLARED_BEFORE_ANY_RUN",
+  "declared_at": "2026-07-29T01:10:00-07:00",
+  "branch": "agent/claude-sfm-afe-fidelity-controller-benchmark-20260729 from frozen 736fa6c; artifacts under /data3/research1/claude_sfm_afe_fidelity_controller_<FROZEN_SHA>/",
+  "golden_rule": "exact full-H moving-pedestrian SOCP is the ONLY execution and replay authority: enter D+/execute/train iff resolved AND y=1 AND full_h AND terminal_step=10; privileged SFM simulation generates and ranks but never certifies; always_select disabled for certified benchmarks; NVP terminates fail-closed; no relabeling",
+  "controller_score_J": "faithful replication of the committed exact_sfm_horizon_filter_action score with per-gamma weights: J = gsw*goal_cost + .015*mean(u^2) + .02*||u0-u0_nominal||^2 - cw*min(clear,1) + clearance_target_cost, goal_cost = .04*arrival if reached<=H10 else ||terminal-GOAL||; computed from the privileged simulation diagnostics; used for F/B8 execution ranking and as J_ctrl in objective G",
+  "banks": {
+    "phase0": {"ep0": 460000, "m_per_gamma": 10, "role": "O/F/B8 support benchmark, fixed CRN"},
+    "gathering": "standard expansion bank; macro-round k gathers expansion_scenarios(1+k) (56 lineages)",
+    "m10_eval": {"ep0": 390000, "noise_seed": 20260740, "m_per_gamma": 10, "role": "identical CRN raw screening bank across arms and rounds (development-only)"},
+    "m50": {"ep0": 470000, "noise_seed": 20260750, "m_per_gamma": 50},
+    "m100": {"ep0": 480000, "noise_seed": 20260751, "m_per_gamma": 100, "role": "untouched until the single winner is frozen"}
+  },
+  "afe": "one keyed x0~N(0,I) per proposal incl. deterministic templates (persisted); z=normalize(phi_s_from_x0((1-s)x0+sU,s,c)), s=.9; RBF GP rebuilt once per macro-round from previous round's exact-SOCP-positive queries (cap 512, gamma-equal quota, ell=0.3259987743470518 lambda=.01 from the authenticated preflight, fail-closed recalibration only on numerical condition), adaptive beta for ESS in {.25,.50}, B=8 without replacement, no within-round GP update; round-1 previous = the archived B9 round-1 shard (certified executed positives with stored x0)",
+  "store": "certified-query shard: D = every resolved B query, D+ = ALL exact positives per context (set-valued); episodes terminate at NVP",
+  "objectives": {
+    "U": "L_U = sum_c mass(c) * mean over P_c of L_CFM (== hierarchy mass gamma->cell->context->certified query)",
+    "G": "q(U|c) ∝ exp(-(J-Jmin)/tau_J), tau_J calibrated once per round so within-context median ESS/|P_c| = 0.5 (bisection, no manual temperature)",
+    "replay": "corrected whole-dataset accumulation, ONE Adam step per epoch, W=2 fail-closed (round 1 window = {B9 r1 shard, round-1 certified shard}; k>=2 = {k-1,k}), production cfm_loss weighting (chunk weights b*w_i summed), frozen encoder, positives only; no teacher/demo/fallback/prox/anchor/rollback/recovery/uncertified data"
+  },
+  "screening": "2 gathers from r1 (ESS .25/.50, shared across objectives/doses) x {U,G} x {d1: lr1e-5 4 steps, d2: lr3e-5 4 steps} = 8 one-round arms on the M10 bank; promote every Pareto-nondominated arm then at most best two by (CR, -Validity, -clearance, -SR, timeout, time); full Pareto table always reported",
+  "expansion": "two promoted recipes x 10 macro-rounds from immutable r1; checkpoints every round; M10 at rounds 0,1,2,5,10; per-recipe best by M10 only; both to disjoint M50; single winner to untouched M100",
+  "compute": "GPU3 exclusively verified now; GPU1 re-checked by UUID before the expansion stage and used only if exclusively free; shared read-only verifier cache keyed by (context-hash, U-hash, gamma, verifier version)",
+  "interpretation": "four methods kept distinct (unverified oracle / full-pool SOCP-gated / budgeted B8 AFE / raw expanded flow); no 97-99% transfer claim unless the raw M100 achieves it; poor-liveness full pool => verifier-support gap binding; full works+B8 fails => acquisition binding; B8 works+raw fails => CFM transfer binding"
+}
