@@ -1,0 +1,7 @@
+{"status":"AFE_FIDELITY_DELIVERY_COMPLETE","frozen_sha":"0c52010",
+"phase0":"P(pool has SOCP positive)=.938, mean multiplicity 26.9, yet full-pool certified execution NVP .986 (CR 0.000) and B8 NVP 1.0: closed-loop verifier-support intersection is the binding limitation (pre-registered interpretation), not CFM, controller quality, or acquisition ranking",
+"screening":"8-arm Pareto table in SCREEN.json; promoted ess0p5_U_d1 + ess0p25_U_d1 (U objective, lr 1e-5, 4 whole-dataset steps)",
+"expansion":"both recipes 10 certified macro-rounds from immutable r1; best per recipe = round 1 (EXPANSION_M10.json)",
+"m50":"r1 .303 CR / .730 V; both recipes .289 CR / .737 V; winner ess0p25_U_d1 r1",
+"final_m100_untouched_480000":{"r1":{"SR":0.6857,"CR":0.2771,"V":0.7278,"clr":0.1223,"t":11.006},"winner":{"SR":0.6914,"CR":0.2714,"V":0.7316,"clr":0.1238,"t":11.134}},
+"verdict":"small consistent improvement on every axis (dCR -.006, dV +.004, dSR +.006, dclr +.002) but WITHIN NOISE at n=700; no 97-99% transfer claim; the certified-set CFM transfers a real but epsilon-scale fraction of controller support into the raw flow"}
