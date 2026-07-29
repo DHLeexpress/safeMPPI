@@ -126,20 +126,42 @@ def _scene(axis, context, rollout, t):
     axis.grid(alpha=.2)
 
 
-def _draw_controller(axis, context, rollout, t):
+def _humans_at(rollout, t):
+    environment = SS.scene_profile("double_density_velocity_ood")
+    humans = SS.make_humans(
+        EPISODE, 0, environment["n_ped"],
+        tuple(environment["ped_speed_range"]),
+    )
+    state = np.zeros(4, np.float32)
+    controls = np.asarray(rollout["controls"], np.float32)
+    for step in range(int(t)):
+        action = controls[step]
+        state[:2] += SS.DT * state[2:4] + 0.5 * SS.DT ** 2 * action
+        state[2:4] += SS.DT * action
+        SS.advance_humans(humans, state)
+    return humans
+
+
+def _draw_controller(axis, context, rollout, t, policy, device):
     _scene(axis, context, rollout, t)
-    trace = list(rollout.get("trace") or ())
-    pool = (trace[t].get("output_filter") or {}).get("candidate_pool", ()) \
-        if t < len(trace) else ()
+    # Exact from the deploy trace: executed path (drawn by _scene) and the
+    # actually selected branch.  The surrounding candidate family is
+    # REGENERATED at the stored context with the committed pool machinery
+    # (cold-start seeding) and labeled by privileged exact-SFM feasibility;
+    # it is representative, not the byte-exact deploy-time pool.
+    humans = _humans_at(rollout, t)
+    pool_context = dict(
+        context, gamma=GAMMA, scenario_id=EPISODE, step=int(t),
+    )
+    pool = MP.build_codex_pool(
+        policy, pool_context, humans, device=device, seed_step=int(t),
+    )
     feasible = rejected = 0
-    for candidate in pool:
+    for index in range(len(pool["plans"])):
         segment = SM.rollout_positions(
-            context["state"], np.asarray(candidate["controls"], np.float32),
+            context["state"], pool["plans"][index],
         )
-        if candidate.get("selected"):
-            axis.plot(segment[:, 0], segment[:, 1], color="#0868d9", lw=2.8,
-                      zorder=8)
-        elif candidate.get("hard_margin_feasible"):
+        if pool["privileged_feasible"][index]:
             feasible += 1
             axis.plot(segment[:, 0], segment[:, 1], color="#159447", lw=.7,
                       alpha=.4, zorder=4)
@@ -147,13 +169,21 @@ def _draw_controller(axis, context, rollout, t):
             rejected += 1
             axis.plot(segment[:, 0], segment[:, 1], color="#d62728", lw=.6,
                       alpha=.3, zorder=4)
-    reason = (trace[t].get("output_filter") or {}).get("selection_reason") \
+    trace = list(rollout.get("trace") or ())
+    diag = (trace[t].get("output_filter") or {}) if t < len(trace) else {}
+    selected = trace[t].get("selected_plan_positions") \
         if t < len(trace) else None
+    if selected is not None:
+        selected = np.asarray(selected, np.float32)
+        axis.plot(selected[:, 0], selected[:, 1], color="#0868d9", lw=2.8,
+                  zorder=8)
     axis.set_title(
-        f"privileged controller t={t}\nfeasible {feasible} / rejected "
-        f"{rejected} / {reason}", fontsize=10,
+        f"privileged controller t={t} (branches regenerated)\n"
+        f"feasible {feasible} / rejected {rejected} / "
+        f"{diag.get('selection_reason')} / "
+        f"clear {diag.get('selected_horizon_clear'):.2f}", fontsize=10,
     )
-    return len(pool)
+    return feasible + rejected
 
 
 def _draw_raw(axis, name, policy, context, rollout, t, device):
@@ -193,15 +223,15 @@ def run(args):
         clearance = float(np.linalg.norm(
             contexts[t]["ped_xy"] - contexts[t]["state"][:2][None], axis=1,
         ).min() - SS.R_PED)
-        has_pool = t < len(trace) and bool(
-            (trace[t].get("output_filter") or {}).get("candidate_pool"),
+        has_selected = t < len(trace) and (
+            trace[t].get("selected_plan_positions") is not None
         )
-        candidates.append((clearance, not has_pool, t))
+        candidates.append((not has_selected, clearance, t))
     snapshot = min(candidates)[2]
 
     figure, axes = plt.subplots(1, 3, figsize=(16.8, 5.8))
     pool_size = _draw_controller(axes[0], contexts[snapshot], rollout,
-                                 snapshot)
+                                 snapshot, r1_policy, device)
     before = _draw_raw(axes[1], "immutable r1", r1_policy,
                        contexts[snapshot], rollout, snapshot, device)
     after = _draw_raw(axes[2], args.post_name, post_policy,
@@ -222,7 +252,8 @@ def run(args):
         def _frame(t):
             for axis in axes:
                 axis.clear()
-            _draw_controller(axes[0], contexts[t], rollout, t)
+            _draw_controller(axes[0], contexts[t], rollout, t, r1_policy,
+                             device)
             _draw_raw(axes[1], "immutable r1", r1_policy, contexts[t],
                       rollout, t, device)
             _draw_raw(axes[2], args.post_name, post_policy, contexts[t],
