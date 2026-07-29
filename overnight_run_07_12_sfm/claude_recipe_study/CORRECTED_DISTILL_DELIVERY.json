@@ -1,0 +1,54 @@
+{
+  "status": "CORRECTED_PRIVILEGED_DISTILL_DELIVERY_COMPLETE",
+  "completed_at": "2026-07-28T15:40:00-07:00",
+  "branch": "agent/claude-sfm-corrected-privileged-distill-20260728 (frozen launch SHA 736fa6c; render fixes b33abd4+; master/Codex/PR3/prior artifacts untouched)",
+  "artifact_root": "/data3/research1/claude_sfm_corrected_privileged_distill_736fa6c",
+  "phase1_answer": "YES — the historical privileged deterministic SFM controller still works online under the current severe OOD: 70/70 fixed-CRN episodes (SR 1.000, CR 0.000, timeout 0.000), successful clearance .233, time 4.47 s, with r1 as prior. Its executed-window exact-SOCP Validity is .414 (audit-only; 32% of H10 windows audit-positive): flawless behavior, largely non-certificate-conformant. This is a direct measurement on bank 440000; the historical 98% figure is NOT claimed to transfer.",
+  "phase2_dataset": {"lineages": 70, "windows": 2500, "gamma_balance": "uniform .143 mass per gamma", "construction": "executed-action H10 windows only, terminal prefixes omitted, contexts reconstructed fail-closed (0 mismatches), selection/clearance/step-filter provenance + audit-only SOCP labels", "separation": "never enters D, D+/D-, GP, acquisition, or beta calibration"},
+  "phase3_fixes_verified": {
+    "ordinary": "BS.signed_update on fail-closed W=2 {B9 r1 shard, new round-2 shard}: exactly ONE accumulated Adam step per epoch (asserted per epoch)",
+    "teacher": "L_T = sum_i m_i L_CFM(i); chunk weights b*m_i summed, never re-multiplied; production-policy chunked-vs-direct gradient agreement < 1e-5 (analysis/test_claude_corrected_distill.py, full RNG-state replay incl. dropout)",
+    "baseline_reader": "label-based; the prior records[0]-as-r1 bug disclosed in the pre-registration — re-checked archived tables, no prior conclusion flips"
+  },
+  "phase4_m10": {
+    "bank": "ep0 390000 seed 20260740 (n=70/arm)",
+    "adam_steps": {"A_r1": 0, "B_ordinary_e1": 1, "C_teacher_ep1": 1, "C_teacher_ep4": 4, "D": 2},
+    "key_rows": {
+      "A_r1": {"SR": 0.771, "CR": 0.186, "timeout": 0.043, "V": 0.752, "clr": 0.144, "t": 10.91},
+      "B_ordinary_e1": {"SR": 0.743, "CR": 0.157, "timeout": 0.100, "V": 0.771, "clr": 0.130, "t": 11.63},
+      "C_lr1e5_ep1": {"SR": 0.771, "CR": 0.171, "timeout": 0.057, "V": 0.756, "clr": 0.141, "t": 10.89},
+      "C_lr3e5_ep1": {"SR": 0.757, "CR": 0.171, "timeout": 0.071, "V": 0.758, "clr": 0.137, "t": 10.86},
+      "D_best_teacher_then_ordinary": {"SR": 0.714, "CR": 0.214, "timeout": 0.071, "V": 0.758, "clr": 0.140, "t": 11.66}
+    },
+    "measurable_change": "teacher moves the policy measurably (trunk drift 1e-4..1.4e-3; first-action RMSE .004-.046; H10 RMSE similar) — the no-inert-distillation precondition for any failure claim is satisfied",
+    "gradient_cosines_at_r1_corrected_objective": {"cos_teacher_Dplus": -0.069, "cos_teacher_Dminus": 0.570, "cos_Dplus_Dminus": -0.083},
+    "promoted": ["B_ordinary_e1", "C_teacher_lr1em05_ep1", "C_teacher_lr3em05_ep1", "D"]
+  },
+  "m50_confirmation": {
+    "bank": "ep0 450000 seed 20260748 (350 rollouts/arm), disjoint",
+    "table": {
+      "r0": {"SR": 0.749, "CR": 0.249, "timeout": 0.003, "V": 0.608, "clr": 0.128, "t": 8.41},
+      "r1": {"SR": 0.680, "CR": 0.283, "timeout": 0.037, "V": 0.705, "clr": 0.131, "t": 10.59},
+      "B":  {"SR": 0.671, "CR": 0.277, "timeout": 0.051, "V": 0.721, "clr": 0.129, "t": 11.38},
+      "C1": {"SR": 0.674, "CR": 0.294, "timeout": 0.031, "V": 0.703, "clr": 0.134, "t": 10.62},
+      "C3": {"SR": 0.683, "CR": 0.291, "timeout": 0.026, "V": 0.702, "clr": 0.135, "t": 10.53},
+      "D":  {"SR": 0.666, "CR": 0.283, "timeout": 0.051, "V": 0.717, "clr": 0.129, "t": 11.13}
+    },
+    "verdict": "no promoted candidate CONFIRMS an improvement over r1 at M50: B's V +.016 / CR -.006 are within noise; the teacher arms' M10 CR gains reverse (+.008..+.011); clearance gains +.003/.004 within noise. The corrected teacher is measurable but not confirmably beneficial at these doses; no further promotion, no Kazuki-dominance claim."
+  },
+  "mechanistic_conclusion": "With the corrected objective and corrected replay, the gradient anti-alignment persists: even the SUCCESSFUL executed windows of a perfect (70/70) privileged controller align with the direction of the policy's verifier-REJECTED windows (cos +.57) and against its certified ones (cos -.07). The controller's fast goal-directed style is exactly what the gamma-contraction certificate rejects; behavior cloning it in weight space at safe doses produces epsilon change, and at effective doses (all prior studies) destroys liveness. The runtime-computation gap (controller: per-step privileged simulation + selection) is not distillable into this flow at any dose tested.",
+  "diagnostics": {
+    "route_entropy_and_spread": "phase4/route_diversity_diagnostics.json (entropy ~.675, spread ~5.0, representation cosine >= .9995 across all arms — no collapse)",
+    "socp_audit_positive_fraction_teacher": 0.323,
+    "controller_success_lineages": 70
+  },
+  "deliverables": {
+    "m10_screening": "phase4/M10_STUDY.json (full Pareto table, nothing hidden)",
+    "m50_table": "m50/ + paper_trends/sr_timeout_table.csv",
+    "paper_plot": "paper_trends/b1_margin50_metric_trends.{png,pdf} (round-index mapping 0..5 = r0,r1,B,C1,C3,D in round_index_mapping.json; numeric SEs in corrected_study_rows.jsonl)",
+    "active_dodge": "dodge/active_dodge_250003_g0p1.{png,mp4} (+ .json; snapshot t=40, 66 regenerated branches, exact selected branch + executed path from trace; controller success in 48 steps; r1 6/16 vs post-teacher 5/16 audit-positive)",
+    "teacher_buffer": "phase12/D_MPC_corrected.pt",
+    "qualification": "phase12/qualification.json + r1_raw_teacher_bank/",
+    "manifest": "SHA256_MANIFEST.json"
+  }
+}
