@@ -207,7 +207,7 @@ def collect(
     bundle = dict(
         version=1,
         status=STATUS,
-        source=FA._source(),
+        source=RA.FA._source(),
         checkpoint=os.path.abspath(checkpoint),
         checkpoint_sha256=RA.FA._sha256_file(checkpoint),
         episodes=list(episodes),
