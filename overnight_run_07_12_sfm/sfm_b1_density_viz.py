@@ -37,6 +37,7 @@ METHOD_LABELS = {
     "selected": "Arm-A r10 learned raw",
     "kazuki": "Kazuki generate-guide-refine",
 }
+CYAN = "#00A6D6"
 MAGENTA = "#CC79A7"
 METHOD_ALIASES = {
     "expert": ("expert", "safemppi_expert"),
@@ -574,22 +575,56 @@ def draw_method_panel(axis, method, run, gamma, step, *, verifier_result=None,
         axis.plot(plan[:, 0], plan[:, 1], color="#7F3C8D", lw=.82, marker="o", ms=2.2)
         guidance = trace.get("accumulated_guidance")
         if guidance:
-            vector = float(guidance_scale) * np.asarray(guidance["net_guidance_action"], float)
-            norm = float(np.linalg.norm(vector))
-            if norm > float(guidance_cap):
-                vector *= float(guidance_cap) / norm
             start = np.asarray(trace["state"], float)[:2]
-            arrow = FancyArrowPatch(
-                tuple(start), tuple(start + vector), arrowstyle="-|>", mutation_scale=15,
-                lw=2.6, color=MAGENTA, shrinkA=0, shrinkB=0, zorder=11,
+            components = (
+                ("goal_guidance_action", CYAN, "goal"),
+                ("safety_guidance_action", MAGENTA, "safety"),
             )
-            axis.add_patch(arrow)
-            metadata.update(
-                guidance_present=True,
-                net_guidance_action=np.asarray(guidance["net_guidance_action"], float).tolist(),
-                net_guidance_norm=float(guidance["net_guidance_norm"]),
-                display_scale=float(guidance_scale), display_cap=float(guidance_cap),
-            )
+            if all(key in guidance for key, _, _ in components):
+                component_metadata = {}
+                for key, color, label in components:
+                    raw = np.asarray(guidance[key], float)
+                    vector = float(guidance_scale) * raw
+                    norm = float(np.linalg.norm(vector))
+                    if norm > float(guidance_cap):
+                        vector *= float(guidance_cap) / norm
+                    axis.add_patch(FancyArrowPatch(
+                        tuple(start), tuple(start + vector),
+                        arrowstyle="-|>", mutation_scale=15,
+                        lw=2.6, color=color, shrinkA=0, shrinkB=0, zorder=11,
+                    ))
+                    component_metadata[label] = dict(
+                        action=raw.tolist(), norm=float(np.linalg.norm(raw)),
+                    )
+                metadata.update(
+                    guidance_present=True,
+                    guidance_components=component_metadata,
+                    guidance_semantics=guidance.get("component_semantics"),
+                    display_scale=float(guidance_scale),
+                    display_cap=float(guidance_cap),
+                )
+            else:
+                vector = float(guidance_scale) * np.asarray(
+                    guidance["net_guidance_action"], float,
+                )
+                norm = float(np.linalg.norm(vector))
+                if norm > float(guidance_cap):
+                    vector *= float(guidance_cap) / norm
+                axis.add_patch(FancyArrowPatch(
+                    tuple(start), tuple(start + vector),
+                    arrowstyle="-|>", mutation_scale=15,
+                    lw=2.6, color=MAGENTA, shrinkA=0, shrinkB=0, zorder=11,
+                ))
+                metadata.update(
+                    guidance_present=True,
+                    legacy_net_guidance=True,
+                    net_guidance_action=np.asarray(
+                        guidance["net_guidance_action"], float,
+                    ).tolist(),
+                    net_guidance_norm=float(guidance["net_guidance_norm"]),
+                    display_scale=float(guidance_scale),
+                    display_cap=float(guidance_cap),
+                )
         else:
             metadata["guidance_present"] = False
     _set_clean_axis(axis)

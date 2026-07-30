@@ -797,6 +797,8 @@ def guided_generate(policy, ctx, state, goal, ped_pred, ped_vel, r_col, z_init, 
     N, H = len(z_init), policy.H_pred
     z = z_init; ctxN = policy._expand_ctx(ctx, N)
     z_unguided = z_init.detach().clone() if collect_diagnostics else None
+    goal_integral = torch.zeros_like(z) if collect_diagnostics else None
+    safety_integral = torch.zeros_like(z) if collect_diagnostics else None
     safe_coef = _sample_safe_coefficients(cfg, z.device, z.dtype)
     markup = float(cfg.markup) ** torch.arange(H - 1, -1, -1, dtype=z.dtype, device=z.device)
     markup = markup[None, :, None]
@@ -820,11 +822,18 @@ def guided_generate(policy, ctx, state, goal, ped_pred, ped_vel, r_col, z_init, 
         raw_goal_norm = torch.linalg.vector_norm(g_goal)
         g_cbf = g_cbf * base_norm / (raw_cbf_norm + 1e-8)
         g_goal = g_goal * base_norm / (raw_goal_norm + 1e-8)
-        guidance = (float(cfg.goal_coef) * g_goal.reshape(N, H, 2)
-                    + safe_coef * g_cbf.reshape(N, H, 2) * markup)
+        goal_guidance = float(cfg.goal_coef) * g_goal.reshape(N, H, 2)
+        safety_guidance = safe_coef * g_cbf.reshape(N, H, 2) * markup
+        guidance = goal_guidance + safety_guidance
         z = z + (tau_next - tau) * (base + guidance.reshape(N, -1))
         if collect_diagnostics:
             z_unguided = z_unguided + (tau_next - tau) * base_unguided
+            goal_integral = goal_integral + (
+                tau_next - tau
+            ) * goal_guidance.reshape(N, -1)
+            safety_integral = safety_integral + (
+                tau_next - tau
+            ) * safety_guidance.reshape(N, -1)
             trace.append(dict(
                 tau=tau, dtau=tau_next - tau, base_norm=float(base_norm.detach().cpu()),
                 raw_cbf_grad_norm=float(raw_cbf_norm.detach().cpu()),
@@ -834,6 +843,15 @@ def guided_generate(policy, ctx, state, goal, ped_pred, ped_vel, r_col, z_init, 
                 endpoint_min_pred_clear=float((torch.linalg.vector_norm(
                     pos.unsqueeze(2) - ped_pred.unsqueeze(0), dim=3) - r_col).min().detach().cpu()),
             ))
+    if collect_diagnostics:
+        trace[-1].update(
+            integrated_goal_guidance=goal_integral.detach(),
+            integrated_safety_guidance=safety_integral.detach(),
+            component_semantics=(
+                "ODE-time integrals of the additive normalized goal and CBF "
+                "guidance fields evaluated along the guided latent path"
+            ),
+        )
     return z, trace, z_unguided
 
 
@@ -1096,13 +1114,37 @@ def kazuki_sfm_deploy(policy, episode, gamma, cfg=None, n_ped=20, T=180, reach=0
             guided_final_action = U_gen[seed_index, 0].detach().cpu().numpy().astype(np.float32)
             unguided_final_action = U_unguided[seed_index, 0].detach().cpu().numpy().astype(np.float32)
             net_guidance_action = guided_final_action - unguided_final_action
+            component_row = ode_diag[-1]
+            integrated_goal = component_row.pop("integrated_goal_guidance")
+            integrated_safety = component_row.pop("integrated_safety_guidance")
+            component_semantics = component_row.pop("component_semantics")
+            goal_guidance_action = (
+                integrated_goal[seed_index]
+                .reshape(H, 2)[0].detach().cpu().numpy().astype(np.float32)
+                * float(policy.u_max)
+            )
+            safety_guidance_action = (
+                integrated_safety[seed_index]
+                .reshape(H, 2)[0].detach().cpu().numpy().astype(np.float32)
+                * float(policy.u_max)
+            )
             guidance_diag = dict(
                 selected_generated_index=seed_index,
                 guided_final_action=guided_final_action,
                 unguided_final_action=unguided_final_action,
                 net_guidance_action=net_guidance_action,
                 net_guidance_norm=float(np.linalg.norm(net_guidance_action)),
-                semantics="guided final acceleration minus unguided final acceleration from the same latent sample")
+                goal_guidance_action=goal_guidance_action,
+                goal_guidance_norm=float(np.linalg.norm(goal_guidance_action)),
+                safety_guidance_action=safety_guidance_action,
+                safety_guidance_norm=float(np.linalg.norm(safety_guidance_action)),
+                component_semantics=component_semantics,
+                semantics=(
+                    "net: guided final acceleration minus unguided final "
+                    "acceleration from the same latent sample; goal/safety: "
+                    "separate integrated additive guidance components before "
+                    "MPPI refinement"
+                ))
             viz_controls = U_best.detach().clone()
             viz_controls[0] = torch.as_tensor(action, dtype=viz_controls.dtype, device=viz_controls.device)
             with torch.no_grad():

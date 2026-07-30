@@ -1,0 +1,720 @@
+"""Training-ready audit of same-latent Kazuki repair during B1 gathering.
+
+The collector keeps two deliberately separate stores:
+
+* ``executed_round.pt``: one exact full-H window per executed context, matching
+  the existing offline replay contract;
+* ``query_sidecar.pt``: every resolved base B=4 and repair B=4 query, retained
+  for audit only unless a later experiment explicitly opts into all-query
+  replay.
+
+No independent raw continuation and no privileged MPC proposal are used.
+"""
+from __future__ import annotations
+
+import argparse
+from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor
+import copy
+import os
+
+import numpy as np
+import torch
+
+import _paths  # noqa: F401
+import grid_policy_sfm as GPS
+import sfm_b1_cost as BC
+import sfm_b1_eval as BE
+import sfm_b1_expand as BX
+import sfm_b1_full_episode_audit as FA
+import sfm_b1_kazuki_repair as KR
+import sfm_b1_offline_store as OS
+import sfm_b1_rbf as BR
+import sfm_b1_store as BS
+import sfm_metrics2 as SM
+import sfm_scene as SS
+
+
+STATUS = "SFM_B1_KAZUKI_REPAIR_AUDIT_COMPLETE"
+DEFAULT_SCENARIOS = (250_001, 250_003)
+DEFAULT_GAMMAS = (0.1, 0.5, 1.0)
+DEFAULT_ELL = 0.24210826720721101
+DEFAULT_SAMPLE_SEED = 700_000
+DEFAULT_AUDIT_SEED = 20260730
+EXPECTED_CHECKPOINT_SHA256 = (
+    "1b5179c935d3eeff8824967d707d64cc9bab273949ee1f0e4f190172bab1b215"
+)
+
+
+def _query_row(
+    candidate_id, controls, x0, result, *, acquisition_step, sigma,
+    mode, source, parent_candidate_id=None,
+):
+    return dict(
+        candidate_id=int(candidate_id),
+        parent_candidate_id=(
+            None if parent_candidate_id is None else int(parent_candidate_id)
+        ),
+        controls=np.asarray(controls, np.float32),
+        x0=np.asarray(x0, np.float32),
+        result=result,
+        acquisition_step=int(acquisition_step),
+        sigma=float(sigma),
+        mode=str(mode),
+        source=str(source),
+    )
+
+
+def _add_sidecar_query(shard, context_id, row):
+    result = row["result"]
+    if not result.get("resolved"):
+        shard.add_error(
+            context_key=(
+                shard.contexts[int(context_id)]["scenario_id"],
+                shard.contexts[int(context_id)]["gamma"],
+                shard.contexts[int(context_id)]["step"],
+            ),
+            candidate_id=row["candidate_id"],
+            error=result.get("error"),
+        )
+        return None
+    query_id = shard.add_resolved_query(
+        context_id,
+        row["candidate_id"],
+        row["controls"],
+        row["sigma"],
+        result,
+        acquisition_step=row["acquisition_step"],
+        hp_margin=row.get("hp_margin"),
+        expert_cost=row.get("expert_cost"),
+        mode=row["mode"],
+    )
+    stored = shard.queries[int(query_id)]
+    stored.update(
+        x0=np.asarray(row["x0"], np.float32),
+        query_source=row["source"],
+        parent_candidate_id=row["parent_candidate_id"],
+        audit_only=True,
+        replay_default=False,
+    )
+    row["query_id"] = int(query_id)
+    return int(query_id)
+
+
+def _admissible(rows, selector, prepared, gamma):
+    return BC.select_admissible(
+        [row for row in rows if row["result"].get("resolved")],
+        selector=selector,
+        state=prepared["state"],
+        ped_xy=prepared["ped_xy"],
+        ped_vel=prepared["ped_vel"],
+        gamma=float(gamma),
+    )
+
+
+def _repair_trigger(replica, chosen):
+    current_trap = FA._trap(replica.states)
+    if current_trap:
+        return "trap_streak"
+    if chosen is None:
+        return "finite_B_NVP"
+    if KR.predicted_trap(replica.states, chosen["controls"][0]):
+        return "predicted_trap"
+    return None
+
+
+def collect(
+    checkpoint,
+    *,
+    scenarios=DEFAULT_SCENARIOS,
+    gammas=DEFAULT_GAMMAS,
+    scene_profile="double_density_velocity_ood",
+    selector="margin",
+    device="cuda",
+    verifier_workers=16,
+    sample_seed=DEFAULT_SAMPLE_SEED,
+    audit_seed=DEFAULT_AUDIT_SEED,
+    ell=DEFAULT_ELL,
+    T=180,
+    outdir,
+):
+    """Collect immutable traces plus executed/query shards for one frozen model."""
+    scenarios = tuple(map(int, scenarios))
+    gammas = tuple(map(float, gammas))
+    if not scenarios or len(set(scenarios)) != len(scenarios):
+        raise ValueError("scenarios must be distinct and nonempty")
+    if (
+        not gammas
+        or len(set(gammas)) != len(gammas)
+        or any(value not in tuple(map(float, SS.GAMMAS)) for value in gammas)
+    ):
+        raise ValueError(f"gammas must be a distinct subset of {SS.GAMMAS}")
+    if selector not in ("margin", "safemppi_cost"):
+        raise ValueError("selector must be margin or safemppi_cost")
+    if scene_profile != "double_density_velocity_ood":
+        raise ValueError("repair audit is pinned to double-shift OOD")
+    if int(T) != 180:
+        raise ValueError("repair audit is scientifically pinned to T=180")
+    checkpoint = os.path.abspath(checkpoint)
+    outdir = os.path.abspath(outdir)
+    if os.path.exists(outdir):
+        raise FileExistsError(f"refusing to reuse output directory: {outdir}")
+    checkpoint_sha = FA._sha256_file(checkpoint)
+    if checkpoint_sha != EXPECTED_CHECKPOINT_SHA256:
+        raise RuntimeError(
+            f"checkpoint SHA mismatch: expected {EXPECTED_CHECKPOINT_SHA256}, "
+            f"observed {checkpoint_sha}"
+        )
+
+    environment = SS.scene_profile(scene_profile)
+    policy, _ = GPS.load_sfm_policy(checkpoint, device=device)
+    policy.eval()
+    phi_policy = copy.deepcopy(policy).eval()
+    for parameter in phi_policy.parameters():
+        parameter.requires_grad_(False)
+    policy_hash = BX.policy_sha256(policy)
+    replicas = [
+        BX.Replica(
+            scenario,
+            gamma,
+            n_ped=environment["n_ped"],
+            ped_speed_range=tuple(environment["ped_speed_range"]),
+        )
+        for scenario in scenarios for gamma in gammas
+    ]
+    cfg = BX.ArmConfig(
+        name="diagnostic",
+        selector=selector,
+        alpha=0.0,
+        rounds=1,
+        K=16,
+        B=4,
+        T=int(T),
+        H=10,
+        W=2,
+        batch=128,
+        lr=1.0e-5,
+        ess_target=0.5,
+        nfe=8,
+        temp=1.0,
+        phi_s=0.9,
+        gp_lam=1.0e-2,
+        verifier_workers=int(verifier_workers),
+        smoke=False,
+        seed=int(audit_seed),
+        scene_profile=scene_profile,
+    ).validate()
+    gp = BR.RBFGP(float(ell), cfg.gp_lam)
+    beta, calibrated_ess = FA._calibrate_empty_gp_beta(
+        phi_policy, gp, replicas, cfg, device,
+    )
+
+    executed_shard = OS.ExecutedRoundShard(1)
+    query_shard = BS.RoundShard(1)
+    traces = []
+    counts = Counter()
+    sigma_pool, sigma_selected, ess_values = [], [], []
+    trap_streaks = defaultdict(int)
+
+    with ProcessPoolExecutor(max_workers=int(verifier_workers)) as executor:
+        for step in range(int(T)):
+            live = [replica for replica in replicas if replica.alive]
+            live, batch = BX._stack_prepared(live, device)
+            if not live:
+                break
+            with torch.no_grad():
+                windows, contexts, x0 = FA._keyed_windows(
+                    policy,
+                    live,
+                    batch,
+                    K=cfg.K,
+                    round_i=1,
+                    step=step,
+                    source="K",
+                    seed=int(sample_seed),
+                    nfe=cfg.nfe,
+                    temp=cfg.temp,
+                )
+                features = FA._features_from_x0(
+                    phi_policy, windows, contexts, x0, cfg.phi_s,
+                )
+            windows_np = windows.detach().cpu().numpy()
+            x0_np = x0.detach().cpu().numpy()
+
+            selected_by_context = []
+            acquisition_by_context = []
+            for context_index, replica in enumerate(live):
+                generator = torch.Generator(
+                    device=features.device,
+                ).manual_seed(FA._keyed_seed(
+                    int(audit_seed),
+                    1,
+                    replica.scenario_id,
+                    f"{replica.gamma:.8f}",
+                    step,
+                    "acquisition",
+                ))
+                selected, acquisition = gp.sequential_acquire(
+                    features[context_index],
+                    cfg.B,
+                    beta,
+                    generator=generator,
+                )
+                selected_by_context.append(list(map(int, selected)))
+                acquisition_by_context.append(acquisition)
+                sigma_pool.extend(map(
+                    float,
+                    gp.acquisition_sigma(features[context_index])
+                    .detach().cpu(),
+                ))
+                sigma_selected.extend(
+                    float(row["chosen_sigma"]) for row in acquisition
+                )
+                ess_values.extend(float(row["ess_norm"]) for row in acquisition)
+
+            base_tasks = []
+            for context_index, replica in enumerate(live):
+                prepared = replica.prepared
+                for candidate_id in selected_by_context[context_index]:
+                    base_tasks.append((
+                        context_index,
+                        candidate_id,
+                        prepared["state"],
+                        windows_np[context_index, candidate_id],
+                        prepared["ped_xy"],
+                        prepared["ped_vel"],
+                        replica.gamma,
+                    ))
+            base_results = list(executor.map(SM.verify_in_worker, base_tasks))
+            counts["base_verifier_queries"] += len(base_tasks)
+            base_by_context = defaultdict(dict)
+            for context_index, candidate_id, result in base_results:
+                base_by_context[int(context_index)][int(candidate_id)] = result
+
+            prepared_contexts = []
+            repair_indices = []
+            for context_index, replica in enumerate(live):
+                prepared = replica.prepared
+                prediction = SM.predict_pedestrians(
+                    prepared["ped_xy"], prepared["ped_vel"], cfg.H,
+                )
+                all_rows = []
+                for candidate_id in range(cfg.K):
+                    controls = windows_np[context_index, candidate_id]
+                    segment = SM.rollout_positions(prepared["state"], controls)
+                    all_rows.append(dict(
+                        candidate_id=int(candidate_id),
+                        controls=controls,
+                        x0=x0_np[context_index, candidate_id],
+                        segment=segment,
+                        mode=BE.classify_candidate(segment, prediction),
+                    ))
+                base_rows = []
+                for acquisition_step, candidate_id in enumerate(
+                    selected_by_context[context_index]
+                ):
+                    source = all_rows[candidate_id]
+                    base_rows.append(_query_row(
+                        candidate_id,
+                        source["controls"],
+                        source["x0"],
+                        base_by_context[context_index][candidate_id],
+                        acquisition_step=acquisition_step,
+                        sigma=acquisition_by_context[context_index][
+                            acquisition_step
+                        ]["chosen_sigma"],
+                        mode=source["mode"],
+                        source="base_B",
+                    ))
+                base_choice = _admissible(
+                    base_rows, selector, prepared, replica.gamma,
+                )
+                trigger = _repair_trigger(replica, base_choice)
+                prepared_contexts.append(dict(
+                    all_rows=all_rows,
+                    base_rows=base_rows,
+                    base_choice=base_choice,
+                    trigger=trigger,
+                    repair_rows=[],
+                    repair_diagnostics=None,
+                ))
+                if trigger is not None:
+                    repair_indices.append(context_index)
+
+            repair_tasks = []
+            for context_index in repair_indices:
+                replica = live[context_index]
+                selected = selected_by_context[context_index]
+                guided, diagnostics = KR.same_latent_guided_controls(
+                    policy,
+                    contexts[context_index],
+                    replica.prepared["state"],
+                    replica.prepared["ped_xy"],
+                    replica.prepared["ped_vel"],
+                    replica.gamma,
+                    x0[context_index, selected],
+                    nfe=cfg.nfe,
+                    collect_diagnostics=True,
+                )
+                guided_np = guided.detach().cpu().numpy()
+                prepared_contexts[context_index][
+                    "repair_diagnostics"
+                ] = diagnostics
+                for acquisition_step, (candidate_id, controls) in enumerate(
+                    zip(selected, guided_np)
+                ):
+                    repair_id = cfg.K + int(candidate_id)
+                    repair_tasks.append((
+                        context_index,
+                        repair_id,
+                        replica.prepared["state"],
+                        controls,
+                        replica.prepared["ped_xy"],
+                        replica.prepared["ped_vel"],
+                        replica.gamma,
+                    ))
+                    prepared_contexts[context_index]["repair_rows"].append(
+                        dict(
+                            repair_id=repair_id,
+                            parent_candidate_id=int(candidate_id),
+                            acquisition_step=int(acquisition_step),
+                            controls=controls,
+                        )
+                    )
+            repair_results = list(executor.map(SM.verify_in_worker, repair_tasks))
+            counts["repair_verifier_queries"] += len(repair_tasks)
+            repair_result_lookup = {
+                (int(context_index), int(candidate_id)): result
+                for context_index, candidate_id, result in repair_results
+            }
+
+            for context_index, replica in enumerate(live):
+                prepared = replica.prepared
+                values = prepared_contexts[context_index]
+                sidecar_context_id = query_shard.add_context(
+                    scenario_id=replica.scenario_id,
+                    gamma=replica.gamma,
+                    step=step,
+                    state=prepared["state"],
+                    hp10=prepared["hp10"].numpy(),
+                    low5=prepared["low"].numpy(),
+                    hist=prepared["hist"].numpy(),
+                    ped_xy=prepared["ped_xy"],
+                    ped_vel=prepared["ped_vel"],
+                )
+                for row in values["base_rows"]:
+                    _add_sidecar_query(query_shard, sidecar_context_id, row)
+                    counts[f"base_{FA._result_label(row['result'])}"] += 1
+
+                repair_rows = []
+                for repair in values["repair_rows"]:
+                    parent_id = int(repair["parent_candidate_id"])
+                    source = values["all_rows"][parent_id]
+                    repair_id = int(repair["repair_id"])
+                    row = _query_row(
+                        repair_id,
+                        repair["controls"],
+                        source["x0"],
+                        repair_result_lookup[(context_index, repair_id)],
+                        acquisition_step=repair["acquisition_step"],
+                        sigma=values["base_rows"][
+                            repair["acquisition_step"]
+                        ]["sigma"],
+                        mode=BE.classify_candidate(
+                            SM.rollout_positions(
+                                prepared["state"], repair["controls"],
+                            ),
+                            SM.predict_pedestrians(
+                                prepared["ped_xy"],
+                                prepared["ped_vel"],
+                                cfg.H,
+                            ),
+                        ),
+                        source="kazuki_guided_B",
+                        parent_candidate_id=parent_id,
+                    )
+                    repair_rows.append(row)
+                    _add_sidecar_query(query_shard, sidecar_context_id, row)
+                    counts[f"repair_{FA._result_label(row['result'])}"] += 1
+                values["repair_rows"] = repair_rows
+                repaired_choice = (
+                    _admissible(
+                        repair_rows, selector, prepared, replica.gamma,
+                    )
+                    if values["trigger"] is not None else None
+                )
+                for row in repair_rows:
+                    if row.get("query_id") is None:
+                        continue
+                    stored = query_shard.queries[int(row["query_id"])]
+                    if "hp_margin" in row:
+                        stored["hp_margin"] = float(row["hp_margin"])
+                    if "expert_cost" in row:
+                        stored["expert_cost"] = float(row["expert_cost"])
+                chosen = (
+                    repaired_choice
+                    if values["trigger"] is not None else values["base_choice"]
+                )
+
+                trace = dict(
+                    round=1,
+                    step=int(step),
+                    scenario_id=int(replica.scenario_id),
+                    gamma=float(replica.gamma),
+                    state=prepared["state"].copy(),
+                    next_state=prepared["state"].copy(),
+                    ped_xy=prepared["ped_xy"].copy(),
+                    ped_vel=prepared["ped_vel"].copy(),
+                    all_K=values["all_rows"],
+                    selected_ids=selected_by_context[context_index],
+                    query_rows=values["base_rows"],
+                    guided_query_rows=repair_rows,
+                    acquisition=acquisition_by_context[context_index],
+                    repair_trigger=values["trigger"],
+                    repair_diagnostics=values["repair_diagnostics"],
+                    repair_selected_id=None,
+                    executed_id=None,
+                    executed_controls=None,
+                    executed_x0=None,
+                    executed_result=None,
+                    execution_source=None,
+                    trap_streak_before=int(trap_streaks[
+                        (replica.scenario_id, replica.gamma)
+                    ]),
+                    trap_event=False,
+                    trap_fail_closed=False,
+                    negative_reasons=[],
+                )
+                if chosen is None:
+                    replica.alive = False
+                    replica.status = "repair_nvp"
+                    trace["negative_reasons"].append("repair_no_admissible_B")
+                    counts["repair_fail_closed"] += 1
+                    traces.append(trace)
+                    continue
+
+                is_repair = values["trigger"] is not None
+                selected_x0 = np.asarray(chosen["x0"], np.float32)
+                controls = np.asarray(chosen["controls"], np.float32)
+                result = chosen["result"]
+                if (
+                    trap_streaks[(replica.scenario_id, replica.gamma)]
+                    >= KR.TRAP_PATIENCE - 1
+                    and KR.predicted_trap(replica.states, controls[0])
+                ):
+                    replica.alive = False
+                    replica.status = "trap_fail_closed"
+                    trace.update(
+                        trap_fail_closed=True,
+                        negative_reasons=["predicted_third_consecutive_trap"],
+                    )
+                    counts["trap_fail_closed"] += 1
+                    traces.append(trace)
+                    continue
+
+                executed_context_id = executed_shard.add_context(
+                    scenario_id=replica.scenario_id,
+                    gamma=replica.gamma,
+                    step=step,
+                    state=prepared["state"],
+                    hp10=prepared["hp10"].numpy(),
+                    low5=prepared["low"].numpy(),
+                    hist=prepared["hist"].numpy(),
+                    ped_xy=prepared["ped_xy"],
+                    ped_vel=prepared["ped_vel"],
+                )
+                execution_source = (
+                    f"kazuki_repair_{values['trigger']}_{selector}"
+                    if is_repair else f"verified_{selector}"
+                )
+                window_id = executed_shard.add_executed_window(
+                    executed_context_id,
+                    controls,
+                    selected_x0,
+                    result,
+                    execution_source=execution_source,
+                    nvp_context=values["trigger"] == "finite_B_NVP",
+                    candidate_id=chosen["candidate_id"],
+                    acquisition_step=chosen["acquisition_step"],
+                    sigma=chosen["sigma"],
+                    hp_margin=chosen["hp_margin"],
+                    mode=chosen["mode"],
+                )
+                sidecar_query_id = chosen.get("query_id")
+                if sidecar_query_id is not None:
+                    query_shard.mark_executed(
+                        sidecar_query_id,
+                        hp_margin=chosen["hp_margin"],
+                        expert_cost=chosen.get("expert_cost"),
+                    )
+
+                BX._advance(replica, controls[0])
+                trap_event = FA._trap(replica.states)
+                trap_key = (replica.scenario_id, replica.gamma)
+                streak, stop = KR.next_trap_streak(
+                    trap_streaks[trap_key], trap_event,
+                )
+                trap_streaks[trap_key] = streak
+                collision, success, clearance = FA._post_action_terminal(replica)
+                if stop and replica.alive:
+                    replica.alive = False
+                    replica.status = "trap_fail_closed"
+                    counts["trap_fail_closed"] += 1
+                stored = executed_shard.windows[int(window_id)]
+                stored.update(
+                    trap_event=bool(trap_event),
+                    trap_streak=int(streak),
+                    collision_after_action=bool(collision),
+                    success_after_action=bool(success),
+                )
+                trace.update(
+                    next_state=replica.state.copy(),
+                    repair_selected_id=(
+                        int(chosen["candidate_id"]) if is_repair else None
+                    ),
+                    executed_id=int(chosen["candidate_id"]),
+                    executed_controls=controls,
+                    executed_x0=selected_x0,
+                    executed_result=result,
+                    executed_label=FA._result_label(result),
+                    execution_source=execution_source,
+                    window_id=int(window_id),
+                    trap_event=bool(trap_event),
+                    trap_streak_after=int(streak),
+                    trap_fail_closed=bool(stop),
+                    collision_after_action=bool(collision),
+                    success_after_action=bool(success),
+                    clearance_after_action=float(clearance),
+                )
+                counts["executed_windows"] += 1
+                counts[f"source_{execution_source}"] += 1
+                traces.append(trace)
+
+    for replica in replicas:
+        if replica.alive:
+            replica.alive = False
+            replica.status = "timeout"
+    if BX.policy_sha256(policy) != policy_hash:
+        raise RuntimeError("policy changed during frozen repair collection")
+    executed_summary = executed_shard.validate()
+    query_summary = query_shard.validate()
+    if int(executed_summary["Dminus"]) != 0:
+        raise RuntimeError("repair collector executed a verifier-negative window")
+    if int(counts["base_verifier_queries"]) != len(query_shard.contexts) * cfg.B:
+        raise RuntimeError("base B=4 accounting mismatch")
+
+    os.makedirs(outdir)
+    executed_path = os.path.join(outdir, "executed_round.pt")
+    query_path = os.path.join(outdir, "query_sidecar.pt")
+    executed_manifest = executed_shard.save(executed_path)
+    query_manifest = query_shard.save(query_path)
+    outcomes = [dict(
+        scenario_id=int(replica.scenario_id),
+        gamma=float(replica.gamma),
+        status=str(replica.status),
+        success=replica.status == "success",
+        collision=replica.status == "collision",
+        timeout=replica.status == "timeout",
+        repair_nvp=replica.status == "repair_nvp",
+        trap_fail_closed=replica.status == "trap_fail_closed",
+        steps=len(replica.controls),
+        minimum_clearance=float(replica.minimum_clearance),
+    ) for replica in replicas]
+    bundle = dict(
+        version=1,
+        status=STATUS,
+        source=FA._source(),
+        checkpoint=checkpoint,
+        checkpoint_sha256=checkpoint_sha,
+        scene_profile=scene_profile,
+        environment=environment,
+        scenarios=list(scenarios),
+        gammas=list(gammas),
+        selector=selector,
+        protocol=dict(
+            K=cfg.K,
+            B=cfg.B,
+            H=cfg.H,
+            T=int(T),
+            ell=float(ell),
+            beta=float(beta),
+            calibrated_ess_over_K=float(calibrated_ess),
+            realized_ess_over_K=float(np.mean(ess_values)),
+            acquisition=BR.acquisition_diagnostics(
+                sigma_pool, sigma_selected,
+            ),
+            repair=KR.manifest(),
+            D_exec=(
+                "one exact-positive executed H10 window per executed context"
+            ),
+            D_query=(
+                "all resolved base and repair B labels; audit-only by default"
+            ),
+            GP_population="unchanged: prior executed D+ only",
+        ),
+        sample_seed=int(sample_seed),
+        audit_seed=int(audit_seed),
+        counts=dict(counts),
+        outcomes=outcomes,
+        executed_shard=executed_manifest,
+        query_sidecar=query_manifest,
+        traces=traces,
+    )
+    trace_path = os.path.join(outdir, "repair_trace.pt")
+    FA._save_torch(trace_path, bundle)
+    marker = dict(
+        status=STATUS,
+        source=bundle["source"],
+        trace_path=os.path.abspath(trace_path),
+        trace_sha256=FA._sha256_file(trace_path),
+        checkpoint_sha256=checkpoint_sha,
+        selector=selector,
+        counts=dict(counts),
+        outcomes=outcomes,
+        executed_shard=executed_manifest,
+        query_sidecar=query_manifest,
+    )
+    FA._write_json(os.path.join(outdir, "COMPLETE.json"), marker)
+    return trace_path
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--outdir", required=True)
+    parser.add_argument(
+        "--scenarios", type=int, nargs="+", default=DEFAULT_SCENARIOS,
+    )
+    parser.add_argument(
+        "--gammas", type=float, nargs="+", default=DEFAULT_GAMMAS,
+    )
+    parser.add_argument(
+        "--scene-profile", default="double_density_velocity_ood",
+    )
+    parser.add_argument(
+        "--selector", choices=("margin", "safemppi_cost"), default="margin",
+    )
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--verifier-workers", type=int, default=16)
+    parser.add_argument("--sample-seed", type=int, default=DEFAULT_SAMPLE_SEED)
+    parser.add_argument("--audit-seed", type=int, default=DEFAULT_AUDIT_SEED)
+    parser.add_argument("--ell", type=float, default=DEFAULT_ELL)
+    args = parser.parse_args(argv)
+    collect(
+        args.checkpoint,
+        scenarios=args.scenarios,
+        gammas=args.gammas,
+        scene_profile=args.scene_profile,
+        selector=args.selector,
+        device=args.device,
+        verifier_workers=args.verifier_workers,
+        sample_seed=args.sample_seed,
+        audit_seed=args.audit_seed,
+        ell=args.ell,
+        T=180,
+        outdir=args.outdir,
+    )
+
+
+if __name__ == "__main__":
+    main()
