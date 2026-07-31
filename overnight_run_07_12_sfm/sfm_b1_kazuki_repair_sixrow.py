@@ -150,6 +150,7 @@ def collect(
     sample_seed=700_000,
     audit_seed=20260730,
     ell=RA.DEFAULT_ELL,
+    neutral_continuation=False,
     T=180,
 ):
     episodes = tuple(map(int, episodes))
@@ -198,6 +199,7 @@ def collect(
         sample_seed=sample_seed,
         audit_seed=audit_seed,
         ell=ell,
+        neutral_continuation=neutral_continuation,
         T=T,
         outdir=repair_dir,
     )
@@ -215,6 +217,7 @@ def collect(
         scene_profile=scene_profile,
         environment=environment,
         selector=selector,
+        neutral_continuation=bool(neutral_continuation),
         sample_seed=int(sample_seed),
         audit_seed=int(audit_seed),
         raw=raw,
@@ -231,7 +234,8 @@ def collect(
             ),
             repair=(
                 "K=16, RBF B=4; same-latent locked guidance only on NVP/trap; "
-                "guided B is reverified; no raw fallback or privileged MPC"
+                "guided B is reverified; optional exact-negative neutral "
+                "continuation; no raw fallback or privileged MPC"
             ),
         ),
     )
@@ -246,6 +250,7 @@ def collect(
         episodes=list(episodes),
         gammas=list(gammas),
         selector=selector,
+        neutral_continuation=bool(neutral_continuation),
         repair_complete=os.path.join(repair_dir, "COMPLETE.json"),
     ))
     return trace_path
@@ -394,12 +399,15 @@ def _draw_repair(axis, rows, step):
             linewidth=2.0 if selected else 1.15,
             alpha=.98 if selected else .76,
         )
-    if trace.get("executed_result") is not None:
+    if (
+        trace.get("executed_result") is not None
+        and int(trace["executed_result"].get("y", 0)) == 1
+    ):
         audit = DV.checked_verifier_levels(
             trace, dict(result=trace["executed_result"]), H=10,
         )
         DV._draw_verifier_geometry(axis, audit)
-    else:
+    elif trace.get("executed_result") is None:
         position = np.asarray(trace["state"], float)[:2]
         axis.plot(
             position[0], position[1],
@@ -460,7 +468,11 @@ def _side_text(
             "cyan=goal · magenta=safety",
         ),
         (
-            f"Active B4 repair · {bundle['selector']}",
+            (
+                f"Active B4 neutral repair · {bundle['selector']}"
+                if bundle.get("neutral_continuation")
+                else f"Active B4 repair · {bundle['selector']}"
+            ),
             "base B=green · guided B=magenta",
             "no independent raw / privileged MPC",
         ),
@@ -557,12 +569,19 @@ def draw_frame(bundle, frame_index, frames, *, layout=None):
     return layout
 
 
-def _legend():
+def _legend(neutral_continuation=False):
     return [
         Line2D([], [], color=TRUE_BLUE, lw=1.4, label=r"base executed exact-positive $D^+$"),
         Line2D([], [], color="#111111", lw=1.2, label="executed first-action path"),
         Line2D([], [], color=GREEN, lw=1.1, label="base RBF B=4 query"),
-        Line2D([], [], color=MAGENTA, lw=1.5, label="guided B repair / repaired executed branch"),
+        Line2D(
+            [], [], color=MAGENTA, lw=1.5,
+            label=(
+                "guided B repair / neutral executed branch"
+                if neutral_continuation
+                else "guided B repair / repaired executed branch"
+            ),
+        ),
         Line2D([], [], color=TRUE_RED, marker="x", lw=0, label="exact rejected endpoint"),
         Line2D([], [], color=GREEN, lw=.7, label="executed verifier levels h=1..10"),
         Line2D([], [], color=CYAN, lw=2.2, label=r"Kazuki integrated $\nabla$ goal"),
@@ -584,7 +603,7 @@ def render(trace_path, output_dir, *, fps=5, frame_stride=2, dpi=105):
     layout = _layout(bundle)
     figure = layout[0]
     figure.legend(
-        handles=_legend(),
+        handles=_legend(bool(bundle.get("neutral_continuation"))),
         loc="lower right",
         bbox_to_anchor=(.985, .012),
         frameon=False,
@@ -626,6 +645,7 @@ def render(trace_path, output_dir, *, fps=5, frame_stride=2, dpi=105):
         episodes=list(map(int, bundle["episodes"])),
         gammas=list(map(float, bundle["gammas"])),
         selector=bundle["selector"],
+        neutral_continuation=bool(bundle.get("neutral_continuation")),
     )
     _write_json(os.path.join(output_dir, "RENDER_COMPLETE.json"), report)
     return report
@@ -654,6 +674,9 @@ def main(argv=None):
     collect_parser.add_argument("--sample-seed", type=int, default=700_000)
     collect_parser.add_argument("--audit-seed", type=int, default=20260730)
     collect_parser.add_argument("--ell", type=float, default=RA.DEFAULT_ELL)
+    collect_parser.add_argument(
+        "--neutral-continuation", action="store_true",
+    )
 
     render_parser = subparsers.add_parser("render")
     render_parser.add_argument("--trace", required=True)
@@ -675,6 +698,7 @@ def main(argv=None):
             sample_seed=args.sample_seed,
             audit_seed=args.audit_seed,
             ell=args.ell,
+            neutral_continuation=args.neutral_continuation,
             T=180,
         )
     else:

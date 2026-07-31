@@ -175,3 +175,109 @@ def test_manifest_excludes_privileged_and_independent_fallbacks():
     assert "no privileged MPC" in manifest["exclusions"]
     assert "no independent raw fallback" in manifest["exclusions"]
     assert SS.DT > 0
+
+
+def _negative_rows():
+    rows = []
+    for candidate_id in range(4):
+        rows.append(dict(
+            candidate_id=16 + candidate_id,
+            parent_candidate_id=candidate_id,
+            acquisition_step=candidate_id,
+            controls=np.full((10, 2), candidate_id, np.float32),
+            x0=np.full(20, candidate_id, np.float32),
+            sigma=0.1 + candidate_id,
+            mode="test",
+            query_id=candidate_id,
+            result=dict(
+                resolved=True,
+                y=0,
+                full_h=True,
+                terminal_step=10,
+                taskspace=True,
+                collision_free=True,
+                certificate=False,
+                diagnostics={},
+            ),
+        ))
+    return rows
+
+
+def _prepared():
+    return dict(
+        state=np.zeros(4, np.float32),
+        hp10=torch.zeros(10, 16, 12),
+        low=torch.zeros(5),
+        hist=torch.zeros(16, 2),
+        ped_xy=np.zeros((1, 2), np.float32),
+        ped_vel=np.zeros((1, 2), np.float32),
+    )
+
+
+def test_neutral_margin_ranks_all_four_negatives_without_relabeling(
+    monkeypatch,
+):
+    rows = _negative_rows()
+    margins = iter((0.1, 0.7, 0.7, -0.2))
+    monkeypatch.setattr(
+        A.BC,
+        "nominal_hp_margin",
+        lambda *args: (next(margins), 1.0, 1.0),
+    )
+    chosen = A._select_neutral(rows, "margin", _prepared(), 0.5)
+    assert chosen["candidate_id"] == 17
+    assert all(row["result"]["y"] == 0 for row in rows)
+
+
+def test_neutral_cost_ranks_all_four_negatives(monkeypatch):
+    rows = _negative_rows()
+    monkeypatch.setattr(
+        A.BC,
+        "nominal_hp_margin",
+        lambda *args: (0.2, 1.0, 1.0),
+    )
+    monkeypatch.setattr(
+        A.BC,
+        "safemppi_proposal_cost",
+        lambda *args, **kwargs: torch.tensor([3.0, 1.0, 1.0, 2.0]),
+    )
+    chosen = A._select_neutral(
+        rows, "safemppi_cost", _prepared(), 0.5,
+    )
+    assert chosen["candidate_id"] == 17
+    assert chosen["expert_cost"] == 1.0
+
+
+def test_neutral_selection_requires_four_exact_full_h_negatives():
+    rows = _negative_rows()
+    rows[0]["result"]["resolved"] = False
+    assert A._select_neutral(rows, "margin", _prepared(), 0.5) is None
+    rows = _negative_rows()
+    rows[0]["result"]["y"] = 1
+    assert A._select_neutral(rows, "margin", _prepared(), 0.5) is None
+
+
+def test_neutral_record_is_separate_and_nontraining(tmp_path):
+    rows = _negative_rows()
+    for row in rows:
+        row["hp_margin"] = 0.2
+    replica = SimpleNamespace(scenario_id=250001, gamma=0.5)
+    record = A._neutral_record(
+        0,
+        replica,
+        _prepared(),
+        rows[0],
+        step=9,
+        selector="margin",
+        repair_trigger="finite_B_NVP",
+    )
+    assert record["semantic_label"] == "neutral"
+    assert record["verifier_y"] == 0
+    assert not record["train_eligible"]
+    assert not record["replay_default"]
+    assert not record["gp_eligible"]
+    path = tmp_path / "neutral_round.pt"
+    marker = A._save_neutral_records(path, [record])
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    assert marker["D0"] == 1
+    assert payload["records"][0]["population"] == "D0"

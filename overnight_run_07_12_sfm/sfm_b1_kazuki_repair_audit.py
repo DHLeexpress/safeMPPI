@@ -1,12 +1,15 @@
 """Training-ready audit of same-latent Kazuki repair during B1 gathering.
 
-The collector keeps two deliberately separate stores:
+The collector keeps three deliberately separate stores:
 
 * ``executed_round.pt``: one exact full-H window per executed context, matching
   the existing offline replay contract;
 * ``query_sidecar.pt``: every resolved base B=4 and repair B=4 query, retained
   for audit only unless a later experiment explicitly opts into all-query
   replay.
+* ``neutral_round.pt``: opt-in guided verifier-negative executions, isolated
+  from training D+/D-, GP, and replay while remaining exact-negative in the
+  audit query sidecar.
 
 No independent raw continuation and no privileged MPC proposal are used.
 """
@@ -112,6 +115,152 @@ def _admissible(rows, selector, prepared, gamma):
     )
 
 
+def _all_full_h_negative(rows, expected=4):
+    return len(rows) == int(expected) and all(
+        row["result"].get("resolved")
+        and int(row["result"].get("y", -1)) == 0
+        and bool(row["result"].get("full_h"))
+        and int(row["result"].get("terminal_step", -1)) == 10
+        for row in rows
+    )
+
+
+def _select_neutral(rows, selector, prepared, gamma):
+    """Rank four exact-negative guided rows without relabeling them."""
+    if not _all_full_h_negative(rows):
+        return None
+    for row in rows:
+        margin, hp_old, hp_new = BC.nominal_hp_margin(
+            prepared["state"],
+            row["controls"][0],
+            prepared["ped_xy"],
+            gamma,
+        )
+        row["hp_margin"] = float(margin)
+        row["hp_old"] = float(hp_old)
+        row["hp_new"] = float(hp_new)
+    if selector == "margin":
+        return max(
+            rows,
+            key=lambda row: (
+                row["hp_margin"],
+                -int(row["candidate_id"]),
+            ),
+        )
+    if selector != "safemppi_cost":
+        raise ValueError(f"unknown neutral selector: {selector}")
+    controls = torch.as_tensor(
+        np.stack([row["controls"] for row in rows]),
+        dtype=torch.float32,
+    )
+    costs = BC.safemppi_proposal_cost(
+        prepared["state"],
+        controls,
+        SS.GOAL,
+        prepared["ped_xy"],
+        prepared["ped_vel"],
+    ).cpu().numpy()
+    for row, cost in zip(rows, costs):
+        row["expert_cost"] = float(cost)
+    return min(
+        rows,
+        key=lambda row: (
+            row["expert_cost"],
+            int(row["candidate_id"]),
+        ),
+    )
+
+
+def _neutral_record(
+    neutral_id,
+    replica,
+    prepared,
+    chosen,
+    *,
+    step,
+    selector,
+    repair_trigger,
+):
+    result = chosen["result"]
+    if not _all_full_h_negative([chosen], expected=1):
+        raise ValueError("neutral execution requires one exact full-H negative")
+    controls = np.asarray(chosen["controls"], np.float32)
+    x0 = np.asarray(chosen["x0"], np.float32)
+    if tuple(controls.shape) != (10, 2) or not np.isfinite(controls).all():
+        raise ValueError("neutral controls must be finite [10,2]")
+    if tuple(x0.shape) != (20,) or not np.isfinite(x0).all():
+        raise ValueError("neutral x0 must be finite [20]")
+    return dict(
+        neutral_id=int(neutral_id),
+        population="D0",
+        semantic_label="neutral",
+        round=1,
+        scenario_id=int(replica.scenario_id),
+        gamma=float(replica.gamma),
+        step=int(step),
+        state=np.asarray(prepared["state"], np.float32),
+        hp10=np.asarray(prepared["hp10"].numpy(), np.float32),
+        low5=np.asarray(prepared["low"].numpy(), np.float32),
+        hist=np.asarray(prepared["hist"].numpy(), np.float32),
+        ped_xy=np.asarray(prepared["ped_xy"], np.float32),
+        ped_vel=np.asarray(prepared["ped_vel"], np.float32),
+        controls=controls,
+        x0=x0,
+        verifier_result=result,
+        verifier_y=int(result["y"]),
+        candidate_id=int(chosen["candidate_id"]),
+        parent_candidate_id=chosen.get("parent_candidate_id"),
+        query_id=chosen.get("query_id"),
+        sigma=float(chosen["sigma"]),
+        hp_margin=float(chosen["hp_margin"]),
+        expert_cost=(
+            None
+            if chosen.get("expert_cost") is None
+            else float(chosen["expert_cost"])
+        ),
+        selector=str(selector),
+        repair_trigger=str(repair_trigger),
+        execution_source=(
+            f"kazuki_repair_neutral_{repair_trigger}_{selector}"
+        ),
+        train_eligible=False,
+        replay_default=False,
+        gp_eligible=False,
+    )
+
+
+def _save_neutral_records(path, records):
+    path = os.fspath(path)
+    for expected, record in enumerate(records):
+        if int(record["neutral_id"]) != expected:
+            raise AssertionError("neutral IDs are not dense")
+        if (
+            record["semantic_label"] != "neutral"
+            or record["population"] != "D0"
+            or record["train_eligible"]
+            or record["replay_default"]
+            or record["gp_eligible"]
+            or int(record["verifier_y"]) != 0
+        ):
+            raise AssertionError("invalid neutral execution record")
+    payload = dict(
+        version=1,
+        status="SFM_B1_NEUTRAL_ROUND_COMPLETE",
+        round=1,
+        records=records,
+        summary=dict(D0=len(records), train_eligible=0, gp_eligible=0),
+    )
+    FA._save_torch(path, payload)
+    marker = dict(
+        status=payload["status"],
+        file=os.path.abspath(path),
+        sha256=FA._sha256_file(path),
+        **payload["summary"],
+    )
+    FA._write_json(path + ".COMPLETE.json", marker)
+    return marker
+
+
 def _repair_trigger(replica, chosen):
     current_trap = FA._trap(replica.states)
     if current_trap:
@@ -135,6 +284,7 @@ def collect(
     sample_seed=DEFAULT_SAMPLE_SEED,
     audit_seed=DEFAULT_AUDIT_SEED,
     ell=DEFAULT_ELL,
+    neutral_continuation=False,
     T=180,
     outdir,
 ):
@@ -211,6 +361,7 @@ def collect(
 
     executed_shard = OS.ExecutedRoundShard(1)
     query_shard = BS.RoundShard(1)
+    neutral_records = []
     traces = []
     counts = Counter()
     sigma_pool, sigma_selected, ess_values = [], [], []
@@ -443,6 +594,18 @@ def collect(
                     )
                     if values["trigger"] is not None else None
                 )
+                neutral_choice = (
+                    _select_neutral(
+                        repair_rows, selector, prepared, replica.gamma,
+                    )
+                    if (
+                        bool(neutral_continuation)
+                        and values["trigger"] is not None
+                        and repaired_choice is None
+                        and _all_full_h_negative(repair_rows)
+                    )
+                    else None
+                )
                 for row in repair_rows:
                     if row.get("query_id") is None:
                         continue
@@ -452,7 +615,7 @@ def collect(
                     if "expert_cost" in row:
                         stored["expert_cost"] = float(row["expert_cost"])
                 chosen = (
-                    repaired_choice
+                    repaired_choice or neutral_choice
                     if values["trigger"] is not None else values["base_choice"]
                 )
 
@@ -473,6 +636,8 @@ def collect(
                     repair_trigger=values["trigger"],
                     repair_diagnostics=values["repair_diagnostics"],
                     repair_selected_id=None,
+                    neutral_execution=False,
+                    neutral_id=None,
                     executed_id=None,
                     executed_controls=None,
                     executed_x0=None,
@@ -494,6 +659,9 @@ def collect(
                     continue
 
                 is_repair = values["trigger"] is not None
+                is_neutral = (
+                    neutral_choice is not None and chosen is neutral_choice
+                )
                 selected_x0 = np.asarray(chosen["x0"], np.float32)
                 controls = np.asarray(chosen["controls"], np.float32)
                 result = chosen["result"]
@@ -512,40 +680,72 @@ def collect(
                     traces.append(trace)
                     continue
 
-                executed_context_id = executed_shard.add_context(
-                    scenario_id=replica.scenario_id,
-                    gamma=replica.gamma,
-                    step=step,
-                    state=prepared["state"],
-                    hp10=prepared["hp10"].numpy(),
-                    low5=prepared["low"].numpy(),
-                    hist=prepared["hist"].numpy(),
-                    ped_xy=prepared["ped_xy"],
-                    ped_vel=prepared["ped_vel"],
-                )
                 execution_source = (
-                    f"kazuki_repair_{values['trigger']}_{selector}"
-                    if is_repair else f"verified_{selector}"
+                    (
+                        f"kazuki_repair_neutral_"
+                        f"{values['trigger']}_{selector}"
+                    )
+                    if is_neutral
+                    else (
+                        f"kazuki_repair_{values['trigger']}_{selector}"
+                        if is_repair else f"verified_{selector}"
+                    )
                 )
-                window_id = executed_shard.add_executed_window(
-                    executed_context_id,
-                    controls,
-                    selected_x0,
-                    result,
-                    execution_source=execution_source,
-                    nvp_context=values["trigger"] == "finite_B_NVP",
-                    candidate_id=chosen["candidate_id"],
-                    acquisition_step=chosen["acquisition_step"],
-                    sigma=chosen["sigma"],
-                    hp_margin=chosen["hp_margin"],
-                    mode=chosen["mode"],
-                )
+                window_id = None
+                neutral_record = None
+                if is_neutral:
+                    neutral_record = _neutral_record(
+                        len(neutral_records),
+                        replica,
+                        prepared,
+                        chosen,
+                        step=step,
+                        selector=selector,
+                        repair_trigger=values["trigger"],
+                    )
+                    neutral_records.append(neutral_record)
+                else:
+                    executed_context_id = executed_shard.add_context(
+                        scenario_id=replica.scenario_id,
+                        gamma=replica.gamma,
+                        step=step,
+                        state=prepared["state"],
+                        hp10=prepared["hp10"].numpy(),
+                        low5=prepared["low"].numpy(),
+                        hist=prepared["hist"].numpy(),
+                        ped_xy=prepared["ped_xy"],
+                        ped_vel=prepared["ped_vel"],
+                    )
+                    window_id = executed_shard.add_executed_window(
+                        executed_context_id,
+                        controls,
+                        selected_x0,
+                        result,
+                        execution_source=execution_source,
+                        nvp_context=values["trigger"] == "finite_B_NVP",
+                        candidate_id=chosen["candidate_id"],
+                        acquisition_step=chosen["acquisition_step"],
+                        sigma=chosen["sigma"],
+                        hp_margin=chosen["hp_margin"],
+                        mode=chosen["mode"],
+                    )
                 sidecar_query_id = chosen.get("query_id")
                 if sidecar_query_id is not None:
                     query_shard.mark_executed(
                         sidecar_query_id,
                         hp_margin=chosen["hp_margin"],
                         expert_cost=chosen.get("expert_cost"),
+                    )
+                    query_stored = query_shard.queries[
+                        int(sidecar_query_id)
+                    ]
+                    query_stored["execution_role"] = (
+                        "neutral_continuation"
+                        if is_neutral else "verified_execution"
+                    )
+                    query_stored["neutral_id"] = (
+                        int(neutral_record["neutral_id"])
+                        if is_neutral else None
                     )
 
                 BX._advance(replica, controls[0])
@@ -560,25 +760,48 @@ def collect(
                     replica.alive = False
                     replica.status = "trap_fail_closed"
                     counts["trap_fail_closed"] += 1
-                stored = executed_shard.windows[int(window_id)]
-                stored.update(
-                    trap_event=bool(trap_event),
-                    trap_streak=int(streak),
-                    collision_after_action=bool(collision),
-                    success_after_action=bool(success),
-                )
+                if is_neutral:
+                    neutral_record.update(
+                        next_state=replica.state.copy(),
+                        trap_event=bool(trap_event),
+                        trap_streak=int(streak),
+                        collision_after_action=bool(collision),
+                        success_after_action=bool(success),
+                        clearance_after_action=float(clearance),
+                    )
+                    counts["neutral_executions"] += 1
+                else:
+                    stored = executed_shard.windows[int(window_id)]
+                    stored.update(
+                        trap_event=bool(trap_event),
+                        trap_streak=int(streak),
+                        collision_after_action=bool(collision),
+                        success_after_action=bool(success),
+                    )
+                    counts["executed_training_windows"] += 1
                 trace.update(
                     next_state=replica.state.copy(),
                     repair_selected_id=(
                         int(chosen["candidate_id"]) if is_repair else None
                     ),
+                    neutral_execution=bool(is_neutral),
+                    neutral_id=(
+                        int(neutral_record["neutral_id"])
+                        if is_neutral else None
+                    ),
                     executed_id=int(chosen["candidate_id"]),
                     executed_controls=controls,
                     executed_x0=selected_x0,
                     executed_result=result,
-                    executed_label=FA._result_label(result),
+                    executed_label=(
+                        "neutral"
+                        if is_neutral else FA._result_label(result)
+                    ),
+                    executed_verifier_label=FA._result_label(result),
                     execution_source=execution_source,
-                    window_id=int(window_id),
+                    window_id=(
+                        None if window_id is None else int(window_id)
+                    ),
                     trap_event=bool(trap_event),
                     trap_streak_after=int(streak),
                     trap_fail_closed=bool(stop),
@@ -600,14 +823,30 @@ def collect(
     query_summary = query_shard.validate()
     if int(executed_summary["Dminus"]) != 0:
         raise RuntimeError("repair collector executed a verifier-negative window")
+    if len(neutral_records) != int(counts["neutral_executions"]):
+        raise RuntimeError("neutral execution accounting mismatch")
+    if int(counts["executed_training_windows"]) != int(
+        executed_summary["D"]
+    ):
+        raise RuntimeError("executed training-window accounting mismatch")
+    if int(counts["executed_windows"]) != (
+        int(executed_summary["D"]) + len(neutral_records)
+    ):
+        raise RuntimeError("total executed-action accounting mismatch")
+    if not bool(neutral_continuation) and neutral_records:
+        raise RuntimeError("default fail-closed arm produced neutral records")
     if int(counts["base_verifier_queries"]) != len(query_shard.contexts) * cfg.B:
         raise RuntimeError("base B=4 accounting mismatch")
 
     os.makedirs(outdir)
     executed_path = os.path.join(outdir, "executed_round.pt")
     query_path = os.path.join(outdir, "query_sidecar.pt")
+    neutral_path = os.path.join(outdir, "neutral_round.pt")
     executed_manifest = executed_shard.save(executed_path)
     query_manifest = query_shard.save(query_path)
+    neutral_manifest = _save_neutral_records(
+        neutral_path, neutral_records,
+    )
     outcomes = [dict(
         scenario_id=int(replica.scenario_id),
         gamma=float(replica.gamma),
@@ -631,6 +870,7 @@ def collect(
         scenarios=list(scenarios),
         gammas=list(gammas),
         selector=selector,
+        neutral_continuation=bool(neutral_continuation),
         protocol=dict(
             K=cfg.K,
             B=cfg.B,
@@ -650,6 +890,12 @@ def collect(
             D_query=(
                 "all resolved base and repair B labels; audit-only by default"
             ),
+            D_neutral=(
+                "guided full-H verifier-negative actions actually executed "
+                "after an NVP/trap repair trigger; isolated from "
+                "training D+/D-/GP/replay and retained as exact-negative "
+                "in the audit query sidecar"
+            ),
             GP_population="unchanged: prior executed D+ only",
         ),
         sample_seed=int(sample_seed),
@@ -658,6 +904,7 @@ def collect(
         outcomes=outcomes,
         executed_shard=executed_manifest,
         query_sidecar=query_manifest,
+        neutral_shard=neutral_manifest,
         traces=traces,
     )
     trace_path = os.path.join(outdir, "repair_trace.pt")
@@ -669,10 +916,12 @@ def collect(
         trace_sha256=FA._sha256_file(trace_path),
         checkpoint_sha256=checkpoint_sha,
         selector=selector,
+        neutral_continuation=bool(neutral_continuation),
         counts=dict(counts),
         outcomes=outcomes,
         executed_shard=executed_manifest,
         query_sidecar=query_manifest,
+        neutral_shard=neutral_manifest,
     )
     FA._write_json(os.path.join(outdir, "COMPLETE.json"), marker)
     return trace_path
@@ -699,6 +948,7 @@ def main(argv=None):
     parser.add_argument("--sample-seed", type=int, default=DEFAULT_SAMPLE_SEED)
     parser.add_argument("--audit-seed", type=int, default=DEFAULT_AUDIT_SEED)
     parser.add_argument("--ell", type=float, default=DEFAULT_ELL)
+    parser.add_argument("--neutral-continuation", action="store_true")
     args = parser.parse_args(argv)
     collect(
         args.checkpoint,
@@ -711,6 +961,7 @@ def main(argv=None):
         sample_seed=args.sample_seed,
         audit_seed=args.audit_seed,
         ell=args.ell,
+        neutral_continuation=args.neutral_continuation,
         T=180,
         outdir=args.outdir,
     )
