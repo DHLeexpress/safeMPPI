@@ -77,6 +77,7 @@ class StudyConfig:
     gp_lambda: float = 1.0e-2
     ess_target: float = 0.5
     selector: str = "margin"
+    encoder_lr_ratio: float = 0.0
     alpha: float = 0.0
     scene_profile: str = "double_density_velocity_ood"
     sample_seed: int = 700_000
@@ -102,8 +103,10 @@ class StudyConfig:
             or int(self.T) != 180
         ):
             raise ValueError("K/B/H/T protocol changed")
-        if self.selector != "margin":
-            raise ValueError("this study is pinned to max-step-margin")
+        if self.selector not in ("margin", "progress_gated_margin"):
+            raise ValueError("unsupported neutral-study selector")
+        if float(self.encoder_lr_ratio) not in (0.0, 0.1):
+            raise ValueError("encoder_lr_ratio must be 0 (frozen) or 0.1")
         if float(self.alpha) != 0.0:
             raise ValueError("this study is pinned to alpha=0")
         if self.scene_profile != "double_density_velocity_ood":
@@ -237,6 +240,7 @@ def _population_update(
     encoder_before = BS.module_sha256(policy.enc_grid)
     expected = {_identity(holder, row) for holder, row in records}
     losses = []
+    encoder_gradient_norms = []
     exposure_hashes = []
     policy.train()
     for inner in range(int(inner_steps)):
@@ -255,12 +259,22 @@ def _population_update(
             raise RuntimeError(
                 f"{population} pass duplicated or omitted a sample"
             )
+        squared = torch.zeros((), dtype=torch.float64)
+        for parameter in policy.enc_grid.parameters():
+            if parameter.grad is not None:
+                squared += parameter.grad.detach().to(
+                    dtype=torch.float64,
+                ).square().sum().cpu()
+        encoder_gradient_norms.append(float(squared.sqrt()))
         optimizer.step()
         losses.append(float(loss))
         exposure_hashes.append(_sha256_jsonable(identities))
     policy.eval()
     encoder_after = BS.module_sha256(policy.enc_grid)
-    if encoder_after != encoder_before:
+    if (
+        not any(parameter.requires_grad for parameter in policy.enc_grid.parameters())
+        and encoder_after != encoder_before
+    ):
         raise RuntimeError("visual encoder changed during replay")
     return {
         "population": str(population),
@@ -271,9 +285,39 @@ def _population_update(
         "exact_once_per_inner_step": True,
         "exposure_identity_sha256": exposure_hashes,
         "losses": losses,
+        "encoder_gradient_norms": encoder_gradient_norms,
         "mass": _compact_mass(accounting),
         "encoder_sha_before": encoder_before,
         "encoder_sha_after": encoder_after,
+    }
+
+
+@torch.no_grad()
+def _encoder_probe(policy, records, *, device, limit=256):
+    """Return deterministic E_g tokens for a fixed record prefix."""
+    ordered = sorted(records, key=lambda item: _identity(*item))[:int(limit)]
+    if not ordered:
+        raise ValueError("encoder probe requires records")
+    grid, _, _, _ = BS._tensor_batch(ordered, device)
+    was_training = policy.training
+    policy.eval()
+    token = policy.enc_grid(grid.float()).detach().cpu()
+    policy.train(was_training)
+    return token
+
+
+def _encoder_probe_comparison(before, after):
+    before = torch.as_tensor(before, dtype=torch.float64).reshape(-1)
+    after = torch.as_tensor(after, dtype=torch.float64).reshape(-1)
+    if tuple(before.shape) != tuple(after.shape):
+        raise ValueError("encoder probe shapes changed")
+    cosine = float(torch.dot(before, after) / (
+        before.norm() * after.norm()
+    ).clamp_min(1.0e-12))
+    return {
+        "token_cosine": cosine,
+        "token_rms_change": float((after - before).square().mean().sqrt()),
+        "values": int(before.numel()),
     }
 
 
@@ -534,6 +578,7 @@ def _probe_checkpoint(
     device,
     executor,
     batch,
+    selector="margin",
 ):
     policy, _ = GPS.load_sfm_policy(checkpoint, device=device)
     policy.eval()
@@ -643,7 +688,7 @@ def _probe_checkpoint(
         ]
         selected = BC.select_admissible(
             B_orig,
-            selector="margin",
+            selector=selector,
             state=anchor["state"],
             ped_xy=anchor["ped_xy"],
             ped_vel=anchor["ped_vel"],
@@ -1098,12 +1143,16 @@ def _restore_optimizer(optimizer, path, parameters, *, resume_round, inner_steps
     if int(payload.get("round", -1)) != int(resume_round):
         raise RuntimeError("optimizer round mismatch")
     state = payload.get("optimizer", {})
-    groups = state.get("param_groups", ())
-    if len(groups) != 1 or float(groups[0].get("lr", -1)) != float(
-        optimizer.param_groups[0]["lr"]
+    groups = list(state.get("param_groups", ()))
+    if len(groups) != len(optimizer.param_groups) or any(
+        float(source.get("lr", -1)) != float(target["lr"])
+        for source, target in zip(groups, optimizer.param_groups)
     ):
         raise RuntimeError("optimizer hyperparameters changed")
-    ids = list(groups[0].get("params", ()))
+    ids = [
+        parameter_id
+        for group in groups for parameter_id in group.get("params", ())
+    ]
     if len(ids) != len(parameters) or len(state.get("state", {})) != len(parameters):
         raise RuntimeError("optimizer parameter support is incomplete")
     expected_step = 2 * int(resume_round) * int(inner_steps)
@@ -1136,6 +1185,8 @@ def run(args):
         batch=128,
         ell=float(args.ell),
         gp_cap=int(args.gp_cap),
+        selector=str(args.selector),
+        encoder_lr_ratio=float(args.encoder_lr_ratio),
         sample_seed=int(args.sample_seed),
         audit_seed=int(args.audit_seed),
         train_seed=int(args.train_seed),
@@ -1171,18 +1222,35 @@ def run(args):
     policy_checkpoint = resume["checkpoint"] if resume else checkpoint
     policy, _ = GPS.load_sfm_policy(policy_checkpoint, device=args.device)
     frozen = BS.configure_expansion_trainability(policy)
-    visual_sha = BS.module_sha256(policy.enc_grid)
-    if resume and visual_sha != resume["visual_encoder_sha256"]:
+    if cfg.encoder_lr_ratio > 0.0:
+        policy.enc_grid.requires_grad_(True)
+    initial_visual_sha = BS.module_sha256(policy.enc_grid)
+    if resume and initial_visual_sha != resume["visual_encoder_sha256"]:
         raise RuntimeError("resume visual encoder hash mismatch")
     trainable_names = [
         name for name, parameter in policy.named_parameters()
         if parameter.requires_grad
     ]
-    parameters = [
+    encoder_parameter_ids = {
+        id(parameter) for parameter in policy.enc_grid.parameters()
+    }
+    main_parameters = [
         parameter for parameter in policy.parameters()
         if parameter.requires_grad
+        and id(parameter) not in encoder_parameter_ids
     ]
-    optimizer = torch.optim.Adam(parameters, lr=cfg.lr)
+    encoder_parameters = [
+        parameter for parameter in policy.enc_grid.parameters()
+        if parameter.requires_grad
+    ]
+    parameters = [*main_parameters, *encoder_parameters]
+    optimizer_groups = [{"params": main_parameters, "lr": cfg.lr}]
+    if encoder_parameters:
+        optimizer_groups.append({
+            "params": encoder_parameters,
+            "lr": cfg.lr * cfg.encoder_lr_ratio,
+        })
+    optimizer = torch.optim.Adam(optimizer_groups)
     optimizer_restore = (
         _restore_optimizer(
             optimizer,
@@ -1242,7 +1310,7 @@ def run(args):
                 scenarios=scenarios,
                 gammas=tuple(map(float, SP.GAMMAS)),
                 scene_profile=cfg.scene_profile,
-                selector="margin",
+                selector=cfg.selector,
                 device=args.device,
                 verifier_workers=int(args.workers),
                 sample_seed=cfg.sample_seed,
@@ -1288,6 +1356,7 @@ def run(args):
                 device=args.device,
                 executor=probe_executor,
                 batch=cfg.batch,
+                selector=cfg.selector,
             )
             gradient = _gradient_diagnostics(
                 policy,
@@ -1313,6 +1382,12 @@ def run(args):
                     seed=cfg.train_seed + round_i,
                 ),
             }
+            encoder_probe_records = [
+                *positive_records, *neutral_records,
+            ]
+            encoder_probe_before = _encoder_probe(
+                policy, encoder_probe_records, device=args.device,
+            )
 
             before_parameters = R2._module_snapshot(policy)
             positive_update = _population_update(
@@ -1345,6 +1420,7 @@ def run(args):
                 device=args.device,
                 executor=probe_executor,
                 batch=cfg.batch,
+                selector=cfg.selector,
             )
             gradient_after_positive = _gradient_diagnostics(
                 policy,
@@ -1409,6 +1485,7 @@ def run(args):
                 device=args.device,
                 executor=probe_executor,
                 batch=cfg.batch,
+                selector=cfg.selector,
             )
             fixed_after_neutral = {
                 "Dplus": NS._fixed_loss(
@@ -1426,7 +1503,13 @@ def run(args):
                     seed=cfg.train_seed + round_i,
                 ),
             }
-            if BS.module_sha256(policy.enc_grid) != visual_sha:
+            encoder_probe_after = _encoder_probe(
+                policy, encoder_probe_records, device=args.device,
+            )
+            if (
+                cfg.encoder_lr_ratio == 0.0
+                and BS.module_sha256(policy.enc_grid) != initial_visual_sha
+            ):
                 raise RuntimeError("visual encoder changed")
 
             paired_positive = _probe_comparison(
@@ -1449,7 +1532,8 @@ def run(args):
                     "B_orig": "same original RBF-selected candidate IDs",
                     "verifier": SM.verifier_manifest(),
                     "selection": (
-                        "exact y=1 AND nominal-Hp gate, then max margin"
+                        "exact y=1 AND nominal-Hp gate, then "
+                        f"{cfg.selector}"
                     ),
                     "claim": (
                         "local generator correction/resubstitution; not "
@@ -1546,6 +1630,21 @@ def run(args):
                         before_parameters, after_neutral_parameters,
                     ),
                 },
+                "encoder_diagnostics": {
+                    **_encoder_probe_comparison(
+                        encoder_probe_before, encoder_probe_after,
+                    ),
+                    "relative_parameter_drift": (
+                        R2._module_relative_drift(
+                            before_parameters, after_neutral_parameters,
+                        )["E_g"]
+                    ),
+                    "lr": (
+                        0.0 if cfg.encoder_lr_ratio == 0.0
+                        else cfg.lr * cfg.encoder_lr_ratio
+                    ),
+                    "trainable": bool(cfg.encoder_lr_ratio > 0.0),
+                },
                 "paired_trigger_probe": {
                     "file": os.path.join(
                         round_dir, "PAIRED_TRIGGER_PROBE.json",
@@ -1630,7 +1729,20 @@ def run(args):
         "checkpoint_sha256": source_sha,
         "config": asdict(cfg),
         "frozen_parameters": frozen,
-        "visual_encoder_sha256": visual_sha,
+        "initial_visual_encoder_sha256": initial_visual_sha,
+        "visual_encoder_sha256": BS.module_sha256(policy.enc_grid),
+        "optimizer_groups": [
+            {
+                "name": "trunk_head_low_history",
+                "lr": cfg.lr,
+                "parameters": len(main_parameters),
+            },
+            *([{
+                "name": "enc_grid",
+                "lr": cfg.lr * cfg.encoder_lr_ratio,
+                "parameters": len(encoder_parameters),
+            }] if encoder_parameters else []),
+        ],
         "rounds": int(cfg.rounds),
         "rounds_run_this_invocation": len(history),
         "resume": resume,
@@ -1667,7 +1779,9 @@ def run(args):
             "fixed_trigger_probe": (
                 "causal local generator audit at remembered contexts"
             ),
-            "disjoint_M20": "small screening metric, not final confirmation",
+            f"disjoint_M{int(args.eval_M)}": (
+                "small screening metric, not final confirmation"
+            ),
             "D0": (
                 "teacher action with immutable exact y=0; never a "
                 "certificate-positive claim"
@@ -1710,6 +1824,15 @@ def build_parser():
     )
     parser.add_argument("--lr", type=float, default=DEFAULT_LR)
     parser.add_argument("--inner-steps", type=int, default=DEFAULT_INNER_STEPS)
+    parser.add_argument(
+        "--selector",
+        choices=("margin", "progress_gated_margin"),
+        default="margin",
+    )
+    parser.add_argument(
+        "--encoder-lr-ratio", type=float, default=0.0,
+        help="0 keeps E_g frozen; the only creative sanity value is 0.1",
+    )
     parser.add_argument("--ell", type=float, default=RA.DEFAULT_ELL)
     parser.add_argument("--gp-cap", type=int, default=DEFAULT_GP_CAP)
     parser.add_argument("--probe-per-gamma", type=int, default=4)
@@ -1725,8 +1848,8 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    if int(args.eval_M) != 20:
-        raise ValueError("sanity metric bank is pinned to M=20/gamma")
+    if int(args.eval_M) not in (10, 20):
+        raise ValueError("screening metric bank must be M=10 or M=20/gamma")
     run(args)
     print(os.path.join(
         args.output_root, "DELIVERY_COMPLETE.json",

@@ -148,6 +148,10 @@ def _select_neutral(rows, selector, prepared, gamma):
                 -int(row["candidate_id"]),
             ),
         )
+    if selector == "progress_gated_margin":
+        return BC.select_progress_gated_margin(
+            rows, state=prepared["state"],
+        )
     if selector != "safemppi_cost":
         raise ValueError(f"unknown neutral selector: {selector}")
     controls = torch.as_tensor(
@@ -459,8 +463,13 @@ def collect(
         or any(value not in tuple(map(float, SS.GAMMAS)) for value in gammas)
     ):
         raise ValueError(f"gammas must be a distinct subset of {SS.GAMMAS}")
-    if selector not in ("margin", "safemppi_cost"):
-        raise ValueError("selector must be margin or safemppi_cost")
+    if selector not in (
+        "margin", "progress_gated_margin", "safemppi_cost",
+    ):
+        raise ValueError(
+            "selector must be margin, progress_gated_margin, or "
+            "safemppi_cost"
+        )
     if scene_profile != "double_density_velocity_ood":
         raise ValueError("repair audit is pinned to double-shift OOD")
     if int(T) != 180:
@@ -1084,6 +1093,7 @@ def collect(
             beta=float(beta),
             calibrated_ess_over_K=float(calibrated_ess),
             realized_ess_over_K=float(np.mean(ess_values)),
+            gp_diagnostics=gp.diagnostics(),
             acquisition=BR.acquisition_diagnostics(
                 sigma_pool, sigma_selected,
             ),
@@ -1129,6 +1139,8 @@ def collect(
         neutral_shard=neutral_manifest,
         gp_buffer_ids=gp_ids,
         gp_selection=gp_selection,
+        gp_diagnostics=gp.diagnostics(),
+        acquisition=bundle["protocol"]["acquisition"],
     )
     FA._write_json(os.path.join(outdir, "COMPLETE.json"), marker)
     return trace_path
@@ -1148,7 +1160,9 @@ def main(argv=None):
         "--scene-profile", default="double_density_velocity_ood",
     )
     parser.add_argument(
-        "--selector", choices=("margin", "safemppi_cost"), default="margin",
+        "--selector", choices=(
+            "margin", "progress_gated_margin", "safemppi_cost",
+        ), default="margin",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--verifier-workers", type=int, default=16)

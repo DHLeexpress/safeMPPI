@@ -17,6 +17,7 @@ import run_sfm_neutral_temperature_m50 as GLOBAL
 
 HERE = Path(__file__).resolve().parent
 STATUS = "SFM_NEUTRAL_AUTONOMOUS_FOLLOWUP_COMPLETE"
+CREATIVE_TRIGGER_STATUS = "SFM_NEUTRAL_CREATIVE_SANITY_REQUIRED"
 
 
 def _wait(path: Path, poll: int) -> dict:
@@ -144,6 +145,9 @@ def run(args) -> dict:
     achieved = r100_gamma.get("objective_achieved") is True
     result = {
         "status": STATUS,
+        "source_commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=HERE, text=True,
+        ).strip(),
         "action": (
             "STOP_GOAL_ACHIEVED_AT_R100"
             if achieved else "CREATIVE_SANITY_REQUIRED"
@@ -162,7 +166,24 @@ def run(args) -> dict:
         "started_at": started.isoformat(),
         "completed_at": datetime.now(timezone.utc).isoformat(),
     }
-    GLOBAL._write(output / "DELIVERY_COMPLETE.json", result)
+    delivery_path = output / "DELIVERY_COMPLETE.json"
+    GLOBAL._write(delivery_path, result)
+    if not achieved:
+        trigger = {
+            "status": CREATIVE_TRIGGER_STATUS,
+            "action": "CREATIVE_SANITY_REQUIRED",
+            "source_commit": result["source_commit"],
+            "autonomous_delivery": str(delivery_path),
+            "autonomous_delivery_sha256": GLOBAL.FUNNEL.sha256_file(
+                delivery_path
+            ),
+            "selected_arm": arm,
+            "r100_training_delivery": result["r100_training_delivery"],
+            "r100_global_delivery": result["r100_global_delivery"],
+            "r100_gamma_delivery": result["r100_gamma_delivery"],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        GLOBAL._write(output / "CREATIVE_SANITY_REQUIRED.json", trigger)
     print(json.dumps(result, indent=2))
     return result
 

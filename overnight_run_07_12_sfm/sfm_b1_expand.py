@@ -55,7 +55,10 @@ class ArmConfig:
         if (self.K, self.B, self.T, self.H, self.W, self.batch, self.lr, self.ess_target) != (
                 16, 4, 180, 10, 2, 128, 1.0e-5, 0.5):
             raise ValueError("scientific B1 knobs differ from the frozen protocol")
-        if self.selector not in ("margin", "safemppi_cost", "balanced_rank"):
+        if self.selector not in (
+            "margin", "progress_gated_margin", "safemppi_cost",
+            "balanced_rank",
+        ):
             raise ValueError("invalid arm selector")
         if self.scene_profile not in (
                 "legacy_velocity_ood", "requested_ood", "density_ood",

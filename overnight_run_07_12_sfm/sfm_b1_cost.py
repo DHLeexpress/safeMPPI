@@ -13,6 +13,9 @@ from cfm_mppi.safegpc_adapter.safemppi import SafeMPPIConfig
 import sfm_scene as SS
 
 
+PROGRESS_GATE_DISPLACEMENT_M = 0.2
+
+
 def frozen_expert_config():
     """The exact mode-1 adapter config whose cost terms define arms B--D."""
     values = GS.mode1_config(range_m=SS.R_SENSE, u_max=SS.U_MAX, noise_var_mult=3.0)
@@ -95,6 +98,42 @@ def nominal_hp_margin(state, first_action, ped_xy, gamma):
     return new - (1.0 - float(gamma)) * old, old, new
 
 
+def select_progress_gated_margin(rows, *, state):
+    """Prefer progressive, non-stalling H10 plans, then maximize Hp margin.
+
+    This is a selector only.  The caller remains responsible for the exact
+    verifier and nominal-Hp admission gates.  If no admitted row clears the
+    progress gate, the historical max-margin rule is used unchanged.
+    """
+    if not rows:
+        return None
+    initial = np.asarray(state, np.float32).reshape(4)[:2]
+    goal_distance = float(np.linalg.norm(initial - SS.GOAL))
+    progressive = []
+    for row in rows:
+        states = rollout_states(
+            state,
+            np.asarray(row["controls"], np.float32)[None],
+        )[0].detach().cpu().numpy()
+        displacement = float(np.linalg.norm(states[-1, :2] - initial))
+        progress = goal_distance - float(
+            np.linalg.norm(states[-1, :2] - SS.GOAL)
+        )
+        row["H10_displacement"] = displacement
+        row["H10_goal_progress"] = progress
+        row["progress_gate_eligible"] = bool(
+            displacement >= PROGRESS_GATE_DISPLACEMENT_M
+            and progress > 0.0
+        )
+        if row["progress_gate_eligible"]:
+            progressive.append(row)
+    support = progressive or rows
+    return max(
+        support,
+        key=lambda row: (row["hp_margin"], -int(row["candidate_id"])),
+    )
+
+
 def select_admissible(query_rows, *, selector, state, ped_xy, ped_vel, gamma):
     """Gate by y and one-step nominal Hp before either frozen selector."""
     admissible = []
@@ -111,6 +150,8 @@ def select_admissible(query_rows, *, selector, state, ped_xy, ped_vel, gamma):
         return None
     if selector == "margin":
         return max(admissible, key=lambda row: (row["hp_margin"], -int(row["candidate_id"])))
+    if selector == "progress_gated_margin":
+        return select_progress_gated_margin(admissible, state=state)
     if selector not in ("safemppi_cost", "balanced_rank"):
         raise ValueError(f"unknown selector: {selector}")
     controls = torch.as_tensor(np.stack([row["controls"] for row in admissible]), dtype=torch.float32)
