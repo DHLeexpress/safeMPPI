@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 import sfm_b1_offline_eval as E
 import sfm_protocol as SP
@@ -189,8 +190,26 @@ def test_gamma_temperature_scales_the_matching_latent(monkeypatch):
     schedule = tuple(.4 + .1 * index for index in range(len(SP.GAMMAS)))
     monkeypatch.setattr(E, "TEMPERATURE_BY_GAMMA", schedule)
     latents = np.ones((3, 4), np.float32)
-    scaled = E._scale_latents(latents, [0, 2, 6])
-    assert scaled[:, 0] == pytest.approx([schedule[0], schedule[2], schedule[6]])
+    scaled = E._latent_tensor(latents, [0, 2, 6], device="cpu")
+    assert scaled[:, 0].numpy() == pytest.approx(
+        [schedule[0], schedule[2], schedule[6]]
+    )
+
+
+def test_global_temperature_preserves_original_tensor_arithmetic(monkeypatch):
+    temperature = .55
+    monkeypatch.setattr(E, "TEMPERATURE", temperature)
+    monkeypatch.setattr(
+        E,
+        "TEMPERATURE_BY_GAMMA",
+        tuple(temperature for _ in SP.GAMMAS),
+    )
+    latents = np.random.default_rng(7).standard_normal(
+        (3, 4), dtype=np.float32
+    )
+    expected = temperature * torch.as_tensor(latents)
+    actual = E._latent_tensor(latents, [0, 2, 6], device="cpu")
+    assert torch.equal(actual, expected)
 
 
 def test_gamma_temperature_requires_exactly_seven_values(tmp_path):

@@ -155,13 +155,22 @@ def _temperature_description() -> str:
     )
 
 
-def _scale_latents(latents: np.ndarray, gamma_indices: list[int]) -> np.ndarray:
-    values = np.asarray(latents, np.float32)
+def _latent_tensor(
+    latents: np.ndarray,
+    gamma_indices: list[int],
+    *,
+    device: torch.device | str,
+) -> torch.Tensor:
+    values = torch.as_tensor(np.asarray(latents), device=device)
     if len(values) != len(gamma_indices):
         raise ValueError("one gamma index is required per latent")
-    scales = np.asarray([
+    if len(set(TEMPERATURE_BY_GAMMA)) == 1:
+        # Preserve the original global-temperature arithmetic exactly.  Moving
+        # this multiply to NumPy changes borderline rollout outcomes.
+        return TEMPERATURE * values
+    scales = torch.as_tensor([
         TEMPERATURE_BY_GAMMA[int(index)] for index in gamma_indices
-    ], np.float32)
+    ], dtype=values.dtype, device=device)
     return values * scales[:, None]
 
 
@@ -274,13 +283,14 @@ def run_batched_raw(
         low_tensor = torch.stack(lows).to(device)
         history_tensor = torch.stack(histories).to(device)
         context = policy.ctx_from(hp10_tensor, low_tensor, history_tensor)
-        scaled_latents = _scale_latents(
+        scaled_latents = _latent_tensor(
             np.asarray(latents),
             [episode.gamma_index for episode, _, _ in active],
+            device=device,
         )
         windows = BE.integrate_latents(
             policy,
-            torch.as_tensor(scaled_latents, device=device),
+            scaled_latents,
             context,
             nfe=NFE,
         ).reshape(len(active), H, 2)
