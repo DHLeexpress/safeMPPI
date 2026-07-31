@@ -482,20 +482,24 @@ def _side_text(
         *labels[method],
     ]
     if method == 2:
+        outcomes = {
+            (
+                int(value["scenario_id"]),
+                round(float(value["gamma"]), 8),
+            ): value
+            for value in bundle["repair"]["outcomes"]
+        }
         local_status = []
         for gamma in bundle["gammas"]:
-            traces = repair_index[
-                (episode, round(float(gamma), 8))
-            ]
+            key = (episode, round(float(gamma), 8))
+            traces = repair_index[key]
             final_step = max(traces)
             local_step = min(int(simulator_step), final_step)
-            final_trace = traces[final_step]
-            stopped = (
-                int(simulator_step) >= final_step
-                and final_trace.get("repair_trigger") is not None
-                and final_trace.get("repair_selected_id") is None
+            terminal = (
+                str(outcomes[key]["status"]).replace("_", " ")
+                if int(simulator_step) >= final_step else ""
             )
-            suffix = " · repair NVP" if stopped else ""
+            suffix = f" · {terminal}" if terminal else ""
             local_status.append(
                 f"γ={float(gamma):g}: t={local_step}{suffix}"
             )
@@ -633,7 +637,8 @@ def render(trace_path, output_dir, *, fps=5, frame_stride=2, dpi=105):
     plt.close(figure)
     report = dict(
         status=RENDER_STATUS,
-        source=bundle.get("source"),
+        trace_source=bundle.get("source"),
+        renderer_source=RA.FA._source(),
         trace_path=os.path.abspath(trace_path),
         trace_sha256=RA.FA._sha256_file(trace_path),
         frames=frames,
