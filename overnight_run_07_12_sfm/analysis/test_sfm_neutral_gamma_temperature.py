@@ -45,6 +45,7 @@ def test_global_temperature_reference_reuse_is_fail_closed(tmp_path):
     initial.write_text("{}")
     reference_root = tmp_path / "disjoint_m50"
     selection = {}
+    frozen_records = []
     for method in ("pretrained", "expanded"):
         scenario_ids = list(range(470000, 470050))
         rows = [
@@ -61,15 +62,33 @@ def test_global_temperature_reference_reuse_is_fail_closed(tmp_path):
                 "seed": 7, "gammas": list(map(float, G.SP.GAMMAS)),
                 "NFE": 8, "dtype": "float32",
                 "shape": [7, 50, 180, 20], "sha256": "a" * 64,
+                "temperature_by_gamma": [.55] * 7,
             },
             "temperature": .55,
-            "temperature_by_gamma": [.55] * 7,
             "records": [{
                 "round": 0,
                 "cell": {
                     "rows": rows, "checkpoint_sha256": method,
+                    "checkpoint": f"/{method}.pt",
                     "scene_profile": "double_density_velocity_ood",
                     "cell_key": f"cell-{method}",
+                    "summary": {
+                        "pooled": {
+                            "SR": 1.0, "CR": 0.0, "timeout": 0.0,
+                            "Validity": {"mean": .5},
+                            "successful_clearance": {"mean": .1},
+                            "successful_time_to_goal": {"mean": 8.0},
+                        },
+                        "per_gamma": {
+                            str(gamma): {
+                                "SR": 1.0, "CR": 0.0, "timeout": 0.0,
+                                "Validity": {"mean": .5},
+                                "successful_clearance": {"mean": .1},
+                                "successful_time_to_goal": {"mean": 8.0},
+                            }
+                            for gamma in G.SP.GAMMAS
+                        },
+                    },
                 },
             }],
         }
@@ -79,12 +98,19 @@ def test_global_temperature_reference_reuse_is_fail_closed(tmp_path):
         selection[method] = {
             "temperature": .55,
             "round": 0,
+            "checkpoint": f"/{method}.pt",
             "checkpoint_sha256": method,
         }
+        payload["records"][0]["cell"]["checkpoint"] = f"/{method}.pt"
+        destination.write_text(json.dumps(payload))
+        frozen_records.append(G.BASE._record_from_cell(
+            payload, method=method, temperature=.55,
+        ))
     state = {
         "banks": {"disjoint_confirmation": {
             "ep0": 470000, "M_per_gamma": 50, "noise_seed": 7,
-        }}
+        }},
+        "final_records": frozen_records,
     }
     cells, reuse = G._reuse_global_temperature_cells(
         initial, state, selection
@@ -172,6 +198,54 @@ def test_prior_calibration_cells_are_content_authenticated(tmp_path):
         G._reuse_prior_calibration_cells(
             root, methods, bank, [.7],
             {"pretrained": {}, "expanded": {}},
+        )
+
+
+def test_locked_checkpoint_bytes_and_fresh_cell_are_fail_closed(tmp_path):
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"frozen")
+    locked = {
+        "checkpoint": str(checkpoint),
+        "checkpoint_sha256": G.BASE.FUNNEL.sha256_file(checkpoint),
+        "round": 2,
+        "temperature_by_gamma": [.7] * 7,
+    }
+    G._authenticate_method_checkpoints({"expanded": locked})
+    rows = [
+        _row(episode, gamma)
+        for gamma in G.SP.GAMMAS for episode in range(480000, 480050)
+    ]
+    payload = {
+        "scene_profile": "double_density_velocity_ood",
+        "bank": {
+            "ep0": 480000, "M_per_gamma": 50,
+            "scenario_ids": list(range(480000, 480050)),
+        },
+        "noise_bank": {
+            "seed": 9, "gammas": list(map(float, G.SP.GAMMAS)),
+            "NFE": 8, "dtype": "float32",
+            "shape": [7, 50, 180, 20], "sha256": "d" * 64,
+        },
+        "temperature_by_gamma": [.7] * 7,
+        "records": [{
+            "round": 2,
+            "cell": {
+                "rows": rows,
+                "checkpoint_sha256": locked["checkpoint_sha256"],
+            },
+        }],
+    }
+    assert G._validate_fresh_raw_cell(
+        payload, locked=locked, ep0=480000, noise_seed=9,
+    ) == "d" * 64
+
+    checkpoint.write_bytes(b"mutated")
+    with pytest.raises(RuntimeError, match="locked expanded checkpoint"):
+        G._authenticate_method_checkpoints({"expanded": locked})
+    payload["records"][0]["cell"]["checkpoint_sha256"] = "0" * 64
+    with pytest.raises(RuntimeError, match="fresh raw confirmation"):
+        G._validate_fresh_raw_cell(
+            payload, locked=locked, ep0=480000, noise_seed=9,
         )
 
 

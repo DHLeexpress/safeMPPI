@@ -97,6 +97,31 @@ def _ref_identity(ref: dict) -> tuple:
     )
 
 
+def _round_ref_from_marker(path: Path) -> dict:
+    path = path.resolve()
+    record, marker_sha = _read_hashed(path)
+    if record.get("status") != "SFM_B1_NEUTRAL_MULTIROUND_ROUND_COMPLETE":
+        raise RuntimeError("round marker status changed")
+    checkpoint = Path(record["checkpoint"]).resolve()
+    checkpoint_sha = record["checkpoint_sha256"]
+    if FUNNEL.sha256_file(checkpoint) != checkpoint_sha:
+        raise RuntimeError("round checkpoint digest mismatch")
+    ref = {
+        "path": str(path), "sha256": marker_sha,
+        "round": int(record["round"]),
+        "post_D0": str(checkpoint), "post_D0_sha256": checkpoint_sha,
+    }
+    post_positive = checkpoint.with_name(
+        f"round_{int(record['round']):02d}_post_positive.pt"
+    )
+    if post_positive.is_file():
+        ref.update({
+            "post_Dplus": str(post_positive.resolve()),
+            "post_Dplus_sha256": FUNNEL.sha256_file(post_positive),
+        })
+    return ref
+
+
 def _delivery_round_refs(delivery: dict, *, seen=()) -> list[dict]:
     """Authenticate a possibly nested resume chain and return all refs."""
     current_paths = [
@@ -108,8 +133,7 @@ def _delivery_round_refs(delivery: dict, *, seen=()) -> list[dict]:
             raise RuntimeError("current round-record path snapshot changed")
     else:
         current_refs = [
-            {"path": path, "sha256": FUNNEL.sha256_file(Path(path))}
-            for path in current_paths
+            _round_ref_from_marker(Path(path)) for path in current_paths
         ]
 
     prior_refs = []
@@ -147,6 +171,27 @@ def _authenticated_round_records(delivery: dict) -> list[dict]:
             raise RuntimeError("round marker status changed")
         if "round" in ref and int(ref["round"]) != int(record["round"]):
             raise RuntimeError("round marker index changed")
+        checkpoint = Path(record["checkpoint"]).resolve()
+        checkpoint_sha = record["checkpoint_sha256"]
+        if FUNNEL.sha256_file(checkpoint) != checkpoint_sha:
+            raise RuntimeError("round checkpoint digest mismatch")
+        has_post_d0 = "post_D0" in ref or "post_D0_sha256" in ref
+        if has_post_d0 and (
+            str(Path(ref.get("post_D0", "")).resolve()) != str(checkpoint)
+            or ref.get("post_D0_sha256") != checkpoint_sha
+        ):
+            raise RuntimeError("round post-D0 snapshot changed")
+        has_post_positive = (
+            "post_Dplus" in ref or "post_Dplus_sha256" in ref
+        )
+        if has_post_positive:
+            post_positive = Path(ref.get("post_Dplus", "")).resolve()
+            if (
+                not ref.get("post_Dplus_sha256")
+                or FUNNEL.sha256_file(post_positive)
+                != ref["post_Dplus_sha256"]
+            ):
+                raise RuntimeError("round post-Dplus digest mismatch")
         records.append(record)
     return records
 
@@ -233,16 +278,36 @@ def _record_from_cell(payload: dict, *, method: str, temperature: float) -> dict
 def _screen_rows(root: Path, arm_names: list[str], payloads: list[dict]) -> tuple[list[dict], dict]:
     rows, r0 = [], None
     for arm_name, delivery in zip(arm_names, payloads):
+        lineage = {
+            int(record["round"]): record
+            for record in _authenticated_round_records(delivery)
+        }
         for record in delivery["disjoint_raw_evaluation"]["records"]:
-            pooled = _pooled(record["pooled"])
             round_index = int(record["round"])
+            if round_index == 0:
+                frozen_path = Path(delivery["checkpoint"]).resolve()
+                frozen_sha = delivery["checkpoint_sha256"]
+            else:
+                if round_index not in lineage:
+                    raise RuntimeError("screening round is absent from lineage")
+                frozen_path = Path(lineage[round_index]["checkpoint"]).resolve()
+                frozen_sha = lineage[round_index]["checkpoint_sha256"]
+            checkpoint = Path(
+                record.get("checkpoint", frozen_path)
+            ).resolve()
+            expected_sha = record.get("checkpoint_sha256", frozen_sha)
+            if (
+                checkpoint != frozen_path
+                or expected_sha != frozen_sha
+                or FUNNEL.sha256_file(checkpoint) != expected_sha
+            ):
+                raise RuntimeError("screening checkpoint digest mismatch")
+            pooled = _pooled(record["pooled"])
             row = {
                 "arm": arm_name,
                 "round": round_index,
-                "checkpoint": str(Path(record.get(
-                    "checkpoint",
-                    root / arm_name / "checkpoints" / f"round_{round_index:02d}.pt",
-                )).resolve()),
+                "checkpoint": str(checkpoint),
+                "checkpoint_sha256": expected_sha,
                 "pooled": pooled,
             }
             if round_index == 0:

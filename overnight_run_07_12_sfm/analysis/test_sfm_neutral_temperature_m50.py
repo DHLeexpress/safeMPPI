@@ -105,16 +105,18 @@ def test_authenticated_round_records_follow_nested_resume_chain(tmp_path):
     prior_path = None
     prior_delivery = None
     for round_i in (1, 2, 3):
+        checkpoint = tmp_path / f"round_{round_i:02d}.pt"
+        post_positive = tmp_path / f"round_{round_i:02d}_post_positive.pt"
+        checkpoint.write_bytes(f"checkpoint-{round_i}".encode())
+        post_positive.write_bytes(f"positive-{round_i}".encode())
         marker = tmp_path / f"round_{round_i}.json"
         marker.write_text(json.dumps({
             "status": "SFM_B1_NEUTRAL_MULTIROUND_ROUND_COMPLETE",
             "round": round_i,
+            "checkpoint": str(checkpoint),
+            "checkpoint_sha256": S.FUNNEL.sha256_file(checkpoint),
         }))
-        ref = {
-            "path": str(marker),
-            "sha256": S.FUNNEL.sha256_file(marker),
-            "round": round_i,
-        }
+        ref = S._round_ref_from_marker(marker)
         delivery = {
             "status": "SFM_B1_NEUTRAL_MULTIROUND_COMPLETE",
             "round_records": [str(marker)],
@@ -136,3 +138,78 @@ def test_authenticated_round_records_follow_nested_resume_chain(tmp_path):
     prior_delivery["round_record_refs"][0]["path"] = str(tmp_path / "wrong")
     with pytest.raises(RuntimeError, match="current round-record path"):
         S._authenticated_round_records(prior_delivery)
+
+
+def test_legacy_delivery_refs_gain_round_and_checkpoint_identity(tmp_path):
+    checkpoint = tmp_path / "round_01.pt"
+    post_positive = tmp_path / "round_01_post_positive.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    post_positive.write_bytes(b"positive")
+    marker = tmp_path / "round.json"
+    marker.write_text(json.dumps({
+        "status": "SFM_B1_NEUTRAL_MULTIROUND_ROUND_COMPLETE",
+        "round": 1, "checkpoint": str(checkpoint),
+        "checkpoint_sha256": S.FUNNEL.sha256_file(checkpoint),
+    }))
+    delivery = {"round_records": [str(marker)]}
+    refs = S._delivery_round_refs(delivery)
+    assert refs[0]["round"] == 1
+    assert refs[0]["post_D0_sha256"] == S.FUNNEL.sha256_file(checkpoint)
+    assert refs[0]["post_Dplus_sha256"] == S.FUNNEL.sha256_file(post_positive)
+
+    checkpoint.write_bytes(b"mutated")
+    with pytest.raises(RuntimeError, match="checkpoint digest"):
+        S._authenticated_round_records(delivery)
+
+
+def test_screen_checkpoint_must_belong_to_authenticated_round(tmp_path):
+    pretrained = tmp_path / "pretrained.pt"
+    checkpoint = tmp_path / "round_01.pt"
+    post_positive = tmp_path / "round_01_post_positive.pt"
+    pretrained.write_bytes(b"pretrained")
+    checkpoint.write_bytes(b"round-one")
+    post_positive.write_bytes(b"positive")
+    marker = tmp_path / "round.json"
+    marker.write_text(json.dumps({
+        "status": "SFM_B1_NEUTRAL_MULTIROUND_ROUND_COMPLETE",
+        "round": 1, "checkpoint": str(checkpoint),
+        "checkpoint_sha256": S.FUNNEL.sha256_file(checkpoint),
+    }))
+    delivery = {
+        "checkpoint": str(pretrained),
+        "checkpoint_sha256": S.FUNNEL.sha256_file(pretrained),
+        "round_records": [str(marker)],
+        "round_record_refs": [S._round_ref_from_marker(marker)],
+        "disjoint_raw_evaluation": {"records": [
+            {
+                "round": 0, "checkpoint": str(pretrained),
+                "checkpoint_sha256": S.FUNNEL.sha256_file(pretrained),
+                "pooled": {
+                    "SR": .5, "CR": .5, "timeout": 0,
+                    "Validity": {"mean": .5},
+                    "successful_clearance": {"mean": .1},
+                    "successful_time_to_goal": {"mean": 8.0},
+                },
+            }, {
+                "round": 1, "checkpoint": str(checkpoint),
+                "checkpoint_sha256": S.FUNNEL.sha256_file(checkpoint),
+                "pooled": {
+                "SR": .5, "CR": .5, "timeout": 0,
+                "Validity": {"mean": .5},
+                "successful_clearance": {"mean": .1},
+                "successful_time_to_goal": {"mean": 8.0},
+            },
+        }]},
+    }
+    rows, _ = S._screen_rows(tmp_path, ["arm"], [delivery])
+    assert rows[0]["checkpoint_sha256"] == S.FUNNEL.sha256_file(checkpoint)
+    legacy = delivery["disjoint_raw_evaluation"]["records"][1]
+    legacy.pop("checkpoint")
+    legacy.pop("checkpoint_sha256")
+    rows, _ = S._screen_rows(tmp_path, ["arm"], [delivery])
+    assert rows[0]["checkpoint"] == str(checkpoint.resolve())
+    delivery["disjoint_raw_evaluation"]["records"][1][
+        "checkpoint_sha256"
+    ] = "0" * 64
+    with pytest.raises(RuntimeError, match="screening checkpoint"):
+        S._screen_rows(tmp_path, ["arm"], [delivery])

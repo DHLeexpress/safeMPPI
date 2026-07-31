@@ -187,6 +187,9 @@ def _reuse_global_temperature_cells(
     bank = initial["banks"]["disjoint_confirmation"]
     cells = {method: {} for method in methods}
     records = {}
+    frozen_records = {
+        row["method"]: row for row in initial.get("final_records", ())
+    }
     for method in ("pretrained", "expanded"):
         selected = methods[method]
         temperature = float(selected["temperature"])
@@ -225,7 +228,9 @@ def _reuse_global_temperature_cells(
             or not isinstance(noise.get("sha256"), str)
             or len(noise["sha256"]) != 64
             or float(payload["temperature"]) != temperature
-            or payload.get("temperature_by_gamma")
+            or payload.get(
+                "temperature_by_gamma", noise.get("temperature_by_gamma")
+            )
             != [temperature] * len(SP.GAMMAS)
             or int(record["round"]) != int(selected["round"])
             or record["cell"]["checkpoint_sha256"]
@@ -235,6 +240,20 @@ def _reuse_global_temperature_cells(
         ):
             raise RuntimeError(
                 f"global-temperature reference contract failed for {method}"
+            )
+        observed = BASE._record_from_cell(
+            payload, method=method, temperature=temperature,
+        )
+        frozen = frozen_records.get(method)
+        if frozen is None or any(
+            observed[key] != frozen[key]
+            for key in (
+                "round", "checkpoint", "checkpoint_sha256", "temperature",
+                "pooled", "per_gamma",
+            )
+        ):
+            raise RuntimeError(
+                f"global-temperature sidecar changed after delivery for {method}"
             )
         cells[method][temperature] = payload
         records[method] = {
@@ -371,6 +390,7 @@ def _reuse_prior_calibration_cells(
 
 def _calibration_crn_sha(
     cells: dict[str, dict[float, dict]], temperatures: list[float],
+    methods: dict[str, dict],
 ) -> str:
     missing = [
         (method, float(temperature))
@@ -387,7 +407,108 @@ def _calibration_crn_sha(
     }
     if len(hashes) != 1:
         raise RuntimeError("calibration temperatures do not share one CRN bank")
+    for method, selected in methods.items():
+        for temperature in temperatures:
+            observed = cells[method][float(temperature)]["records"][0][
+                "cell"
+            ]["checkpoint_sha256"]
+            if observed != selected["checkpoint_sha256"]:
+                raise RuntimeError("calibration cell checkpoint digest changed")
     return next(iter(hashes))
+
+
+def _authenticate_method_checkpoints(methods: dict[str, dict]) -> None:
+    for method, selected in methods.items():
+        path = Path(selected["checkpoint"]).resolve()
+        if BASE.FUNNEL.sha256_file(path) != selected["checkpoint_sha256"]:
+            raise RuntimeError(f"locked {method} checkpoint digest mismatch")
+
+
+def _validate_fresh_raw_cell(
+    payload: dict, *, locked: dict, ep0: int, noise_seed: int,
+) -> str:
+    record = payload["records"][0]
+    rows = _raw_rows(payload)
+    expected_ids = list(range(int(ep0), int(ep0) + 50))
+    noise = payload.get("noise_bank", {})
+    per_gamma_ids = {
+        float(gamma): sorted(
+            int(row["episode"]) for row in rows
+            if float(row["gamma"]) == float(gamma)
+        )
+        for gamma in SP.GAMMAS
+    }
+    if (
+        payload.get("scene_profile") != "double_density_velocity_ood"
+        or int(payload["bank"]["ep0"]) != int(ep0)
+        or int(payload["bank"]["M_per_gamma"]) != 50
+        or payload["bank"].get("scenario_ids") != expected_ids
+        or int(noise.get("seed", -1)) != int(noise_seed)
+        or noise.get("gammas") != list(map(float, SP.GAMMAS))
+        or int(noise.get("NFE", -1)) != 8
+        or noise.get("dtype") != "float32"
+        or noise.get("shape") != [len(SP.GAMMAS), 50, 180, 20]
+        or not isinstance(noise.get("sha256"), str)
+        or len(noise["sha256"]) != 64
+        or payload.get("temperature_by_gamma")
+        != list(map(float, locked["temperature_by_gamma"]))
+        or int(record["round"]) != int(locked["round"])
+        or record["cell"]["checkpoint_sha256"]
+        != locked["checkpoint_sha256"]
+        or len(rows) != 50 * len(SP.GAMMAS)
+        or any(ids != expected_ids for ids in per_gamma_ids.values())
+    ):
+        raise RuntimeError("fresh raw confirmation contract changed")
+    return noise["sha256"]
+
+
+def _validate_fresh_kazuki(
+    payload: dict, *, pretrained: dict, ep0: int,
+) -> None:
+    expected_ids = list(range(int(ep0), int(ep0) + 50))
+    rows = payload.get("rows", ())
+    per_gamma_ids = {
+        float(gamma): sorted(
+            int(row["episode"]) for row in rows
+            if float(row["gamma"]) == float(gamma)
+        )
+        for gamma in SP.GAMMAS
+    }
+    if (
+        payload.get("scene_profile") != "double_density_velocity_ood"
+        or int(payload.get("ep0", -1)) != int(ep0)
+        or int(payload.get("M_per_gamma", -1)) != 50
+        or payload.get("checkpoint_sha256")
+        != pretrained["checkpoint_sha256"]
+        or len(rows) != 50 * len(SP.GAMMAS)
+        or any(ids != expected_ids for ids in per_gamma_ids.values())
+    ):
+        raise RuntimeError("fresh Kazuki confirmation contract changed")
+
+
+def _validate_calibration_kazuki(
+    payload: dict, *, initial: dict, bank: dict, pretrained: dict,
+) -> dict:
+    frozen = next(
+        (row for row in initial.get("final_records", ())
+         if row.get("method") == "kazuki_locked"),
+        None,
+    )
+    observed = BASE._kazuki_record(payload)
+    if frozen is None or any(
+        observed[key] != frozen[key]
+        for key in (
+            "round", "checkpoint", "checkpoint_sha256", "temperature",
+            "pooled", "per_gamma",
+        )
+    ):
+        raise RuntimeError("calibration Kazuki sidecar changed after delivery")
+    _validate_fresh_kazuki(
+        payload, pretrained=pretrained, ep0=int(bank["ep0"]),
+    )
+    if int(bank["M_per_gamma"]) != 50:
+        raise RuntimeError("Kazuki calibration bank is not M50")
+    return observed
 
 
 def _metric(rows: list[dict], name: str) -> float:
@@ -479,6 +600,7 @@ def run(args) -> dict:
         "pretrained": selected["selected_pretrained"],
         "expanded": selected["selected_expanded"],
     }
+    _authenticate_method_checkpoints(methods)
     cells, reuse = _reuse_global_temperature_cells(
         initial_path, initial, methods
     )
@@ -520,11 +642,22 @@ def run(args) -> dict:
         cells[method][temperature] = BASE._read(
             out / "raw_m50_offline_metrics.json"
         )
-    calibration_noise_sha256 = _calibration_crn_sha(cells, temperatures)
+    calibration_noise_sha256 = _calibration_crn_sha(
+        cells, temperatures, methods,
+    )
+    _authenticate_method_checkpoints(methods)
 
     kazuki_path = initial_path.parent / "disjoint_m50" / "kazuki_locked.json"
     kazuki_payload = BASE._read(kazuki_path)
-    kazuki = BASE._kazuki_record(kazuki_payload)
+    kazuki = _validate_calibration_kazuki(
+        kazuki_payload, initial=initial, bank=calibration_bank,
+        pretrained=methods["pretrained"],
+    )
+    kazuki_calibration_reference = {
+        "path": str(kazuki_path),
+        "file_sha256": BASE.FUNNEL.sha256_file(kazuki_path),
+        "rows_sha256": _json_value_sha256(kazuki_payload["rows"]),
+    }
     kazuki_liveness = BASE._liveness_contract([], kazuki)
     pretrained = _pick(
         _enumerate(
@@ -560,6 +693,7 @@ def run(args) -> dict:
         "pretrained": pretrained,
         "expanded": expanded,
         "kazuki": kazuki,
+        "kazuki_calibration_reference": kazuki_calibration_reference,
         "target_envelope": target,
         "liveness_contract": liveness,
         "gamma_trend_gate": {
@@ -578,6 +712,7 @@ def run(args) -> dict:
     BASE._write(output / "SCHEDULE_LOCKED.json", lock)
 
     final_root = output / "fresh_disjoint_m50"
+    _authenticate_method_checkpoints(methods)
     final_jobs, final_meta = [], {}
     for method, record in (("pretrained", pretrained), ("expanded", expanded)):
         out = final_root / method
@@ -616,6 +751,20 @@ def run(args) -> dict:
         for method, path in final_meta.items()
     }
     final_kazuki_payload = BASE._read(final_kazuki)
+    _authenticate_method_checkpoints(methods)
+    fresh_noise_hashes = {
+        _validate_fresh_raw_cell(
+            raw_payloads[method], locked=locked,
+            ep0=args.final_ep0, noise_seed=args.final_noise_seed,
+        )
+        for method, locked in (("pretrained", pretrained), ("expanded", expanded))
+    }
+    if len(fresh_noise_hashes) != 1:
+        raise RuntimeError("fresh raw methods do not share one CRN bank")
+    _validate_fresh_kazuki(
+        final_kazuki_payload, pretrained=methods["pretrained"],
+        ep0=args.final_ep0,
+    )
     final_records = [
         BASE._record_from_cell(
             raw_payloads[method], method=method, temperature=1.0

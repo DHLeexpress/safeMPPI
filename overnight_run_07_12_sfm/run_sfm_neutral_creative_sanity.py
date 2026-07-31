@@ -208,6 +208,26 @@ def _round_catalog(chain: list[tuple[Path, dict]]) -> dict[int, dict]:
     return catalog
 
 
+def _authenticate_lock_membership(lock: dict) -> dict | None:
+    checkpoint = Path(lock["checkpoint"]).resolve()
+    if _sha256(checkpoint) != lock["checkpoint_sha256"]:
+        raise RuntimeError("creative lock checkpoint digest mismatch")
+    if lock.get("training_run") is None:
+        return None
+    run = Path(lock["training_run"]).resolve()
+    catalog = _round_catalog(_delivery_chain(run / "DELIVERY_COMPLETE.json"))
+    round_i = int(lock["round"])
+    if round_i not in catalog:
+        raise RuntimeError("creative lock round is absent from its lineage")
+    frozen = catalog[round_i]
+    if (
+        checkpoint != Path(frozen["post_D0"]).resolve()
+        or lock["checkpoint_sha256"] != frozen["post_D0_sha256"]
+    ):
+        raise RuntimeError("creative lock is not a frozen post-D0 checkpoint")
+    return frozen
+
+
 def _bank_from(ep0: int, M: int, role: str) -> dict:
     return {
         "role": str(role),
@@ -546,7 +566,7 @@ def _expanded_lock(
         row for row in payload["final_records"]
         if row["method"] == "expanded"
     )
-    return {
+    lock = {
         "name": str(name),
         "checkpoint": record["checkpoint"],
         "checkpoint_sha256": record["checkpoint_sha256"],
@@ -558,6 +578,8 @@ def _expanded_lock(
             None if training_run is None else str(training_run.resolve())
         ),
     }
+    _authenticate_lock_membership(lock)
+    return lock
 
 
 def _common_best_available(
@@ -567,6 +589,7 @@ def _common_best_available(
     cache = output / "cache"
     jobs, destinations = [], {}
     for lock in locks:
+        _authenticate_lock_membership(lock)
         name = lock["name"]
         destination = output / name
         jobs.append({
@@ -596,6 +619,8 @@ def _common_best_available(
         row["temperature_by_gamma"] = lock["temperature_by_gamma"]
         row["metrics_json"] = str(metrics)
         row["metrics_sha256"] = _sha256(metrics)
+        if row["checkpoint_sha256"] != lock["checkpoint_sha256"]:
+            raise RuntimeError("common-M50 evaluator used another checkpoint")
         records.append(row)
 
     baseline = next(
@@ -714,6 +739,7 @@ def _extend_common_winner_to_r100(
     lock = common.get("selected_lock")
     if lock is None or lock["name"] == "r100_baseline":
         return None
+    _authenticate_lock_membership(lock)
     source_run = Path(lock["training_run"]).resolve()
     source_delivery = _read(source_run / "DELIVERY_COMPLETE.json")
     cfg = source_delivery["config"]

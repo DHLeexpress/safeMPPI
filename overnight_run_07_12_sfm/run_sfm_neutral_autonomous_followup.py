@@ -95,18 +95,35 @@ def run(args) -> dict:
     resume_delivery, resume_delivery_sha256 = GLOBAL._read_hashed(
         resume_delivery_path
     )
+    resume_lineage = GLOBAL._authenticated_round_records(resume_delivery)
+    lineage_by_round = {
+        int(record["round"]): record for record in resume_lineage
+    }
     cfg = resume_delivery["config"]
     resume_round = int(resume_delivery["rounds"])
     if resume_round != 50:
         raise RuntimeError("autonomous continuation expects an r50 source")
-    scenario_ids = []
-    for marker in resume_delivery["round_records"]:
-        scenario_ids.extend(map(int, GLOBAL._read(Path(marker))["scenarios"]))
+    scenario_ids = [
+        int(scenario) for record in resume_lineage
+        for scenario in record["scenarios"]
+    ]
     scenario_ep0 = min(scenario_ids)
 
     r100_parent = output / "r100_training"
     r100_root = r100_parent / arm
     locked_round = int(locked_best["round"])
+    if locked_round not in lineage_by_round:
+        raise RuntimeError("locked best is absent from the r50 lineage")
+    locked_lineage = lineage_by_round[locked_round]
+    if (
+        Path(locked_best["checkpoint"]).resolve()
+        != Path(locked_lineage["checkpoint"]).resolve()
+        or locked_best["checkpoint_sha256"]
+        != locked_lineage["checkpoint_sha256"]
+        or GLOBAL.FUNNEL.sha256_file(Path(locked_best["checkpoint"]))
+        != locked_best["checkpoint_sha256"]
+    ):
+        raise RuntimeError("locked best is not an authenticated r50 checkpoint")
     eval_rounds = sorted({0, locked_round, resume_round, *range(60, 101, 10)})
     train_command = [
         sys.executable, str(HERE / "sfm_b1_neutral_multiround.py"),

@@ -310,6 +310,7 @@ def test_full_creative_extension_resumes_selected_run_not_pretrained(
         _write(output / "DELIVERY_COMPLETE.json", {"status": "complete"})
 
     monkeypatch.setattr(C, "_run", fake_run)
+    monkeypatch.setattr(C, "_authenticate_lock_membership", lambda lock: {})
     monkeypatch.setattr(C, "_confirm_full_run", lambda **_kwargs: {
         "objective_achieved": False,
     })
