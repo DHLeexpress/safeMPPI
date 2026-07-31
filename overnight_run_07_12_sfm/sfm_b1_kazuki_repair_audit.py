@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import nullcontext
 import copy
 import os
 
@@ -178,6 +179,7 @@ def _neutral_record(
     chosen,
     *,
     step,
+    round_i=1,
     selector,
     repair_trigger,
 ):
@@ -194,7 +196,7 @@ def _neutral_record(
         neutral_id=int(neutral_id),
         population="D0",
         semantic_label="neutral",
-        round=1,
+        round=int(round_i),
         scenario_id=int(replica.scenario_id),
         gamma=float(replica.gamma),
         step=int(step),
@@ -229,7 +231,7 @@ def _neutral_record(
     )
 
 
-def _save_neutral_records(path, records):
+def _save_neutral_records(path, records, *, round_i=1):
     path = os.fspath(path)
     for expected, record in enumerate(records):
         if int(record["neutral_id"]) != expected:
@@ -246,7 +248,7 @@ def _save_neutral_records(path, records):
     payload = dict(
         version=1,
         status="SFM_B1_NEUTRAL_ROUND_COMPLETE",
-        round=1,
+        round=int(round_i),
         records=records,
         summary=dict(D0=len(records), train_eligible=0, gp_eligible=0),
     )
@@ -259,6 +261,159 @@ def _save_neutral_records(path, records):
     )
     FA._write_json(path + ".COMPLETE.json", marker)
     return marker
+
+
+def _gamma_balanced_gp(
+    phi_policy,
+    previous,
+    *,
+    gammas,
+    round_i,
+    ell,
+    cap,
+    lam,
+    phi_s,
+    device,
+    seed,
+):
+    """Build a previous-round-only GP with an equal supported gamma quota."""
+    gp = BR.RBFGP(float(ell), float(lam))
+    empty = {
+        str(gamma): 0 for gamma in gammas
+    }
+    if previous is None:
+        return gp, [], dict(
+            requested_cap=int(cap),
+            effective_cap=0,
+            quota=0,
+            rotating_extra_gamma=None,
+            per_gamma=empty,
+            source_round=None,
+            population="previous executed D+ only",
+        )
+
+    groups = {}
+    for gamma_index, gamma in enumerate(gammas):
+        records = [
+            (previous, row)
+            for row in previous.Dplus
+            if round(
+                float(previous.contexts[int(row["context_id"])]["gamma"]),
+                8,
+            ) == round(float(gamma), 8)
+        ]
+        groups[float(gamma)] = BS.hierarchical_order(
+            records, int(seed) + gamma_index,
+        )
+    quota = min(
+        int(cap) // len(gammas),
+        min(len(groups[float(gamma)]) for gamma in gammas),
+    )
+    if quota == 0:
+        counts = {
+            str(gamma): len(groups[float(gamma)])
+            for gamma in gammas
+        }
+        raise RuntimeError(
+            "previous-round D+ cannot support all declared gammas; "
+            f"per_gamma={counts}"
+        )
+    selected = [
+        record
+        for gamma in gammas
+        for record in groups[float(gamma)][:quota]
+    ]
+    rotation = (int(round_i) - 2) % len(gammas)
+    extra_gamma = None
+    if quota > 0 and len(selected) < int(cap):
+        for offset in range(len(gammas)):
+            gamma = float(gammas[(rotation + offset) % len(gammas)])
+            if len(groups[gamma]) > quota:
+                selected.append(groups[gamma][quota])
+                extra_gamma = gamma
+                break
+
+    if selected:
+        feature_parts = []
+        for start in range(0, len(selected), 256):
+            values = selected[start:start + 256]
+            hp10, low, hist, controls = BX._record_batch(values, device)
+            x0 = torch.as_tensor(
+                np.stack([row["x0"] for _, row in values]),
+                device=device,
+            ).float()
+            feature_parts.append(phi_policy.phi_s_from_x0(
+                controls,
+                phi_policy.ctx_from(hp10, low, hist),
+                x0,
+                s=float(phi_s),
+            ))
+        gp.set_buffer(torch.cat(feature_parts))
+    identities = [
+        (int(shard.round_i), int(row["window_id"]))
+        for shard, row in selected
+    ]
+    if len(identities) != len(set(identities)):
+        raise RuntimeError("dynamic gamma-balanced GP contains duplicates")
+    per_gamma = Counter(
+        str(previous.contexts[int(row["context_id"])]["gamma"])
+        for _, row in selected
+    )
+    return gp, identities, dict(
+        requested_cap=int(cap),
+        effective_cap=len(selected),
+        quota=int(quota),
+        rotating_extra_gamma=extra_gamma,
+        per_gamma={
+            str(gamma): int(per_gamma[str(gamma)])
+            for gamma in gammas
+        },
+        source_round=int(previous.round_i),
+        population="previous executed D+ only; D0 excluded",
+    )
+
+
+@torch.no_grad()
+def _calibrate_gp_beta(
+    phi_policy, gp, replicas, cfg, device, *, round_i,
+):
+    live, batch = BX._stack_prepared(replicas, device)
+    windows, contexts, x0 = FA._keyed_windows(
+        phi_policy,
+        live,
+        batch,
+        K=cfg.K,
+        round_i=int(round_i),
+        step=-1,
+        source="beta_calibration",
+        seed=cfg.seed,
+        nfe=cfg.nfe,
+        temp=cfg.temp,
+    )
+    features = FA._features_from_x0(
+        phi_policy, windows, contexts, x0, cfg.phi_s,
+    )
+    score_vectors = []
+    for replica, values in zip(live, features):
+        generator = torch.Generator(device=values.device).manual_seed(
+            FA._keyed_seed(
+                cfg.seed,
+                int(round_i),
+                replica.scenario_id,
+                f"{replica.gamma:.8f}",
+                "beta_order",
+            )
+        )
+        order = torch.randperm(
+            len(values), generator=generator, device=values.device,
+        )
+        score_vectors.extend(
+            gp.sequential_score_vectors(values, order, cfg.B)
+        )
+    beta, ess = BR.solve_beta(
+        score_vectors, target=cfg.ess_target,
+    )
+    return float(beta), float(ess)
 
 
 def _repair_trigger(replica, chosen):
@@ -285,6 +440,11 @@ def collect(
     audit_seed=DEFAULT_AUDIT_SEED,
     ell=DEFAULT_ELL,
     neutral_continuation=False,
+    round_i=1,
+    expected_checkpoint_sha256=EXPECTED_CHECKPOINT_SHA256,
+    previous_executed_path=None,
+    gp_cap=512,
+    verifier_executor=None,
     T=180,
     outdir,
 ):
@@ -307,13 +467,36 @@ def collect(
         raise ValueError("repair audit is scientifically pinned to T=180")
     checkpoint = os.path.abspath(checkpoint)
     outdir = os.path.abspath(outdir)
+    round_i = int(round_i)
+    if round_i < 1:
+        raise ValueError("round_i must be positive")
+    if int(gp_cap) < len(gammas):
+        raise ValueError("gp_cap must permit at least one row per gamma")
     if os.path.exists(outdir):
         raise FileExistsError(f"refusing to reuse output directory: {outdir}")
     checkpoint_sha = FA._sha256_file(checkpoint)
-    if checkpoint_sha != EXPECTED_CHECKPOINT_SHA256:
+    if (
+        expected_checkpoint_sha256 is None
+        or checkpoint_sha != str(expected_checkpoint_sha256)
+    ):
         raise RuntimeError(
-            f"checkpoint SHA mismatch: expected {EXPECTED_CHECKPOINT_SHA256}, "
+            f"checkpoint SHA mismatch: expected "
+            f"{expected_checkpoint_sha256}, "
             f"observed {checkpoint_sha}"
+        )
+    previous = (
+        None
+        if previous_executed_path is None
+        else OS.ExecutedRoundShard.load(previous_executed_path)
+    )
+    if round_i == 1 and previous is not None:
+        raise ValueError("round 1 cannot have previous GP support")
+    if round_i > 1 and previous is None:
+        raise ValueError("round >1 requires previous executed D+ support")
+    if previous is not None and int(previous.round_i) != round_i - 1:
+        raise ValueError(
+            "previous executed shard must be from the immediately "
+            "preceding round"
         )
 
     environment = SS.scene_profile(scene_profile)
@@ -354,20 +537,36 @@ def collect(
         seed=int(audit_seed),
         scene_profile=scene_profile,
     ).validate()
-    gp = BR.RBFGP(float(ell), cfg.gp_lam)
-    beta, calibrated_ess = FA._calibrate_empty_gp_beta(
-        phi_policy, gp, replicas, cfg, device,
+    gp, gp_ids, gp_selection = _gamma_balanced_gp(
+        phi_policy,
+        previous,
+        gammas=gammas,
+        round_i=round_i,
+        ell=float(ell),
+        cap=int(gp_cap),
+        lam=cfg.gp_lam,
+        phi_s=cfg.phi_s,
+        device=device,
+        seed=int(audit_seed) + round_i * 101,
+    )
+    beta, calibrated_ess = _calibrate_gp_beta(
+        phi_policy, gp, replicas, cfg, device, round_i=round_i,
     )
 
-    executed_shard = OS.ExecutedRoundShard(1)
-    query_shard = BS.RoundShard(1)
+    executed_shard = OS.ExecutedRoundShard(round_i)
+    query_shard = BS.RoundShard(round_i)
     neutral_records = []
     traces = []
     counts = Counter()
     sigma_pool, sigma_selected, ess_values = [], [], []
     trap_streaks = defaultdict(int)
 
-    with ProcessPoolExecutor(max_workers=int(verifier_workers)) as executor:
+    executor_scope = (
+        ProcessPoolExecutor(max_workers=int(verifier_workers))
+        if verifier_executor is None
+        else nullcontext(verifier_executor)
+    )
+    with executor_scope as executor:
         for step in range(int(T)):
             live = [replica for replica in replicas if replica.alive]
             live, batch = BX._stack_prepared(live, device)
@@ -379,7 +578,7 @@ def collect(
                     live,
                     batch,
                     K=cfg.K,
-                    round_i=1,
+                    round_i=round_i,
                     step=step,
                     source="K",
                     seed=int(sample_seed),
@@ -399,7 +598,7 @@ def collect(
                     device=features.device,
                 ).manual_seed(FA._keyed_seed(
                     int(audit_seed),
-                    1,
+                    round_i,
                     replica.scenario_id,
                     f"{replica.gamma:.8f}",
                     step,
@@ -620,7 +819,7 @@ def collect(
                 )
 
                 trace = dict(
-                    round=1,
+                    round=round_i,
                     step=int(step),
                     scenario_id=int(replica.scenario_id),
                     gamma=float(replica.gamma),
@@ -700,6 +899,7 @@ def collect(
                         prepared,
                         chosen,
                         step=step,
+                        round_i=round_i,
                         selector=selector,
                         repair_trigger=values["trigger"],
                     )
@@ -845,7 +1045,7 @@ def collect(
     executed_manifest = executed_shard.save(executed_path)
     query_manifest = query_shard.save(query_path)
     neutral_manifest = _save_neutral_records(
-        neutral_path, neutral_records,
+        neutral_path, neutral_records, round_i=round_i,
     )
     outcomes = [dict(
         scenario_id=int(replica.scenario_id),
@@ -862,6 +1062,7 @@ def collect(
     bundle = dict(
         version=1,
         status=STATUS,
+        round=round_i,
         source=FA._source(),
         checkpoint=checkpoint,
         checkpoint_sha256=checkpoint_sha,
@@ -877,6 +1078,9 @@ def collect(
             H=cfg.H,
             T=int(T),
             ell=float(ell),
+            gp_cap=int(gp_cap),
+            gp_buffer_ids=gp_ids,
+            gp_selection=gp_selection,
             beta=float(beta),
             calibrated_ess_over_K=float(calibrated_ess),
             realized_ess_over_K=float(np.mean(ess_values)),
@@ -915,6 +1119,7 @@ def collect(
         trace_path=os.path.abspath(trace_path),
         trace_sha256=FA._sha256_file(trace_path),
         checkpoint_sha256=checkpoint_sha,
+        round=round_i,
         selector=selector,
         neutral_continuation=bool(neutral_continuation),
         counts=dict(counts),
@@ -922,6 +1127,8 @@ def collect(
         executed_shard=executed_manifest,
         query_sidecar=query_manifest,
         neutral_shard=neutral_manifest,
+        gp_buffer_ids=gp_ids,
+        gp_selection=gp_selection,
     )
     FA._write_json(os.path.join(outdir, "COMPLETE.json"), marker)
     return trace_path
