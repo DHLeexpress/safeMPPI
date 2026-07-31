@@ -70,6 +70,18 @@ def _records(gather_dir):
     return rows
 
 
+def _protocol(gather_dir):
+    payload = _load(os.path.join(gather_dir, "repair_trace.pt"))
+    protocol = payload["protocol"]
+    return {
+        "beta": float(protocol["beta"]),
+        "calibrated_ess_over_K": float(protocol["calibrated_ess_over_K"]),
+        "realized_ess_over_K": float(protocol["realized_ess_over_K"]),
+        "uplift": float(protocol["acquisition"]["uplift"]),
+        "gp_effective_cap": int(protocol["gp_selection"]["effective_cap"]),
+    }
+
+
 def _diversity(rows):
     if not rows:
         return {"samples": 0, "occupied_025m_bins": 0, "heading_entropy": 0.0,
@@ -92,9 +104,9 @@ def _diversity(rows):
     }
 
 
-def render(rows_by_name, labels, output_stem):
+def render(rows_by_name, labels, metadata, output_stem):
     figure, axes = plt.subplots(3, 4, figsize=(13.0, 9.7), sharex=True, sharey=True)
-    manifest = {"gammas": list(GAMMAS), "rows": {}}
+    manifest = {"gammas": list(GAMMAS), "protocol": metadata, "rows": {}}
     for row_index, (name, rows) in enumerate(rows_by_name.items()):
         manifest["rows"][name] = {}
         for column, gamma in enumerate(GAMMAS):
@@ -149,7 +161,7 @@ def render(rows_by_name, labels, output_stem):
         plt.Line2D([0], [0], color="black", lw=0.8, label="executed context path"),
     ]
     figure.legend(handles=handles, ncol=3, loc="upper center", frameon=False)
-    figure.suptitle("Actual acquisition support after one expansion round", y=0.965)
+    figure.suptitle("Actual D+ / D0 acquisition support · two shared OOD scenarios", y=0.965)
     figure.tight_layout(rect=(0, 0, 1, 0.94))
     os.makedirs(os.path.dirname(os.path.abspath(output_stem)), exist_ok=True)
     for suffix in ("png", "pdf"):
@@ -172,12 +184,17 @@ def main(argv=None):
         "ess05": _records(args.ess05_gather),
         "ess01": _records(args.ess01_gather),
     }
-    labels = {
-        "pretrained": "r0 gather",
-        "ess05": "post-r1 · ESS 0.5",
-        "ess01": "post-r1 · ESS 0.1",
+    metadata = {
+        "pretrained": _protocol(args.pretrained_gather),
+        "ess05": _protocol(args.ess05_gather),
+        "ess01": _protocol(args.ess01_gather),
     }
-    render(rows, labels, os.path.abspath(args.output_stem))
+    labels = {
+        "pretrained": "r0 gather\nGP empty",
+        "ess05": f"post-r1 · ESS 0.5\nβ={metadata['ess05']['beta']:.4g}",
+        "ess01": f"post-r1 · ESS 0.1\nβ={metadata['ess01']['beta']:.4g}",
+    }
+    render(rows, labels, metadata, os.path.abspath(args.output_stem))
 
 
 if __name__ == "__main__":
