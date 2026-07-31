@@ -145,6 +145,22 @@ def test_chunked_weighting_gradient_matches_direct_hierarchy_objective():
     torch.testing.assert_close(chunked, policy.scale.grad)
 
 
+def test_gradient_temporarily_enables_training_and_restores_mode():
+    _, records = N._neutral_records(_payload())
+    policy = _TinyPolicy()
+    policy.eval()
+    gradient = N._gradient(
+        policy,
+        records,
+        batch=1,
+        device="cpu",
+        seed=13,
+    )
+    assert gradient["scale"] is not None
+    assert not policy.training
+    assert policy.scale.grad is None
+
+
 def test_neutral_conversion_rejects_nested_verifier_inconsistency():
     payload = _payload()
     payload["records"][0]["verifier_result"]["full_h"] = False

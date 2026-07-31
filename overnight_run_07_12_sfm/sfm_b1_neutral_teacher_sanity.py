@@ -271,19 +271,25 @@ def _neutral_update(
 
 def _gradient(policy, records, *, batch, device, seed):
     mass, _ = BS.hierarchy_mass(records)
-    policy.zero_grad(set_to_none=True)
-    _objective(
-        policy,
-        records,
-        mass,
-        batch=batch,
-        device=device,
-        seed=seed,
-        backward=True,
-    )
-    value = BS._gradient_snapshot(policy)
-    policy.zero_grad(set_to_none=True)
-    return value
+    was_training = policy.training
+    try:
+        # cuDNN GRU backward is unavailable in eval mode.  This diagnostic
+        # must use the same train-mode network semantics as both replay phases.
+        policy.train()
+        policy.zero_grad(set_to_none=True)
+        _objective(
+            policy,
+            records,
+            mass,
+            batch=batch,
+            device=device,
+            seed=seed,
+            backward=True,
+        )
+        return BS._gradient_snapshot(policy)
+    finally:
+        policy.zero_grad(set_to_none=True)
+        policy.train(was_training)
 
 
 def _cosine(first, second):
