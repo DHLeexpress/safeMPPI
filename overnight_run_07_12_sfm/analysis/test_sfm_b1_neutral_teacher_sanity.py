@@ -27,7 +27,12 @@ def _payload():
             "ped_vel": np.zeros((40, 2), np.float32),
             "controls": np.full((10, 2), 0.2 + index, np.float32),
             "x0": np.zeros(20, np.float32),
-            "verifier_result": {"resolved": True, "y": 0},
+            "verifier_result": {
+                "resolved": True,
+                "y": 0,
+                "full_h": True,
+                "terminal_step": 10,
+            },
             "verifier_y": 0,
             "train_eligible": False,
             "replay_default": False,
@@ -107,5 +112,41 @@ def test_neutral_update_uses_whole_support_once_per_inner_step():
 def test_neutral_conversion_rejects_relabeling():
     payload = _payload()
     payload["records"][0]["verifier_y"] = 1
+    with pytest.raises(RuntimeError, match="D0 semantics"):
+        N._neutral_records(payload)
+
+
+def test_chunked_weighting_gradient_matches_direct_hierarchy_objective():
+    _, records = N._neutral_records(_payload())
+    mass, _ = BS.hierarchy_mass(records)
+    policy = _TinyPolicy()
+    policy.zero_grad(set_to_none=True)
+    N._objective(
+        policy,
+        records,
+        mass,
+        batch=1,
+        device="cpu",
+        seed=11,
+        backward=True,
+    )
+    chunked = policy.scale.grad.detach().clone()
+
+    policy.zero_grad(set_to_none=True)
+    direct = 0.0
+    for holder, row in records:
+        context = holder.contexts[row["context_id"]]
+        target = torch.as_tensor(row["controls"]).mean()
+        low = torch.as_tensor(context["low5"])
+        direct = direct + mass[(id(holder), row["query_id"])] * (
+            policy.scale * low[0] - target
+        ).square()
+    direct.backward()
+    torch.testing.assert_close(chunked, policy.scale.grad)
+
+
+def test_neutral_conversion_rejects_nested_verifier_inconsistency():
+    payload = _payload()
+    payload["records"][0]["verifier_result"]["full_h"] = False
     with pytest.raises(RuntimeError, match="D0 semantics"):
         N._neutral_records(payload)

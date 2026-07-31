@@ -112,11 +112,16 @@ def _neutral_records(payload):
     holder = _NeutralHolder(payload["round"])
     records = []
     for expected, source in enumerate(payload["records"]):
+        verifier = source.get("verifier_result", {})
         if (
             int(source["neutral_id"]) != expected
             or source["population"] != "D0"
             or source["semantic_label"] != "neutral"
             or int(source["verifier_y"]) != 0
+            or not verifier.get("resolved")
+            or int(verifier.get("y", -1)) != 0
+            or not verifier.get("full_h")
+            or int(verifier.get("terminal_step", -1)) != SP.H
             or source["train_eligible"]
             or source["replay_default"]
             or source["gp_eligible"]
@@ -387,6 +392,7 @@ def _train(
     ordinary = _summarize_ordinary(ordinary)
     if ordinary["optimizer_steps"] != 1:
         raise RuntimeError("ordinary alpha=0 phase must use one Adam step")
+    policy.eval()
     ordinary_fixed_after = {
         "Dplus": _fixed_loss(
             policy,
