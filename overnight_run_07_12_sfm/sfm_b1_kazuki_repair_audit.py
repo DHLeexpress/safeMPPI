@@ -20,6 +20,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
 import copy
+from dataclasses import replace
 import os
 
 import numpy as np
@@ -537,7 +538,7 @@ def collect(
         W=2,
         batch=128,
         lr=1.0e-5,
-        ess_target=float(ess_target),
+        ess_target=0.5,
         nfe=8,
         temp=1.0,
         phi_s=0.9,
@@ -547,6 +548,9 @@ def collect(
         seed=int(audit_seed),
         scene_profile=scene_profile,
     ).validate()
+    if not 0.0 < float(ess_target) <= 1.0:
+        raise ValueError("ess_target must be in (0, 1]")
+    cfg = replace(cfg, ess_target=float(ess_target))
     gp, gp_ids, gp_selection = _gamma_balanced_gp(
         phi_policy,
         previous,
