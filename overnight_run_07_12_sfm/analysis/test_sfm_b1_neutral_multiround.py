@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import json
 import numpy as np
 import pytest
 import torch
@@ -143,6 +144,50 @@ def test_restore_optimizer_preserves_global_adam_step(tmp_path):
         neutral_replay=False,
     )
     assert one_phase_report["expected_adam_step"] == 4
+
+
+def test_nested_resume_round_refs_are_recursive_and_contiguous(tmp_path):
+    deliveries = []
+    lineage = []
+    for round_i in (1, 2, 3):
+        checkpoint = tmp_path / f"round_{round_i:02d}.pt"
+        post_positive = tmp_path / f"round_{round_i:02d}_post_positive.pt"
+        checkpoint.write_bytes(f"checkpoint-{round_i}".encode())
+        post_positive.write_bytes(f"positive-{round_i}".encode())
+        marker = tmp_path / f"round_{round_i:02d}.json"
+        record = {
+            "status": M.ROUND_STATUS, "round": round_i,
+            "checkpoint": str(checkpoint),
+            "checkpoint_sha256": M.FA._sha256_file(checkpoint),
+            "scenarios": [260000 + 2 * round_i - 2, 260000 + 2 * round_i - 1],
+        }
+        marker.write_text(json.dumps(record))
+        current_ref = M._round_record_ref(marker, record)
+        delivery = {
+            "status": M.STATUS,
+            "round_records": [str(marker)],
+            "round_record_refs": [current_ref],
+        }
+        if deliveries:
+            prior_path, prior = deliveries[-1]
+            delivery["resume"] = {
+                "delivery": str(prior_path),
+                "delivery_sha256": M.FA._sha256_file(prior_path),
+                "round_record_refs": list(lineage),
+            }
+        delivery_path = tmp_path / f"delivery_{round_i}.json"
+        delivery_path.write_text(json.dumps(delivery))
+        lineage.append(current_ref)
+        deliveries.append((delivery_path, delivery))
+
+    final_path, final_delivery = deliveries[-1]
+    refs = M._delivery_lineage_refs(final_delivery, final_path)
+    assert [row["round"] for row in refs] == [1, 2, 3]
+
+    broken = dict(deliveries[-1][1])
+    broken["round_record_refs"] = [dict(lineage[-1], path=str(tmp_path / "wrong"))]
+    with pytest.raises(RuntimeError, match="current resume round snapshot"):
+        M._delivery_lineage_refs(broken, deliveries[-1][0])
 
 
 def _positive_result():

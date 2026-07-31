@@ -46,15 +46,31 @@ def test_global_temperature_reference_reuse_is_fail_closed(tmp_path):
     reference_root = tmp_path / "disjoint_m50"
     selection = {}
     for method in ("pretrained", "expanded"):
-        rows = [_row(470000, gamma) for gamma in G.SP.GAMMAS]
-        rows *= 50
+        scenario_ids = list(range(470000, 470050))
+        rows = [
+            _row(episode, gamma)
+            for gamma in G.SP.GAMMAS for episode in scenario_ids
+        ]
         payload = {
-            "bank": {"ep0": 470000, "M_per_gamma": 50},
-            "noise_bank": {"seed": 7},
+            "scene_profile": "double_density_velocity_ood",
+            "bank": {
+                "ep0": 470000, "M_per_gamma": 50,
+                "scenario_ids": scenario_ids,
+            },
+            "noise_bank": {
+                "seed": 7, "gammas": list(map(float, G.SP.GAMMAS)),
+                "NFE": 8, "dtype": "float32",
+                "shape": [7, 50, 180, 20], "sha256": "a" * 64,
+            },
             "temperature": .55,
+            "temperature_by_gamma": [.55] * 7,
             "records": [{
                 "round": 0,
-                "cell": {"rows": rows, "checkpoint_sha256": method},
+                "cell": {
+                    "rows": rows, "checkpoint_sha256": method,
+                    "scene_profile": "double_density_velocity_ood",
+                    "cell_key": f"cell-{method}",
+                },
             }],
         }
         destination = reference_root / method / "raw_m50_offline_metrics.json"
@@ -78,9 +94,85 @@ def test_global_temperature_reference_reuse_is_fail_closed(tmp_path):
     )
     assert cells["pretrained"][.55]["temperature"] == .55
 
+    expanded_path = (
+        reference_root / "expanded" / "raw_m50_offline_metrics.json"
+    )
+    expanded = json.loads(expanded_path.read_text())
+    expanded["noise_bank"]["sha256"] = "b" * 64
+    expanded_path.write_text(json.dumps(expanded))
+    with pytest.raises(RuntimeError, match="do not share CRN bytes"):
+        G._reuse_global_temperature_cells(initial, state, selection)
+    expanded["noise_bank"]["sha256"] = "a" * 64
+    expanded_path.write_text(json.dumps(expanded))
+
     selection["expanded"]["checkpoint_sha256"] = "wrong"
     with pytest.raises(RuntimeError, match="reference contract failed for expanded"):
         G._reuse_global_temperature_cells(initial, state, selection)
+
+
+def test_prior_calibration_cells_are_content_authenticated(tmp_path):
+    bank = {"ep0": 470000, "M_per_gamma": 50, "noise_seed": 17}
+    methods = {
+        "pretrained": {"round": 0, "checkpoint_sha256": "pre"},
+        "expanded": {"round": 2, "checkpoint_sha256": "exp"},
+    }
+    root = tmp_path / "prior"
+    for method, selected in methods.items():
+        scenario_ids = list(range(470000, 470050))
+        rows = [
+            _row(episode, gamma)
+            for gamma in G.SP.GAMMAS for episode in scenario_ids
+        ]
+        payload = {
+            "scene_profile": "double_density_velocity_ood",
+            "bank": {
+                "ep0": 470000, "M_per_gamma": 50,
+                "scenario_ids": scenario_ids,
+            },
+            "noise_bank": {
+                "seed": 17, "gammas": list(map(float, G.SP.GAMMAS)),
+                "NFE": 8, "dtype": "float32",
+                "shape": [7, 50, 180, 20], "sha256": "c" * 64,
+            },
+            "temperature": .7,
+            "temperature_by_gamma": [.7] * 7,
+            "records": [{
+                "round": selected["round"],
+                "cell": {
+                    "rows": rows,
+                    "checkpoint_sha256": selected["checkpoint_sha256"],
+                    "scene_profile": "double_density_velocity_ood",
+                    "cell_key": f"{method}-cell",
+                },
+            }],
+        }
+        path = (
+            root / "calibration_m50" / f"{method}_temp0p7"
+            / "raw_m50_offline_metrics.json"
+        )
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(payload))
+    cells = {"pretrained": {}, "expanded": {}}
+    reuse = G._reuse_prior_calibration_cells(
+        root, methods, bank, [.7], cells,
+    )
+    assert len(reuse["records"]) == 2
+    assert not reuse["missing_cells_will_be_run"]
+    assert set(cells) == {"pretrained", "expanded"}
+    assert cells["expanded"][.7]["records"][0]["round"] == 2
+
+    path = (
+        root / "calibration_m50" / "expanded_temp0p7"
+        / "raw_m50_offline_metrics.json"
+    )
+    broken = json.loads(path.read_text())
+    broken["records"][0]["round"] = 3
+    path.write_text(json.dumps(broken))
+    with pytest.raises(RuntimeError, match="prior calibration contract"):
+        G._reuse_prior_calibration_cells(
+            root, methods, bank, [.7],
+            {"pretrained": {}, "expanded": {}},
+        )
 
 
 def test_ci_win_requires_all_four_intervals_strictly_favorable():
@@ -162,3 +254,21 @@ def test_final_objective_requires_ci_liveness_and_gamma_trend():
     gates = G._final_objective_gates(bad_liveness, comparisons)
     assert not gates["final_liveness_eligible"]
     assert not gates["objective_achieved"]
+
+
+def test_one_fully_reversed_trend_family_cannot_hide_in_mean():
+    pooled = {
+        "SR": .8, "CR": .1, "timeout": 0.0,
+        "Validity": .7, "clearance": .2, "time_to_goal": 8.0,
+    }
+    per_gamma = {}
+    for index, gamma in enumerate(G.SP.GAMMAS):
+        cell = dict(pooled)
+        cell["CR"] = .1 + .01 * index
+        cell["Validity"] = .5 + .02 * index
+        cell["clearance"] = .3 - .01 * index
+        cell["time_to_goal"] = 7.0 + 2.0 * index
+        per_gamma[str(gamma)] = cell
+    record = {"pooled": pooled, "per_gamma": per_gamma}
+    assert G.BASE._trend(record)["mean_fraction"] == .75
+    assert not G.BASE._trend_eligible(record)

@@ -1147,6 +1147,69 @@ def _validate_resume_config(previous_config, current_config):
     return compatibility_normalized
 
 
+def _round_record_ref(path, record):
+    marker = os.path.abspath(os.fspath(path))
+    checkpoint = os.path.abspath(record["checkpoint"])
+    round_i = int(record["round"])
+    post_positive = os.path.join(
+        os.path.dirname(checkpoint), f"round_{round_i:02d}_post_positive.pt",
+    )
+    if FA._sha256_file(checkpoint) != record["checkpoint_sha256"]:
+        raise RuntimeError("round checkpoint digest mismatch")
+    return {
+        "path": marker,
+        "sha256": FA._sha256_file(marker),
+        "round": round_i,
+        "post_D0": checkpoint,
+        "post_D0_sha256": record["checkpoint_sha256"],
+        "post_Dplus": post_positive,
+        "post_Dplus_sha256": FA._sha256_file(post_positive),
+    }
+
+
+def _delivery_lineage_refs(delivery, delivery_path, seen=()):
+    """Authenticate current and recursively resumed round artifacts."""
+    delivery_path = os.path.abspath(os.fspath(delivery_path))
+    if delivery_path in seen:
+        raise RuntimeError("cyclic resume delivery chain")
+    current_paths = [
+        os.path.abspath(path) for path in delivery.get("round_records", ())
+    ]
+    frozen_current = list(delivery.get("round_record_refs", ()))
+    computed_current = []
+    for path in current_paths:
+        with open(path) as stream:
+            record = json.load(stream)
+        if record.get("status") != ROUND_STATUS:
+            raise RuntimeError("invalid resume round marker")
+        computed_current.append(_round_record_ref(path, record))
+    if frozen_current:
+        if frozen_current != computed_current:
+            raise RuntimeError("current resume round snapshot changed")
+        current_refs = frozen_current
+    else:
+        current_refs = computed_current
+
+    prior_refs = []
+    resume = delivery.get("resume")
+    if resume:
+        prior_path = os.path.abspath(resume["delivery"])
+        payload = open(prior_path, "rb").read()
+        if hashlib.sha256(payload).hexdigest() != resume.get("delivery_sha256"):
+            raise RuntimeError("nested resume delivery digest mismatch")
+        prior_delivery = json.loads(payload)
+        expected = _delivery_lineage_refs(
+            prior_delivery, prior_path, seen=(*seen, delivery_path),
+        )
+        snapshot = list(resume.get("round_record_refs", ()))
+        if not snapshot:
+            raise RuntimeError("nested resume lacks frozen prior-round refs")
+        if snapshot != expected:
+            raise RuntimeError("nested resume round snapshot changed")
+        prior_refs = snapshot
+    return [*prior_refs, *current_refs]
+
+
 def _resume_artifacts(resume_root, cfg, *, source_sha, scenario_ep0):
     root = os.path.abspath(os.fspath(resume_root))
     delivery_path = os.path.join(root, "DELIVERY_COMPLETE.json")
@@ -1163,15 +1226,18 @@ def _resume_artifacts(resume_root, cfg, *, source_sha, scenario_ep0):
     compatibility_normalized = _validate_resume_config(
         previous_config, current_config,
     )
-    round_records = list(delivery.get("round_records", ()))
-    if not round_records:
+    current_round_records = list(delivery.get("round_records", ()))
+    if not current_round_records:
         raise RuntimeError("resume delivery has no round records")
+    round_record_refs = _delivery_lineage_refs(delivery, delivery_path)
     records = []
-    for path in round_records:
-        with open(path) as stream:
+    for ref in round_record_refs:
+        if FA._sha256_file(ref["path"]) != ref["sha256"]:
+            raise RuntimeError("resume round marker digest mismatch")
+        with open(ref["path"]) as stream:
             record = json.load(stream)
-        if record.get("status") != ROUND_STATUS:
-            raise RuntimeError("invalid resume round marker")
+        if int(record["round"]) != int(ref["round"]):
+            raise RuntimeError("resume round marker index changed")
         records.append(record)
     rounds = [int(record["round"]) for record in records]
     if rounds != list(range(1, max(rounds) + 1)):
@@ -1229,6 +1295,7 @@ def _resume_artifacts(resume_root, cfg, *, source_sha, scenario_ep0):
         "root": root,
         "delivery": delivery_path,
         "delivery_sha256": FA._sha256_file(delivery_path),
+        "round_record_refs": round_record_refs,
         "resume_round": resume_round,
         "checkpoint": checkpoint,
         "checkpoint_sha256": final["checkpoint_sha256"],
@@ -1248,6 +1315,7 @@ def _resume_artifacts(resume_root, cfg, *, source_sha, scenario_ep0):
 
 def _restore_optimizer(
     optimizer, path, parameters, *, resume_round, inner_steps,
+    parameter_names=None,
     neutral_replay=True,
 ):
     payload = torch.load(path, map_location="cpu", weights_only=False)
@@ -1255,11 +1323,17 @@ def _restore_optimizer(
         raise RuntimeError("optimizer round mismatch")
     state = payload.get("optimizer", {})
     groups = list(state.get("param_groups", ()))
-    if len(groups) != len(optimizer.param_groups) or any(
-        float(source.get("lr", -1)) != float(target["lr"])
-        for source, target in zip(groups, optimizer.param_groups)
-    ):
+    target_groups = list(optimizer.param_groups)
+    if len(groups) != len(target_groups):
         raise RuntimeError("optimizer hyperparameters changed")
+    for source, target in zip(groups, target_groups):
+        source_hyper = {key: value for key, value in source.items() if key != "params"}
+        target_hyper = {key: value for key, value in target.items() if key != "params"}
+        if source_hyper != target_hyper:
+            raise RuntimeError("optimizer hyperparameters changed")
+    saved_names = payload.get("parameter_names")
+    if saved_names is not None and list(saved_names) != list(parameter_names or ()):
+        raise RuntimeError("optimizer named parameter order changed")
     ids = [
         parameter_id
         for group in groups for parameter_id in group.get("params", ())
@@ -1284,11 +1358,40 @@ def _restore_optimizer(
         "expected_adam_step": expected_step,
         "updates_per_round": updates_per_round,
         "parameters": len(parameters),
+        "parameter_names_authenticated": saved_names is not None,
+        "legacy_parameter_order_reconstructed": saved_names is None,
+        "param_group_hyperparameters": [
+            {key: value for key, value in group.items() if key != "params"}
+            for group in groups
+        ],
     }
 
 
 def run(args):
     eval_rounds = _parse_eval_rounds(args.eval_rounds, args.rounds)
+    locked_eval_values = (
+        args.locked_eval_checkpoint,
+        args.locked_eval_round,
+        args.locked_eval_sha256,
+    )
+    if any(value is not None for value in locked_eval_values) and not all(
+        value is not None for value in locked_eval_values
+    ):
+        raise ValueError("locked prior-best evaluation requires path, round, and SHA")
+    locked_eval = None
+    if all(value is not None for value in locked_eval_values):
+        locked_round = int(args.locked_eval_round)
+        locked_checkpoint = os.path.abspath(args.locked_eval_checkpoint)
+        locked_sha = str(args.locked_eval_sha256)
+        if locked_round not in eval_rounds or locked_round in (0, int(args.rounds)):
+            raise ValueError("locked prior-best round must be an interior eval round")
+        if FA._sha256_file(locked_checkpoint) != locked_sha:
+            raise RuntimeError("locked prior-best checkpoint SHA changed")
+        locked_eval = {
+            "round": locked_round,
+            "checkpoint": locked_checkpoint,
+            "checkpoint_sha256": locked_sha,
+        }
     cfg = StudyConfig(
         name=str(args.name),
         rounds=int(args.rounds),
@@ -1362,6 +1465,12 @@ def run(args):
         if parameter.requires_grad
     ]
     parameters = [*main_parameters, *encoder_parameters]
+    name_by_parameter_id = {
+        id(parameter): name for name, parameter in policy.named_parameters()
+    }
+    optimizer_parameter_names = [
+        name_by_parameter_id[id(parameter)] for parameter in parameters
+    ]
     optimizer_groups = [{"params": main_parameters, "lr": cfg.lr}]
     if encoder_parameters:
         optimizer_groups.append({
@@ -1376,6 +1485,7 @@ def run(args):
             parameters,
             resume_round=resume["resume_round"],
             inner_steps=cfg.inner_steps,
+            parameter_names=optimizer_parameter_names,
             neutral_replay=cfg.neutral_replay,
         )
         if resume else None
@@ -1415,6 +1525,15 @@ def run(args):
             "round": start_round,
             "phase": "resume_anchor_after_D0",
             "checkpoint": current_checkpoint,
+        })
+    if locked_eval is not None:
+        if any(item["round"] == locked_eval["round"] for item in milestone_arms):
+            raise ValueError("locked prior-best duplicates an existing milestone")
+        milestone_arms.append({
+            "name": f"locked_r{locked_eval['round']}",
+            "round": locked_eval["round"],
+            "phase": "locked_prior_best",
+            "checkpoint": locked_eval["checkpoint"],
         })
 
     context = mp.get_context("spawn")
@@ -1627,6 +1746,7 @@ def run(args):
             torch.save({
                 "round": round_i,
                 "optimizer": optimizer.state_dict(),
+                "parameter_names": optimizer_parameter_names,
             }, optimizer_path)
             phase_neutral = _probe_checkpoint(
                 round_checkpoint,
@@ -1921,12 +2041,24 @@ def run(args):
         "rounds_run_this_invocation": len(history),
         "resume": resume,
         "optimizer_restore": optimizer_restore,
+        "locked_prior_best": locked_eval,
         "trainable_parameter_names": trainable_names,
         "round_records": [
             os.path.join(
                 rounds_dir,
                 f"round_{record['round']:02d}",
                 "ROUND_COMPLETE.json",
+            )
+            for record in history
+        ],
+        "round_record_refs": [
+            _round_record_ref(
+                os.path.join(
+                    rounds_dir,
+                    f"round_{record['round']:02d}",
+                    "ROUND_COMPLETE.json",
+                ),
+                record,
             )
             for record in history
         ],
@@ -1966,6 +2098,12 @@ def run(args):
             ),
         },
     }
+    finished_source = FA._source()
+    if (
+        not finished_source["tracked_worktree_clean"]
+        or finished_source["commit"] != source["commit"]
+    ):
+        raise RuntimeError("source worktree changed during neutral training")
     _write_json(
         os.path.join(output_root, "DELIVERY_COMPLETE.json"), complete,
     )
@@ -1996,6 +2134,9 @@ def build_parser():
             "and the final round"
         ),
     )
+    parser.add_argument("--locked-eval-checkpoint")
+    parser.add_argument("--locked-eval-round", type=int)
+    parser.add_argument("--locked-eval-sha256")
     parser.add_argument("--lr", type=float, default=DEFAULT_LR)
     parser.add_argument("--inner-steps", type=int, default=DEFAULT_INNER_STEPS)
     parser.add_argument(

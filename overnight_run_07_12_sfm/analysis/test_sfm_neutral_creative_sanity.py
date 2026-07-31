@@ -157,6 +157,20 @@ def test_stage_a_gate_requires_liveness_gain_safety_and_gamma_trend():
     )
 
 
+def test_early_selector_qualification_does_not_require_r100_equal_dose():
+    candidate = [_metric_row(0, SR=.6, CR=.35, timeout=.05, validity=.6)]
+    control = [_metric_row(1, SR=.60, CR=.35, timeout=.05, validity=.60)]
+    candidate.append(_metric_row(
+        1, SR=.66, CR=.35, timeout=.04, validity=.60,
+    ))
+    unreachable_r100 = _metric_row(
+        100, SR=.99, CR=.0, timeout=.0, validity=.99,
+    )
+    gate = C._selector_gate(candidate, control, unreachable_r100)
+    assert gate["passed"]
+    assert not gate["decisions"][0]["noninferior_to_r100_reference"]
+
+
 def test_encoder_stage_stops_on_drift_regression_or_cr(tmp_path):
     marker = {
         "round": 1,
@@ -196,6 +210,119 @@ def test_encoder_stage_stops_on_drift_regression_or_cr(tmp_path):
     )
     assert gate["unsafe"]
     assert not gate["continue_to_round5"]
+
+
+def test_encoder_stage_preserves_earlier_eligible_round(tmp_path):
+    paths = []
+    candidates, controls, control_markers = [], [], {}
+    for round_i, cosine in ((1, .995), (2, .97)):
+        marker = {
+            "round": round_i,
+            "encoder_diagnostics": {
+                "token_cosine": cosine,
+                "relative_parameter_drift": .001,
+                "cumulative_from_reference": {
+                    "token_cosine": cosine, "token_rms_change": .01,
+                    "relative_parameter_drift": .001,
+                },
+            },
+            "updates": {
+                "Dplus": {"encoder_gradient_norms": [.1]},
+                "D0": {"encoder_gradient_norms": [.2]},
+            },
+            "paired_trigger_probe": {
+                "Dplus_increment": {"Dplus_regressed": 0},
+            },
+            "gather": {
+                "gp_diagnostics": {"kernel_effective_rank": 13.0},
+                "acquisition": {"uplift": .012},
+            },
+        }
+        path = _write(tmp_path / f"round{round_i}.json", marker)
+        paths.append(str(path))
+        candidates.append(_metric_row(
+            round_i, SR=.7, CR=.2, timeout=.1, validity=.70,
+        ))
+        controls.append(_metric_row(
+            round_i, SR=.7, CR=.2, timeout=.1, validity=.68,
+        ))
+        control_markers[round_i] = {
+            "gather": {
+                "gp_diagnostics": {"kernel_effective_rank": 11.0},
+                "acquisition": {"uplift": .009},
+            },
+        }
+    gate = C._encoder_stage_gate(
+        {"round_records": paths}, candidates, controls, control_markers,
+    )
+    assert gate["eligible_rounds"] == [1]
+    assert not gate["continue_to_round5"]
+
+
+def test_full_creative_command_keeps_locked_winner_and_m20():
+    command = C._training_command(
+        checkpoint="pre.pt", output="out", name="arm", rounds=100,
+        scenario_ep0=1, eval_ep0=2, eval_rounds=(0, 2, 100),
+        lr=1e-5, inner_steps=1, ell=.2, gp_cap=512,
+        selector="margin", encoder_lr_ratio=0.0, workers=2,
+        noise_seed=3, sample_seed=4, audit_seed=5, train_seed=6,
+        probe_seed=7, eval_M=20,
+        locked_eval={
+            "checkpoint": "best.pt", "round": 2,
+            "checkpoint_sha256": "abc",
+        },
+    )
+    assert command[command.index("--eval-M") + 1] == "20"
+    assert command[command.index("--locked-eval-round") + 1] == "2"
+
+
+def test_full_creative_extension_resumes_selected_run_not_pretrained(
+    tmp_path, monkeypatch,
+):
+    source_run = tmp_path / "stage_c5"
+    source_run.mkdir()
+    marker = _write(source_run / "round5.json", {
+        "round": 5, "scenarios": [260008, 260009],
+    })
+    source_delivery = {
+        "rounds": 5,
+        "checkpoint": "/pretrained.pt",
+        "round_records": [str(marker)],
+        "config": {
+            "name": "encoder_c5", "lr": 1e-5, "inner_steps": 1,
+            "ell": .2, "gp_cap": 512, "selector": "margin",
+            "encoder_lr_ratio": .1, "sample_seed": 1, "audit_seed": 2,
+            "train_seed": 3, "probe_seed": 4, "neutral_replay": True,
+        },
+    }
+    _write(source_run / "DELIVERY_COMPLETE.json", source_delivery)
+    common = {"selected_lock": {
+        "name": "encoder_c5_r3", "training_run": str(source_run),
+        "round": 3, "checkpoint": "/locked-r3.pt",
+        "checkpoint_sha256": "locked-sha",
+    }}
+    commands = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        output = Path(command[command.index("--output-root") + 1])
+        output.mkdir(parents=True)
+        _write(output / "DELIVERY_COMPLETE.json", {"status": "complete"})
+
+    monkeypatch.setattr(C, "_run", fake_run)
+    monkeypatch.setattr(C, "_confirm_full_run", lambda **_kwargs: {
+        "objective_achieved": False,
+    })
+    result = C._extend_common_winner_to_r100(
+        common, output=tmp_path / "out", eval_ep0=1, confirm_ep0=2,
+        noise_seed=3, gpus=[1, 3], workers=4,
+    )
+    command = commands[0]
+    assert command[command.index("--resume-run-root") + 1] == str(source_run)
+    assert command[command.index("--rounds") + 1] == "100"
+    eval_rounds = command[command.index("--eval-rounds") + 1]
+    assert {3, 5, 10, 100}.issubset(set(map(int, eval_rounds.split(","))))
+    assert result["source_lock"]["round"] == 3
 
 
 def test_legacy_control_gp_uplift_is_read_from_authenticated_trace(tmp_path):

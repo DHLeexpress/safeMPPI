@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import datetime, timezone
+import hashlib
 import json
 import math
 import os
@@ -38,11 +39,32 @@ HERE = Path(__file__).resolve().parent
 STATUS = "SFM_NEUTRAL_TEMPERATURE_DISJOINT_M50_COMPLETE"
 METRICS = ("CR", "Validity", "clearance", "time_to_goal")
 LOWER_IS_BETTER = {"CR", "time_to_goal"}
+MIN_TREND_FAMILY_FRACTION = .75
+
+
+def _source_gate(expected: str | None = None) -> str:
+    commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=HERE, text=True,
+    ).strip()
+    dirty = subprocess.check_output(
+        ["git", "status", "--porcelain"], cwd=HERE, text=True,
+    ).strip()
+    if dirty:
+        raise RuntimeError("evaluation requires a clean frozen worktree")
+    if expected is not None and commit != str(expected):
+        raise RuntimeError("evaluation source commit differs from the pin")
+    return commit
 
 
 def _read(path: Path) -> dict:
     with path.open() as stream:
         return json.load(stream)
+
+
+def _read_hashed(path: Path) -> tuple[dict, str]:
+    """Read immutable JSON bytes once so payload and digest cannot diverge."""
+    payload = path.read_bytes()
+    return json.loads(payload), hashlib.sha256(payload).hexdigest()
 
 
 def _write(path: Path, value) -> None:
@@ -67,6 +89,68 @@ def _wait_for_deliveries(root: Path, arm_names: list[str], poll: int) -> list[di
     return payloads
 
 
+def _ref_identity(ref: dict) -> tuple:
+    return (
+        str(Path(ref["path"]).resolve()),
+        ref["sha256"],
+        int(ref["round"]) if "round" in ref else None,
+    )
+
+
+def _delivery_round_refs(delivery: dict, *, seen=()) -> list[dict]:
+    """Authenticate a possibly nested resume chain and return all refs."""
+    current_paths = [
+        str(Path(path).resolve()) for path in delivery.get("round_records", ())
+    ]
+    current_refs = list(delivery.get("round_record_refs", ()))
+    if current_refs:
+        if [str(Path(ref["path"]).resolve()) for ref in current_refs] != current_paths:
+            raise RuntimeError("current round-record path snapshot changed")
+    else:
+        current_refs = [
+            {"path": path, "sha256": FUNNEL.sha256_file(Path(path))}
+            for path in current_paths
+        ]
+
+    prior_refs = []
+    resume = delivery.get("resume")
+    if resume:
+        prior_path = Path(resume["delivery"]).resolve()
+        if str(prior_path) in seen:
+            raise RuntimeError("cyclic resume delivery chain")
+        prior, prior_sha = _read_hashed(prior_path)
+        if prior_sha != resume["delivery_sha256"]:
+            raise RuntimeError("resume delivery digest mismatch")
+        if prior.get("status") != "SFM_B1_NEUTRAL_MULTIROUND_COMPLETE":
+            raise RuntimeError("resume delivery status changed")
+        expected = _delivery_round_refs(
+            prior, seen=(*seen, str(prior_path)),
+        )
+        snapshot = list(resume.get("round_record_refs", ()))
+        if not snapshot:
+            raise RuntimeError("resumed delivery lacks frozen prior-round refs")
+        if list(map(_ref_identity, snapshot)) != list(map(_ref_identity, expected)):
+            raise RuntimeError("resume prior-round snapshot changed")
+        prior_refs = snapshot
+    return [*prior_refs, *current_refs]
+
+
+def _authenticated_round_records(delivery: dict) -> list[dict]:
+    refs = _delivery_round_refs(delivery)
+    records = []
+    for ref in refs:
+        path = Path(ref["path"]).resolve()
+        if FUNNEL.sha256_file(path) != ref["sha256"]:
+            raise RuntimeError("round marker digest mismatch")
+        record = _read(path)
+        if record.get("status") != "SFM_B1_NEUTRAL_MULTIROUND_ROUND_COMPLETE":
+            raise RuntimeError("round marker status changed")
+        if "round" in ref and int(ref["round"]) != int(record["round"]):
+            raise RuntimeError("round marker index changed")
+        records.append(record)
+    return records
+
+
 def _validate_banks(
     payloads: list[dict], *, screen_ep0: int, screen_M: int,
     validation_ep0: int, validation_M: int, final_ep0: int,
@@ -82,13 +166,15 @@ def _validate_banks(
             raise RuntimeError("delivery screening bank differs from declaration")
         if int(payload.get("rounds", -1)) != int(expected_final_round):
             raise RuntimeError("delivery does not reach the expected final round")
-        arm_scenarios = set()
-        for marker in payload.get("round_records", []):
-            record = _read(Path(marker))
-            arm_scenarios.update(map(int, record.get("scenarios", ())))
-        expected_scenarios = 2 * int(payload.get(
-            "rounds_run_this_invocation", payload["rounds"]
-        ))
+        lineage = _authenticated_round_records(payload)
+        lineage_rounds = [int(record["round"]) for record in lineage]
+        if lineage_rounds != list(range(1, int(payload["rounds"]) + 1)):
+            raise RuntimeError("training round lineage is not contiguous")
+        arm_scenarios = {
+            int(scenario) for record in lineage
+            for scenario in record.get("scenarios", ())
+        }
+        expected_scenarios = 2 * int(payload["rounds"])
         if len(arm_scenarios) != expected_scenarios:
             raise RuntimeError("training scenario lineage is incomplete")
         if training_scenarios and arm_scenarios != training_scenarios:
@@ -283,6 +369,7 @@ def _compact_kazuki(rollout: dict, episode: int, gamma: float) -> dict:
 
 
 def run_kazuki(args) -> dict:
+    _source_gate(getattr(args, "expected_source_commit", None))
     policy, _ = GPS.load_sfm_policy(args.checkpoint, device=args.device)
     policy.eval()
     config = KZ.KazukiConfig(safe_coefs=(0.3,), goal_coef=0.5).validate()
@@ -426,6 +513,14 @@ def _trend(record: dict) -> dict:
     }
 
 
+def _trend_eligible(record: dict) -> bool:
+    """Require every requested gamma-ordering family, not just its mean."""
+    fractions = _trend(record)["adjacent_pair_fractions"]
+    return all(
+        value >= MIN_TREND_FAMILY_FRACTION for value in fractions.values()
+    )
+
+
 def _selection_key(row: dict, target: dict, liveness: dict) -> tuple:
     shortfall = _shortfalls(row, target)
     trend = _trend(row)
@@ -484,6 +579,9 @@ def _render(records: list[dict], output: Path) -> None:
 
 def run(args) -> dict:
     started = datetime.now(timezone.utc)
+    source_commit = _source_gate(
+        getattr(args, "expected_source_commit", None)
+    )
     training_root = Path(args.training_root).resolve()
     output = Path(args.output_dir).resolve()
     if output.exists():
@@ -676,9 +774,7 @@ def run(args) -> dict:
     _render(final_records, final_root / "four_metric_per_gamma.png")
     result = {
         "status": STATUS,
-        "source_commit": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=HERE, text=True
-        ).strip(),
+        "source_commit": source_commit,
         "training_root": str(training_root),
         "training_scenario_ids": sorted(training_scenarios),
         "training_deliveries": [
@@ -721,6 +817,7 @@ def run(args) -> dict:
             datetime.now(timezone.utc) - started
         ).total_seconds(),
     }
+    _source_gate(source_commit)
     _write(output / "DELIVERY_COMPLETE.json", result)
     print(json.dumps({
         "status": STATUS,
@@ -755,6 +852,7 @@ def build_parser() -> argparse.ArgumentParser:
     full.add_argument("--final-ep0", type=int, default=470_000)
     full.add_argument("--final-noise-seed", type=int, default=2_026_073_5)
     full.add_argument("--expected-final-round", type=int, default=50)
+    full.add_argument("--expected-source-commit")
 
     kazuki = sub.add_parser("kazuki")
     kazuki.add_argument("--checkpoint", required=True)
@@ -763,6 +861,7 @@ def build_parser() -> argparse.ArgumentParser:
     kazuki.add_argument("--workers", type=int, default=32)
     kazuki.add_argument("--device", default="cuda:0")
     kazuki.add_argument("--output", required=True)
+    kazuki.add_argument("--expected-source-commit")
     return parser
 
 

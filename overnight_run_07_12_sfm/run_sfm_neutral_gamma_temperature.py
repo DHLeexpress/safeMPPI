@@ -14,6 +14,7 @@ import hashlib
 import itertools
 import json
 from pathlib import Path
+import subprocess
 import sys
 import time
 
@@ -24,6 +25,27 @@ import sfm_protocol as SP
 
 
 STATUS = "SFM_NEUTRAL_GAMMA_TEMPERATURE_M50_COMPLETE"
+
+
+def _gpu_inventory(indices: list[int]) -> dict:
+    output = subprocess.check_output([
+        "nvidia-smi",
+        "--query-gpu=index,uuid,name,driver_version,memory.total",
+        "--format=csv,noheader,nounits",
+    ], text=True)
+    rows = []
+    for line in output.splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) != 5:
+            raise RuntimeError("unexpected nvidia-smi inventory row")
+        rows.append({
+            "index": int(fields[0]), "uuid": fields[1], "name": fields[2],
+            "driver_version": fields[3], "memory_total_MiB": int(fields[4]),
+        })
+    by_index = {row["index"]: row for row in rows}
+    if any(int(index) not in by_index for index in indices):
+        raise RuntimeError("requested physical GPU is absent")
+    return {"requested_indices": list(map(int, indices)), "devices": rows}
 
 
 def _wait(path: Path, poll: int) -> dict:
@@ -91,7 +113,7 @@ def _pick(candidates, *, target: dict, liveness: dict) -> dict:
         shortfall = BASE._shortfalls(row, target)
         return (
             0 if BASE._liveness_eligible(row, liveness) else 1,
-            0 if trend["mean_fraction"] >= .75 else 1,
+            0 if BASE._trend_eligible(row) else 1,
             max(shortfall.values()),
             sum(shortfall.values()),
             -trend["mean_fraction"],
@@ -124,7 +146,7 @@ def _final_objective_gates(final_records: list[dict], comparisons: dict) -> dict
     expanded_trend = BASE._trend(expanded)
     paired_ci_clean = all(map(_ci_win, comparisons.values()))
     liveness_eligible = BASE._liveness_eligible(expanded, liveness_contract)
-    gamma_trend_eligible = expanded_trend["mean_fraction"] >= .75
+    gamma_trend_eligible = BASE._trend_eligible(expanded)
     return {
         "paired_ci_clean_four_metric_win": paired_ci_clean,
         "final_liveness_contract": liveness_contract,
@@ -150,6 +172,13 @@ def _rows_sha256(payload: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _json_value_sha256(value) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _reuse_global_temperature_cells(
     initial_path: Path,
     initial: dict,
@@ -167,15 +196,42 @@ def _reuse_global_temperature_cells(
         )
         payload = BASE._read(reference_path)
         record = payload["records"][0]
+        rows = _raw_rows(payload)
+        expected_ids = list(range(
+            int(bank["ep0"]), int(bank["ep0"]) + int(bank["M_per_gamma"])
+        ))
+        noise = payload.get("noise_bank", {})
+        per_gamma_ids = {
+            float(gamma): sorted(
+                int(row["episode"]) for row in rows
+                if float(row["gamma"]) == float(gamma)
+            )
+            for gamma in SP.GAMMAS
+        }
         if (
-            int(payload["bank"]["ep0"]) != int(bank["ep0"])
+            payload.get("scene_profile") != "double_density_velocity_ood"
+            or record["cell"].get("scene_profile")
+            != "double_density_velocity_ood"
+            or int(payload["bank"]["ep0"]) != int(bank["ep0"])
             or int(payload["bank"]["M_per_gamma"]) != int(bank["M_per_gamma"])
+            or payload["bank"].get("scenario_ids") != expected_ids
             or int(payload["noise_bank"]["seed"]) != int(bank["noise_seed"])
+            or noise.get("gammas") != list(map(float, SP.GAMMAS))
+            or int(noise.get("NFE", -1)) != 8
+            or noise.get("dtype") != "float32"
+            or noise.get("shape") != [
+                len(SP.GAMMAS), int(bank["M_per_gamma"]), 180, 20
+            ]
+            or not isinstance(noise.get("sha256"), str)
+            or len(noise["sha256"]) != 64
             or float(payload["temperature"]) != temperature
+            or payload.get("temperature_by_gamma")
+            != [temperature] * len(SP.GAMMAS)
             or int(record["round"]) != int(selected["round"])
             or record["cell"]["checkpoint_sha256"]
             != selected["checkpoint_sha256"]
-            or len(_raw_rows(payload)) != 50 * len(SP.GAMMAS)
+            or len(rows) != int(bank["M_per_gamma"]) * len(SP.GAMMAS)
+            or any(ids != expected_ids for ids in per_gamma_ids.values())
         ):
             raise RuntimeError(
                 f"global-temperature reference contract failed for {method}"
@@ -186,9 +242,18 @@ def _reuse_global_temperature_cells(
             "reference": str(reference_path),
             "reference_file_sha256": BASE.FUNNEL.sha256_file(reference_path),
             "reference_rows_sha256": _rows_sha256(payload),
+            "noise_bank_sha256": noise["sha256"],
+            "cell_key": record["cell"]["cell_key"],
             "checkpoint_sha256": selected["checkpoint_sha256"],
             "rerun": False,
         }
+    if (
+        records["pretrained"]["noise_bank_sha256"]
+        != records["expanded"]["noise_bank_sha256"]
+    ):
+        raise RuntimeError(
+            "reused pretrained and expanded cells do not share CRN bytes"
+        )
     reuse = {
         "status": "GLOBAL_TEMPERATURE_CALIBRATION_CELLS_REUSED",
         "reason": (
@@ -200,6 +265,129 @@ def _reuse_global_temperature_cells(
         "records": records,
     }
     return cells, reuse
+
+
+def _validate_prior_calibration_cell(
+    path: Path, payload: dict, *, method: str, temperature: float,
+    selected: dict, bank: dict,
+) -> dict:
+    record = payload["records"][0]
+    rows = _raw_rows(payload)
+    expected_ids = list(range(
+        int(bank["ep0"]), int(bank["ep0"]) + int(bank["M_per_gamma"])
+    ))
+    noise = payload.get("noise_bank", {})
+    per_gamma_ids = {
+        float(gamma): sorted(
+            int(row["episode"]) for row in rows
+            if float(row["gamma"]) == float(gamma)
+        )
+        for gamma in SP.GAMMAS
+    }
+    if (
+        payload.get("scene_profile") != "double_density_velocity_ood"
+        or record["cell"].get("scene_profile")
+        != "double_density_velocity_ood"
+        or int(payload["bank"]["ep0"]) != int(bank["ep0"])
+        or int(payload["bank"]["M_per_gamma"]) != int(bank["M_per_gamma"])
+        or payload["bank"].get("scenario_ids") != expected_ids
+        or int(noise.get("seed", -1)) != int(bank["noise_seed"])
+        or noise.get("gammas") != list(map(float, SP.GAMMAS))
+        or int(noise.get("NFE", -1)) != 8
+        or noise.get("dtype") != "float32"
+        or noise.get("shape") != [
+            len(SP.GAMMAS), int(bank["M_per_gamma"]), 180, 20
+        ]
+        or not isinstance(noise.get("sha256"), str)
+        or len(noise["sha256"]) != 64
+        or float(payload["temperature"]) != float(temperature)
+        or payload.get("temperature_by_gamma")
+        != [float(temperature)] * len(SP.GAMMAS)
+        or int(record["round"]) != int(selected["round"])
+        or record["cell"]["checkpoint_sha256"]
+        != selected["checkpoint_sha256"]
+        or len(rows) != int(bank["M_per_gamma"]) * len(SP.GAMMAS)
+        or any(ids != expected_ids for ids in per_gamma_ids.values())
+    ):
+        raise RuntimeError(
+            f"prior calibration contract failed for {method} temp={temperature:g}"
+        )
+    return {
+        "method": method,
+        "temperature": float(temperature),
+        "reference": str(path),
+        "reference_file_sha256": BASE.FUNNEL.sha256_file(path),
+        "reference_rows_sha256": _rows_sha256(payload),
+        "noise_bank_sha256": noise["sha256"],
+        "cell_key": record["cell"]["cell_key"],
+        "checkpoint_sha256": selected["checkpoint_sha256"],
+    }
+
+
+def _reuse_prior_calibration_cells(
+    root: Path, methods: dict[str, dict], bank: dict,
+    temperatures: list[float], cells: dict[str, dict[float, dict]],
+) -> dict:
+    records = []
+    for method, selected in methods.items():
+        for temperature in temperatures:
+            if float(temperature) in cells[method]:
+                continue
+            name = f"{method}_temp{temperature:g}".replace(".", "p")
+            path = root / "calibration_m50" / name / "raw_m50_offline_metrics.json"
+            if not path.is_file():
+                continue
+            payload, file_sha = BASE._read_hashed(path)
+            provenance = _validate_prior_calibration_cell(
+                path, payload, method=method, temperature=temperature,
+                selected=selected, bank=bank,
+            )
+            if provenance["reference_file_sha256"] != file_sha:
+                raise RuntimeError("calibration bytes changed while being read")
+            cells[method][float(temperature)] = payload
+            records.append(provenance)
+
+    for temperature in temperatures:
+        if all(float(temperature) in cells[method] for method in methods):
+            hashes = {
+                cells[method][float(temperature)]["noise_bank"]["sha256"]
+                for method in methods
+            }
+            if len(hashes) != 1:
+                raise RuntimeError(
+                    f"reused temp={temperature:g} cells do not share CRN bytes"
+                )
+    return {
+        "status": "PRIOR_CALIBRATION_CELLS_CONTENT_AUTHENTICATED",
+        "root": str(root),
+        "records": records,
+        "missing_cells_will_be_run": [
+            {"method": method, "temperature": float(temperature)}
+            for method in methods for temperature in temperatures
+            if float(temperature) not in cells[method]
+        ],
+    }
+
+
+def _calibration_crn_sha(
+    cells: dict[str, dict[float, dict]], temperatures: list[float],
+) -> str:
+    missing = [
+        (method, float(temperature))
+        for method in ("pretrained", "expanded")
+        for temperature in temperatures
+        if float(temperature) not in cells[method]
+    ]
+    if missing:
+        raise RuntimeError(f"calibration grid is incomplete: {missing}")
+    hashes = {
+        cells[method][float(temperature)]["noise_bank"]["sha256"]
+        for method in ("pretrained", "expanded")
+        for temperature in temperatures
+    }
+    if len(hashes) != 1:
+        raise RuntimeError("calibration temperatures do not share one CRN bank")
+    return next(iter(hashes))
 
 
 def _metric(rows: list[dict], name: str) -> float:
@@ -262,8 +450,11 @@ def _ci_win(value: dict) -> bool:
 
 def run(args) -> dict:
     started = datetime.now(timezone.utc)
+    source_commit = BASE._source_gate(args.expected_source_commit)
+    gpu_provenance = _gpu_inventory(args.gpus)
     initial_path = Path(args.initial_delivery).resolve()
-    initial = _wait(initial_path, args.poll_seconds)
+    _wait(initial_path, args.poll_seconds)
+    initial, initial_sha256 = BASE._read_hashed(initial_path)
     if initial.get("status") != BASE.STATUS:
         raise RuntimeError("invalid global-temperature delivery")
     calibration_bank = initial["banks"]["disjoint_confirmation"]
@@ -292,6 +483,15 @@ def run(args) -> dict:
         initial_path, initial, methods
     )
     BASE._write(output / "GLOBAL_TEMPERATURE_REUSE.json", reuse)
+    prior_reuse = {
+        "status": "PRIOR_CALIBRATION_REUSE_NOT_REQUESTED", "records": [],
+    }
+    if args.reuse_calibration_root:
+        prior_reuse = _reuse_prior_calibration_cells(
+            Path(args.reuse_calibration_root).resolve(), methods,
+            calibration_bank, temperatures, cells,
+        )
+    BASE._write(output / "PRIOR_CALIBRATION_REUSE.json", prior_reuse)
 
     calibration_root = output / "calibration_m50"
     jobs, metadata = [], {}
@@ -320,6 +520,7 @@ def run(args) -> dict:
         cells[method][temperature] = BASE._read(
             out / "raw_m50_offline_metrics.json"
         )
+    calibration_noise_sha256 = _calibration_crn_sha(cells, temperatures)
 
     kazuki_path = initial_path.parent / "disjoint_m50" / "kazuki_locked.json"
     kazuki_payload = BASE._read(kazuki_path)
@@ -351,14 +552,20 @@ def run(args) -> dict:
             "the former global-temperature M50 is intentionally reused and "
             "therefore reclassified as calibration, not confirmation"
         ),
+        "analysis_source_commit": source_commit,
+        "initial_delivery": str(initial_path),
+        "initial_delivery_sha256": initial_sha256,
         "temperature_grid": temperatures,
+        "calibration_noise_bank_sha256": calibration_noise_sha256,
         "pretrained": pretrained,
         "expanded": expanded,
         "kazuki": kazuki,
         "target_envelope": target,
         "liveness_contract": liveness,
         "gamma_trend_gate": {
-            "minimum_adjacent_pair_mean_fraction": .75,
+            "minimum_each_adjacent_pair_family_fraction": (
+                BASE.MIN_TREND_FAMILY_FRACTION
+            ),
             "pretrained": BASE._trend(pretrained),
             "expanded": BASE._trend(expanded),
         },
@@ -396,10 +603,12 @@ def run(args) -> dict:
             "--ep0", str(args.final_ep0), "--M", "50",
             "--workers", str(args.workers), "--device", "cuda:0",
             "--output", str(final_kazuki),
+            "--expected-source-commit", source_commit,
         ],
     })
+    confirmation_gpu = int(args.gpus[0])
     BASE._run_jobs(
-        final_jobs, gpus=args.gpus, workers=args.workers,
+        final_jobs, gpus=[confirmation_gpu], workers=args.workers,
         log_dir=output / "logs",
     )
     raw_payloads = {
@@ -417,7 +626,8 @@ def run(args) -> dict:
         row["temperature"] = None
         row["temperature_by_gamma"] = locked["temperature_by_gamma"]
     final_records.append(BASE._kazuki_record(final_kazuki_payload))
-    BASE._render(final_records, final_root / "four_metric_per_gamma.png")
+    plot_path = final_root / "four_metric_per_gamma.png"
+    BASE._render(final_records, plot_path)
     exp_rows = _raw_rows(raw_payloads["expanded"])
     comparisons = {
         "expanded_minus_pretrained": _paired_cluster_ci(
@@ -430,16 +640,49 @@ def run(args) -> dict:
         ),
     }
     objective_gates = _final_objective_gates(final_records, comparisons)
+    if BASE.FUNNEL.sha256_file(initial_path) != initial_sha256:
+        raise RuntimeError("initial delivery changed during gamma calibration")
+    BASE._source_gate(source_commit)
+    fresh_artifacts = {}
+    for method, path in final_meta.items():
+        metrics_path = path / "raw_m50_offline_metrics.json"
+        payload = raw_payloads[method]
+        fresh_artifacts[method] = {
+            "path": str(metrics_path),
+            "file_sha256": BASE.FUNNEL.sha256_file(metrics_path),
+            "rows_sha256": _rows_sha256(payload),
+            "noise_bank_sha256": payload["noise_bank"]["sha256"],
+            "checkpoint_sha256": payload["records"][0]["cell"][
+                "checkpoint_sha256"
+            ],
+        }
+    fresh_artifacts["kazuki_locked"] = {
+        "path": str(final_kazuki),
+        "file_sha256": BASE.FUNNEL.sha256_file(final_kazuki),
+        "rows_sha256": _json_value_sha256(final_kazuki_payload["rows"]),
+        "checkpoint_sha256": final_kazuki_payload["checkpoint_sha256"],
+    }
+    fresh_artifacts["plots"] = {
+        str(path): BASE.FUNNEL.sha256_file(path)
+        for path in (plot_path, plot_path.with_suffix(".pdf"))
+    }
     result = {
         "status": STATUS,
+        "source_commit": source_commit,
         "initial_delivery": str(initial_path),
+        "initial_delivery_sha256": initial_sha256,
         "global_temperature_calibration_reuse": reuse,
+        "prior_calibration_reuse": prior_reuse,
+        "gpu_provenance": gpu_provenance,
         "calibration_bank": calibration_bank,
         "fresh_confirmation_bank": {
             "M_per_gamma": 50,
             "ep0": args.final_ep0,
             "noise_seed": args.final_noise_seed,
+            "single_physical_gpu_index": confirmation_gpu,
+            "execution": "sequential to avoid cross-GPU comparison noise",
         },
+        "fresh_confirmation_artifacts": fresh_artifacts,
         "lock": lock,
         "final_records": final_records,
         "paired_cluster_differences": comparisons,
@@ -473,6 +716,8 @@ def build_parser():
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--final-ep0", type=int, default=480_000)
     parser.add_argument("--final-noise-seed", type=int, default=2_026_073_6)
+    parser.add_argument("--reuse-calibration-root")
+    parser.add_argument("--expected-source-commit")
     return parser
 
 

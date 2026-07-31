@@ -49,29 +49,52 @@ def _run(command: list[str], *, log: Path, gpu: int | None = None,
 
 def run(args) -> dict:
     started = datetime.now(timezone.utc)
+    source_commit = GLOBAL._source_gate()
+    gpu_provenance = GAMMA._gpu_inventory(
+        sorted({int(args.training_gpu), 1, 3})
+    )
     gamma_delivery_path = Path(args.gamma_delivery).resolve()
     gamma = _wait(gamma_delivery_path, args.poll_seconds)
+    gamma_delivery_sha256 = GLOBAL.FUNNEL.sha256_file(gamma_delivery_path)
     output = Path(args.output_dir).resolve()
     if output.exists():
         raise FileExistsError(output)
     output.mkdir(parents=True)
     if gamma.get("status") != GAMMA.STATUS:
         raise RuntimeError("invalid calibrated M50 delivery")
+    if gamma.get("source_commit") != source_commit:
+        raise RuntimeError("calibrated M50 was produced by another source")
+    initial_path = Path(gamma["initial_delivery"]).resolve()
+    if (
+        GLOBAL.FUNNEL.sha256_file(initial_path)
+        != gamma.get("initial_delivery_sha256")
+    ):
+        raise RuntimeError("gamma input delivery digest changed")
     if gamma.get("objective_achieved") is True:
         result = {
             "status": STATUS,
+            "source_commit": source_commit,
             "action": "STOP_GOAL_ACHIEVED_AT_R50_OR_EARLIER",
             "gamma_delivery": str(gamma_delivery_path),
+            "gamma_delivery_sha256": gamma_delivery_sha256,
+            "gpu_provenance": gpu_provenance,
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }
+        GLOBAL._source_gate(source_commit)
+        if GLOBAL.FUNNEL.sha256_file(gamma_delivery_path) != gamma_delivery_sha256:
+            raise RuntimeError("gamma delivery changed before stop decision")
         GLOBAL._write(output / "DELIVERY_COMPLETE.json", result)
         return result
 
-    initial = GLOBAL._read(Path(gamma["initial_delivery"]))
+    initial = GLOBAL._read(initial_path)
+    locked_best = gamma["lock"]["expanded"]
     arm = str(initial["selection"]["selected_expanded"]["method"])
     training_root = Path(initial["training_root"]).resolve()
     resume_root = training_root / arm
-    resume_delivery = GLOBAL._read(resume_root / "DELIVERY_COMPLETE.json")
+    resume_delivery_path = resume_root / "DELIVERY_COMPLETE.json"
+    resume_delivery, resume_delivery_sha256 = GLOBAL._read_hashed(
+        resume_delivery_path
+    )
     cfg = resume_delivery["config"]
     resume_round = int(resume_delivery["rounds"])
     if resume_round != 50:
@@ -83,7 +106,8 @@ def run(args) -> dict:
 
     r100_parent = output / "r100_training"
     r100_root = r100_parent / arm
-    eval_rounds = [0, resume_round, *range(60, 101, 10)]
+    locked_round = int(locked_best["round"])
+    eval_rounds = sorted({0, locked_round, resume_round, *range(60, 101, 10)})
     train_command = [
         sys.executable, str(HERE / "sfm_b1_neutral_multiround.py"),
         "--checkpoint", resume_delivery["checkpoint"],
@@ -107,6 +131,21 @@ def run(args) -> dict:
         "--device", "cuda:0",
         "--workers", str(args.workers),
     ]
+    if locked_round == resume_round:
+        resume_checkpoint = Path(
+            resume_root / "checkpoints" / f"round_{resume_round:02d}.pt"
+        )
+        if (
+            GLOBAL.FUNNEL.sha256_file(resume_checkpoint)
+            != locked_best["checkpoint_sha256"]
+        ):
+            raise RuntimeError("locked best does not match the resume anchor")
+    else:
+        train_command.extend([
+            "--locked-eval-checkpoint", str(locked_best["checkpoint"]),
+            "--locked-eval-round", str(locked_round),
+            "--locked-eval-sha256", str(locked_best["checkpoint_sha256"]),
+        ])
     _run(
         train_command, log=output / "logs" / "r50_to_r100.log",
         gpu=args.training_gpu, cpu_range="16-79",
@@ -114,6 +153,8 @@ def run(args) -> dict:
     r100_delivery = GLOBAL._read(r100_root / "DELIVERY_COMPLETE.json")
     if int(r100_delivery.get("rounds", -1)) != 100:
         raise RuntimeError("r100 continuation delivery is incomplete")
+    if r100_delivery.get("source", {}).get("commit") != source_commit:
+        raise RuntimeError("r100 continuation used another source commit")
 
     global_root = output / "r100_global_temperature"
     global_command = [
@@ -128,6 +169,7 @@ def run(args) -> dict:
         "--validation-noise-seed", "20260738",
         "--final-ep0", "510000", "--final-noise-seed", "20260739",
         "--expected-final-round", "100",
+        "--expected-source-commit", source_commit,
     ]
     _run(global_command, log=output / "logs" / "r100_global_temperature.log")
 
@@ -139,24 +181,30 @@ def run(args) -> dict:
         "--temperatures", "0.55,0.7,0.85,1.0",
         "--gpus", "1", "3", "--workers", "32",
         "--final-ep0", "520000", "--final-noise-seed", "20260740",
+        "--expected-source-commit", source_commit,
     ]
     _run(gamma_command, log=output / "logs" / "r100_gamma_temperature.log")
     r100_gamma = GLOBAL._read(r100_gamma_root / "DELIVERY_COMPLETE.json")
     achieved = r100_gamma.get("objective_achieved") is True
+    if GLOBAL.FUNNEL.sha256_file(gamma_delivery_path) != gamma_delivery_sha256:
+        raise RuntimeError("r50 gamma delivery changed during continuation")
+    if GLOBAL.FUNNEL.sha256_file(resume_delivery_path) != resume_delivery_sha256:
+        raise RuntimeError("r50 resume delivery changed during continuation")
+    GLOBAL._source_gate(source_commit)
     result = {
         "status": STATUS,
-        "source_commit": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=HERE, text=True,
-        ).strip(),
+        "source_commit": source_commit,
         "action": (
             "STOP_GOAL_ACHIEVED_AT_R100"
             if achieved else "CREATIVE_SANITY_REQUIRED"
         ),
         "selected_arm": arm,
+        "locked_prior_best": locked_best,
+        "gpu_provenance": gpu_provenance,
+        "r50_training_delivery": str(resume_delivery_path),
+        "r50_training_delivery_sha256": resume_delivery_sha256,
         "r50_gamma_delivery": str(gamma_delivery_path),
-        "r50_gamma_delivery_sha256": GLOBAL.FUNNEL.sha256_file(
-            gamma_delivery_path
-        ),
+        "r50_gamma_delivery_sha256": gamma_delivery_sha256,
         "r100_training_delivery": str(r100_root / "DELIVERY_COMPLETE.json"),
         "r100_training_delivery_sha256": GLOBAL.FUNNEL.sha256_file(
             r100_root / "DELIVERY_COMPLETE.json"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import pytest
 
@@ -97,3 +98,41 @@ def test_gamma_trend_is_diagnostic_not_per_gamma_temperature_tuning():
     trend = S._trend(record)
     assert trend["mean_fraction"] == 1.0
     assert record["temperature"] == .7
+
+
+def test_authenticated_round_records_follow_nested_resume_chain(tmp_path):
+    lineage = []
+    prior_path = None
+    prior_delivery = None
+    for round_i in (1, 2, 3):
+        marker = tmp_path / f"round_{round_i}.json"
+        marker.write_text(json.dumps({
+            "status": "SFM_B1_NEUTRAL_MULTIROUND_ROUND_COMPLETE",
+            "round": round_i,
+        }))
+        ref = {
+            "path": str(marker),
+            "sha256": S.FUNNEL.sha256_file(marker),
+            "round": round_i,
+        }
+        delivery = {
+            "status": "SFM_B1_NEUTRAL_MULTIROUND_COMPLETE",
+            "round_records": [str(marker)],
+            "round_record_refs": [ref],
+        }
+        if prior_delivery is not None:
+            delivery["resume"] = {
+                "delivery": str(prior_path),
+                "delivery_sha256": S.FUNNEL.sha256_file(prior_path),
+                "round_record_refs": list(lineage),
+            }
+        path = tmp_path / f"delivery_{round_i}.json"
+        path.write_text(json.dumps(delivery))
+        lineage.append(ref)
+        prior_path, prior_delivery = path, delivery
+    records = S._authenticated_round_records(prior_delivery)
+    assert [row["round"] for row in records] == [1, 2, 3]
+
+    prior_delivery["round_record_refs"][0]["path"] = str(tmp_path / "wrong")
+    with pytest.raises(RuntimeError, match="current round-record path"):
+        S._authenticated_round_records(prior_delivery)
