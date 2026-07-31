@@ -13,6 +13,7 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -64,6 +65,46 @@ def _wait_for_deliveries(root: Path, arm_names: list[str], poll: int) -> list[di
     if len(checkpoints) != 1:
         raise RuntimeError("arms do not share one pretrained checkpoint")
     return payloads
+
+
+def _validate_banks(
+    payloads: list[dict], *, screen_ep0: int, screen_M: int,
+    validation_ep0: int, validation_M: int, final_ep0: int,
+) -> set[int]:
+    training_scenarios = set()
+    for payload in payloads:
+        screen = payload.get("disjoint_raw_evaluation", {})
+        if (
+            int(screen.get("ep0", -1)) != int(screen_ep0)
+            or int(screen.get("M_per_gamma", -1)) != int(screen_M)
+        ):
+            raise RuntimeError("delivery screening bank differs from declaration")
+        if int(payload.get("rounds", -1)) != 50:
+            raise RuntimeError("temperature study requires completed round 50")
+        arm_scenarios = set()
+        for marker in payload.get("round_records", []):
+            record = _read(Path(marker))
+            arm_scenarios.update(map(int, record.get("scenarios", ())))
+        if len(arm_scenarios) != 100:
+            raise RuntimeError("training scenario lineage is incomplete")
+        if training_scenarios and arm_scenarios != training_scenarios:
+            raise RuntimeError("arms used different training scenarios")
+        training_scenarios = arm_scenarios
+    banks = {
+        "screen": set(range(int(screen_ep0), int(screen_ep0) + int(screen_M))),
+        "validation": set(range(
+            int(validation_ep0), int(validation_ep0) + int(validation_M)
+        )),
+        "final": set(range(int(final_ep0), int(final_ep0) + 50)),
+    }
+    names = list(banks)
+    for index, name in enumerate(names):
+        if banks[name] & training_scenarios:
+            raise RuntimeError(f"{name} bank overlaps training scenarios")
+        for other in names[index + 1:]:
+            if banks[name] & banks[other]:
+                raise RuntimeError(f"{name} and {other} banks overlap")
+    return training_scenarios
 
 
 def _mean(value: dict) -> float:
@@ -124,6 +165,9 @@ def _screen_rows(root: Path, arm_names: list[str], payloads: list[dict]) -> tupl
 
 def _screen_key(row: dict, r0: dict) -> tuple:
     value, base = row["pooled"], r0["pooled"]
+    if any(not math.isfinite(float(value[key])) for key in METRICS):
+        return (1, float("inf"), float("inf"), float("inf"), float("inf"),
+                float("inf"), row["round"], row["arm"])
     wins = (
         int(value["CR"] < base["CR"])
         + int(value["Validity"] > base["Validity"])
@@ -131,6 +175,7 @@ def _screen_key(row: dict, r0: dict) -> tuple:
         + int(value["time_to_goal"] < base["time_to_goal"])
     )
     return (
+        0,
         -wins,
         value["CR"],
         -value["Validity"],
@@ -309,12 +354,41 @@ def _shortfalls(row: dict, target: dict) -> dict:
     value = row["pooled"]
     result = {}
     for metric in METRICS:
+        if not math.isfinite(float(value[metric])):
+            result[metric] = float("inf")
+            continue
         scale = max(abs(float(target[metric])), .02)
         if metric in LOWER_IS_BETTER:
             result[metric] = max(0.0, value[metric] - target[metric]) / scale
         else:
             result[metric] = max(0.0, target[metric] - value[metric]) / scale
     return result
+
+
+def _liveness_contract(pretrained: list[dict], kazuki: dict) -> dict:
+    references = [*pretrained, kazuki]
+    return {
+        "minimum_SR": max(
+            0.0, min(row["pooled"]["SR"] for row in references) - .05
+        ),
+        "maximum_timeout": min(
+            1.0, max(row["pooled"]["timeout"] for row in references) + .05
+        ),
+        "every_gamma_has_success": True,
+    }
+
+
+def _liveness_eligible(row: dict, contract: dict) -> bool:
+    if (
+        row["pooled"]["SR"] < contract["minimum_SR"]
+        or row["pooled"]["timeout"] > contract["maximum_timeout"]
+    ):
+        return False
+    return all(
+        math.isfinite(float(cell["clearance"]))
+        and math.isfinite(float(cell["time_to_goal"]))
+        for cell in row["per_gamma"].values()
+    )
 
 
 def _trend(record: dict) -> dict:
@@ -347,10 +421,11 @@ def _trend(record: dict) -> dict:
     }
 
 
-def _selection_key(row: dict, target: dict) -> tuple:
+def _selection_key(row: dict, target: dict, liveness: dict) -> tuple:
     shortfall = _shortfalls(row, target)
     trend = _trend(row)
     return (
+        0 if _liveness_eligible(row, liveness) else 1,
         max(shortfall.values()),
         sum(shortfall.values()),
         -trend["mean_fraction"],
@@ -413,13 +488,15 @@ def run(args) -> dict:
     temperatures = [float(item) for item in args.temperatures.split(",")]
     if 1.0 not in temperatures or any(item <= 0 or item > 1 for item in temperatures):
         raise ValueError("temperatures must be in (0,1] and include 1")
-    if not (
-        args.screen_ep0 + args.screen_M <= args.validation_ep0
-        and args.validation_ep0 + args.validation_M <= args.final_ep0
-    ):
-        raise ValueError("screen, validation, and final scenario banks overlap")
-
     deliveries = _wait_for_deliveries(training_root, arm_names, args.poll_seconds)
+    training_scenarios = _validate_banks(
+        deliveries,
+        screen_ep0=args.screen_ep0,
+        screen_M=args.screen_M,
+        validation_ep0=args.validation_ep0,
+        validation_M=args.validation_M,
+        final_ep0=args.final_ep0,
+    )
     screen_rows, screen_r0 = _screen_rows(
         training_root, arm_names, deliveries
     )
@@ -503,13 +580,14 @@ def run(args) -> dict:
         row for row in validation_records if row["method"] != "pretrained"
     ]
     target = _envelope(pretrained_records, kazuki_validation)
+    liveness = _liveness_contract(pretrained_records, kazuki_validation)
     selected_expanded = min(
-        expanded_records, key=lambda row: _selection_key(row, target)
+        expanded_records,
+        key=lambda row: _selection_key(row, target, liveness),
     )
     selected_pretrained = min(
-        pretrained_records, key=lambda row: _selection_key(
-            row, _envelope([row], kazuki_validation)
-        )
+        pretrained_records,
+        key=lambda row: _selection_key(row, target, liveness),
     )
     selection = {
         "status": "LOCKED_BEFORE_DISJOINT_M50",
@@ -521,11 +599,16 @@ def run(args) -> dict:
         "global_temperature_only": True,
         "per_gamma_temperature_forbidden": True,
         "target_envelope": target,
+        "liveness_contract": liveness,
         "selected_expanded": selected_expanded,
         "selected_pretrained": selected_pretrained,
         "expanded_shortfalls": _shortfalls(selected_expanded, target),
-        "expanded_four_metric_gate": all(
-            value == 0 for value in _shortfalls(selected_expanded, target).values()
+        "expanded_point_estimate_four_metric_gate": (
+            _liveness_eligible(selected_expanded, liveness)
+            and all(
+                value == 0
+                for value in _shortfalls(selected_expanded, target).values()
+            )
         ),
         "expanded_gamma_trend": _trend(selected_expanded),
     }
@@ -591,6 +674,7 @@ def run(args) -> dict:
             ["git", "rev-parse", "HEAD"], cwd=HERE, text=True
         ).strip(),
         "training_root": str(training_root),
+        "training_scenario_ids": sorted(training_scenarios),
         "training_deliveries": [
             str(training_root / name / "DELIVERY_COMPLETE.json")
             for name in arm_names
@@ -616,7 +700,13 @@ def run(args) -> dict:
         "final_records": final_records,
         "final_target_envelope": final_target,
         "final_expanded_shortfalls": final_shortfall,
-        "final_four_metric_win": all(value == 0 for value in final_shortfall.values()),
+        "final_point_estimate_four_metric_gate": all(
+            value == 0 for value in final_shortfall.values()
+        ),
+        "scientific_win_status": (
+            "PENDING_PAIRED_SCENARIO_CLUSTER_CI; point estimates alone are "
+            "not a win claim"
+        ),
         "final_gamma_trends": {
             row["method"]: _trend(row) for row in final_records
         },
@@ -628,7 +718,9 @@ def run(args) -> dict:
     _write(output / "DELIVERY_COMPLETE.json", result)
     print(json.dumps({
         "status": STATUS,
-        "four_metric_win": result["final_four_metric_win"],
+        "point_estimate_four_metric_gate": (
+            result["final_point_estimate_four_metric_gate"]
+        ),
         "expanded": expanded_final["pooled"],
         "delivery": str(output / "DELIVERY_COMPLETE.json"),
     }, indent=2))

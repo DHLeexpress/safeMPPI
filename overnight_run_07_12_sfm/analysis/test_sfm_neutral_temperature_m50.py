@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import pytest
 
 import run_sfm_neutral_temperature_m50 as S
@@ -58,6 +59,28 @@ def test_four_metric_gate_has_zero_shortfall_only_for_strict_envelope_win():
         metric: 0.0 for metric in S.METRICS
     }
     assert S._shortfalls(loser, target)["clearance"] == pytest.approx(.2)
+
+
+def test_no_success_metrics_can_never_win_selection():
+    target = {
+        "CR": .2,
+        "Validity": .6,
+        "clearance": .1,
+        "time_to_goal": 9,
+    }
+    collapsed = _record(
+        "expanded", cr=0.0, validity=.9,
+        clearance=float("nan"), time=float("nan"),
+    )
+    shortfall = S._shortfalls(collapsed, target)
+    assert math.isinf(shortfall["clearance"])
+    assert math.isinf(shortfall["time_to_goal"])
+    liveness = {
+        "minimum_SR": .5,
+        "maximum_timeout": .1,
+        "every_gamma_has_success": True,
+    }
+    assert not S._liveness_eligible(collapsed, liveness)
 
 
 def test_gamma_trend_is_diagnostic_not_per_gamma_temperature_tuning():
