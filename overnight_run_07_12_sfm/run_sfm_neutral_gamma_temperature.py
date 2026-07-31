@@ -140,6 +140,52 @@ def _raw_rows(payload: dict) -> list[dict]:
     return payload["records"][0]["cell"]["rows"]
 
 
+def _rows_sha256(payload: dict) -> str:
+    encoded = json.dumps(
+        _raw_rows(payload),
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _global_temperature_parity(
+    initial_path: Path,
+    initial: dict,
+    cells: dict[str, dict[float, dict]],
+) -> dict:
+    records = {}
+    for method in ("pretrained", "expanded"):
+        selected = initial["selection"][f"selected_{method}"]
+        temperature = float(selected["temperature"])
+        if temperature not in cells[method]:
+            raise RuntimeError(
+                f"selected global temperature {temperature} was not rerun"
+            )
+        reference_path = (
+            initial_path.parent / "disjoint_m50" / method
+            / "raw_m50_offline_metrics.json"
+        )
+        reference_sha = _rows_sha256(BASE._read(reference_path))
+        rerun_sha = _rows_sha256(cells[method][temperature])
+        if rerun_sha != reference_sha:
+            raise RuntimeError(
+                f"global-temperature production parity failed for {method}: "
+                f"reference={reference_sha} rerun={rerun_sha}"
+            )
+        records[method] = {
+            "temperature": temperature,
+            "reference": str(reference_path),
+            "reference_rows_sha256": reference_sha,
+            "rerun_rows_sha256": rerun_sha,
+        }
+    return {
+        "status": "GLOBAL_TEMPERATURE_PRODUCTION_PARITY_VERIFIED",
+        "records": records,
+    }
+
+
 def _metric(rows: list[dict], name: str) -> float:
     point = _point(rows)
     return float(point[name])
@@ -253,6 +299,8 @@ def run(args) -> dict:
         cells[method][temperature] = BASE._read(
             out / "raw_m50_offline_metrics.json"
         )
+    parity = _global_temperature_parity(initial_path, initial, cells)
+    BASE._write(output / "GLOBAL_TEMPERATURE_PARITY.json", parity)
 
     kazuki_path = initial_path.parent / "disjoint_m50" / "kazuki_locked.json"
     kazuki_payload = BASE._read(kazuki_path)
@@ -366,6 +414,7 @@ def run(args) -> dict:
     result = {
         "status": STATUS,
         "initial_delivery": str(initial_path),
+        "global_temperature_production_parity": parity,
         "calibration_bank": calibration_bank,
         "fresh_confirmation_bank": {
             "M_per_gamma": 50,

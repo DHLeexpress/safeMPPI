@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+
+import pytest
+
 import run_sfm_neutral_gamma_temperature as G
 
 
@@ -34,6 +38,32 @@ def test_paired_ci_requires_complete_scenario_clusters():
     result = G._paired_cluster_ci(rows, rows, seed=1, draws=20)
     assert all(value["paired_cluster_95"] == [0.0, 0.0] for value in result.values())
     assert not G._ci_win(result)
+
+
+def test_global_temperature_parity_is_fail_closed(tmp_path):
+    initial = tmp_path / "DELIVERY_COMPLETE.json"
+    initial.write_text("{}")
+    reference_root = tmp_path / "disjoint_m50"
+    selection = {}
+    cells = {}
+    for method in ("pretrained", "expanded"):
+        rows = [_row(470000, gamma) for gamma in G.SP.GAMMAS]
+        payload = {"records": [{"cell": {"rows": rows}}]}
+        destination = reference_root / method / "raw_m50_offline_metrics.json"
+        destination.parent.mkdir(parents=True)
+        destination.write_text(json.dumps(payload))
+        selection[f"selected_{method}"] = {"temperature": .55}
+        cells[method] = {.55: payload}
+    verified = G._global_temperature_parity(
+        initial, {"selection": selection}, cells
+    )
+    assert verified["status"] == (
+        "GLOBAL_TEMPERATURE_PRODUCTION_PARITY_VERIFIED"
+    )
+
+    cells["expanded"][.55]["records"][0]["cell"]["rows"][0]["success"] = False
+    with pytest.raises(RuntimeError, match="production parity failed for expanded"):
+        G._global_temperature_parity(initial, {"selection": selection}, cells)
 
 
 def test_ci_win_requires_all_four_intervals_strictly_favorable():
