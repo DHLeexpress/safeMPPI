@@ -400,3 +400,84 @@ def test_neutral_record_accepts_explicit_round():
     assert record["round"] == 2
     assert record["verifier_y"] == 0
     assert not record["gp_eligible"]
+
+
+def test_id_anchor_mass_is_uniform_over_trajectories_then_windows():
+    episodes = np.asarray([7, 7, 7, 11, 11, 42], np.int64)
+    mass = M._id_anchor_mass(episodes)
+    assert mass.shape == (6,)
+    assert abs(float(mass.sum()) - 1.0) < 1.0e-12
+    expected = np.asarray([
+        1.0 / (3 * 3), 1.0 / (3 * 3), 1.0 / (3 * 3),
+        1.0 / (3 * 2), 1.0 / (3 * 2),
+        1.0 / (3 * 1),
+    ])
+    assert np.allclose(mass, expected)
+    assert abs(float(mass[-1]) - 1.0 / 3.0) < 1.0e-12
+    for episode in (7, 11, 42):
+        selected = mass[episodes == episode]
+        assert abs(float(selected.sum()) - 1.0 / 3.0) < 1.0e-12
+    with pytest.raises(ValueError):
+        M._id_anchor_mass(np.zeros(0, np.int64))
+
+
+def test_id_anchor_resume_guard_matches_flag_and_window_count():
+    legacy = {"round": 3, "Dplus": 8}
+    enabled = {"round": 3, "id_anchor": {"windows": 350}}
+    M._id_anchor_resume_guard(legacy, 0)
+    M._id_anchor_resume_guard(enabled, 350)
+    with pytest.raises(RuntimeError, match="flag mismatch"):
+        M._id_anchor_resume_guard(legacy, 350)
+    with pytest.raises(RuntimeError, match="flag mismatch"):
+        M._id_anchor_resume_guard(enabled, 0)
+    with pytest.raises(RuntimeError, match="window count"):
+        M._id_anchor_resume_guard(enabled, 700)
+
+
+def test_restore_optimizer_counts_the_single_id_anchor_step(tmp_path):
+    path = tmp_path / "optimizer.pt"
+
+    def _save(steps, round_i):
+        policy = _TinyPolicy()
+        optimizer = torch.optim.Adam([policy.scale], lr=3.0e-5)
+        for _ in range(int(steps)):
+            optimizer.zero_grad(set_to_none=True)
+            policy.scale.square().backward()
+            optimizer.step()
+        torch.save(
+            {"round": int(round_i), "optimizer": optimizer.state_dict()}, path,
+        )
+
+    def _restore(**kwargs):
+        resumed = _TinyPolicy()
+        target = torch.optim.Adam([resumed.scale], lr=3.0e-5)
+        return M._restore_optimizer(
+            target, str(path), [resumed.scale], **kwargs,
+        )
+
+    # one round of D+ (4) + D0 (4) + exactly one anchor step = 9
+    _save(9, 1)
+    anchored = _restore(resume_round=1, inner_steps=4, id_anchor=True)
+    assert anchored["expected_adam_step"] == 2 * 1 * 4 + 1
+    assert anchored["updates_per_round"] == 2
+    with pytest.raises(RuntimeError, match="Adam step"):
+        _restore(resume_round=1, inner_steps=4, id_anchor=False)
+
+    # D+ only plus the anchor, three rounds: (1*inner)*r + r
+    _save(9, 3)
+    one_phase = _restore(
+        resume_round=3, inner_steps=2, id_anchor=True, neutral_replay=False,
+    )
+    assert one_phase["expected_adam_step"] == 1 * 3 * 2 + 3
+    with pytest.raises(RuntimeError, match="Adam step"):
+        _restore(
+            resume_round=3, inner_steps=2, id_anchor=False,
+            neutral_replay=False,
+        )
+
+    # flag off reproduces the pre-existing expectation exactly
+    _save(18, 3)
+    legacy = _restore(resume_round=3, inner_steps=3, id_anchor=False)
+    assert legacy["expected_adam_step"] == 2 * 3 * 3
+    assert legacy["updates_per_round"] == 2
+    assert _restore(resume_round=3, inner_steps=3)["expected_adam_step"] == 18

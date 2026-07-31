@@ -55,6 +55,21 @@ DEFAULT_PROBE_PER_GAMMA = 4
 DEFAULT_GP_CAP = 512
 DEFAULT_LR = 3.0e-5
 DEFAULT_INNER_STEPS = 4
+DEFAULT_ID_ANCHOR_DATASET = (
+    "/home/dohyun/projects/cfm_mppi/overnight_run_07_12_sfm/dataset_id_v01"
+)
+# Pinned exact digests of the seven frozen ID window banks.  These equal the
+# per-file sha256 recorded in the promoted pretrained checkpoint's split_meta.
+ID_ANCHOR_FILE_SHA256 = (
+    ("0.1", "de5d5b161753f3151a127c2c518a363ef40bb0e73ccc47bb3ed8e2afe0d07efa"),
+    ("0.2", "2c28df830863188f89ad5d62bcec73dc9f72806367c40528cc17a946ce7abc93"),
+    ("0.3", "55f01dd745ee53cac8c5ab50f0b955831c6980bde7ce88e7696979112e216733"),
+    ("0.4", "04f5a17903659c78f1def5b7c9f465db2727c9023d832d1ed9e3c34499da5363"),
+    ("0.5", "8cfc9fd74787c1a3969badc4e7f17a882e570ec17531b230fda7245ec93c4577"),
+    ("0.7", "2f0508f5b26ecfed62290c695d9aeee1e2355b9e16e6568782916ad722736507"),
+    ("1.0", "d2ffaedd2e16a550af42d923ed01a1c4774951338963fb211c9124c696faa0b4"),
+)
+ID_ANCHOR_SPLIT = "pretrain_train_only"
 
 
 @dataclass(frozen=True)
@@ -313,6 +328,285 @@ def _skipped_population_update(records, *, population):
         "skipped": True,
         "reason": "D0 collected for causal audit but neutral replay disabled",
     }
+
+
+def _id_anchor_mass(episodes):
+    """Per-gamma window mass: uniform over trajectories, then over windows."""
+    values = np.asarray(episodes, dtype=np.int64).reshape(-1)
+    if not len(values):
+        raise ValueError("ID-anchor gamma bank is empty")
+    unique, inverse, counts = np.unique(
+        values, return_inverse=True, return_counts=True,
+    )
+    mass = 1.0 / (
+        float(len(unique)) * counts[inverse.reshape(-1)].astype(np.float64)
+    )
+    total = float(mass.sum())
+    if abs(total - 1.0) > 1.0e-6:
+        raise RuntimeError("ID-anchor hierarchical mass does not sum to one")
+    return mass / total
+
+
+def _id_anchor_preflight(dataset, windows):
+    """Authenticate the anchor request before the study creates any output."""
+    import sfm_b1_expert as EXPERT
+
+    windows = int(windows)
+    if windows <= 0:
+        raise ValueError("ID-anchor preflight requires a positive window count")
+    if windows % len(SP.GAMMAS):
+        raise ValueError(
+            "--id-anchor-windows must be a multiple of the seven gammas"
+        )
+    dataset = os.path.abspath(os.fspath(dataset))
+    if not os.path.isdir(dataset):
+        raise FileNotFoundError(dataset)
+    manifest_path = os.path.join(dataset, "manifest.json")
+    files = [
+        os.path.join(dataset, f"sfm_windows_g{gamma}.pt")
+        for gamma in map(float, SP.GAMMAS)
+    ]
+    for path in (manifest_path, *files):
+        if not os.path.isfile(path):
+            raise FileNotFoundError(path)
+    manifest_sha256 = FA._sha256_file(manifest_path)
+    if manifest_sha256 != EXPERT.DATASET_MANIFEST_SHA256:
+        raise RuntimeError("ID-anchor dataset manifest SHA changed")
+    return {
+        "windows": windows,
+        "per_gamma": windows // len(SP.GAMMAS),
+        "dataset": dataset,
+        "manifest": manifest_path,
+        "files": files,
+        "manifest_sha256": manifest_sha256,
+    }
+
+
+def _id_anchor_banks(preflight, checkpoint):
+    """Load the frozen ID pretraining TRAIN split for the anchor replay.
+
+    Imports stay local so the disabled default never touches the pretraining
+    modules.  Mass is recomputed here with numpy rather than importing
+    stage3_pretrain_sfm, whose module namespace is a training entry point.
+    The retained support is exactly the pretraining train episodes recorded in
+    the promoted checkpoint's split_meta, so the anchor can never replay a
+    pretraining validation window.
+    """
+    import sfm_hp_history as SH
+
+    with open(preflight["manifest"]) as stream:
+        manifest = json.load(stream)
+    manifest_rows = {
+        round(float(row["gamma"]), 8): row for row in manifest["files"]
+    }
+    pinned = dict(ID_ANCHOR_FILE_SHA256)
+    if sorted(pinned) != sorted(str(gamma) for gamma in SP.GAMMAS):
+        raise RuntimeError("pinned ID-anchor digests do not cover the gammas")
+    checkpoint = os.path.abspath(os.fspath(checkpoint))
+    split_meta = torch.load(
+        checkpoint, map_location="cpu", weights_only=False,
+    ).get("split_meta")
+    if not isinstance(split_meta, dict):
+        raise RuntimeError(
+            "pretrained checkpoint carries no split_meta; the ID anchor "
+            "requires the authenticated pretraining train split"
+        )
+    banks = []
+    file_sha256 = {}
+    for gamma, path in zip(map(float, SP.GAMMAS), preflight["files"]):
+        digest = FA._sha256_file(path)
+        if digest != pinned[str(gamma)]:
+            raise RuntimeError(f"ID-anchor bank digest changed: {path}")
+        file_sha256[str(gamma)] = digest
+        payload = torch.load(
+            path, map_location="cpu", mmap=True, weights_only=False,
+        )
+        if not payload.get("success_only", False):
+            raise RuntimeError(f"ID-anchor bank is not successful-only: {path}")
+        if float(payload["gamma"]) != float(gamma):
+            raise RuntimeError(f"ID-anchor bank gamma mismatch: {path}")
+        episodes = payload["episode"].to(torch.int64).reshape(-1).clone()
+        steps = payload["step"].to(torch.int64).reshape(-1)
+        row = manifest_rows[round(float(gamma), 8)]
+        if len(episodes) != int(row["n_windows"]):
+            raise RuntimeError(
+                "ID-anchor window count disagrees with the manifest"
+            )
+        if int(len(torch.unique(episodes))) != int(row["n_traj"]):
+            raise RuntimeError(
+                "ID-anchor trajectory count disagrees with the manifest"
+            )
+        hp10 = SH.build_hp10(payload["grid"], episodes, steps)
+        split = split_meta[str(gamma)]
+        train_episodes = torch.as_tensor(
+            sorted(map(int, split["train_episodes"])), dtype=torch.int64,
+        )
+        if not len(train_episodes):
+            raise RuntimeError(f"pretraining train split is empty at {gamma}")
+        keep = torch.isin(episodes, train_episodes)
+        retained = episodes[keep].clone()
+        trajectories = int(len(torch.unique(retained)))
+        if not len(retained) or trajectories < 1:
+            raise RuntimeError(
+                f"ID-anchor gamma {gamma} retains no train-split trajectory"
+            )
+        expected_windows = split.get("train_windows")
+        if (
+            expected_windows is not None
+            and len(retained) != int(expected_windows)
+        ):
+            raise RuntimeError(
+                "ID-anchor train-split window count disagrees with split_meta"
+            )
+        bank = {
+            "gamma": float(gamma),
+            "file": path,
+            "sha256": digest,
+            "windows": int(len(retained)),
+            "trajectories": trajectories,
+            "source_windows": int(len(episodes)),
+            "hp10": hp10[keep].to(dtype=torch.float32).contiguous(),
+            "low5": payload["low5"][keep].to(dtype=torch.float32).clone(),
+            "hist": payload["hist"][keep].to(dtype=torch.float32).clone(),
+            "U": payload["U"][keep].to(dtype=torch.float32).clone(),
+            "episode": retained,
+            "mass": _id_anchor_mass(retained),
+        }
+        expected = {
+            "hp10": (bank["windows"], SP.H, 16, 12),
+            "low5": (bank["windows"], 5),
+            "hist": (bank["windows"], SP.K, 2),
+            "U": (bank["windows"], SP.H, 2),
+        }
+        for key, shape in expected.items():
+            if tuple(bank[key].shape) != shape:
+                raise RuntimeError(
+                    f"ID-anchor bank {key} shape {tuple(bank[key].shape)} "
+                    f"is not {shape}"
+                )
+        banks.append(bank)
+    return {
+        "dataset": preflight["dataset"],
+        "manifest_sha256": preflight["manifest_sha256"],
+        "file_sha256": file_sha256,
+        "split": ID_ANCHOR_SPLIT,
+        "split_source": checkpoint,
+        "banks": banks,
+    }
+
+
+def _id_anchor_update(
+    policy,
+    optimizer,
+    bundle,
+    *,
+    windows,
+    batch,
+    device,
+    round_i,
+    train_seed,
+    sample_seed,
+):
+    """One extra Adam step on frozen ID windows, isolated from D+/D0.
+
+    The anchor batch is drawn with replacement from the per-gamma hierarchical
+    mass, never enters a store, shard, or the RBF GP, and stays on the CPU
+    except for the microbatch currently in flight.
+    """
+    banks = bundle["banks"]
+    per_gamma = int(windows) // len(banks)
+    if per_gamma < 1 or per_gamma * len(banks) != int(windows):
+        raise ValueError("ID-anchor windows must divide evenly across gammas")
+    draw_seed = (
+        int(train_seed) * 9176 + int(sample_seed) + 31 * int(round_i) + 7
+    )
+    generator = np.random.default_rng(draw_seed)
+    selection = []
+    for index, bank in enumerate(banks):
+        drawn = generator.choice(
+            len(bank["mass"]), size=per_gamma, replace=True, p=bank["mass"],
+        )
+        selection.extend((index, int(row)) for row in drawn)
+    total = len(selection)
+    if total != int(windows):
+        raise RuntimeError("ID-anchor batch size changed")
+    encoder_before = BS.module_sha256(policy.enc_grid)
+    policy.train()
+    optimizer.zero_grad(set_to_none=True)
+    weighted_loss = 0.0
+    for start in range(0, total, int(batch)):
+        chunk = selection[start:start + int(batch)]
+        hp10 = torch.stack([banks[b]["hp10"][i] for b, i in chunk])
+        low5 = torch.stack([banks[b]["low5"][i] for b, i in chunk])
+        hist = torch.stack([banks[b]["hist"][i] for b, i in chunk])
+        controls = torch.stack([banks[b]["U"][i] for b, i in chunk])
+        torch.manual_seed(
+            int(train_seed) * 104729 + 611 * int(round_i) + start
+        )
+        loss = policy.cfm_loss(
+            controls.to(device),
+            policy.ctx_from(
+                hp10.to(device), low5.to(device), hist.to(device),
+            ),
+        )
+        if not bool(torch.isfinite(loss)):
+            raise FloatingPointError("non-finite ID-anchor CFM loss")
+        share = len(chunk) / float(total)
+        (loss * share).backward()
+        weighted_loss += float(loss.detach()) * share
+    squared = torch.zeros((), dtype=torch.float64)
+    for group in optimizer.param_groups:
+        for parameter in group["params"]:
+            if parameter.grad is not None:
+                squared += parameter.grad.detach().to(
+                    dtype=torch.float64,
+                ).square().sum().cpu()
+    gradient_norm = float(squared.sqrt())
+    if not math.isfinite(gradient_norm):
+        raise FloatingPointError("non-finite ID-anchor gradient norm")
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    policy.eval()
+    encoder_after = BS.module_sha256(policy.enc_grid)
+    if (
+        not any(parameter.requires_grad for parameter in policy.enc_grid.parameters())
+        and encoder_after != encoder_before
+    ):
+        raise RuntimeError("visual encoder changed during ID-anchor replay")
+    return {
+        "windows": int(total),
+        "per_gamma": int(per_gamma),
+        "loss_weighted_mean": float(weighted_loss),
+        "grad_norm": gradient_norm,
+        "dataset": str(bundle["dataset"]),
+        "dataset_manifest_sha256": str(bundle["manifest_sha256"]),
+        "file_sha256": dict(bundle["file_sha256"]),
+        "split": str(bundle["split"]),
+        "split_source": str(bundle["split_source"]),
+        "per_gamma_support": [
+            {
+                "gamma": float(bank["gamma"]),
+                "trajectories": int(bank["trajectories"]),
+                "windows": int(bank["windows"]),
+                "source_windows": int(bank["source_windows"]),
+                "sha256": str(bank["sha256"]),
+            }
+            for bank in banks
+        ],
+        "sample_seed": int(draw_seed),
+        "sample_seed_formula": "train_seed*9176+sample_seed+31*r+7",
+        "microbatch_seed_formula": (
+            "train_seed*104729+611*r+batch_start"
+        ),
+    }
+
+
+def _id_anchor_resume_guard(record, windows):
+    enabled = int(windows) > 0
+    if ("id_anchor" in record) != enabled:
+        raise RuntimeError("id-anchor flag mismatch with resume source")
+    if enabled and int(record["id_anchor"]["windows"]) != int(windows):
+        raise RuntimeError("id-anchor window count differs from resume source")
 
 
 @torch.no_grad()
@@ -1212,7 +1506,9 @@ def _delivery_lineage_refs(delivery, delivery_path, seen=()):
     return [*prior_refs, *current_refs]
 
 
-def _resume_artifacts(resume_root, cfg, *, source_sha, scenario_ep0):
+def _resume_artifacts(
+    resume_root, cfg, *, source_sha, scenario_ep0, id_anchor_windows=0,
+):
     root = os.path.abspath(os.fspath(resume_root))
     delivery_path = os.path.join(root, "DELIVERY_COMPLETE.json")
     if not os.path.isfile(delivery_path):
@@ -1257,6 +1553,7 @@ def _resume_artifacts(resume_root, cfg, *, source_sha, scenario_ep0):
     if observed_scenarios != expected_scenarios:
         raise RuntimeError("resume scenario schedule is incomplete or changed")
     final = records[-1]
+    _id_anchor_resume_guard(final, id_anchor_windows)
     checkpoint = os.path.join(
         root, "checkpoints", f"round_{resume_round:02d}.pt"
     )
@@ -1319,6 +1616,7 @@ def _restore_optimizer(
     optimizer, path, parameters, *, resume_round, inner_steps,
     parameter_names=None,
     neutral_replay=True,
+    id_anchor=False,
 ):
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if int(payload.get("round", -1)) != int(resume_round):
@@ -1343,7 +1641,14 @@ def _restore_optimizer(
     if len(ids) != len(parameters) or len(state.get("state", {})) != len(parameters):
         raise RuntimeError("optimizer parameter support is incomplete")
     updates_per_round = 1 + int(bool(neutral_replay))
-    expected_step = updates_per_round * int(resume_round) * int(inner_steps)
+    # The optional ID anchor is exactly one Adam step per round regardless of
+    # inner_steps, so it is a separate additive term rather than another
+    # inner_steps-scaled population.
+    anchor_steps_per_round = int(bool(id_anchor))
+    expected_step = (
+        updates_per_round * int(resume_round) * int(inner_steps)
+        + anchor_steps_per_round * int(resume_round)
+    )
     for parameter_id, parameter in zip(ids, parameters):
         values = state["state"].get(parameter_id)
         if values is None:
@@ -1394,6 +1699,15 @@ def run(args):
             "checkpoint": locked_checkpoint,
             "checkpoint_sha256": locked_sha,
         }
+    id_anchor_windows = int(getattr(args, "id_anchor_windows", 0) or 0)
+    id_anchor_enabled = id_anchor_windows > 0
+    id_anchor_preflight = (
+        _id_anchor_preflight(
+            getattr(args, "id_anchor_dataset", DEFAULT_ID_ANCHOR_DATASET),
+            id_anchor_windows,
+        )
+        if id_anchor_enabled else None
+    )
     cfg = StudyConfig(
         name=str(args.name),
         rounds=int(args.rounds),
@@ -1434,6 +1748,7 @@ def run(args):
             cfg,
             source_sha=source_sha,
             scenario_ep0=int(args.scenario_ep0),
+            id_anchor_windows=id_anchor_windows,
         )
         if args.resume_run_root else None
     )
@@ -1490,8 +1805,13 @@ def run(args):
             inner_steps=cfg.inner_steps,
             parameter_names=optimizer_parameter_names,
             neutral_replay=cfg.neutral_replay,
+            id_anchor=id_anchor_enabled,
         )
         if resume else None
+    )
+    id_anchor = (
+        _id_anchor_banks(id_anchor_preflight, checkpoint)
+        if id_anchor_enabled else None
     )
     round0_path = os.path.join(checkpoints_dir, "round_00.pt")
     if not resume:
@@ -1730,62 +2050,132 @@ def run(args):
             round_checkpoint = os.path.join(
                 checkpoints_dir, f"round_{round_i:02d}.pt",
             )
-            checkpoint_marker = _save_checkpoint(policy, round_checkpoint, {
-                "study": STATUS,
-                "round": round_i,
-                "phase": (
-                    "post_Dplus_then_D0"
-                    if cfg.neutral_replay else "post_Dplus_D0_audit_only"
-                ),
-                "study_config": asdict(cfg),
-                "Dplus_records": len(positive_records),
-                "D0_records": len(neutral_records),
-                "D0_original_verifier_y": 0,
-                "D0_gp_eligible": False,
-                "D0_used": bool(cfg.neutral_replay),
-            })
             optimizer_path = os.path.join(
                 checkpoints_dir, f"round_{round_i:02d}_optimizers.pt",
             )
-            torch.save({
-                "round": round_i,
-                "optimizer": optimizer.state_dict(),
-                "parameter_names": optimizer_parameter_names,
-            }, optimizer_path)
-            phase_neutral = _probe_checkpoint(
-                round_checkpoint,
-                anchors,
-                phase=(
-                    "after_D0" if cfg.neutral_replay
-                    else "after_Dplus_D0_audit_only"
-                ),
-                device=args.device,
-                executor=probe_executor,
-                batch=cfg.batch,
-                selector=cfg.selector,
-            )
-            fixed_after_neutral = {
-                "Dplus": NS._fixed_loss(
-                    policy,
-                    positive_records,
-                    batch=cfg.batch,
+
+            def _save_round_checkpoint(path, extra=None):
+                metadata = {
+                    "study": STATUS,
+                    "round": round_i,
+                    "phase": (
+                        "post_Dplus_then_D0"
+                        if cfg.neutral_replay else "post_Dplus_D0_audit_only"
+                    ),
+                    "study_config": asdict(cfg),
+                    "Dplus_records": len(positive_records),
+                    "D0_records": len(neutral_records),
+                    "D0_original_verifier_y": 0,
+                    "D0_gp_eligible": False,
+                    "D0_used": bool(cfg.neutral_replay),
+                }
+                if extra:
+                    metadata.update(extra)
+                return _save_checkpoint(policy, path, metadata)
+
+            def _save_optimizer_state():
+                torch.save({
+                    "round": round_i,
+                    "optimizer": optimizer.state_dict(),
+                    "parameter_names": optimizer_parameter_names,
+                }, optimizer_path)
+
+            def _probe_after_D0(path):
+                return _probe_checkpoint(
+                    path,
+                    anchors,
+                    phase=(
+                        "after_D0" if cfg.neutral_replay
+                        else "after_Dplus_D0_audit_only"
+                    ),
                     device=args.device,
-                    seed=cfg.train_seed + round_i,
-                ),
-                "D0": NS._fixed_loss(
-                    policy,
-                    neutral_records,
+                    executor=probe_executor,
                     batch=cfg.batch,
-                    device=args.device,
-                    seed=cfg.train_seed + round_i,
-                ),
-            }
+                    selector=cfg.selector,
+                )
+
+            def _fixed_loss_pair():
+                return {
+                    "Dplus": NS._fixed_loss(
+                        policy,
+                        positive_records,
+                        batch=cfg.batch,
+                        device=args.device,
+                        seed=cfg.train_seed + round_i,
+                    ),
+                    "D0": NS._fixed_loss(
+                        policy,
+                        neutral_records,
+                        batch=cfg.batch,
+                        device=args.device,
+                        seed=cfg.train_seed + round_i,
+                    ),
+                }
+
+            # Every "after_D0" artifact is measured on the post-D0, pre-anchor
+            # policy so the enabled arm stays comparable with the control; the
+            # anchor step then produces the round checkpoint itself.
+            if id_anchor:
+                post_d0_path = os.path.join(
+                    checkpoints_dir, f"round_{round_i:02d}_post_D0.pt",
+                )
+                post_d0_marker = _save_round_checkpoint(post_d0_path, {
+                    "id_anchor_pending": True,
+                })
+                phase_neutral = _probe_after_D0(post_d0_path)
+            else:
+                post_d0_path = None
+                post_d0_marker = None
+                checkpoint_marker = _save_round_checkpoint(round_checkpoint)
+                _save_optimizer_state()
+                phase_neutral = _probe_after_D0(round_checkpoint)
+            fixed_after_neutral = _fixed_loss_pair()
             encoder_probe_after = _encoder_probe(
                 policy, encoder_probe_records, device=args.device,
             )
             encoder_cumulative = _encoder_reference_comparison(
                 policy, encoder_reference, device=args.device,
             )
+            if id_anchor:
+                id_anchor_update = _id_anchor_update(
+                    policy,
+                    optimizer,
+                    id_anchor,
+                    windows=id_anchor_windows,
+                    batch=cfg.batch,
+                    device=args.device,
+                    round_i=round_i,
+                    train_seed=int(args.train_seed),
+                    sample_seed=cfg.sample_seed,
+                )
+                after_anchor_parameters = R2._module_snapshot(policy)
+                checkpoint_marker = _save_round_checkpoint(round_checkpoint, {
+                    "id_anchor": {
+                        "windows": int(id_anchor_windows),
+                        "dataset": id_anchor["dataset"],
+                        "manifest_sha256": id_anchor["manifest_sha256"],
+                        "file_sha256": id_anchor["file_sha256"],
+                        "split": id_anchor["split"],
+                    },
+                })
+                _save_optimizer_state()
+                fixed_after_id_anchor = _fixed_loss_pair()
+                id_anchor_update.update({
+                    "post_D0_checkpoint": post_d0_marker["checkpoint"],
+                    "post_D0_checkpoint_sha256": (
+                        post_d0_marker["checkpoint_sha256"]
+                    ),
+                    "round_checkpoint_phase": "post_id_anchor",
+                    "round_checkpoint_note": (
+                        "this record's checkpoint_sha256 is the post-anchor "
+                        "round checkpoint; every after_D0 diagnostic was "
+                        "measured on post_D0_checkpoint before the anchor step"
+                    ),
+                })
+            else:
+                id_anchor_update = None
+                after_anchor_parameters = None
+                fixed_after_id_anchor = None
             if (
                 cfg.encoder_lr_ratio == 0.0
                 and BS.module_sha256(policy.enc_grid) != initial_visual_sha
@@ -1856,8 +2246,16 @@ def run(args):
                         "after_D0" if cfg.neutral_replay
                         else "after_Dplus_D0_audit_only"
                     ),
-                    "checkpoint": round_checkpoint,
+                    "checkpoint": (
+                        post_d0_path if post_d0_path else round_checkpoint
+                    ),
                 },
+                *([{
+                    "name": f"r{round_i}_post_id_anchor",
+                    "round": round_i,
+                    "phase": "after_id_anchor",
+                    "checkpoint": round_checkpoint,
+                }] if id_anchor_update is not None else []),
             ]
             raw_m2_dir = os.path.join(round_dir, "same_lineage_raw_M2")
             os.makedirs(raw_m2_dir)
@@ -1895,6 +2293,10 @@ def run(args):
                     "before": fixed_before,
                     "after_Dplus": fixed_after_positive,
                     "after_D0": fixed_after_neutral,
+                    **(
+                        {"after_id_anchor": fixed_after_id_anchor}
+                        if fixed_after_id_anchor is not None else {}
+                    ),
                 },
                 "updates": {
                     "Dplus": positive_update,
@@ -1902,6 +2304,8 @@ def run(args):
                     "phase_order": (
                         ["Dplus", "D0"]
                         if cfg.neutral_replay else ["Dplus"]
+                    ) + (
+                        ["id_anchor"] if id_anchor_update is not None else []
                     ),
                     "same_lr_and_inner_steps": bool(cfg.neutral_replay),
                 },
@@ -1914,6 +2318,20 @@ def run(args):
                     ),
                     "total": R2._module_relative_drift(
                         before_parameters, after_neutral_parameters,
+                    ),
+                    **(
+                        {
+                            "id_anchor_increment": R2._module_relative_drift(
+                                after_neutral_parameters,
+                                after_anchor_parameters,
+                            ),
+                            "total_including_anchor": (
+                                R2._module_relative_drift(
+                                    before_parameters, after_anchor_parameters,
+                                )
+                            ),
+                        }
+                        if after_anchor_parameters is not None else {}
                     ),
                 },
                 "encoder_diagnostics": {
@@ -1952,6 +2370,10 @@ def run(args):
                         for row in raw_m2["records"]
                     ],
                 },
+                **(
+                    {"id_anchor": id_anchor_update}
+                    if id_anchor_update is not None else {}
+                ),
                 **checkpoint_marker,
                 "optimizer_state": {
                     "path": optimizer_path,
@@ -1989,7 +2411,8 @@ def run(args):
                     "name": f"r{round_i}",
                     "round": round_i,
                     "phase": (
-                        "after_D0" if cfg.neutral_replay
+                        "after_id_anchor" if id_anchor_update is not None
+                        else "after_D0" if cfg.neutral_replay
                         else "after_Dplus_D0_audit_only"
                     ),
                     "checkpoint": round_checkpoint,
@@ -2043,6 +2466,35 @@ def run(args):
         ],
         "rounds": int(cfg.rounds),
         "rounds_run_this_invocation": len(history),
+        **({"id_anchor": {
+            "windows": int(id_anchor_windows),
+            "per_gamma": int(id_anchor_windows // len(SP.GAMMAS)),
+            "dataset": id_anchor["dataset"],
+            "manifest_sha256": id_anchor["manifest_sha256"],
+            "file_sha256": id_anchor["file_sha256"],
+            "split": id_anchor["split"],
+            "split_source": id_anchor["split_source"],
+            "per_gamma_support": [
+                {
+                    "gamma": float(bank["gamma"]),
+                    "trajectories": int(bank["trajectories"]),
+                    "windows": int(bank["windows"]),
+                    "source_windows": int(bank["source_windows"]),
+                    "sha256": str(bank["sha256"]),
+                }
+                for bank in id_anchor["banks"]
+            ],
+            "optimizer_steps_per_round": 1,
+            "sample_seed_formula": "train_seed*9176+sample_seed+31*r+7",
+            "microbatch_seed_formula": (
+                "train_seed*104729+611*r+batch_start"
+            ),
+            "position": (
+                "after the whole-D0 update and every after_D0 diagnostic, "
+                "before the round checkpoint; never enters D+, D0, a store, "
+                "a shard, or the RBF GP"
+            ),
+        }} if id_anchor else {}),
         "resume": resume,
         "optimizer_restore": optimizer_restore,
         "locked_prior_best": locked_eval,
@@ -2158,6 +2610,18 @@ def build_parser():
         help="collect and audit D0 but skip its optimizer update",
     )
     parser.set_defaults(neutral_replay=True)
+    parser.add_argument(
+        "--id-anchor-windows", type=int, default=0,
+        help=(
+            "0 disables the ID-anchor replay entirely; a positive multiple "
+            "of the seven gammas draws that many frozen pretraining windows "
+            "per round for exactly one extra Adam step after the D0 update"
+        ),
+    )
+    parser.add_argument(
+        "--id-anchor-dataset", type=str, default=DEFAULT_ID_ANCHOR_DATASET,
+        help="frozen ID pretraining window bank used by --id-anchor-windows",
+    )
     parser.add_argument("--ell", type=float, default=RA.DEFAULT_ELL)
     parser.add_argument("--gp-cap", type=int, default=DEFAULT_GP_CAP)
     parser.add_argument("--ess-target", type=float, default=0.5)
@@ -2176,6 +2640,12 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     if int(args.eval_M) not in (10, 20):
         raise ValueError("screening metric bank must be M=10 or M=20/gamma")
+    if int(args.id_anchor_windows) < 0:
+        raise ValueError("--id-anchor-windows must be non-negative")
+    if int(args.id_anchor_windows) % len(SP.GAMMAS):
+        raise ValueError(
+            "--id-anchor-windows must be a multiple of the seven gammas"
+        )
     run(args)
     print(os.path.join(
         args.output_root, "DELIVERY_COMPLETE.json",
