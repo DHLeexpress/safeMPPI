@@ -95,6 +95,8 @@ class StudyConfig:
             raise ValueError("lr must be finite and positive")
         if int(self.inner_steps) < 1:
             raise ValueError("inner_steps must be positive")
+        if not 0.0 < float(self.ess_target) <= 1.0:
+            raise ValueError("ess_target must be in (0, 1]")
         if int(self.batch) != 128:
             raise ValueError("canonical microbatch size is 128")
         if (
@@ -1401,6 +1403,7 @@ def run(args):
         batch=128,
         ell=float(args.ell),
         gp_cap=int(args.gp_cap),
+        ess_target=float(args.ess_target),
         selector=str(args.selector),
         encoder_lr_ratio=float(args.encoder_lr_ratio),
         neutral_replay=bool(args.neutral_replay),
@@ -1566,6 +1569,7 @@ def run(args):
                 expected_checkpoint_sha256=current_sha,
                 previous_executed_path=previous_executed_path,
                 gp_cap=cfg.gp_cap,
+                ess_target=cfg.ess_target,
                 verifier_executor=probe_executor,
                 T=cfg.T,
                 outdir=gather_dir,
@@ -2156,6 +2160,7 @@ def build_parser():
     parser.set_defaults(neutral_replay=True)
     parser.add_argument("--ell", type=float, default=RA.DEFAULT_ELL)
     parser.add_argument("--gp-cap", type=int, default=DEFAULT_GP_CAP)
+    parser.add_argument("--ess-target", type=float, default=0.5)
     parser.add_argument("--probe-per-gamma", type=int, default=4)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--workers", type=int, default=64)

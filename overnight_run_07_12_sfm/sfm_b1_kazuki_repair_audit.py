@@ -448,6 +448,7 @@ def collect(
     expected_checkpoint_sha256=EXPECTED_CHECKPOINT_SHA256,
     previous_executed_path=None,
     gp_cap=512,
+    ess_target=0.5,
     verifier_executor=None,
     T=180,
     outdir,
@@ -536,7 +537,7 @@ def collect(
         W=2,
         batch=128,
         lr=1.0e-5,
-        ess_target=0.5,
+        ess_target=float(ess_target),
         nfe=8,
         temp=1.0,
         phi_s=0.9,
@@ -1169,6 +1170,7 @@ def main(argv=None):
     parser.add_argument("--sample-seed", type=int, default=DEFAULT_SAMPLE_SEED)
     parser.add_argument("--audit-seed", type=int, default=DEFAULT_AUDIT_SEED)
     parser.add_argument("--ell", type=float, default=DEFAULT_ELL)
+    parser.add_argument("--ess-target", type=float, default=0.5)
     parser.add_argument("--neutral-continuation", action="store_true")
     args = parser.parse_args(argv)
     collect(
@@ -1182,6 +1184,7 @@ def main(argv=None):
         sample_seed=args.sample_seed,
         audit_seed=args.audit_seed,
         ell=args.ell,
+        ess_target=args.ess_target,
         neutral_continuation=args.neutral_continuation,
         T=180,
         outdir=args.outdir,
