@@ -1655,6 +1655,8 @@ def run(args):
                 {
                     "name": row["name"],
                     "round": row["round"],
+                    "checkpoint": row["cell"]["checkpoint"],
+                    "checkpoint_sha256": row["cell"]["checkpoint_sha256"],
                     "pooled": row["cell"]["summary"]["pooled"],
                 }
                 for row in disjoint["records"]

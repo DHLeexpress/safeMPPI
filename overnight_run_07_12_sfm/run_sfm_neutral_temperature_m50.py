@@ -70,6 +70,7 @@ def _wait_for_deliveries(root: Path, arm_names: list[str], poll: int) -> list[di
 def _validate_banks(
     payloads: list[dict], *, screen_ep0: int, screen_M: int,
     validation_ep0: int, validation_M: int, final_ep0: int,
+    expected_final_round: int,
 ) -> set[int]:
     training_scenarios = set()
     for payload in payloads:
@@ -79,13 +80,16 @@ def _validate_banks(
             or int(screen.get("M_per_gamma", -1)) != int(screen_M)
         ):
             raise RuntimeError("delivery screening bank differs from declaration")
-        if int(payload.get("rounds", -1)) != 50:
-            raise RuntimeError("temperature study requires completed round 50")
+        if int(payload.get("rounds", -1)) != int(expected_final_round):
+            raise RuntimeError("delivery does not reach the expected final round")
         arm_scenarios = set()
         for marker in payload.get("round_records", []):
             record = _read(Path(marker))
             arm_scenarios.update(map(int, record.get("scenarios", ())))
-        if len(arm_scenarios) != 100:
+        expected_scenarios = 2 * int(payload.get(
+            "rounds_run_this_invocation", payload["rounds"]
+        ))
+        if len(arm_scenarios) != expected_scenarios:
             raise RuntimeError("training scenario lineage is incomplete")
         if training_scenarios and arm_scenarios != training_scenarios:
             raise RuntimeError("arms used different training scenarios")
@@ -149,9 +153,10 @@ def _screen_rows(root: Path, arm_names: list[str], payloads: list[dict]) -> tupl
             row = {
                 "arm": arm_name,
                 "round": round_index,
-                "checkpoint": str(
-                    (root / arm_name / "checkpoints" / f"round_{round_index:02d}.pt").resolve()
-                ),
+                "checkpoint": str(Path(record.get(
+                    "checkpoint",
+                    root / arm_name / "checkpoints" / f"round_{round_index:02d}.pt",
+                )).resolve()),
                 "pooled": pooled,
             }
             if round_index == 0:
@@ -496,6 +501,7 @@ def run(args) -> dict:
         validation_ep0=args.validation_ep0,
         validation_M=args.validation_M,
         final_ep0=args.final_ep0,
+        expected_final_round=args.expected_final_round,
     )
     screen_rows, screen_r0 = _screen_rows(
         training_root, arm_names, deliveries
@@ -748,6 +754,7 @@ def build_parser() -> argparse.ArgumentParser:
     full.add_argument("--validation-noise-seed", type=int, default=2_026_073_4)
     full.add_argument("--final-ep0", type=int, default=470_000)
     full.add_argument("--final-noise-seed", type=int, default=2_026_073_5)
+    full.add_argument("--expected-final-round", type=int, default=50)
 
     kazuki = sub.add_parser("kazuki")
     kazuki.add_argument("--checkpoint", required=True)
