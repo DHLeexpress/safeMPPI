@@ -87,6 +87,38 @@ def test_population_update_uses_every_row_once_per_inner_pass():
     assert float(policy.scale.detach()) != before
 
 
+def test_restore_optimizer_preserves_global_adam_step(tmp_path):
+    policy = _TinyPolicy()
+    optimizer = torch.optim.Adam([policy.scale], lr=3.0e-5)
+    for _ in range(4):
+        optimizer.zero_grad(set_to_none=True)
+        policy.scale.square().backward()
+        optimizer.step()
+    path = tmp_path / "optimizer.pt"
+    torch.save({"round": 2, "optimizer": optimizer.state_dict()}, path)
+
+    resumed_policy = _TinyPolicy()
+    resumed = torch.optim.Adam([resumed_policy.scale], lr=3.0e-5)
+    report = M._restore_optimizer(
+        resumed,
+        str(path),
+        [resumed_policy.scale],
+        resume_round=2,
+        inner_steps=1,
+    )
+    assert report["expected_adam_step"] == 4
+    assert int(resumed.state[resumed_policy.scale]["step"].item()) == 4
+
+    with pytest.raises(RuntimeError, match="round mismatch"):
+        M._restore_optimizer(
+            torch.optim.Adam([resumed_policy.scale], lr=3.0e-5),
+            str(path),
+            [resumed_policy.scale],
+            resume_round=3,
+            inner_steps=1,
+        )
+
+
 def _positive_result():
     return {
         "resolved": True,

@@ -1005,6 +1005,126 @@ def _parse_eval_rounds(value, final_round):
     return rounds
 
 
+def _resume_artifacts(resume_root, cfg, *, source_sha, scenario_ep0):
+    root = os.path.abspath(os.fspath(resume_root))
+    delivery_path = os.path.join(root, "DELIVERY_COMPLETE.json")
+    if not os.path.isfile(delivery_path):
+        raise FileNotFoundError(delivery_path)
+    with open(delivery_path) as stream:
+        delivery = json.load(stream)
+    if delivery.get("status") != STATUS:
+        raise RuntimeError("resume source is not a completed neutral run")
+    if delivery.get("checkpoint_sha256") != source_sha:
+        raise RuntimeError("resume source uses another pretrained checkpoint")
+    previous_config = delivery.get("config", {})
+    current_config = asdict(cfg)
+    for key, value in current_config.items():
+        if key in {"name", "rounds"}:
+            continue
+        if previous_config.get(key) != value:
+            raise RuntimeError(f"resume config changed: {key}")
+    round_records = list(delivery.get("round_records", ()))
+    if not round_records:
+        raise RuntimeError("resume delivery has no round records")
+    records = []
+    for path in round_records:
+        with open(path) as stream:
+            record = json.load(stream)
+        if record.get("status") != ROUND_STATUS:
+            raise RuntimeError("invalid resume round marker")
+        records.append(record)
+    rounds = [int(record["round"]) for record in records]
+    if rounds != list(range(1, max(rounds) + 1)):
+        raise RuntimeError("resume rounds are not contiguous from one")
+    resume_round = rounds[-1]
+    if resume_round >= int(cfg.rounds):
+        raise RuntimeError("resume source already reaches requested final round")
+    expected_scenarios = set(range(
+        int(scenario_ep0), int(scenario_ep0) + 2 * resume_round
+    ))
+    observed_scenarios = {
+        int(scenario)
+        for record in records for scenario in record.get("scenarios", ())
+    }
+    if observed_scenarios != expected_scenarios:
+        raise RuntimeError("resume scenario schedule is incomplete or changed")
+    final = records[-1]
+    checkpoint = os.path.join(
+        root, "checkpoints", f"round_{resume_round:02d}.pt"
+    )
+    optimizer = os.path.join(
+        root, "checkpoints", f"round_{resume_round:02d}_optimizers.pt"
+    )
+    previous_executed = os.path.join(
+        root, "rounds", f"round_{resume_round:02d}",
+        "gather", "executed_round.pt",
+    )
+    if FA._sha256_file(checkpoint) != final["checkpoint_sha256"]:
+        raise RuntimeError("resume checkpoint hash mismatch")
+    if FA._sha256_file(optimizer) != final["optimizer_state"]["sha256"]:
+        raise RuntimeError("resume optimizer hash mismatch")
+    expected_shard_sha = final["gather"]["executed_shard"]["sha256"]
+    if FA._sha256_file(previous_executed) != expected_shard_sha:
+        raise RuntimeError("resume GP-support shard hash mismatch")
+    executed = OS.ExecutedRoundShard.load(previous_executed)
+    positive = OS.positive_records(executed)
+    support = {
+        float(holder.contexts[int(row["context_id"])]["gamma"])
+        for holder, row in positive
+    }
+    if support != set(map(float, SP.GAMMAS)):
+        raise RuntimeError("resume GP support does not cover all gammas")
+    return {
+        "root": root,
+        "delivery": delivery_path,
+        "delivery_sha256": FA._sha256_file(delivery_path),
+        "resume_round": resume_round,
+        "checkpoint": checkpoint,
+        "checkpoint_sha256": final["checkpoint_sha256"],
+        "optimizer": optimizer,
+        "optimizer_sha256": final["optimizer_state"]["sha256"],
+        "previous_executed": previous_executed,
+        "previous_executed_sha256": expected_shard_sha,
+        "visual_encoder_sha256": delivery["visual_encoder_sha256"],
+        "next_scenarios": [
+            int(scenario_ep0) + 2 * resume_round,
+            int(scenario_ep0) + 2 * resume_round + 1,
+        ],
+    }
+
+
+def _restore_optimizer(optimizer, path, parameters, *, resume_round, inner_steps):
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if int(payload.get("round", -1)) != int(resume_round):
+        raise RuntimeError("optimizer round mismatch")
+    state = payload.get("optimizer", {})
+    groups = state.get("param_groups", ())
+    if len(groups) != 1 or float(groups[0].get("lr", -1)) != float(
+        optimizer.param_groups[0]["lr"]
+    ):
+        raise RuntimeError("optimizer hyperparameters changed")
+    ids = list(groups[0].get("params", ()))
+    if len(ids) != len(parameters) or len(state.get("state", {})) != len(parameters):
+        raise RuntimeError("optimizer parameter support is incomplete")
+    expected_step = 2 * int(resume_round) * int(inner_steps)
+    for parameter_id, parameter in zip(ids, parameters):
+        values = state["state"].get(parameter_id)
+        if values is None:
+            raise RuntimeError("optimizer parameter state is missing")
+        step = int(torch.as_tensor(values["step"]).item())
+        if step != expected_step:
+            raise RuntimeError("optimizer Adam step does not match global round")
+        for key in ("exp_avg", "exp_avg_sq"):
+            if tuple(values[key].shape) != tuple(parameter.shape):
+                raise RuntimeError("optimizer moment shape mismatch")
+    optimizer.load_state_dict(state)
+    return {
+        "round": int(resume_round),
+        "expected_adam_step": expected_step,
+        "parameters": len(parameters),
+    }
+
+
 def run(args):
     eval_rounds = _parse_eval_rounds(args.eval_rounds, args.rounds)
     cfg = StudyConfig(
@@ -1037,25 +1157,56 @@ def run(args):
     rounds_dir = os.path.join(output_root, "rounds")
     os.makedirs(rounds_dir)
 
-    policy, _ = GPS.load_sfm_policy(checkpoint, device=args.device)
+    resume = (
+        _resume_artifacts(
+            args.resume_run_root,
+            cfg,
+            source_sha=source_sha,
+            scenario_ep0=int(args.scenario_ep0),
+        )
+        if args.resume_run_root else None
+    )
+    if resume and int(resume["resume_round"]) not in eval_rounds:
+        raise ValueError("resumed evaluation must include the anchor round")
+    policy_checkpoint = resume["checkpoint"] if resume else checkpoint
+    policy, _ = GPS.load_sfm_policy(policy_checkpoint, device=args.device)
     frozen = BS.configure_expansion_trainability(policy)
     visual_sha = BS.module_sha256(policy.enc_grid)
+    if resume and visual_sha != resume["visual_encoder_sha256"]:
+        raise RuntimeError("resume visual encoder hash mismatch")
+    trainable_names = [
+        name for name, parameter in policy.named_parameters()
+        if parameter.requires_grad
+    ]
     parameters = [
         parameter for parameter in policy.parameters()
         if parameter.requires_grad
     ]
     optimizer = torch.optim.Adam(parameters, lr=cfg.lr)
+    optimizer_restore = (
+        _restore_optimizer(
+            optimizer,
+            resume["optimizer"],
+            parameters,
+            resume_round=resume["resume_round"],
+            inner_steps=cfg.inner_steps,
+        )
+        if resume else None
+    )
     round0_path = os.path.join(checkpoints_dir, "round_00.pt")
-    _save_checkpoint(policy, round0_path, {
-        "study": STATUS,
-        "round": 0,
-        "phase": "pretrained",
-        "source_checkpoint": checkpoint,
-        "source_sha256": source_sha,
-        "study_config": asdict(cfg),
-    })
-    current_checkpoint = checkpoint
-    previous_executed_path = None
+    if not resume:
+        _save_checkpoint(policy, round0_path, {
+            "study": STATUS,
+            "round": 0,
+            "phase": "pretrained",
+            "source_checkpoint": checkpoint,
+            "source_sha256": source_sha,
+            "study_config": asdict(cfg),
+        })
+    current_checkpoint = policy_checkpoint
+    previous_executed_path = (
+        resume["previous_executed"] if resume else None
+    )
     history = []
     milestone_arms = [{
         "name": "r0",
@@ -1063,12 +1214,20 @@ def run(args):
         "phase": "pretrained",
         "checkpoint": checkpoint,
     }]
+    start_round = int(resume["resume_round"]) if resume else 0
+    if resume:
+        milestone_arms.append({
+            "name": f"r{start_round}",
+            "round": start_round,
+            "phase": "resume_anchor_after_D0",
+            "checkpoint": current_checkpoint,
+        })
 
     context = mp.get_context("spawn")
     with ProcessPoolExecutor(
         max_workers=int(args.workers), mp_context=context,
     ) as probe_executor:
-        for round_i in range(1, cfg.rounds + 1):
+        for round_i in range(start_round + 1, cfg.rounds + 1):
             started = time.perf_counter()
             round_dir = os.path.join(rounds_dir, f"round_{round_i:02d}")
             os.makedirs(round_dir)
@@ -1472,14 +1631,18 @@ def run(args):
         "config": asdict(cfg),
         "frozen_parameters": frozen,
         "visual_encoder_sha256": visual_sha,
-        "rounds": len(history),
+        "rounds": int(cfg.rounds),
+        "rounds_run_this_invocation": len(history),
+        "resume": resume,
+        "optimizer_restore": optimizer_restore,
+        "trainable_parameter_names": trainable_names,
         "round_records": [
             os.path.join(
                 rounds_dir,
-                f"round_{index:02d}",
+                f"round_{record['round']:02d}",
                 "ROUND_COMPLETE.json",
             )
-            for index in range(1, len(history) + 1)
+            for record in history
         ],
         "disjoint_raw_evaluation": {
             "file": os.path.join(
@@ -1522,6 +1685,13 @@ def run(args):
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument(
+        "--resume-run-root",
+        help=(
+            "completed neutral run to continue with model, Adam, global "
+            "round/seed schedule, and previous-round GP support intact"
+        ),
+    )
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--name", default="lr3em5_s04")
     parser.add_argument("--rounds", type=int, default=2)

@@ -49,6 +49,7 @@ T = int(SP.T)
 H = int(SP.H)
 NFE = 8
 TEMPERATURE = 1.0
+TEMPERATURE_BY_GAMMA = tuple(1.0 for _ in SP.GAMMAS)
 DEFAULT_EP0 = 260_000
 DEFAULT_NOISE_SEED = 2_026_072_3
 Z95 = 1.959963984540054
@@ -121,7 +122,11 @@ def _noise_bank(*, ep0: int, d: int, seed: int) -> tuple[np.ndarray, dict]:
         "T": T,
         "d": int(d),
         "seed": int(seed),
-        "temperature": TEMPERATURE,
+        "temperature": (
+            TEMPERATURE
+            if len(set(TEMPERATURE_BY_GAMMA)) == 1 else None
+        ),
+        "temperature_by_gamma": list(TEMPERATURE_BY_GAMMA),
         "NFE": NFE,
     }
     generator = np.random.default_rng(int(seed))
@@ -139,6 +144,25 @@ def _noise_bank(*, ep0: int, d: int, seed: int) -> tuple[np.ndarray, dict]:
         ),
     }
     return values, metadata
+
+
+def _temperature_description() -> str:
+    if len(set(TEMPERATURE_BY_GAMMA)) == 1:
+        return f"global {TEMPERATURE_BY_GAMMA[0]:g}"
+    return "by-gamma " + ",".join(
+        f"{gamma:g}:{temperature:g}"
+        for gamma, temperature in zip(SP.GAMMAS, TEMPERATURE_BY_GAMMA)
+    )
+
+
+def _scale_latents(latents: np.ndarray, gamma_indices: list[int]) -> np.ndarray:
+    values = np.asarray(latents, np.float32)
+    if len(values) != len(gamma_indices):
+        raise ValueError("one gamma index is required per latent")
+    scales = np.asarray([
+        TEMPERATURE_BY_GAMMA[int(index)] for index in gamma_indices
+    ], np.float32)
+    return values * scales[:, None]
 
 
 @dataclass
@@ -250,11 +274,13 @@ def run_batched_raw(
         low_tensor = torch.stack(lows).to(device)
         history_tensor = torch.stack(histories).to(device)
         context = policy.ctx_from(hp10_tensor, low_tensor, history_tensor)
+        scaled_latents = _scale_latents(
+            np.asarray(latents),
+            [episode.gamma_index for episode, _, _ in active],
+        )
         windows = BE.integrate_latents(
             policy,
-            TEMPERATURE * torch.as_tensor(
-                np.asarray(latents), device=device
-            ),
+            torch.as_tensor(scaled_latents, device=device),
             context,
             nfe=NFE,
         ).reshape(len(active), H, 2)
@@ -501,7 +527,11 @@ def _cell_key(
         "ep0": int(ep0),
         "M_per_gamma": M_PER_GAMMA,
         "noise_bank": noise_meta,
-        "temperature": TEMPERATURE,
+        "temperature": (
+            TEMPERATURE
+            if len(set(TEMPERATURE_BY_GAMMA)) == 1 else None
+        ),
+        "temperature_by_gamma": list(TEMPERATURE_BY_GAMMA),
         "NFE": NFE,
         "T": T,
         "H": H,
@@ -574,7 +604,8 @@ def _evaluate_checkpoint(
         "rows": compact,
         "metric_semantics": {
             "policy": (
-                f"canonical unguided raw flow, temperature={TEMPERATURE:g}, "
+                "canonical unguided raw flow, temperature="
+                f"{_temperature_description()}, "
                 "NFE=8, one "
                 "generated H=10 window per context, execute first action"
             ),
@@ -727,7 +758,8 @@ def render(records: list[dict], output_dir: str) -> list[str]:
         "rounds": rounds,
         "gammas": list(map(float, SP.GAMMAS)),
         "claim": (
-            f"fixed raw temperature-{TEMPERATURE:g} rollouts; Validity is the "
+            "fixed raw temperature "
+            f"{_temperature_description()} rollouts; Validity is the "
             "trajectory-mean "
             "fraction over every executed window start; terminal horizons use "
             "H_t=min(10,N_tau-t); every indicator requires task-space bounds, "
@@ -744,13 +776,28 @@ def render(records: list[dict], output_dir: str) -> list[str]:
 
 
 def run(args) -> dict:
-    global M_PER_GAMMA, TEMPERATURE
+    global M_PER_GAMMA, TEMPERATURE, TEMPERATURE_BY_GAMMA
     M_PER_GAMMA = int(args.m_per_gamma)
     if M_PER_GAMMA <= 0:
         raise ValueError("--m-per-gamma must be positive")
     TEMPERATURE = float(args.temperature)
     if not math.isfinite(TEMPERATURE) or TEMPERATURE <= 0.0:
         raise ValueError("--temperature must be finite and positive")
+    schedule = (
+        list(map(float, args.temperature_by_gamma))
+        if args.temperature_by_gamma is not None
+        else [TEMPERATURE] * len(SP.GAMMAS)
+    )
+    if (
+        len(schedule) != len(SP.GAMMAS)
+        or any(not math.isfinite(value) or value <= 0.0 for value in schedule)
+    ):
+        raise ValueError(
+            "--temperature-by-gamma requires seven finite positive values"
+        )
+    TEMPERATURE_BY_GAMMA = tuple(schedule)
+    if len(set(TEMPERATURE_BY_GAMMA)) == 1:
+        TEMPERATURE = TEMPERATURE_BY_GAMMA[0]
     specs = _checkpoint_specs(args.checkpoints, args.labels)
     output_dir = os.path.abspath(args.output_dir)
     cache_dir = os.path.abspath(
@@ -801,7 +848,11 @@ def run(args) -> dict:
             "same_scenario_ids_for_every_gamma": True,
         },
         "noise_bank": noise_meta,
-        "temperature": TEMPERATURE,
+        "temperature": (
+            TEMPERATURE
+            if len(set(TEMPERATURE_BY_GAMMA)) == 1 else None
+        ),
+        "temperature_by_gamma": list(TEMPERATURE_BY_GAMMA),
         "records": records,
         "outputs": outputs,
     }
@@ -834,6 +885,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "global raw-policy latent scale; select on a validation bank and "
             "lock before any disjoint confirmation"
+        ),
+    )
+    parser.add_argument(
+        "--temperature-by-gamma",
+        nargs="+",
+        type=float,
+        help=(
+            "seven temperatures ordered as the canonical gamma list; use "
+            "only after a schedule is locked on a separate calibration bank"
         ),
     )
     parser.add_argument("--device", default="cuda")

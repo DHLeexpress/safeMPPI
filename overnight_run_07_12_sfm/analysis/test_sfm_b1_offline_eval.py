@@ -143,6 +143,7 @@ def test_temperature_defaults_to_one_and_is_validated():
         "--output-dir", "out",
     ])
     assert args.temperature == 1.0
+    assert args.temperature_by_gamma is None
 
     args.temperature = 0.0
     args.m_per_gamma = 1
@@ -153,8 +154,14 @@ def test_temperature_defaults_to_one_and_is_validated():
 def test_temperature_is_part_of_noise_and_cache_contract(monkeypatch, tmp_path):
     monkeypatch.setattr(E, "M_PER_GAMMA", 2)
     monkeypatch.setattr(E, "TEMPERATURE", 0.7)
+    monkeypatch.setattr(
+        E, "TEMPERATURE_BY_GAMMA", tuple(.7 for _ in SP.GAMMAS)
+    )
     _, metadata = E._noise_bank(ep0=10, d=4, seed=12)
     assert metadata["temperature"] == pytest.approx(0.7)
+    assert metadata["temperature_by_gamma"] == pytest.approx(
+        [.7] * len(SP.GAMMAS)
+    )
 
     checkpoint = tmp_path / "checkpoint.pt"
     checkpoint.write_bytes(b"checkpoint")
@@ -166,6 +173,9 @@ def test_temperature_is_part_of_noise_and_cache_contract(monkeypatch, tmp_path):
         noise_meta=metadata,
     )
     monkeypatch.setattr(E, "TEMPERATURE", 1.0)
+    monkeypatch.setattr(
+        E, "TEMPERATURE_BY_GAMMA", tuple(1.0 for _ in SP.GAMMAS)
+    )
     key_10 = E._cell_key(
         checkpoint_sha256="checkpoint",
         scene_profile="double_density_velocity_ood",
@@ -173,6 +183,26 @@ def test_temperature_is_part_of_noise_and_cache_contract(monkeypatch, tmp_path):
         noise_meta={**metadata, "temperature": 1.0},
     )
     assert key_07 != key_10
+
+
+def test_gamma_temperature_scales_the_matching_latent(monkeypatch):
+    schedule = tuple(.4 + .1 * index for index in range(len(SP.GAMMAS)))
+    monkeypatch.setattr(E, "TEMPERATURE_BY_GAMMA", schedule)
+    latents = np.ones((3, 4), np.float32)
+    scaled = E._scale_latents(latents, [0, 2, 6])
+    assert scaled[:, 0] == pytest.approx([schedule[0], schedule[2], schedule[6]])
+
+
+def test_gamma_temperature_requires_exactly_seven_values(tmp_path):
+    args = E.build_parser().parse_args([
+        "--checkpoints", str(tmp_path / "missing.pt"),
+        "--labels", "r0",
+        "--output-dir", str(tmp_path / "out"),
+        "--temperature-by-gamma", "0.5", "0.6",
+    ])
+    args.m_per_gamma = 1
+    with pytest.raises(ValueError, match="seven"):
+        E.run(args)
 
 
 def test_render_uses_ball_style_validity_name_and_writes_manifest(tmp_path):

@@ -182,8 +182,9 @@ def evaluator_command(
     cache_dir: Path,
     output_dir: Path,
     temperature: float = 1.0,
+    temperature_by_gamma: list[float] | None = None,
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         str(EVALUATOR),
         "--checkpoints",
@@ -209,6 +210,12 @@ def evaluator_command(
         "--output-dir",
         str(output_dir),
     ]
+    if temperature_by_gamma is not None:
+        command.extend([
+            "--temperature-by-gamma",
+            *map(str, temperature_by_gamma),
+        ])
+    return command
 
 
 def run_job(
