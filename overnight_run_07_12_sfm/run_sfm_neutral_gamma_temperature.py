@@ -211,6 +211,11 @@ def _reuse_global_temperature_cells(
             )
             for gamma in SP.GAMMAS
         }
+        observed_schedule = (
+            payload.get("temperature_by_gamma")
+            or noise.get("temperature_by_gamma")
+            or [float(payload["temperature"])] * len(SP.GAMMAS)
+        )
         if (
             payload.get("scene_profile") != "double_density_velocity_ood"
             or record["cell"].get("scene_profile")
@@ -228,10 +233,7 @@ def _reuse_global_temperature_cells(
             or not isinstance(noise.get("sha256"), str)
             or len(noise["sha256"]) != 64
             or float(payload["temperature"]) != temperature
-            or payload.get(
-                "temperature_by_gamma", noise.get("temperature_by_gamma")
-            )
-            != [temperature] * len(SP.GAMMAS)
+            or observed_schedule != [temperature] * len(SP.GAMMAS)
             or int(record["round"]) != int(selected["round"])
             or record["cell"]["checkpoint_sha256"]
             != selected["checkpoint_sha256"]
