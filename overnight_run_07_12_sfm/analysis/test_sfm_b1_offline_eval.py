@@ -135,6 +135,46 @@ def test_summary_uses_mean_of_per_trajectory_fractions():
     assert "V_safe" not in summary
 
 
+def test_temperature_defaults_to_one_and_is_validated():
+    parser = E.build_parser()
+    args = parser.parse_args([
+        "--checkpoints", "a.pt",
+        "--labels", "r0",
+        "--output-dir", "out",
+    ])
+    assert args.temperature == 1.0
+
+    args.temperature = 0.0
+    args.m_per_gamma = 1
+    with pytest.raises(ValueError, match="temperature"):
+        E.run(args)
+
+
+def test_temperature_is_part_of_noise_and_cache_contract(monkeypatch, tmp_path):
+    monkeypatch.setattr(E, "M_PER_GAMMA", 2)
+    monkeypatch.setattr(E, "TEMPERATURE", 0.7)
+    _, metadata = E._noise_bank(ep0=10, d=4, seed=12)
+    assert metadata["temperature"] == pytest.approx(0.7)
+
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    monkeypatch.setattr(E, "_sha256_file", lambda path: "evaluator")
+    key_07 = E._cell_key(
+        checkpoint_sha256="checkpoint",
+        scene_profile="double_density_velocity_ood",
+        ep0=10,
+        noise_meta=metadata,
+    )
+    monkeypatch.setattr(E, "TEMPERATURE", 1.0)
+    key_10 = E._cell_key(
+        checkpoint_sha256="checkpoint",
+        scene_profile="double_density_velocity_ood",
+        ep0=10,
+        noise_meta={**metadata, "temperature": 1.0},
+    )
+    assert key_07 != key_10
+
+
 def test_render_uses_ball_style_validity_name_and_writes_manifest(tmp_path):
     records = []
     for round_i in (0, 1, 2):

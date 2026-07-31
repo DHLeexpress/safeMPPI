@@ -181,6 +181,7 @@ def evaluator_command(
     workers: int,
     cache_dir: Path,
     output_dir: Path,
+    temperature: float = 1.0,
 ) -> list[str]:
     return [
         sys.executable,
@@ -197,6 +198,8 @@ def evaluator_command(
         str(noise_seed),
         "--m-per-gamma",
         str(m_per_gamma),
+        "--temperature",
+        str(float(temperature)),
         "--device",
         "cuda:0",
         "--workers",

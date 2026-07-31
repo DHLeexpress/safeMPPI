@@ -1,9 +1,11 @@
 """Raw SFM evaluation with terminal-truncated executed-window Validity.
 
 Every checkpoint uses one fixed M/scenario/gamma seed and latent bank.  The
-controller is the unguided raw flow at temperature one: it samples one H=10
-plan per context and executes only its first action.  Acquisition, verifier
-selection, fallback, guidance, and temperature search are absent.
+controller is the unguided raw flow at one declared global sampling
+temperature: it samples one H=10 plan per context and executes only its first
+action.  Acquisition, verifier selection, fallback, and guidance are absent.
+The default temperature remains one; non-default values are intended for a
+separate validation-selected, then locked, evaluation protocol.
 
 For an executed trajectory with ``N_tau`` controls, Validity is the mean of
 the ``N_tau`` exact GREEN-verifier indicators.  The window at start ``t`` uses
@@ -250,7 +252,9 @@ def run_batched_raw(
         context = policy.ctx_from(hp10_tensor, low_tensor, history_tensor)
         windows = BE.integrate_latents(
             policy,
-            torch.as_tensor(np.asarray(latents), device=device),
+            TEMPERATURE * torch.as_tensor(
+                np.asarray(latents), device=device
+            ),
             context,
             nfe=NFE,
         ).reshape(len(active), H, 2)
@@ -570,7 +574,8 @@ def _evaluate_checkpoint(
         "rows": compact,
         "metric_semantics": {
             "policy": (
-                "canonical unguided raw flow, temperature=1, NFE=8, one "
+                f"canonical unguided raw flow, temperature={TEMPERATURE:g}, "
+                "NFE=8, one "
                 "generated H=10 window per context, execute first action"
             ),
             "Validity": (
@@ -722,7 +727,8 @@ def render(records: list[dict], output_dir: str) -> list[str]:
         "rounds": rounds,
         "gammas": list(map(float, SP.GAMMAS)),
         "claim": (
-            "fixed raw temperature-1 rollouts; Validity is the trajectory-mean "
+            f"fixed raw temperature-{TEMPERATURE:g} rollouts; Validity is the "
+            "trajectory-mean "
             "fraction over every executed window start; terminal horizons use "
             "H_t=min(10,N_tau-t); every indicator requires task-space bounds, "
             "time-indexed collision avoidance, and the exact GREEN certificate"
@@ -738,10 +744,13 @@ def render(records: list[dict], output_dir: str) -> list[str]:
 
 
 def run(args) -> dict:
-    global M_PER_GAMMA
+    global M_PER_GAMMA, TEMPERATURE
     M_PER_GAMMA = int(args.m_per_gamma)
     if M_PER_GAMMA <= 0:
         raise ValueError("--m-per-gamma must be positive")
+    TEMPERATURE = float(args.temperature)
+    if not math.isfinite(TEMPERATURE) or TEMPERATURE <= 0.0:
+        raise ValueError("--temperature must be finite and positive")
     specs = _checkpoint_specs(args.checkpoints, args.labels)
     output_dir = os.path.abspath(args.output_dir)
     cache_dir = os.path.abspath(
@@ -792,6 +801,7 @@ def run(args) -> dict:
             "same_scenario_ids_for_every_gamma": True,
         },
         "noise_bank": noise_meta,
+        "temperature": TEMPERATURE,
         "records": records,
         "outputs": outputs,
     }
@@ -816,6 +826,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--noise-seed", type=int, default=DEFAULT_NOISE_SEED)
     parser.add_argument(
         "--m-per-gamma", type=int, default=DEFAULT_M_PER_GAMMA
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help=(
+            "global raw-policy latent scale; select on a validation bank and "
+            "lock before any disjoint confirmation"
+        ),
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--workers", type=int, default=32)
