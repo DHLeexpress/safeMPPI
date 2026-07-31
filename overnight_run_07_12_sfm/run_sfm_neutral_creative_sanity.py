@@ -37,11 +37,6 @@ STATUS = "SFM_NEUTRAL_CREATIVE_SANITY_COMPLETE"
 STAGE_B_STATUS = "SFM_NEUTRAL_STAGE_B_POSTPHASE_AUDIT_COMPLETE"
 STAGE_A_STATUS = "SFM_NEUTRAL_STAGE_A_SELECTOR_SANITY_COMPLETE"
 STAGE_C_STATUS = "SFM_NEUTRAL_STAGE_C_ENCODER_SANITY_COMPLETE"
-EXPECTED_TRIGGER_SOURCE = "9c0ec8ac657e8711e368af4bae4cf9b63328de6b"
-DEFAULT_TRIGGER = Path(
-    "/data3/research1/sfm_neutral_autonomous_9c0ec8a/"
-    "CREATIVE_SANITY_REQUIRED.json"
-)
 DEFAULT_AUDIT_ROUNDS = (1, 2, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
 
 
@@ -74,14 +69,14 @@ def _wait_trigger(path: Path, poll_seconds: int) -> dict:
 
 
 def _validate_trigger(
-    path: Path, trigger: dict, *, expected_source=EXPECTED_TRIGGER_SOURCE,
+    path: Path, trigger: dict, *, expected_source: str,
 ) -> dict:
     if (
         trigger.get("status") != AUTO.CREATIVE_TRIGGER_STATUS
         or trigger.get("action") != "CREATIVE_SANITY_REQUIRED"
     ):
         raise RuntimeError("creative coordinator received a non-trigger marker")
-    if expected_source and trigger.get("source_commit") != expected_source:
+    if trigger.get("source_commit") != expected_source:
         raise RuntimeError("creative trigger was produced by an unexpected source")
     delivery_path = Path(trigger["autonomous_delivery"]).resolve()
     if _sha256(delivery_path) != trigger.get("autonomous_delivery_sha256"):
@@ -90,20 +85,31 @@ def _validate_trigger(
     if (
         delivery.get("status") != AUTO.STATUS
         or delivery.get("action") != "CREATIVE_SANITY_REQUIRED"
-        or delivery.get("ci_clean_four_metric_win") is not False
+        or delivery.get("objective_achieved") is not False
     ):
         raise RuntimeError("autonomous delivery does not authorize creative sanity")
     if delivery.get("source_commit") != trigger.get("source_commit"):
         raise RuntimeError("trigger/autonomous source commit mismatch")
     for key in (
-        "selected_arm", "r100_training_delivery", "r100_gamma_delivery",
+        "selected_arm",
+        "r100_training_delivery", "r100_training_delivery_sha256",
+        "r100_global_delivery", "r100_global_delivery_sha256",
+        "r100_gamma_delivery", "r100_gamma_delivery_sha256",
     ):
         if trigger.get(key) != delivery.get(key):
             raise RuntimeError(f"trigger/autonomous mismatch: {key}")
+    for key in (
+        "r100_training_delivery", "r100_global_delivery",
+        "r100_gamma_delivery",
+    ):
+        referenced = Path(trigger[key]).resolve()
+        if _sha256(referenced) != trigger[f"{key}_sha256"]:
+            raise RuntimeError(f"referenced delivery digest mismatch: {key}")
     gamma = _read(Path(trigger["r100_gamma_delivery"]).resolve())
-    if gamma.get("status") != GAMMA.STATUS or gamma.get(
-        "ci_clean_four_metric_win"
-    ) is not False:
+    if (
+        gamma.get("status") != GAMMA.STATUS
+        or gamma.get("objective_achieved") is not False
+    ):
         raise RuntimeError("r100 gamma result does not require creative sanity")
     return {"delivery": delivery, "gamma": gamma, "path": delivery_path}
 
@@ -319,7 +325,7 @@ def _training_command(
     *, checkpoint, output, name, rounds, scenario_ep0, eval_ep0,
     eval_rounds, lr, inner_steps, ell, gp_cap, selector,
     encoder_lr_ratio, workers, noise_seed, sample_seed, audit_seed,
-    train_seed, probe_seed, resume=None,
+    train_seed, probe_seed, neutral_replay=True, resume=None,
 ):
     command = [
         sys.executable, str(HERE / "sfm_b1_neutral_multiround.py"),
@@ -347,23 +353,228 @@ def _training_command(
     ]
     if resume is not None:
         command.extend(["--resume-run-root", str(resume)])
+    if not neutral_replay:
+        command.append("--no-neutral-replay")
     return command
 
 
-def _run(command, *, log: Path, gpu: int, cpu_range: str) -> None:
+def _run(
+    command, *, log: Path, gpu: int | None, cpu_range: str | None,
+) -> None:
     environment = os.environ.copy()
     environment["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    environment["CUDA_VISIBLE_DEVICES"] = str(int(gpu))
+    if gpu is not None:
+        environment["CUDA_VISIBLE_DEVICES"] = str(int(gpu))
+    else:
+        environment.pop("CUDA_VISIBLE_DEVICES", None)
     environment["PYTHONPATH"] = str(HERE)
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("w") as stream:
+        launched = list(command)
+        if cpu_range is not None:
+            launched = ["taskset", "-c", cpu_range, *launched]
         completed = subprocess.run(
-            ["taskset", "-c", cpu_range, *command],
+            launched,
             cwd=HERE, env=environment, stdout=stream,
             stderr=subprocess.STDOUT, check=False,
         )
     if completed.returncode:
         raise RuntimeError(f"job failed ({completed.returncode}): {log}")
+
+
+def _confirm_candidate(
+    *, training_run: Path, arm_name: str, output: Path, ep0: int,
+    noise_seed: int, gpus, workers: int, selected: dict,
+) -> dict:
+    """Calibrate temperature, then apply the existing fresh-M50 objective."""
+    training_delivery = _read(training_run / "DELIVERY_COMPLETE.json")
+    training_screen = training_delivery["disjoint_raw_evaluation"]
+    input_root = output / "training_input"
+    prepared_arm = input_root / arm_name
+    prepared_arm.mkdir(parents=True)
+    selected_round = int(selected["round"])
+    selected_sha = str(selected["checkpoint_sha256"])
+    filtered_records = [
+        record for record in training_screen["records"]
+        if int(record["round"]) in (0, selected_round)
+    ]
+    if len(filtered_records) != 2:
+        raise RuntimeError("confirmation input must contain r0 and one winner")
+    winner = next(
+        record for record in filtered_records
+        if int(record["round"]) == selected_round
+    )
+    if winner["checkpoint_sha256"] != selected_sha:
+        raise RuntimeError("qualification winner checkpoint digest changed")
+    prepared_delivery = dict(training_delivery)
+    prepared_delivery["disjoint_raw_evaluation"] = {
+        **training_screen,
+        "records": filtered_records,
+    }
+    prepared_delivery["confirmation_filter"] = {
+        "source_delivery": str(
+            (training_run / "DELIVERY_COMPLETE.json").resolve()
+        ),
+        "source_delivery_sha256": _sha256(
+            training_run / "DELIVERY_COMPLETE.json"
+        ),
+        "selected_round": selected_round,
+        "selected_checkpoint": selected["checkpoint"],
+        "selected_checkpoint_sha256": selected_sha,
+    }
+    prepared_delivery_path = prepared_arm / "DELIVERY_COMPLETE.json"
+    _write(prepared_delivery_path, prepared_delivery)
+    global_root = output / "global_temperature"
+    global_command = [
+        sys.executable, str(HERE / "run_sfm_neutral_temperature_m50.py"),
+        "run",
+        "--training-root", str(input_root),
+        "--output-dir", str(global_root),
+        "--arm-names", str(arm_name),
+        "--temperatures", "0.55,0.7,0.85,1.0",
+        "--gpus", *map(str, gpus),
+        "--workers", str(int(workers)),
+        "--screen-ep0", str(int(training_screen["ep0"])),
+        "--screen-M", str(int(training_screen["M_per_gamma"])),
+        "--validation-ep0", str(int(ep0)),
+        "--validation-M", "10",
+        "--validation-noise-seed", str(int(noise_seed)),
+        "--final-ep0", str(int(ep0) + 1_000),
+        "--final-noise-seed", str(int(noise_seed) + 1),
+        "--expected-final-round", "5",
+    ]
+    _run(
+        global_command, log=output / "logs" / "global_temperature.log",
+        gpu=None, cpu_range=None,
+    )
+    global_delivery = _read(global_root / "DELIVERY_COMPLETE.json")
+    locked = global_delivery["selection"]["selected_expanded"]
+    if (
+        int(locked["round"]) != selected_round
+        or locked["checkpoint_sha256"] != selected_sha
+    ):
+        raise RuntimeError("global confirmation changed the qualified checkpoint")
+    gamma_root = output / "gamma_temperature"
+    gamma_command = [
+        sys.executable, str(HERE / "run_sfm_neutral_gamma_temperature.py"),
+        "--initial-delivery", str(global_root / "DELIVERY_COMPLETE.json"),
+        "--output-dir", str(gamma_root),
+        "--temperatures", "0.55,0.7,0.85,1.0",
+        "--gpus", *map(str, gpus),
+        "--workers", str(int(workers)),
+        "--final-ep0", str(int(ep0) + 2_000),
+        "--final-noise-seed", str(int(noise_seed) + 2),
+    ]
+    _run(
+        gamma_command, log=output / "logs" / "gamma_temperature.log",
+        gpu=None, cpu_range=None,
+    )
+    global_path = global_root / "DELIVERY_COMPLETE.json"
+    gamma_path = gamma_root / "DELIVERY_COMPLETE.json"
+    gamma = _read(gamma_path)
+    if gamma.get("status") != GAMMA.STATUS:
+        raise RuntimeError("creative candidate confirmation is incomplete")
+    return {
+        "prepared_training_delivery": str(prepared_delivery_path),
+        "prepared_training_delivery_sha256": _sha256(prepared_delivery_path),
+        "global_delivery": str(global_path),
+        "global_delivery_sha256": _sha256(global_path),
+        "gamma_delivery": str(gamma_path),
+        "gamma_delivery_sha256": _sha256(gamma_path),
+        "ci_clean_four_metric_win": bool(
+            gamma.get("ci_clean_four_metric_win")
+        ),
+        "objective_achieved": bool(gamma.get("objective_achieved")),
+        "final_liveness_eligible": bool(
+            gamma.get("final_liveness_eligible")
+        ),
+        "final_gamma_trend_eligible": bool(
+            gamma.get("final_gamma_trend_eligible")
+        ),
+    }
+
+
+def _expanded_lock(gamma_delivery: str, *, name: str) -> dict:
+    path = Path(gamma_delivery).resolve()
+    payload = _read(path)
+    if payload.get("status") != GAMMA.STATUS:
+        raise RuntimeError("invalid gamma-temperature candidate delivery")
+    record = next(
+        row for row in payload["final_records"]
+        if row["method"] == "expanded"
+    )
+    return {
+        "name": str(name),
+        "checkpoint": record["checkpoint"],
+        "checkpoint_sha256": record["checkpoint_sha256"],
+        "round": int(record["round"]),
+        "temperature_by_gamma": record["temperature_by_gamma"],
+        "gamma_delivery": str(path),
+        "gamma_delivery_sha256": _sha256(path),
+    }
+
+
+def _common_best_available(
+    locks, *, output: Path, ep0: int, noise_seed: int, gpus, workers: int,
+) -> dict:
+    """Rank failed-objective candidates on one common M50 bank."""
+    cache = output / "cache"
+    jobs, destinations = [], {}
+    for lock in locks:
+        name = lock["name"]
+        destination = output / name
+        jobs.append({
+            "name": f"common_{name}",
+            "command": GLOBAL.FUNNEL.evaluator_command(
+                [lock["checkpoint"]], [f"r{lock['round']}"],
+                scene_profile="double_density_velocity_ood",
+                ep0=int(ep0), noise_seed=int(noise_seed),
+                m_per_gamma=50, workers=int(workers),
+                cache_dir=cache, output_dir=destination,
+                temperature=1.0,
+                temperature_by_gamma=lock["temperature_by_gamma"],
+            ),
+        })
+        destinations[name] = (lock, destination)
+    GLOBAL._run_jobs(
+        jobs, gpus=list(map(int, gpus)), workers=int(workers),
+        log_dir=output / "logs",
+    )
+    records = []
+    for name, (lock, destination) in destinations.items():
+        metrics = destination / "raw_m50_offline_metrics.json"
+        row = GLOBAL._record_from_cell(
+            _read(metrics), method=name, temperature=1.0,
+        )
+        row["temperature"] = None
+        row["temperature_by_gamma"] = lock["temperature_by_gamma"]
+        row["metrics_json"] = str(metrics)
+        row["metrics_sha256"] = _sha256(metrics)
+        records.append(row)
+
+    def rank(row):
+        value = row["pooled"]
+        return (
+            value["CR"], -value["Validity"], -value["clearance"],
+            value["time_to_goal"], -value["SR"], row["method"],
+        )
+
+    selected = min(records, key=rank)
+    result = {
+        "status": "SFM_NEUTRAL_CREATIVE_COMMON_M50_COMPLETE",
+        "selection_scope": (
+            "best available only; safety-first lexicographic cross-candidate "
+            "ranking, not a four-metric win claim"
+        ),
+        "bank": _bank_from(ep0, 50, "creative_common_best_M50"),
+        "noise_seed": int(noise_seed),
+        "locks": locks,
+        "records": records,
+        "selected": selected,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _write(output / "COMMON_BEST_COMPLETE.json", result)
+    return result
 
 
 def _delivery_eval_rows(delivery: dict) -> list[dict]:
@@ -410,6 +621,13 @@ def _selector_gate(candidate_rows, controls, r100_reference) -> dict:
             value["SR"] >= base["SR"] + .05
             or value["timeout"] <= base["timeout"] - .05
         )
+        reference = r100_reference["pooled"]
+        noninferior_to_r100 = (
+            value["SR"] >= reference["SR"] - .03
+            and value["timeout"] <= reference["timeout"] + .03
+            and value["CR"] <= reference["CR"] + .03
+            and value["Validity"] >= reference["Validity"] - .03
+        )
         decisions.append({
             "round": int(row["round"]),
             "checkpoint": row["checkpoint"],
@@ -417,8 +635,11 @@ def _selector_gate(candidate_rows, controls, r100_reference) -> dict:
             "pooled": value,
             "safety_noninferior_to_matched_margin": bool(safe),
             "liveness_improved_over_matched_margin": bool(live),
+            "noninferior_to_r100_reference": bool(noninferior_to_r100),
             "gamma_trend_pass": _trend_ok(row),
-            "eligible": bool(safe and live and _trend_ok(row)),
+            "eligible": bool(
+                safe and live and noninferior_to_r100 and _trend_ok(row)
+            ),
         })
     eligible = [row for row in decisions if row["eligible"]]
     selected = None if not eligible else min(
@@ -433,7 +654,8 @@ def _selector_gate(candidate_rows, controls, r100_reference) -> dict:
         "rule": (
             "promote only if SR improves >=5pp or timeout falls >=5pp vs "
             "the matched margin round, while CR/Validity are within 3pp and "
-            "the gamma trend score is >=0.75"
+            "the gamma trend score is >=0.75; all liveness/safety fields must "
+            "also be within 3pp of the stored r100 reference"
         ),
         "r100_reference": r100_reference,
         "decisions": decisions,
@@ -442,7 +664,37 @@ def _selector_gate(candidate_rows, controls, r100_reference) -> dict:
     }
 
 
-def _encoder_stage_gate(delivery, candidate_rows, control_rows) -> dict:
+def _control_gp_fields(marker: dict) -> dict:
+    gather = marker["gather"]
+    if "acquisition" in gather:
+        return {
+            "uplift": float(gather["acquisition"]["uplift"]),
+            "effective_rank": (
+                None if "gp_diagnostics" not in gather else float(
+                    gather["gp_diagnostics"]["kernel_effective_rank"]
+                )
+            ),
+            "source": "round_marker",
+        }
+    trace_path = Path(gather["trace_path"]).resolve()
+    if _sha256(trace_path) != gather.get("trace_sha256"):
+        raise RuntimeError("legacy control gather trace digest mismatch")
+    trace = torch.load(trace_path, map_location="cpu", weights_only=False)
+    if trace.get("status") != TRAIN.RA.STATUS:
+        raise RuntimeError("invalid legacy control gather trace")
+    acquisition = trace.get("protocol", {}).get("acquisition")
+    if acquisition is None or "uplift" not in acquisition:
+        raise RuntimeError("legacy control trace lacks acquisition diagnostics")
+    return {
+        "uplift": float(acquisition["uplift"]),
+        "effective_rank": None,
+        "source": "authenticated_legacy_trace",
+    }
+
+
+def _encoder_stage_gate(
+    delivery, candidate_rows, control_rows, control_markers,
+) -> dict:
     controls = {int(row["round"]): row for row in control_rows}
     markers = [_read(Path(path)) for path in delivery["round_records"]]
     diagnostics = []
@@ -453,11 +705,23 @@ def _encoder_stage_gate(delivery, candidate_rows, control_rows) -> dict:
         )
         control = controls[round_i]
         encoder = marker["encoder_diagnostics"]
+        cumulative = encoder["cumulative_from_reference"]
         gather = marker["gather"]
+        control_marker = control_markers[round_i]
+        control_gp = _control_gp_fields(control_marker)
+        candidate_rank = float(
+            gather["gp_diagnostics"]["kernel_effective_rank"]
+        )
+        control_rank = control_gp["effective_rank"]
         diagnostics.append({
             "round": round_i,
             "token_cosine": encoder["token_cosine"],
             "encoder_relative_drift": encoder["relative_parameter_drift"],
+            "cumulative_token_cosine": cumulative["token_cosine"],
+            "cumulative_token_rms_change": cumulative["token_rms_change"],
+            "cumulative_encoder_relative_drift": cumulative[
+                "relative_parameter_drift"
+            ],
             "encoder_gradient_norm_Dplus": marker["updates"]["Dplus"][
                 "encoder_gradient_norms"
             ],
@@ -471,6 +735,16 @@ def _encoder_stage_gate(delivery, candidate_rows, control_rows) -> dict:
                 "kernel_effective_rank"
             ],
             "uncertainty_uplift": gather["acquisition"]["uplift"],
+            "frozen_gp_effective_rank": control_rank,
+            "frozen_uncertainty_uplift": control_gp["uplift"],
+            "frozen_gp_diagnostic_source": control_gp["source"],
+            "delta_gp_effective_rank_vs_frozen": (
+                None if control_rank is None else candidate_rank - control_rank
+            ),
+            "delta_uncertainty_uplift_vs_frozen": (
+                gather["acquisition"]["uplift"]
+                - control_gp["uplift"]
+            ),
             "delta_CR_vs_frozen": (
                 candidate["pooled"]["CR"] - control["pooled"]["CR"]
             ),
@@ -480,21 +754,25 @@ def _encoder_stage_gate(delivery, candidate_rows, control_rows) -> dict:
             ),
         })
     unsafe = any(
-        row["token_cosine"] < .98
+        row["cumulative_token_cosine"] < .98
         or row["Dplus_regressed"] > 0
         or row["delta_CR_vs_frozen"] > .03
         for row in diagnostics
     )
     signal = any(
         row["delta_Validity_vs_frozen"] >= .01
-        or row["uncertainty_uplift"] >= .005
+        or row["delta_uncertainty_uplift_vs_frozen"] >= .002
+        or (
+            row["delta_gp_effective_rank_vs_frozen"] is not None
+            and row["delta_gp_effective_rank_vs_frozen"] >= 1.0
+        )
         for row in diagnostics
     )
     return {
         "rule": (
-            "stop on E_g token cosine <0.98, any D+ regression, or CR >3pp "
+            "stop on cumulative E_g token cosine <0.98, any D+ regression, or CR >3pp "
             "above matched frozen control; continue only with >=1pp Validity "
-            "or >=0.005 uncertainty-uplift signal"
+            "or matched GP uplift/rank improvement"
         ),
         "diagnostics": diagnostics,
         "unsafe": bool(unsafe),
@@ -550,10 +828,34 @@ def run(args) -> dict:
         _bank_from(args.stage_a_ep0, 10, "stage_A_disjoint_M10"),
         _bank_from(args.stage_c3_ep0, 10, "stage_C3_disjoint_M10"),
         _bank_from(args.stage_c5_ep0, 10, "stage_C5_disjoint_M10"),
+        _bank_from(
+            args.stage_b_causal_ep0, 10,
+            "stage_B_Dplus_only_disjoint_M10",
+        ),
     ]
+    confirmation_banks = []
+    for label, ep0 in (
+        ("B_Dplus_only", args.stage_b_confirm_ep0),
+        ("A_selector", args.stage_a_confirm_ep0),
+        ("C_encoder", args.stage_c_confirm_ep0),
+    ):
+        confirmation_banks.extend([
+            _bank_from(ep0, 10, f"{label}_temperature_validation_M10"),
+            _bank_from(ep0 + 1_000, 50, f"{label}_global_M50"),
+            _bank_from(ep0 + 2_000, 50, f"{label}_gamma_fresh_M50"),
+        ])
+    confirmation_banks.append(_bank_from(
+        args.common_best_ep0, 50, "creative_common_best_M50",
+    ))
     known_banks = _known_banks(chain, authenticated["gamma"])
-    _validate_new_banks(banks, known_banks, training_scenarios)
+    _validate_new_banks(
+        [*banks, *confirmation_banks], known_banks, training_scenarios,
+    )
     output.mkdir(parents=True)
+    baseline_lock = _expanded_lock(
+        trigger["r100_gamma_delivery"], name="r100_baseline",
+    )
+    creative_locks = []
     provenance = {
         "status": "SFM_NEUTRAL_CREATIVE_SANITY_PREREGISTERED",
         "source": source,
@@ -570,9 +872,14 @@ def run(args) -> dict:
         ),
         "audit_rounds": list(audit_rounds),
         "known_banks": known_banks,
-        "new_banks": banks,
+        "new_banks": [*banks, *confirmation_banks],
         "no_combined_arm": True,
-        "stage_order": ["B_postphase_audit", "A_selector", "C_encoder"],
+        "stage_order": [
+            "B_postphase_audit",
+            "B_Dplus_only_if_indicated",
+            "A_selector",
+            "C_encoder",
+        ],
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     _write(output / "PREREGISTRATION.json", provenance)
@@ -606,23 +913,91 @@ def run(args) -> dict:
         "gate": stage_b_gate,
     }
     _write(stage_b_root / "STAGE_COMPLETE.json", stage_b)
-    if stage_b_gate["clear_D0_overwrite"]:
-        result = {
-            "status": STATUS,
-            "action": "STOP_DPLUS_ONLY_CAUSAL_ARM_REQUIRED",
-            "reason": (
-                "disjoint evidence identifies D0 overwrite; changing the "
-                "selector or encoder now would confound that mechanism"
-            ),
-            "stages_completed": ["B"],
-            "stage_B": _ref(stage_b_root / "STAGE_COMPLETE.json"),
-            "completed_at": datetime.now(timezone.utc).isoformat(),
-        }
-        _write(output / "DELIVERY_COMPLETE.json", result)
-        return result
-
     cfg = final_delivery["config"]
     scenario_ep0 = min(training_scenarios)
+    stage_b_causal = None
+    if stage_b_gate["clear_D0_overwrite"]:
+        dplus_root = output / "stage_B_Dplus_only"
+        command = _training_command(
+            checkpoint=final_delivery["checkpoint"], output=dplus_root,
+            name=f"{selected_arm}_Dplus_only", rounds=5,
+            scenario_ep0=scenario_ep0, eval_ep0=banks[4]["ep0"],
+            eval_rounds=(0, 1, 2, 3, 4, 5), lr=cfg["lr"],
+            inner_steps=cfg["inner_steps"], ell=cfg["ell"],
+            gp_cap=cfg["gp_cap"], selector="margin",
+            encoder_lr_ratio=0.0, neutral_replay=False,
+            workers=args.workers, noise_seed=args.stage_b_causal_noise_seed,
+            sample_seed=cfg["sample_seed"], audit_seed=cfg["audit_seed"],
+            train_seed=cfg["train_seed"], probe_seed=cfg["probe_seed"],
+        )
+        _run(
+            command, log=output / "logs" / "stage_B_Dplus_only.log",
+            gpu=args.gpus[0], cpu_range="16-79",
+        )
+        dplus_delivery = _read(dplus_root / "DELIVERY_COMPLETE.json")
+        if dplus_delivery["config"].get("neutral_replay") is not False:
+            raise RuntimeError("stage B causal arm replayed D0")
+        dplus_rows = _delivery_eval_rows(dplus_delivery)
+        dplus_controls = _evaluate_specs(
+            _base_specs(catalog, range(1, 6), "margin_control"),
+            root=dplus_root / "matched_margin_control", bank=banks[4],
+            noise_seed=args.stage_b_causal_noise_seed,
+            gpus=args.gpus, workers=args.workers,
+        )
+        dplus_r100 = _evaluate_specs([{
+            "name": "r100_reference", "round": 100,
+            "phase": "post_D0", "checkpoint": catalog[100]["post_D0"],
+        }], root=dplus_root / "r100_reference", bank=banks[4],
+            noise_seed=args.stage_b_causal_noise_seed,
+            gpus=args.gpus, workers=args.workers)[0]
+        dplus_gate = _selector_gate(
+            dplus_rows, dplus_controls, dplus_r100,
+        )
+        stage_b_causal = {
+            "status": "SFM_NEUTRAL_STAGE_B_DPLUS_ONLY_COMPLETE",
+            "single_change": "collect/audit D0 but omit D0 replay",
+            "training_delivery": _ref(
+                dplus_root / "DELIVERY_COMPLETE.json"
+            ),
+            "bank": banks[4],
+            "rows": dplus_rows,
+            "matched_margin_controls": dplus_controls,
+            "qualification_gate": dplus_gate,
+            "confirmation": None,
+        }
+        if dplus_gate["passed"]:
+            stage_b_causal["confirmation"] = _confirm_candidate(
+                training_run=dplus_root,
+                arm_name=dplus_delivery["config"]["name"],
+                output=dplus_root / "confirmation",
+                ep0=args.stage_b_confirm_ep0,
+                noise_seed=args.stage_b_confirm_noise_seed,
+                gpus=args.gpus, workers=args.workers,
+                selected=dplus_gate["selected"],
+            )
+            creative_locks.append(_expanded_lock(
+                stage_b_causal["confirmation"]["gamma_delivery"],
+                name="Dplus_only",
+            ))
+        _write(dplus_root / "STAGE_COMPLETE.json", stage_b_causal)
+        if (
+            stage_b_causal["confirmation"] is not None
+            and stage_b_causal["confirmation"]["objective_achieved"]
+        ):
+            result = {
+                "status": STATUS,
+                "action": "STOP_GOAL_ACHIEVED_BY_DPLUS_ONLY",
+                "objective_achieved": True,
+                "stages_completed": ["B", "B_Dplus_only"],
+                "stage_B": _ref(stage_b_root / "STAGE_COMPLETE.json"),
+                "stage_B_Dplus_only": _ref(
+                    dplus_root / "STAGE_COMPLETE.json"
+                ),
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            }
+            _write(output / "DELIVERY_COMPLETE.json", result)
+            return result
+
     stage_a_root = output / "stage_A_progress_selector"
     command = _training_command(
         checkpoint=final_delivery["checkpoint"], output=stage_a_root,
@@ -669,17 +1044,40 @@ def run(args) -> dict:
         "bank": banks[1],
         "rows": stage_a_rows,
         "matched_margin_controls": controls_a,
-        "gate": stage_a_gate,
+        "qualification_gate": stage_a_gate,
+        "confirmation": None,
     }
-    _write(stage_a_root / "STAGE_COMPLETE.json", stage_a)
     if stage_a_gate["passed"]:
+        stage_a["confirmation"] = _confirm_candidate(
+            training_run=stage_a_root,
+            arm_name=stage_a_delivery["config"]["name"],
+            output=stage_a_root / "confirmation",
+            ep0=args.stage_a_confirm_ep0,
+            noise_seed=args.stage_a_confirm_noise_seed,
+            gpus=args.gpus, workers=args.workers,
+            selected=stage_a_gate["selected"],
+        )
+        creative_locks.append(_expanded_lock(
+            stage_a["confirmation"]["gamma_delivery"],
+            name="progress_gated_margin",
+        ))
+    _write(stage_a_root / "STAGE_COMPLETE.json", stage_a)
+    if (
+        stage_a["confirmation"] is not None
+        and stage_a["confirmation"]["objective_achieved"]
+    ):
         result = {
             "status": STATUS,
-            "action": "PROMOTE_STAGE_A_CANDIDATE",
+            "action": "STOP_GOAL_ACHIEVED_BY_STAGE_A",
+            "objective_achieved": True,
             "stages_completed": ["B", "A"],
             "stage_B": _ref(stage_b_root / "STAGE_COMPLETE.json"),
+            "stage_B_Dplus_only": (
+                None if stage_b_causal is None else _ref(
+                    output / "stage_B_Dplus_only" / "STAGE_COMPLETE.json"
+                )
+            ),
             "stage_A": _ref(stage_a_root / "STAGE_COMPLETE.json"),
-            "selected": stage_a_gate["selected"],
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }
         _write(output / "DELIVERY_COMPLETE.json", result)
@@ -715,7 +1113,10 @@ def run(args) -> dict:
         noise_seed=args.stage_c3_noise_seed, gpus=args.gpus,
         workers=args.workers,
     )
-    c3_gate = _encoder_stage_gate(c3_delivery, c3_rows, c3_controls)
+    c3_gate = _encoder_stage_gate(
+        c3_delivery, c3_rows, c3_controls,
+        {round_i: catalog[round_i]["record"] for round_i in range(1, 4)},
+    )
     c3 = {
         "status": STAGE_C_STATUS,
         "phase": "rounds_1_to_3",
@@ -728,13 +1129,30 @@ def run(args) -> dict:
     }
     _write(stage_c3_root / "STAGE_COMPLETE.json", c3)
     if not c3_gate["continue_to_round5"]:
+        common = _common_best_available(
+            [baseline_lock, *creative_locks],
+            output=output / "common_best_M50",
+            ep0=args.common_best_ep0,
+            noise_seed=args.common_best_noise_seed,
+            gpus=args.gpus, workers=args.workers,
+        )
         result = {
             "status": STATUS,
-            "action": "STOP_NO_CREDIBLE_CREATIVE_ARM",
+            "action": "STOP_NO_VALIDATED_CREATIVE_ARM",
+            "objective_achieved": False,
             "stages_completed": ["B", "A", "C3"],
             "stage_B": _ref(stage_b_root / "STAGE_COMPLETE.json"),
+            "stage_B_Dplus_only": (
+                None if stage_b_causal is None else _ref(
+                    output / "stage_B_Dplus_only" / "STAGE_COMPLETE.json"
+                )
+            ),
             "stage_A": _ref(stage_a_root / "STAGE_COMPLETE.json"),
             "stage_C3": _ref(stage_c3_root / "STAGE_COMPLETE.json"),
+            "best_available_common_M50": _ref(
+                output / "common_best_M50" / "COMMON_BEST_COMPLETE.json"
+            ),
+            "best_available": common["selected"],
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }
         _write(output / "DELIVERY_COMPLETE.json", result)
@@ -771,7 +1189,22 @@ def run(args) -> dict:
     }], root=stage_c5_root / "r100_reference", bank=banks[3],
         noise_seed=args.stage_c5_noise_seed, gpus=args.gpus,
         workers=args.workers)[0]
-    c5_gate = _encoder_stage_gate(c5_delivery, c5_rows, c5_controls)
+    c5_increment_gate = _encoder_stage_gate(
+        c5_delivery, c5_rows, c5_controls,
+        {round_i: catalog[round_i]["record"] for round_i in (4, 5)},
+    )
+    c5_gate = {
+        "rule": c5_increment_gate["rule"],
+        "diagnostics": [
+            *c3_gate["diagnostics"],
+            *c5_increment_gate["diagnostics"],
+        ],
+        "unsafe": bool(c3_gate["unsafe"] or c5_increment_gate["unsafe"]),
+        "signal": bool(c3_gate["signal"] or c5_increment_gate["signal"]),
+    }
+    c5_gate["continue_to_round5"] = bool(
+        not c5_gate["unsafe"] and c5_gate["signal"]
+    )
     selector_c5 = _selector_gate(c5_rows, c5_controls, r100_c5)
     passed = bool(not c5_gate["unsafe"] and selector_c5["passed"])
     c5 = {
@@ -785,20 +1218,60 @@ def run(args) -> dict:
         "diagnostic_gate": c5_gate,
         "promotion_gate": selector_c5,
         "passed": passed,
+        "confirmation": None,
     }
+    if passed:
+        c5["confirmation"] = _confirm_candidate(
+            training_run=stage_c5_root,
+            arm_name=c5_delivery["config"]["name"],
+            output=stage_c5_root / "confirmation",
+            ep0=args.stage_c_confirm_ep0,
+            noise_seed=args.stage_c_confirm_noise_seed,
+            gpus=args.gpus, workers=args.workers,
+            selected=selector_c5["selected"],
+        )
+        creative_locks.append(_expanded_lock(
+            c5["confirmation"]["gamma_delivery"],
+            name="encoder_unfreeze_01x",
+        ))
     _write(stage_c5_root / "STAGE_COMPLETE.json", c5)
+    objective_achieved = bool(
+        c5["confirmation"] is not None
+        and c5["confirmation"]["objective_achieved"]
+    )
+    common = None
+    if not objective_achieved:
+        common = _common_best_available(
+            [baseline_lock, *creative_locks],
+            output=output / "common_best_M50",
+            ep0=args.common_best_ep0,
+            noise_seed=args.common_best_noise_seed,
+            gpus=args.gpus, workers=args.workers,
+        )
     result = {
         "status": STATUS,
         "action": (
-            "PROMOTE_STAGE_C_CANDIDATE"
-            if passed else "STOP_NO_CREDIBLE_CREATIVE_ARM"
+            "STOP_GOAL_ACHIEVED_BY_STAGE_C"
+            if objective_achieved else "STOP_NO_VALIDATED_CREATIVE_ARM"
         ),
         "stages_completed": ["B", "A", "C3", "C5"],
         "stage_B": _ref(stage_b_root / "STAGE_COMPLETE.json"),
+        "stage_B_Dplus_only": (
+            None if stage_b_causal is None else _ref(
+                output / "stage_B_Dplus_only" / "STAGE_COMPLETE.json"
+            )
+        ),
         "stage_A": _ref(stage_a_root / "STAGE_COMPLETE.json"),
         "stage_C3": _ref(stage_c3_root / "STAGE_COMPLETE.json"),
         "stage_C5": _ref(stage_c5_root / "STAGE_COMPLETE.json"),
-        "selected": selector_c5["selected"] if passed else None,
+        "M10_qualified": bool(passed),
+        "objective_achieved": objective_achieved,
+        "best_available_common_M50": (
+            None if common is None else _ref(
+                output / "common_best_M50" / "COMMON_BEST_COMPLETE.json"
+            )
+        ),
+        "best_available": None if common is None else common["selected"],
         "started_at": started.isoformat(),
         "completed_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -808,10 +1281,8 @@ def run(args) -> dict:
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--trigger", default=str(DEFAULT_TRIGGER))
-    parser.add_argument(
-        "--expected-trigger-source", default=EXPECTED_TRIGGER_SOURCE,
-    )
+    parser.add_argument("--trigger", required=True)
+    parser.add_argument("--expected-trigger-source", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--gpus", type=int, nargs="+", default=(1, 3))
@@ -824,10 +1295,30 @@ def build_parser():
     parser.add_argument("--stage-a-ep0", type=int, default=540_000)
     parser.add_argument("--stage-c3-ep0", type=int, default=550_000)
     parser.add_argument("--stage-c5-ep0", type=int, default=560_000)
+    parser.add_argument("--stage-b-causal-ep0", type=int, default=535_000)
+    parser.add_argument("--stage-b-confirm-ep0", type=int, default=570_000)
+    parser.add_argument("--stage-a-confirm-ep0", type=int, default=580_000)
+    parser.add_argument("--stage-c-confirm-ep0", type=int, default=590_000)
+    parser.add_argument("--common-best-ep0", type=int, default=600_000)
     parser.add_argument("--stage-b-noise-seed", type=int, default=2_026_074_1)
     parser.add_argument("--stage-a-noise-seed", type=int, default=2_026_074_2)
     parser.add_argument("--stage-c3-noise-seed", type=int, default=2_026_074_3)
     parser.add_argument("--stage-c5-noise-seed", type=int, default=2_026_074_4)
+    parser.add_argument(
+        "--stage-b-causal-noise-seed", type=int, default=2_026_074_5,
+    )
+    parser.add_argument(
+        "--stage-b-confirm-noise-seed", type=int, default=2_026_074_6,
+    )
+    parser.add_argument(
+        "--stage-a-confirm-noise-seed", type=int, default=2_026_074_7,
+    )
+    parser.add_argument(
+        "--stage-c-confirm-noise-seed", type=int, default=2_026_074_8,
+    )
+    parser.add_argument(
+        "--common-best-noise-seed", type=int, default=2_026_074_9,
+    )
     return parser
 
 

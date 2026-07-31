@@ -78,6 +78,7 @@ class StudyConfig:
     ess_target: float = 0.5
     selector: str = "margin"
     encoder_lr_ratio: float = 0.0
+    neutral_replay: bool = True
     alpha: float = 0.0
     scene_profile: str = "double_density_velocity_ood"
     sample_seed: int = 700_000
@@ -107,6 +108,8 @@ class StudyConfig:
             raise ValueError("unsupported neutral-study selector")
         if float(self.encoder_lr_ratio) not in (0.0, 0.1):
             raise ValueError("encoder_lr_ratio must be 0 (frozen) or 0.1")
+        if not isinstance(self.neutral_replay, bool):
+            raise ValueError("neutral_replay must be boolean")
         if float(self.alpha) != 0.0:
             raise ValueError("this study is pinned to alpha=0")
         if self.scene_profile != "double_density_velocity_ood":
@@ -292,6 +295,24 @@ def _population_update(
     }
 
 
+def _skipped_population_update(records, *, population):
+    _, accounting = BS.hierarchy_mass(records)
+    return {
+        "population": str(population),
+        "records": len(records),
+        "inner_steps": 0,
+        "optimizer_steps": 0,
+        "sample_exposures": 0,
+        "exact_once_per_inner_step": None,
+        "exposure_identity_sha256": [],
+        "losses": [],
+        "encoder_gradient_norms": [],
+        "mass": _compact_mass(accounting),
+        "skipped": True,
+        "reason": "D0 collected for causal audit but neutral replay disabled",
+    }
+
+
 @torch.no_grad()
 def _encoder_probe(policy, records, *, device, limit=256):
     """Return deterministic E_g tokens for a fixed record prefix."""
@@ -318,6 +339,64 @@ def _encoder_probe_comparison(before, after):
         "token_cosine": cosine,
         "token_rms_change": float((after - before).square().mean().sqrt()),
         "values": int(before.numel()),
+    }
+
+
+@torch.no_grad()
+def _encoder_probe_from_grid(policy, grid, *, device):
+    was_training = policy.training
+    policy.eval()
+    token = policy.enc_grid(
+        torch.as_tensor(grid, dtype=torch.float32, device=device)
+    ).detach().cpu()
+    policy.train(was_training)
+    return token
+
+
+def _create_encoder_reference(
+    path, policy, records, *, device, anchor_round, checkpoint_sha256,
+    limit=256,
+):
+    ordered = sorted(records, key=lambda item: _identity(*item))[:int(limit)]
+    if not ordered:
+        raise ValueError("encoder reference requires records")
+    grid, _, _, _ = BS._tensor_batch(ordered, device)
+    grid = grid.detach().cpu()
+    payload = {
+        "status": "SFM_B1_ENCODER_REFERENCE_PROBE",
+        "anchor_round": int(anchor_round),
+        "checkpoint_sha256": str(checkpoint_sha256),
+        "grid": grid,
+        "token": _encoder_probe_from_grid(policy, grid, device=device),
+        "encoder_snapshot": R2._module_snapshot(policy)["E_g"],
+        "records": len(ordered),
+    }
+    torch.save(payload, path)
+    return payload
+
+
+def _load_encoder_reference(path):
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if payload.get("status") != "SFM_B1_ENCODER_REFERENCE_PROBE":
+        raise RuntimeError("invalid encoder reference probe")
+    if not all(key in payload for key in ("grid", "token", "encoder_snapshot")):
+        raise RuntimeError("incomplete encoder reference probe")
+    return payload
+
+
+def _encoder_reference_comparison(policy, reference, *, device):
+    current_token = _encoder_probe_from_grid(
+        policy, reference["grid"], device=device,
+    )
+    current_snapshot = R2._module_snapshot(policy)["E_g"]
+    return {
+        **_encoder_probe_comparison(reference["token"], current_token),
+        "relative_parameter_drift": R2._module_relative_drift(
+            {"E_g": reference["encoder_snapshot"]},
+            {"E_g": current_snapshot},
+        )["E_g"],
+        "anchor_round": int(reference["anchor_round"]),
+        "records": int(reference["records"]),
     }
 
 
@@ -1050,6 +1129,24 @@ def _parse_eval_rounds(value, final_round):
     return rounds
 
 
+def _validate_resume_config(previous_config, current_config):
+    compatibility_defaults = {
+        "encoder_lr_ratio": 0.0,
+        "neutral_replay": True,
+    }
+    compatibility_normalized = {}
+    for key, value in current_config.items():
+        if key in {"name", "rounds"}:
+            continue
+        previous_value = previous_config.get(key)
+        if key not in previous_config and key in compatibility_defaults:
+            previous_value = compatibility_defaults[key]
+            compatibility_normalized[key] = previous_value
+        if previous_value != value:
+            raise RuntimeError(f"resume config changed: {key}")
+    return compatibility_normalized
+
+
 def _resume_artifacts(resume_root, cfg, *, source_sha, scenario_ep0):
     root = os.path.abspath(os.fspath(resume_root))
     delivery_path = os.path.join(root, "DELIVERY_COMPLETE.json")
@@ -1063,11 +1160,9 @@ def _resume_artifacts(resume_root, cfg, *, source_sha, scenario_ep0):
         raise RuntimeError("resume source uses another pretrained checkpoint")
     previous_config = delivery.get("config", {})
     current_config = asdict(cfg)
-    for key, value in current_config.items():
-        if key in {"name", "rounds"}:
-            continue
-        if previous_config.get(key) != value:
-            raise RuntimeError(f"resume config changed: {key}")
+    compatibility_normalized = _validate_resume_config(
+        previous_config, current_config,
+    )
     round_records = list(delivery.get("round_records", ()))
     if not round_records:
         raise RuntimeError("resume delivery has no round records")
@@ -1104,6 +1199,17 @@ def _resume_artifacts(resume_root, cfg, *, source_sha, scenario_ep0):
         root, "rounds", f"round_{resume_round:02d}",
         "gather", "executed_round.pt",
     )
+    encoder_reference = delivery.get("encoder_reference_probe")
+    if encoder_reference is not None:
+        encoder_reference_path = os.path.abspath(encoder_reference["path"])
+        if (
+            not os.path.isfile(encoder_reference_path)
+            or FA._sha256_file(encoder_reference_path)
+            != encoder_reference.get("sha256")
+        ):
+            raise RuntimeError("resume encoder reference digest mismatch")
+    else:
+        encoder_reference_path = None
     if FA._sha256_file(checkpoint) != final["checkpoint_sha256"]:
         raise RuntimeError("resume checkpoint hash mismatch")
     if FA._sha256_file(optimizer) != final["optimizer_state"]["sha256"]:
@@ -1130,15 +1236,20 @@ def _resume_artifacts(resume_root, cfg, *, source_sha, scenario_ep0):
         "optimizer_sha256": final["optimizer_state"]["sha256"],
         "previous_executed": previous_executed,
         "previous_executed_sha256": expected_shard_sha,
+        "encoder_reference": encoder_reference_path,
         "visual_encoder_sha256": delivery["visual_encoder_sha256"],
         "next_scenarios": [
             int(scenario_ep0) + 2 * resume_round,
             int(scenario_ep0) + 2 * resume_round + 1,
         ],
+        "legacy_config_defaults": compatibility_normalized,
     }
 
 
-def _restore_optimizer(optimizer, path, parameters, *, resume_round, inner_steps):
+def _restore_optimizer(
+    optimizer, path, parameters, *, resume_round, inner_steps,
+    neutral_replay=True,
+):
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if int(payload.get("round", -1)) != int(resume_round):
         raise RuntimeError("optimizer round mismatch")
@@ -1155,7 +1266,8 @@ def _restore_optimizer(optimizer, path, parameters, *, resume_round, inner_steps
     ]
     if len(ids) != len(parameters) or len(state.get("state", {})) != len(parameters):
         raise RuntimeError("optimizer parameter support is incomplete")
-    expected_step = 2 * int(resume_round) * int(inner_steps)
+    updates_per_round = 1 + int(bool(neutral_replay))
+    expected_step = updates_per_round * int(resume_round) * int(inner_steps)
     for parameter_id, parameter in zip(ids, parameters):
         values = state["state"].get(parameter_id)
         if values is None:
@@ -1170,6 +1282,7 @@ def _restore_optimizer(optimizer, path, parameters, *, resume_round, inner_steps
     return {
         "round": int(resume_round),
         "expected_adam_step": expected_step,
+        "updates_per_round": updates_per_round,
         "parameters": len(parameters),
     }
 
@@ -1187,6 +1300,7 @@ def run(args):
         gp_cap=int(args.gp_cap),
         selector=str(args.selector),
         encoder_lr_ratio=float(args.encoder_lr_ratio),
+        neutral_replay=bool(args.neutral_replay),
         sample_seed=int(args.sample_seed),
         audit_seed=int(args.audit_seed),
         train_seed=int(args.train_seed),
@@ -1231,6 +1345,10 @@ def run(args):
         name for name, parameter in policy.named_parameters()
         if parameter.requires_grad
     ]
+    effective_frozen_names = [
+        name for name, parameter in policy.named_parameters()
+        if not parameter.requires_grad
+    ]
     encoder_parameter_ids = {
         id(parameter) for parameter in policy.enc_grid.parameters()
     }
@@ -1258,6 +1376,7 @@ def run(args):
             parameters,
             resume_round=resume["resume_round"],
             inner_steps=cfg.inner_steps,
+            neutral_replay=cfg.neutral_replay,
         )
         if resume else None
     )
@@ -1272,6 +1391,13 @@ def run(args):
             "study_config": asdict(cfg),
         })
     current_checkpoint = policy_checkpoint
+    encoder_reference_path = (
+        resume["encoder_reference"] if resume else None
+    )
+    encoder_reference = (
+        _load_encoder_reference(encoder_reference_path)
+        if encoder_reference_path else None
+    )
     previous_executed_path = (
         resume["previous_executed"] if resume else None
     )
@@ -1385,6 +1511,18 @@ def run(args):
             encoder_probe_records = [
                 *positive_records, *neutral_records,
             ]
+            if encoder_reference is None:
+                encoder_reference_path = os.path.join(
+                    output_root, "encoder_reference_probe.pt",
+                )
+                encoder_reference = _create_encoder_reference(
+                    encoder_reference_path,
+                    policy,
+                    encoder_probe_records,
+                    device=args.device,
+                    anchor_round=start_round,
+                    checkpoint_sha256=current_sha,
+                )
             encoder_probe_before = _encoder_probe(
                 policy, encoder_probe_records, device=args.device,
             )
@@ -1447,16 +1585,24 @@ def run(args):
                 ),
             }
 
-            neutral_update = _population_update(
-                policy,
-                optimizer,
-                neutral_records,
-                population="D0",
-                inner_steps=cfg.inner_steps,
-                batch=cfg.batch,
-                device=args.device,
-                seed=cfg.train_seed + round_i * 1_000_003 + 500_000_000,
-            )
+            if cfg.neutral_replay:
+                neutral_update = _population_update(
+                    policy,
+                    optimizer,
+                    neutral_records,
+                    population="D0",
+                    inner_steps=cfg.inner_steps,
+                    batch=cfg.batch,
+                    device=args.device,
+                    seed=(
+                        cfg.train_seed + round_i * 1_000_003
+                        + 500_000_000
+                    ),
+                )
+            else:
+                neutral_update = _skipped_population_update(
+                    neutral_records, population="D0",
+                )
             after_neutral_parameters = R2._module_snapshot(policy)
             round_checkpoint = os.path.join(
                 checkpoints_dir, f"round_{round_i:02d}.pt",
@@ -1464,12 +1610,16 @@ def run(args):
             checkpoint_marker = _save_checkpoint(policy, round_checkpoint, {
                 "study": STATUS,
                 "round": round_i,
-                "phase": "post_Dplus_then_D0",
+                "phase": (
+                    "post_Dplus_then_D0"
+                    if cfg.neutral_replay else "post_Dplus_D0_audit_only"
+                ),
                 "study_config": asdict(cfg),
                 "Dplus_records": len(positive_records),
                 "D0_records": len(neutral_records),
                 "D0_original_verifier_y": 0,
                 "D0_gp_eligible": False,
+                "D0_used": bool(cfg.neutral_replay),
             })
             optimizer_path = os.path.join(
                 checkpoints_dir, f"round_{round_i:02d}_optimizers.pt",
@@ -1481,7 +1631,10 @@ def run(args):
             phase_neutral = _probe_checkpoint(
                 round_checkpoint,
                 anchors,
-                phase="after_D0",
+                phase=(
+                    "after_D0" if cfg.neutral_replay
+                    else "after_Dplus_D0_audit_only"
+                ),
                 device=args.device,
                 executor=probe_executor,
                 batch=cfg.batch,
@@ -1505,6 +1658,9 @@ def run(args):
             }
             encoder_probe_after = _encoder_probe(
                 policy, encoder_probe_records, device=args.device,
+            )
+            encoder_cumulative = _encoder_reference_comparison(
+                policy, encoder_reference, device=args.device,
             )
             if (
                 cfg.encoder_lr_ratio == 0.0
@@ -1572,7 +1728,10 @@ def run(args):
                 {
                     "name": f"r{round_i}_post_D0",
                     "round": round_i,
-                    "phase": "after_D0",
+                    "phase": (
+                        "after_D0" if cfg.neutral_replay
+                        else "after_Dplus_D0_audit_only"
+                    ),
                     "checkpoint": round_checkpoint,
                 },
             ]
@@ -1616,8 +1775,11 @@ def run(args):
                 "updates": {
                     "Dplus": positive_update,
                     "D0": neutral_update,
-                    "phase_order": ["Dplus", "D0"],
-                    "same_lr_and_inner_steps": True,
+                    "phase_order": (
+                        ["Dplus", "D0"]
+                        if cfg.neutral_replay else ["Dplus"]
+                    ),
+                    "same_lr_and_inner_steps": bool(cfg.neutral_replay),
                 },
                 "parameter_relative_drift": {
                     "Dplus_increment": R2._module_relative_drift(
@@ -1644,6 +1806,7 @@ def run(args):
                         else cfg.lr * cfg.encoder_lr_ratio
                     ),
                     "trainable": bool(cfg.encoder_lr_ratio > 0.0),
+                    "cumulative_from_reference": encoder_cumulative,
                 },
                 "paired_trigger_probe": {
                     "file": os.path.join(
@@ -1670,7 +1833,8 @@ def run(args):
                     "path": optimizer_path,
                     "sha256": FA._sha256_file(optimizer_path),
                     "persistent_across_rounds": True,
-                    "single_Adam_across_Dplus_and_D0": True,
+                    "single_Adam_across_active_updates": True,
+                    "D0_replay_enabled": bool(cfg.neutral_replay),
                 },
                 "wall_seconds": time.perf_counter() - started,
             }
@@ -1700,7 +1864,10 @@ def run(args):
                 milestone_arms.append({
                     "name": f"r{round_i}",
                     "round": round_i,
-                    "phase": "after_D0",
+                    "phase": (
+                        "after_D0" if cfg.neutral_replay
+                        else "after_Dplus_D0_audit_only"
+                    ),
                     "checkpoint": round_checkpoint,
                 })
             current_checkpoint = round_checkpoint
@@ -1728,9 +1895,16 @@ def run(args):
         "checkpoint": checkpoint,
         "checkpoint_sha256": source_sha,
         "config": asdict(cfg),
-        "frozen_parameters": frozen,
+        "trainability_configure_initially_frozen": frozen,
+        "frozen_parameters": effective_frozen_names,
         "initial_visual_encoder_sha256": initial_visual_sha,
         "visual_encoder_sha256": BS.module_sha256(policy.enc_grid),
+        "encoder_reference_probe": {
+            "path": encoder_reference_path,
+            "sha256": FA._sha256_file(encoder_reference_path),
+            "anchor_round": int(encoder_reference["anchor_round"]),
+            "records": int(encoder_reference["records"]),
+        },
         "optimizer_groups": [
             {
                 "name": "trunk_head_low_history",
@@ -1833,6 +2007,12 @@ def build_parser():
         "--encoder-lr-ratio", type=float, default=0.0,
         help="0 keeps E_g frozen; the only creative sanity value is 0.1",
     )
+    parser.add_argument(
+        "--no-neutral-replay", dest="neutral_replay",
+        action="store_false",
+        help="collect and audit D0 but skip its optimizer update",
+    )
+    parser.set_defaults(neutral_replay=True)
     parser.add_argument("--ell", type=float, default=RA.DEFAULT_ELL)
     parser.add_argument("--gp-cap", type=int, default=DEFAULT_GP_CAP)
     parser.add_argument("--probe-per-gamma", type=int, default=4)

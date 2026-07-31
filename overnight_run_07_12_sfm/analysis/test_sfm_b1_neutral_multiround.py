@@ -65,6 +65,21 @@ def test_study_config_pins_two_scenarios_and_protocol():
         M.StudyConfig(name="x", K=64).validate()
 
 
+def test_resume_accepts_only_semantically_identical_legacy_defaults():
+    current = M.StudyConfig(name="continued", rounds=100).__dict__
+    previous = dict(current)
+    previous["name"] = "legacy"
+    previous["rounds"] = 50
+    previous.pop("encoder_lr_ratio")
+    previous.pop("neutral_replay")
+    normalized = M._validate_resume_config(previous, current)
+    assert normalized == {"encoder_lr_ratio": 0.0, "neutral_replay": True}
+
+    current_no_d0 = dict(current, neutral_replay=False)
+    with pytest.raises(RuntimeError, match="neutral_replay"):
+        M._validate_resume_config(previous, current_no_d0)
+
+
 def test_population_update_uses_every_row_once_per_inner_pass():
     records = _records()
     policy = _TinyPolicy()
@@ -117,6 +132,17 @@ def test_restore_optimizer_preserves_global_adam_step(tmp_path):
             resume_round=3,
             inner_steps=1,
         )
+
+    one_phase = torch.optim.Adam([resumed_policy.scale], lr=3.0e-5)
+    one_phase_report = M._restore_optimizer(
+        one_phase,
+        str(path),
+        [resumed_policy.scale],
+        resume_round=2,
+        inner_steps=2,
+        neutral_replay=False,
+    )
+    assert one_phase_report["expected_adam_step"] == 4
 
 
 def _positive_result():

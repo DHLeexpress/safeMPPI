@@ -154,10 +154,25 @@ def run(args) -> dict:
         ),
         "selected_arm": arm,
         "r50_gamma_delivery": str(gamma_delivery_path),
+        "r50_gamma_delivery_sha256": GLOBAL.FUNNEL.sha256_file(
+            gamma_delivery_path
+        ),
         "r100_training_delivery": str(r100_root / "DELIVERY_COMPLETE.json"),
+        "r100_training_delivery_sha256": GLOBAL.FUNNEL.sha256_file(
+            r100_root / "DELIVERY_COMPLETE.json"
+        ),
         "r100_global_delivery": str(global_root / "DELIVERY_COMPLETE.json"),
+        "r100_global_delivery_sha256": GLOBAL.FUNNEL.sha256_file(
+            global_root / "DELIVERY_COMPLETE.json"
+        ),
         "r100_gamma_delivery": str(r100_gamma_root / "DELIVERY_COMPLETE.json"),
-        "ci_clean_four_metric_win": achieved,
+        "r100_gamma_delivery_sha256": GLOBAL.FUNNEL.sha256_file(
+            r100_gamma_root / "DELIVERY_COMPLETE.json"
+        ),
+        "ci_clean_four_metric_win": bool(
+            r100_gamma.get("ci_clean_four_metric_win")
+        ),
+        "objective_achieved": achieved,
         "creative_sanity_priority": [
             "nontrap_progress_gated_max_margin",
             "Dplus_only_if_postpositive_audit_supports_it",
@@ -179,8 +194,19 @@ def run(args) -> dict:
             ),
             "selected_arm": arm,
             "r100_training_delivery": result["r100_training_delivery"],
+            "r100_training_delivery_sha256": result[
+                "r100_training_delivery_sha256"
+            ],
             "r100_global_delivery": result["r100_global_delivery"],
+            "r100_global_delivery_sha256": result[
+                "r100_global_delivery_sha256"
+            ],
             "r100_gamma_delivery": result["r100_gamma_delivery"],
+            "r100_gamma_delivery_sha256": result[
+                "r100_gamma_delivery_sha256"
+            ],
+            "ci_clean_four_metric_win": result["ci_clean_four_metric_win"],
+            "objective_achieved": result["objective_achieved"],
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         GLOBAL._write(output / "CREATIVE_SANITY_REQUIRED.json", trigger)
