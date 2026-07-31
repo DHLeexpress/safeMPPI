@@ -56,7 +56,7 @@ def run(args) -> dict:
     output.mkdir(parents=True)
     if gamma.get("status") != GAMMA.STATUS:
         raise RuntimeError("invalid calibrated M50 delivery")
-    if gamma.get("ci_clean_four_metric_win"):
+    if gamma.get("objective_achieved") is True:
         result = {
             "status": STATUS,
             "action": "STOP_GOAL_ACHIEVED_AT_R50_OR_EARLIER",
@@ -141,7 +141,7 @@ def run(args) -> dict:
     ]
     _run(gamma_command, log=output / "logs" / "r100_gamma_temperature.log")
     r100_gamma = GLOBAL._read(r100_gamma_root / "DELIVERY_COMPLETE.json")
-    achieved = bool(r100_gamma.get("ci_clean_four_metric_win"))
+    achieved = r100_gamma.get("objective_achieved") is True
     result = {
         "status": STATUS,
         "action": (

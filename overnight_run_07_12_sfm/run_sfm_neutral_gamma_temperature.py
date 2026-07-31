@@ -115,6 +115,27 @@ def _schedule_sha(record: dict) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _final_objective_gates(final_records: list[dict], comparisons: dict) -> dict:
+    by_method = {row["method"]: row for row in final_records}
+    pretrained = by_method["pretrained"]
+    expanded = by_method["expanded"]
+    kazuki = by_method["kazuki_locked"]
+    liveness_contract = BASE._liveness_contract([pretrained], kazuki)
+    expanded_trend = BASE._trend(expanded)
+    paired_ci_clean = all(map(_ci_win, comparisons.values()))
+    liveness_eligible = BASE._liveness_eligible(expanded, liveness_contract)
+    gamma_trend_eligible = expanded_trend["mean_fraction"] >= .75
+    return {
+        "paired_ci_clean_four_metric_win": paired_ci_clean,
+        "final_liveness_contract": liveness_contract,
+        "final_liveness_eligible": liveness_eligible,
+        "final_gamma_trend_eligible": gamma_trend_eligible,
+        "objective_achieved": (
+            paired_ci_clean and liveness_eligible and gamma_trend_eligible
+        ),
+    }
+
+
 def _raw_rows(payload: dict) -> list[dict]:
     return payload["records"][0]["cell"]["rows"]
 
@@ -341,6 +362,7 @@ def run(args) -> dict:
             seed=args.final_noise_seed + 2,
         ),
     }
+    objective_gates = _final_objective_gates(final_records, comparisons)
     result = {
         "status": STATUS,
         "initial_delivery": str(initial_path),
@@ -353,7 +375,10 @@ def run(args) -> dict:
         "lock": lock,
         "final_records": final_records,
         "paired_cluster_differences": comparisons,
-        "ci_clean_four_metric_win": all(map(_ci_win, comparisons.values())),
+        "ci_clean_four_metric_win": objective_gates[
+            "paired_ci_clean_four_metric_win"
+        ],
+        **objective_gates,
         "gamma_trends": {
             row["method"]: BASE._trend(row) for row in final_records
         },
@@ -364,6 +389,7 @@ def run(args) -> dict:
     print(json.dumps({
         "status": STATUS,
         "ci_clean_four_metric_win": result["ci_clean_four_metric_win"],
+        "objective_achieved": result["objective_achieved"],
         "delivery": str(output / "DELIVERY_COMPLETE.json"),
     }, indent=2))
     return result
