@@ -46,3 +46,32 @@ def test_ci_win_requires_all_four_intervals_strictly_favorable():
     assert G._ci_win(result)
     result["CR"] = {"paired_cluster_95": [-.2, .01]}
     assert not G._ci_win(result)
+
+
+def test_schedule_selection_requires_gamma_trend_before_shortfall():
+    def record(name, trend_ok, cr):
+        pooled = {
+            "SR": .8, "CR": cr, "timeout": 0.0,
+            "Validity": .7, "clearance": .2, "time_to_goal": 8.0,
+        }
+        rows = {}
+        for index, gamma in enumerate(G.SP.GAMMAS):
+            cell = dict(pooled)
+            cell["clearance"] = (.3 - .01 * index) if trend_ok else (.1 + .05 * index)
+            cell["time_to_goal"] = (11 - .2 * index) if trend_ok else (7 + 2.0 * index)
+            cell["Validity"] = .5 + .02 * index
+            cell["CR"] = .1 + .01 * index
+            rows[str(gamma)] = cell
+        return {
+            "method": name, "round": 1, "pooled": pooled,
+            "per_gamma": rows, "temperature_by_gamma": [1.0] * 7,
+        }
+
+    target = {"CR": .1, "Validity": .7, "clearance": .2, "time_to_goal": 8.0}
+    liveness = {"minimum_SR": .5, "maximum_timeout": .1, "every_gamma_has_success": True}
+    selected = G._pick(
+        [record("bad_trend", False, .05), record("good_trend", True, .15)],
+        target=target,
+        liveness=liveness,
+    )
+    assert selected["method"] == "good_trend"

@@ -86,9 +86,22 @@ def _single_reference_target(reference: dict) -> dict:
 
 
 def _pick(candidates, *, target: dict, liveness: dict) -> dict:
+    def key(row):
+        trend = BASE._trend(row)
+        shortfall = BASE._shortfalls(row, target)
+        return (
+            0 if BASE._liveness_eligible(row, liveness) else 1,
+            0 if trend["mean_fraction"] >= .75 else 1,
+            max(shortfall.values()),
+            sum(shortfall.values()),
+            -trend["mean_fraction"],
+            -row["pooled"]["SR"],
+            row["pooled"]["timeout"],
+            tuple(row["temperature_by_gamma"]),
+        )
     return min(
         candidates,
-        key=lambda row: BASE._selection_key(row, target, liveness),
+        key=key,
     )
 
 
@@ -256,6 +269,11 @@ def run(args) -> dict:
         "kazuki": kazuki,
         "target_envelope": target,
         "liveness_contract": liveness,
+        "gamma_trend_gate": {
+            "minimum_adjacent_pair_mean_fraction": .75,
+            "pretrained": BASE._trend(pretrained),
+            "expanded": BASE._trend(expanded),
+        },
         "expanded_shortfalls": BASE._shortfalls(expanded, target),
         "schedule_sha256": {
             "pretrained": _schedule_sha(pretrained),
