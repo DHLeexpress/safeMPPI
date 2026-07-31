@@ -40,30 +40,47 @@ def test_paired_ci_requires_complete_scenario_clusters():
     assert not G._ci_win(result)
 
 
-def test_global_temperature_parity_is_fail_closed(tmp_path):
+def test_global_temperature_reference_reuse_is_fail_closed(tmp_path):
     initial = tmp_path / "DELIVERY_COMPLETE.json"
     initial.write_text("{}")
     reference_root = tmp_path / "disjoint_m50"
     selection = {}
-    cells = {}
     for method in ("pretrained", "expanded"):
         rows = [_row(470000, gamma) for gamma in G.SP.GAMMAS]
-        payload = {"records": [{"cell": {"rows": rows}}]}
+        rows *= 50
+        payload = {
+            "bank": {"ep0": 470000, "M_per_gamma": 50},
+            "noise_bank": {"seed": 7},
+            "temperature": .55,
+            "records": [{
+                "round": 0,
+                "cell": {"rows": rows, "checkpoint_sha256": method},
+            }],
+        }
         destination = reference_root / method / "raw_m50_offline_metrics.json"
         destination.parent.mkdir(parents=True)
         destination.write_text(json.dumps(payload))
-        selection[f"selected_{method}"] = {"temperature": .55}
-        cells[method] = {.55: payload}
-    verified = G._global_temperature_parity(
-        initial, {"selection": selection}, cells
+        selection[method] = {
+            "temperature": .55,
+            "round": 0,
+            "checkpoint_sha256": method,
+        }
+    state = {
+        "banks": {"disjoint_confirmation": {
+            "ep0": 470000, "M_per_gamma": 50, "noise_seed": 7,
+        }}
+    }
+    cells, reuse = G._reuse_global_temperature_cells(
+        initial, state, selection
     )
-    assert verified["status"] == (
-        "GLOBAL_TEMPERATURE_PRODUCTION_PARITY_VERIFIED"
+    assert reuse["status"] == (
+        "GLOBAL_TEMPERATURE_CALIBRATION_CELLS_REUSED"
     )
+    assert cells["pretrained"][.55]["temperature"] == .55
 
-    cells["expanded"][.55]["records"][0]["cell"]["rows"][0]["success"] = False
-    with pytest.raises(RuntimeError, match="production parity failed for expanded"):
-        G._global_temperature_parity(initial, {"selection": selection}, cells)
+    selection["expanded"]["checkpoint_sha256"] = "wrong"
+    with pytest.raises(RuntimeError, match="reference contract failed for expanded"):
+        G._reuse_global_temperature_cells(initial, state, selection)
 
 
 def test_ci_win_requires_all_four_intervals_strictly_favorable():

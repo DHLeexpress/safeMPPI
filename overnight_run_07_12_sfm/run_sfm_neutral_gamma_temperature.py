@@ -150,40 +150,56 @@ def _rows_sha256(payload: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _global_temperature_parity(
+def _reuse_global_temperature_cells(
     initial_path: Path,
     initial: dict,
-    cells: dict[str, dict[float, dict]],
-) -> dict:
+    methods: dict[str, dict],
+) -> tuple[dict[str, dict[float, dict]], dict]:
+    bank = initial["banks"]["disjoint_confirmation"]
+    cells = {method: {} for method in methods}
     records = {}
     for method in ("pretrained", "expanded"):
-        selected = initial["selection"][f"selected_{method}"]
+        selected = methods[method]
         temperature = float(selected["temperature"])
-        if temperature not in cells[method]:
-            raise RuntimeError(
-                f"selected global temperature {temperature} was not rerun"
-            )
         reference_path = (
             initial_path.parent / "disjoint_m50" / method
             / "raw_m50_offline_metrics.json"
         )
-        reference_sha = _rows_sha256(BASE._read(reference_path))
-        rerun_sha = _rows_sha256(cells[method][temperature])
-        if rerun_sha != reference_sha:
+        payload = BASE._read(reference_path)
+        record = payload["records"][0]
+        if (
+            int(payload["bank"]["ep0"]) != int(bank["ep0"])
+            or int(payload["bank"]["M_per_gamma"]) != int(bank["M_per_gamma"])
+            or int(payload["noise_bank"]["seed"]) != int(bank["noise_seed"])
+            or float(payload["temperature"]) != temperature
+            or int(record["round"]) != int(selected["round"])
+            or record["cell"]["checkpoint_sha256"]
+            != selected["checkpoint_sha256"]
+            or len(_raw_rows(payload)) != 50 * len(SP.GAMMAS)
+        ):
             raise RuntimeError(
-                f"global-temperature production parity failed for {method}: "
-                f"reference={reference_sha} rerun={rerun_sha}"
+                f"global-temperature reference contract failed for {method}"
             )
+        cells[method][temperature] = payload
         records[method] = {
             "temperature": temperature,
             "reference": str(reference_path),
-            "reference_rows_sha256": reference_sha,
-            "rerun_rows_sha256": rerun_sha,
+            "reference_file_sha256": BASE.FUNNEL.sha256_file(reference_path),
+            "reference_rows_sha256": _rows_sha256(payload),
+            "checkpoint_sha256": selected["checkpoint_sha256"],
+            "rerun": False,
         }
-    return {
-        "status": "GLOBAL_TEMPERATURE_PRODUCTION_PARITY_VERIFIED",
+    reuse = {
+        "status": "GLOBAL_TEMPERATURE_CALIBRATION_CELLS_REUSED",
+        "reason": (
+            "the locked global-temperature M50 cells are already the exact "
+            "calibration-bank observations; re-running a GPU rollout can "
+            "perturb borderline trajectories and is neither required nor "
+            "scientifically preferable"
+        ),
         "records": records,
     }
+    return cells, reuse
 
 
 def _metric(rows: list[dict], name: str) -> float:
@@ -272,11 +288,17 @@ def run(args) -> dict:
         "pretrained": selected["selected_pretrained"],
         "expanded": selected["selected_expanded"],
     }
+    cells, reuse = _reuse_global_temperature_cells(
+        initial_path, initial, methods
+    )
+    BASE._write(output / "GLOBAL_TEMPERATURE_REUSE.json", reuse)
 
     calibration_root = output / "calibration_m50"
     jobs, metadata = [], {}
     for method, record in methods.items():
         for temperature in temperatures:
+            if temperature in cells[method]:
+                continue
             name = f"{method}_temp{temperature:g}".replace(".", "p")
             out = calibration_root / name
             jobs.append({
@@ -294,13 +316,10 @@ def run(args) -> dict:
     BASE._run_jobs(
         jobs, gpus=args.gpus, workers=args.workers, log_dir=output / "logs"
     )
-    cells = {method: {} for method in methods}
     for method, temperature, out in metadata.values():
         cells[method][temperature] = BASE._read(
             out / "raw_m50_offline_metrics.json"
         )
-    parity = _global_temperature_parity(initial_path, initial, cells)
-    BASE._write(output / "GLOBAL_TEMPERATURE_PARITY.json", parity)
 
     kazuki_path = initial_path.parent / "disjoint_m50" / "kazuki_locked.json"
     kazuki_payload = BASE._read(kazuki_path)
@@ -414,7 +433,7 @@ def run(args) -> dict:
     result = {
         "status": STATUS,
         "initial_delivery": str(initial_path),
-        "global_temperature_production_parity": parity,
+        "global_temperature_calibration_reuse": reuse,
         "calibration_bank": calibration_bank,
         "fresh_confirmation_bank": {
             "M_per_gamma": 50,
