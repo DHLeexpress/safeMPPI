@@ -204,7 +204,12 @@ def _step_bins(records, *, until_step, bin_size=STEP_BIN):
 
 
 def _population_summary(records):
-    per_gamma = Counter(str(row["gamma"]) for _, row in records)
+    # D+ rows (ExecutedRoundShard windows) carry gamma on the context;
+    # G+ rows carry it on the record itself.
+    per_gamma = Counter(
+        str(row["gamma"] if "gamma" in row else ctx["gamma"])
+        for ctx, row in records
+    )
     return dict(
         windows=len(records),
         per_gamma={key: int(value) for key, value in per_gamma.items()},
@@ -550,7 +555,7 @@ def run(args):
         evaluation = _run_paired_eval(
             args,
             checkpoints=[round0_path, final_checkpoint],
-            labels=["r0", f"pilot_r{int(args.rounds)}"],
+            labels=["r0", f"r{int(args.rounds)}"],
             output_dir=os.path.join(output_root, "paired_eval"),
         )
 
