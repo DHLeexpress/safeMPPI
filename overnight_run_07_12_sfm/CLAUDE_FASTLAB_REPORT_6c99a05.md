@@ -165,6 +165,49 @@ branches unchanged: deployment-pivot (verifier-in-loop as the object) and a
 genuinely different objective (distributional/DAgger-style, or closed-loop
 returns), not more of this one.
 
+## Track F addendum: the CFM discrete-target blind spot — found, measured,
+and the first confirmed training-side win (user-directed, 5-h sprint)
+
+**F0 diagnostic (blind spot confirmed).** 79.2% of certified positives were
+never trained on (12,590 exist — 9,297 base-pool + 3,293 teacher — vs 2,620
+executed). 70% of multi-positive contexts are genuinely multi-modal (23.9%
+certify BOTH a left and a right window by the verifier's own homotopy labels).
+The decisive gradient measurement: swapping which certified positive is the
+Dirac target perturbs the update as much as swapping to an unrelated context
+(within-context cross-target cos −0.03 ≈ unrelated +0.02; same-target
+noise-only 0.80), and ‖g_Dirac‖ = 3.0×‖ḡ_set‖ — two-thirds of every canonical
+update's magnitude was selection arbitrariness. Exposure noise is exact 1/K,
+second-order at the Adam-step level. Figure trackF_blindspot_diag.png.
+
+**F1 grid (hypothesis inverted).** Target-SET CFM does NOT convert (base-set
+ΔVal +.010/+.012 n.s.; adding teacher erases it); the beyond-noise effect
+belongs to the sharpened DIRAC arms on the enlarged pool: F1e (executed-Dirac,
+K=8 draws, S2, demo50, context-equal mass, 5 gathers, 20 epochs, ~10 s)
+ΔVal +.054 [ +.032, +.075 ] at M20, 7/7 γ. Figure trackF_multipos_deltas.png.
+Confounds noted: F1c/e differ from E2b in pool size, G+ absence, and mass
+normalization simultaneously.
+
+**M50 confirmation (fresh bank ep0 840000 / noise 20260805, 350 paired
+episodes, temp-1).** r0 = SR .6714 / CR .3286 / TO 0 / Val .6029 / clr .1164 /
+ttg 8.41. F1e = SR .7286 / CR .2714 / TO 0 / Val .6491 / clr .1217 / ttg 9.30.
+Paired scenario-cluster deltas: **Validity +.046 [ +.020, +.071 ] CONFIRMED**
+(first replicated training-side improvement of the campaign); CR −.057
+[ −.140, +.026 ] and SR +.057 [ −.020, +.131 ] favorable, not significant
+(McNemar p=.100 both); clearance +.005 n.s.; **time +0.90 s [ +.69, +1.11 ]
+confirmed cost**. γ-trend eligible 4/4 families at 100%; liveness preserved
+(SR above r0, timeout 0). Goal scorecard: 1 primary metric confirmed won,
+2 favorable-but-noise, SR/timeout preserved, 1 confirmed lost (time).
+Artifacts: fastlab/multipos/ (dataset_stats, trackF_summary/arms JSONs, six
+arm checkpoints, m50_confirm/), diag/.
+
+**Synthesis.** The blind spot is real but its exploitation is asymmetric: the
+certified-set signal cannot be averaged into the flow (variance floor), yet
+merely (a) enlarging the executed-Dirac pool 2.4×, (b) equalizing mass per
+context, and (c) smoothing exposure noise K=8 turns the canonical
+Validity-for-liveness trade into a significant Validity gain at zero
+SR/CR/clearance cost. Time-to-goal remains the structurally unpaid metric of
+window-level imitation.
+
 ## Branch options (decision needed)
 
 1. **Pivot the evaluated object to verifier-gated deployment** (the loop's
