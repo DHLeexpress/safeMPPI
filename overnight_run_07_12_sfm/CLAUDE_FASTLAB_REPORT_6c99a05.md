@@ -79,6 +79,48 @@ with the canonical 50-round null (all four paired M50 CIs straddle zero) and
 the mode-level NVP finding, the evidence converges on: **the bottleneck is the
 imitation channel/objective, not the data supply.**
 
+## Track D addendum: head-only "freezing effect" + demo_frac (user-directed)
+
+Hypothesis: 331k params updated with few hundred windows is the wrong surgery;
+update only the head (Linear 256→20, 5,140 params), optionally stabilized by
+demo_frac ID mixing. Tested offline (6 arms on pretrained-collected D+/G+/D0)
+and closed-loop (3-round chain, `--train-scope head --demo-frac 0.5`).
+Freeze verified byte-level in both (28 non-head tensors sha-identical;
+gradients nonzero only on head.weight/head.bias).
+
+| arm (paired M20 vs r0 .707/.286/.609/8.65s) | SR | CR | Validity | time |
+|---|---|---|---|---|
+| offline head D+ | .686 | .286 (tie) | **.704** | 10.59 |
+| offline head G+ | .514 | **.471** | .442 | 6.67 |
+| offline head D+G | .636 | .357 | .567 | 8.29 |
+| offline head D+G + demo50 | .693 | .300 | .604 | 8.59 |
+| offline head D0 | .671 | .314 | .618 | 9.13 |
+| closed-loop head + demo50 (r3) | .679 | .321 | .589 | 8.34 |
+
+Verdicts:
+1. **Capacity/plasticity is ruled out** as the bottleneck: the head fits the
+   data (CFM loss −2 to −18%) yet no arm beats r0 on CR/SR beyond noise, and
+   the closed-loop head chain reproduces the full-net chain's numbers exactly.
+2. **The canonical expansion is a head re-aim**: 10 epochs of head-only D+
+   training (~10 s) reproduces the entire 50-round canonical outcome
+   (Validity +.095 with 7/7 per-γ sign test p≈.008, time +1.9 s, SR −.02,
+   CR flat). The 50-round loop's learning content ≈ 5k params of re-aiming
+   toward max-margin windows: Validity bought with liveness, nothing else.
+3. **G+ is multi-modal per context** (929 windows / 491 contexts): a linear
+   head must average conflicting certified modes and becomes actively unsafe
+   (CR .471); the full net absorbs them inertly. Teacher data needs
+   mode-aware/distributional treatment, not mean imitation through a bottleneck.
+4. **demo_frac 0.5 stabilizes by neutering** (harmful→inert, never
+   inert→useful), and loss-level ID anchoring holds the ID CFM loss flat
+   (.773→.777) while closed-loop Validity still drops — loss-space anchoring
+   does not transfer to closed-loop behavior.
+5. D0 is not measurably toxic at head level.
+
+Artifacts: `fastlab/head_only/` (6 offline arms + `chain_head_demo50/`),
+figure `/home/dohyun/projects/cfm_mppi/claude_fastlab_6c99a05/trackD_head_only_deltas.png`,
+new script `claude_head_only_offline.py`, pilot flags
+`--train-scope/--head-lr/--demo-frac/--demo-dataset` (defaults byte-identical).
+
 ## Branch options (decision needed)
 
 1. **Pivot the evaluated object to verifier-gated deployment** (the loop's

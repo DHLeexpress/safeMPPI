@@ -45,6 +45,7 @@ import argparse
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 import json
+import math
 import multiprocessing as mp
 import os
 import subprocess
@@ -76,6 +77,363 @@ DEFAULT_UPDATE_PASSES = 4
 DEFAULT_LR = MR.DEFAULT_LR
 DEFAULT_BATCH = 128
 STEP_BIN = 10
+# policy.head is the single nn.Linear(width=256 -> d=2H=20) flow read-out.
+HEAD_PARAMETERS = 256 * 20 + 20
+# Population-specific fold used by run() for the acquired-replay seed; the demo
+# draw reuses it so D+ and G+ never see the same ID microbatch in a round.
+DPLUS_SEED_FOLD = 1_000_003
+GPLUS_SEED_FOLD = 7_000_003
+
+
+def _configure_train_scope(policy, scope):
+    """Apply ``--train-scope`` on top of the canonical expansion trainability.
+
+    ``full`` is exactly today's behaviour: every parameter except the frozen
+    visual encoder ``enc_grid`` trains.  ``head`` additionally freezes the GRU,
+    ``enc_low`` and the residual trunk and re-enables exactly ``policy.head.*``
+    -- the final ``nn.Linear(256, 2H)`` velocity read-out -- so an update can
+    only re-aim the flow field, never move the representation that produced it.
+    """
+    frozen = BS.configure_expansion_trainability(policy)
+    scope = str(scope)
+    if scope not in ("full", "head"):
+        raise ValueError("--train-scope must be full or head")
+    if scope == "head":
+        for parameter in policy.parameters():
+            parameter.requires_grad_(False)
+        for parameter in policy.head.parameters():
+            parameter.requires_grad_(True)
+        expected = {f"head.{name}" for name, _ in policy.head.named_parameters()}
+        trainable_names = {
+            name for name, parameter in policy.named_parameters()
+            if parameter.requires_grad
+        }
+        if trainable_names != expected:
+            raise RuntimeError(
+                "head scope leaked outside policy.head: "
+                f"{sorted(trainable_names ^ expected)}"
+            )
+        frozen = sorted(
+            name for name, parameter in policy.named_parameters()
+            if not parameter.requires_grad
+        )
+    trainable = sorted(
+        name for name, parameter in policy.named_parameters()
+        if parameter.requires_grad
+    )
+    trainable_count = int(sum(
+        parameter.numel() for parameter in policy.parameters()
+        if parameter.requires_grad
+    ))
+    frozen_count = int(sum(
+        parameter.numel() for parameter in policy.parameters()
+        if not parameter.requires_grad
+    ))
+    if scope == "head" and trainable_count != HEAD_PARAMETERS:
+        raise RuntimeError(
+            f"head scope trains {trainable_count} parameters, "
+            f"not the expected {HEAD_PARAMETERS}"
+        )
+    summary = dict(
+        train_scope=scope,
+        trainable_parameters=trainable,
+        trainable_parameter_count=trainable_count,
+        frozen_parameters=frozen,
+        frozen_parameter_count=frozen_count,
+    )
+    print(
+        f"[train-scope] {scope}: trainable {trainable_count} "
+        f"({len(trainable)} tensors: {trainable}) | frozen {frozen_count} "
+        f"({len(frozen)} tensors)",
+        flush=True,
+    )
+    return summary
+
+
+def _demo_plan(batch, demo_frac):
+    """Microbatch composition ceil((1-F)*B) acquired + floor(F*B) demo.
+
+    The two counts always sum to ``B`` because
+    ``ceil((1-F)B) == B - floor(FB)`` for every real ``F``.
+    """
+    batch = int(batch)
+    demo_frac = float(demo_frac)
+    if not 0.0 <= demo_frac < 1.0:
+        raise ValueError("--demo-frac must lie in [0, 1)")
+    acquired = int(math.ceil((1.0 - demo_frac) * batch))
+    demo = int(math.floor(demo_frac * batch))
+    if acquired + demo != batch:
+        raise RuntimeError("demo plan does not tile the microbatch")
+    if demo_frac > 0.0 and (acquired < 1 or demo < 1):
+        raise ValueError("--demo-frac leaves an empty half of the microbatch")
+    return acquired, demo
+
+
+def _demo_bundle(dataset, checkpoint):
+    """Authenticate and load the frozen ID pretraining TRAIN banks once.
+
+    Delegates to the study's own ``MR._id_anchor_preflight`` /
+    ``MR._id_anchor_banks``, so the pinned manifest digest, the seven pinned
+    per-file digests, the ``success_only`` flag and the promoted checkpoint's
+    ``split_meta`` train-episode restriction are all re-verified here.
+    """
+    preflight = MR._id_anchor_preflight(dataset, len(SP.GAMMAS))
+    bundle = MR._id_anchor_banks(preflight, checkpoint)
+    if len(bundle["banks"]) != len(SP.GAMMAS):
+        raise RuntimeError("ID-demo bundle does not cover the seven gammas")
+    return bundle
+
+
+def _demo_provenance(bundle):
+    return dict(
+        dataset=str(bundle["dataset"]),
+        manifest_sha256=str(bundle["manifest_sha256"]),
+        file_sha256=dict(bundle["file_sha256"]),
+        split=str(bundle["split"]),
+        split_source=str(bundle["split_source"]),
+        per_gamma_support=[
+            {
+                "gamma": float(bank["gamma"]),
+                "trajectories": int(bank["trajectories"]),
+                "windows": int(bank["windows"]),
+                "source_windows": int(bank["source_windows"]),
+                "sha256": str(bank["sha256"]),
+            }
+            for bank in bundle["banks"]
+        ],
+    )
+
+
+def _demo_draw(bundle, count, seed):
+    """Gamma-balanced draw of ``count`` ID train windows.
+
+    Gamma slots are round-robin over a seeded permutation of the seven gammas,
+    so per-gamma counts differ by at most one and which gamma receives the
+    surplus rotates with the seed.  Inside a gamma the window is drawn with
+    replacement from the frozen hierarchical ``MR._id_anchor_mass`` (uniform
+    over train trajectories, then uniform over that trajectory's windows) --
+    the same law ``MR._id_anchor_update`` uses.
+    """
+    banks = bundle["banks"]
+    count = int(count)
+    if count < 1:
+        raise ValueError("ID-demo draw requires a positive count")
+    generator = np.random.default_rng(int(seed))
+    order = generator.permutation(len(banks))
+    slots = [int(order[index % len(banks)]) for index in range(count)]
+    drawn = {}
+    for bank_index, number in sorted(Counter(slots).items()):
+        bank = banks[bank_index]
+        drawn[bank_index] = [
+            int(row) for row in generator.choice(
+                len(bank["mass"]), size=int(number), replace=True,
+                p=bank["mass"],
+            )
+        ]
+    cursor = Counter()
+    selection = []
+    for bank_index in slots:
+        selection.append((bank_index, drawn[bank_index][cursor[bank_index]]))
+        cursor[bank_index] += 1
+    return selection
+
+
+def _demo_tensors(bundle, selection, device):
+    banks = bundle["banks"]
+    stack = lambda key: torch.stack(  # noqa: E731
+        [banks[bank][key][row] for bank, row in selection]
+    ).to(device=device, dtype=torch.float32)
+    return stack("hp10"), stack("low5"), stack("hist"), stack("U")
+
+
+@torch.no_grad()
+def _demo_fixed_loss(policy, bundle, *, windows, device, seed):
+    """Deterministic unweighted CFM loss on a fixed ID-demo probe batch."""
+    selection = _demo_draw(bundle, int(windows), int(seed))
+    grid, low, hist, controls = _demo_tensors(bundle, selection, device)
+    was_training = policy.training
+    policy.eval()
+    torch.manual_seed(int(seed))
+    loss = policy.cfm_loss(controls, policy.ctx_from(grid, low, hist))
+    if was_training:
+        policy.train()
+    return float(loss)
+
+
+def _mixed_population_update(
+    policy,
+    optimizer,
+    records,
+    *,
+    population,
+    inner_steps,
+    batch,
+    device,
+    seed,
+    demo_frac,
+    demo_bundle,
+):
+    """Sibling of ``MR._population_update`` with ID-demo microbatch mixing.
+
+    Semantics deliberately mirrored from ``MR._population_update`` /
+    ``NS._objective``: one Adam step per pass, the acquired population ordered
+    by ``BS.hierarchical_order`` and therefore exposed exactly once per pass,
+    per-sample acquired weights ``n_acquired * hierarchy_mass``, non-finite
+    loss rejection, and the frozen-encoder SHA assertion.
+
+    The one change: each microbatch carries ``ceil((1-F)*batch)`` acquired rows
+    *and* ``floor(F*batch)`` ID-demo rows through a single ``ctx_from`` +
+    ``cfm_loss`` call, the demo rows weighted 1.0.  Because ``cfm_loss``
+    averages over the composed batch, the microbatch objective is exactly
+    ``(1-F) * sum_i mass_i * per_i  +  F * mean(demo per)`` -- i.e. canonical
+    demo-fraction mixing, reducing to the unmixed objective at ``F = 0``.
+
+    Demo seed: ``demo_seed = (seed * 9176) + 97 * batch_index + 13`` with
+    ``seed = train_seed + round * fold + pass * 1_000_003`` (fold 1_000_003 for
+    D+, 7_000_003 for G+), so the draw folds train_seed, round, population,
+    pass index and batch index.
+    """
+    if not records:
+        raise ValueError(f"{population} replay requires nonempty support")
+    acquired_n, demo_n = _demo_plan(batch, demo_frac)
+    if demo_n < 1:
+        raise ValueError("mixed replay requires a positive demo fraction")
+    mass, accounting = BS.hierarchy_mass(records)
+    encoder_before = BS.module_sha256(policy.enc_grid)
+    expected = {MR._identity(holder, row) for holder, row in records}
+    losses = []
+    encoder_gradient_norms = []
+    trainable_gradient_norms = []
+    exposure_hashes = []
+    demo_windows = []
+    demo_gamma = Counter()
+    policy.train()
+    for inner in range(int(inner_steps)):
+        optimizer.zero_grad(set_to_none=True)
+        pass_seed = int(seed) + inner * 1_000_003
+        ordered = BS.hierarchical_order(records, pass_seed)
+        visited = []
+        total_loss = 0.0
+        drawn = 0
+        for index, start in enumerate(range(0, len(ordered), acquired_n)):
+            values = ordered[start:start + acquired_n]
+            grid, low, hist, controls = BS._tensor_batch(values, device)
+            weights = torch.as_tensor(
+                [
+                    len(values) * mass[(id(holder), int(row["query_id"]))]
+                    for holder, row in values
+                ],
+                dtype=controls.dtype,
+                device=device,
+            )
+            # A ragged final chunk keeps the F ratio rather than the count.
+            share = max(1, int(round(
+                len(values) * float(demo_n) / float(acquired_n)
+            )))
+            selection = _demo_draw(
+                demo_bundle, share, pass_seed * 9176 + 97 * index + 13,
+            )
+            demo_grid, demo_low, demo_hist, demo_controls = _demo_tensors(
+                demo_bundle, selection, device,
+            )
+            context = policy.ctx_from(
+                torch.cat([grid, demo_grid]),
+                torch.cat([low, demo_low]),
+                torch.cat([hist, demo_hist]),
+            )
+            composed = torch.cat([controls, demo_controls])
+            composed_weights = torch.cat([
+                weights,
+                torch.ones(
+                    len(selection), dtype=controls.dtype, device=device,
+                ),
+            ])
+            torch.manual_seed(pass_seed + start)
+            loss = policy.cfm_loss(composed, context, weights=composed_weights)
+            if not bool(torch.isfinite(loss)):
+                raise FloatingPointError(
+                    f"non-finite mixed CFM loss in {population}"
+                )
+            loss.backward()
+            total_loss += float(loss.detach())
+            drawn += len(selection)
+            if inner == 0:
+                for bank_index, _ in selection:
+                    demo_gamma[
+                        str(demo_bundle["banks"][bank_index]["gamma"])
+                    ] += 1
+            visited.extend(
+                (int(holder.round_i), int(row["query_id"]))
+                for holder, row in values
+            )
+        if len(visited) != len(expected) or set(visited) != expected:
+            raise RuntimeError(
+                f"{population} pass duplicated or omitted a sample"
+            )
+        squared = torch.zeros((), dtype=torch.float64)
+        for parameter in policy.enc_grid.parameters():
+            if parameter.grad is not None:
+                squared += parameter.grad.detach().to(
+                    dtype=torch.float64,
+                ).square().sum().cpu()
+        encoder_gradient_norms.append(float(squared.sqrt()))
+        squared = torch.zeros((), dtype=torch.float64)
+        for group in optimizer.param_groups:
+            for parameter in group["params"]:
+                if parameter.grad is not None:
+                    squared += parameter.grad.detach().to(
+                        dtype=torch.float64,
+                    ).square().sum().cpu()
+        gradient_norm = float(squared.sqrt())
+        if not math.isfinite(gradient_norm):
+            raise FloatingPointError(
+                f"non-finite {population} trainable gradient norm"
+            )
+        trainable_gradient_norms.append(gradient_norm)
+        optimizer.step()
+        losses.append(float(total_loss))
+        exposure_hashes.append(MR._sha256_jsonable(visited))
+        demo_windows.append(int(drawn))
+    optimizer.zero_grad(set_to_none=True)
+    policy.eval()
+    encoder_after = BS.module_sha256(policy.enc_grid)
+    if (
+        not any(
+            parameter.requires_grad
+            for parameter in policy.enc_grid.parameters()
+        )
+        and encoder_after != encoder_before
+    ):
+        raise RuntimeError("visual encoder changed during replay")
+    return {
+        "population": str(population),
+        "records": len(records),
+        "inner_steps": int(inner_steps),
+        "optimizer_steps": int(inner_steps),
+        "sample_exposures": len(records) * int(inner_steps),
+        "exact_once_per_inner_step": True,
+        "exposure_identity_sha256": exposure_hashes,
+        "losses": losses,
+        "encoder_gradient_norms": encoder_gradient_norms,
+        "trainable_gradient_norms": trainable_gradient_norms,
+        "mass": MR._compact_mass(accounting),
+        "encoder_sha_before": encoder_before,
+        "encoder_sha_after": encoder_after,
+        "demo_frac": float(demo_frac),
+        "demo_acquired_per_microbatch": int(acquired_n),
+        "demo_windows_per_microbatch": int(demo_n),
+        "demo_windows_per_pass": demo_windows,
+        "demo_per_gamma_first_pass": {
+            key: int(value) for key, value in sorted(demo_gamma.items())
+        },
+        "demo_seed_formula": (
+            "(train_seed + round*fold + pass*1000003)*9176 + 97*batch + 13; "
+            "fold = 1000003 (Dplus) / 7000003 (Gplus)"
+        ),
+        "microbatch_noise_seed_formula": (
+            "train_seed + round*fold + pass*1000003 + acquired_offset"
+        ),
+    }
 
 
 class _GuidedHolder:
@@ -286,6 +644,13 @@ def run(args):
         raise ValueError("--rounds must be positive")
     if int(args.batch) != DEFAULT_BATCH:
         raise ValueError("canonical microbatch size is 128")
+    demo_frac = float(args.demo_frac)
+    acquired_per_microbatch, demo_per_microbatch = _demo_plan(
+        int(args.batch), demo_frac,
+    )
+    mix_demos = demo_frac > 0.0
+    if args.head_lr is not None and str(args.train_scope) != "head":
+        raise ValueError("--head-lr only applies to --train-scope head")
 
     output_root = os.path.abspath(args.output_root)
     if os.path.exists(output_root):
@@ -298,6 +663,12 @@ def run(args):
     if args.require_clean_worktree and not source["tracked_worktree_clean"]:
         raise RuntimeError("pilot was asked for a clean frozen worktree")
 
+    # Loaded once, before any output exists, so a bad/unpinned ID dataset
+    # fails the pilot before it burns a gather.
+    demo_bundle = (
+        _demo_bundle(args.demo_dataset, checkpoint) if mix_demos else None
+    )
+
     os.makedirs(output_root)
     checkpoints_dir = os.path.join(output_root, "checkpoints")
     rounds_dir = os.path.join(output_root, "rounds")
@@ -305,14 +676,18 @@ def run(args):
     os.makedirs(rounds_dir)
 
     policy, _ = GPS.load_sfm_policy(checkpoint, device=args.device)
-    frozen = BS.configure_expansion_trainability(policy)
+    scope = _configure_train_scope(policy, args.train_scope)
+    frozen = scope["frozen_parameters"]
+    effective_lr = float(args.lr)
+    if str(args.train_scope) == "head" and args.head_lr is not None:
+        effective_lr = float(args.head_lr)
     encoder_sha_start = BS.module_sha256(policy.enc_grid)
     optimizer = torch.optim.Adam(
         [
             parameter for parameter in policy.parameters()
             if parameter.requires_grad
         ],
-        lr=float(args.lr),
+        lr=effective_lr,
     )
     config = dict(
         status=STATUS,
@@ -331,6 +706,18 @@ def run(args):
         crunch_full_pool_until_step=int(args.crunch_full_pool_until_step),
         update_passes=int(args.update_passes),
         lr=float(args.lr),
+        head_lr=(None if args.head_lr is None else float(args.head_lr)),
+        effective_lr=float(effective_lr),
+        train_scope=str(args.train_scope),
+        trainable_parameters=scope["trainable_parameters"],
+        trainable_parameter_count=int(scope["trainable_parameter_count"]),
+        frozen_parameter_count=int(scope["frozen_parameter_count"]),
+        demo_frac=float(demo_frac),
+        demo_acquired_per_microbatch=int(acquired_per_microbatch),
+        demo_windows_per_microbatch=int(demo_per_microbatch),
+        demo_source=(
+            None if demo_bundle is None else _demo_provenance(demo_bundle)
+        ),
         batch=int(args.batch),
         include_dplus=bool(include_dplus),
         train_D0=False,
@@ -349,6 +736,8 @@ def run(args):
         encoder_sha256_start=encoder_sha_start,
     )
     FA._write_json(os.path.join(output_root, "pilot_config.json"), config)
+
+    trunk_sha_start = BS.module_sha256(policy.trunk)
 
     round0_path = os.path.join(checkpoints_dir, "round_00.pt")
     BX._save_checkpoint(policy, round0_path, {
@@ -438,18 +827,44 @@ def run(args):
                     policy, positive_records, batch=int(args.batch),
                     device=args.device, seed=int(args.train_seed) + round_i,
                 )
+            if demo_bundle is not None:
+                fixed_before["ID_demo"] = _demo_fixed_loss(
+                    policy, demo_bundle, windows=int(args.batch),
+                    device=args.device, seed=int(args.train_seed),
+                )
 
-            updates = []
-            if include_dplus:
-                updates.append(MR._population_update(
+            def _update(records, *, population, fold):
+                # F == 0 keeps the canonical study updater byte-for-byte.
+                if not mix_demos:
+                    return MR._population_update(
+                        policy,
+                        optimizer,
+                        records,
+                        population=population,
+                        inner_steps=int(args.update_passes),
+                        batch=int(args.batch),
+                        device=args.device,
+                        seed=int(args.train_seed) + round_i * fold,
+                    )
+                return _mixed_population_update(
                     policy,
                     optimizer,
-                    positive_records,
-                    population="Dplus",
+                    records,
+                    population=population,
                     inner_steps=int(args.update_passes),
                     batch=int(args.batch),
                     device=args.device,
-                    seed=int(args.train_seed) + round_i * 1_000_003,
+                    seed=int(args.train_seed) + round_i * fold,
+                    demo_frac=demo_frac,
+                    demo_bundle=demo_bundle,
+                )
+
+            updates = []
+            if include_dplus:
+                updates.append(_update(
+                    positive_records,
+                    population="Dplus",
+                    fold=DPLUS_SEED_FOLD,
                 ))
                 BX._save_checkpoint(
                     policy,
@@ -465,15 +880,10 @@ def run(args):
                     },
                 )
             if guided_records:
-                updates.append(MR._population_update(
-                    policy,
-                    optimizer,
+                updates.append(_update(
                     guided_records,
                     population="Gplus",
-                    inner_steps=int(args.update_passes),
-                    batch=int(args.batch),
-                    device=args.device,
-                    seed=int(args.train_seed) + round_i * 7_000_003,
+                    fold=GPLUS_SEED_FOLD,
                 ))
 
             fixed_after = {}
@@ -486,6 +896,11 @@ def run(args):
                 fixed_after["Dplus"] = NS._fixed_loss(
                     policy, positive_records, batch=int(args.batch),
                     device=args.device, seed=int(args.train_seed) + round_i,
+                )
+            if demo_bundle is not None:
+                fixed_after["ID_demo"] = _demo_fixed_loss(
+                    policy, demo_bundle, windows=int(args.batch),
+                    device=args.device, seed=int(args.train_seed),
                 )
 
             round_checkpoint = os.path.join(
@@ -571,15 +986,30 @@ def run(args):
         round0_checkpoint_sha256=FA._sha256_file(round0_path),
         encoder_sha256_start=encoder_sha_start,
         encoder_sha256_end=BS.module_sha256(policy.enc_grid),
+        trunk_sha256_start=trunk_sha_start,
+        trunk_sha256_end=BS.module_sha256(policy.trunk),
+        train_scope=scope,
         evaluation=evaluation,
         caveats=[
             "single unreplicated pilot; not a confirmation",
             "G+ is collection-only and never executed in the gather",
             "D0 is collected and audited but never trained on",
-        ],
+        ] + ([
+            "train scope is head-only: policy.head is the sole trainable "
+            "module, so the representation is frozen by construction",
+        ] if str(args.train_scope) == "head" else []) + ([
+            f"every microbatch mixes {demo_per_microbatch} frozen ID "
+            f"pretraining-train demo windows with "
+            f"{acquired_per_microbatch} acquired rows",
+        ] if mix_demos else []),
     )
     if delivery["encoder_sha256_end"] != encoder_sha_start:
         raise RuntimeError("frozen visual encoder changed during the pilot")
+    if (
+        str(args.train_scope) == "head"
+        and delivery["trunk_sha256_end"] != trunk_sha_start
+    ):
+        raise RuntimeError("trunk changed under head-only training scope")
     path = os.path.join(output_root, "PILOT_COMPLETE.json")
     FA._write_json(path, delivery)
     return path
@@ -631,6 +1061,37 @@ def build_parser():
         help="whole-population Adam steps per population per round",
     )
     parser.add_argument("--lr", type=float, default=DEFAULT_LR)
+    parser.add_argument(
+        "--train-scope", choices=("full", "head"), default="full",
+        help=(
+            "full (default, today's behaviour) trains everything except the "
+            "frozen visual encoder; head freezes all of that too and trains "
+            "exactly policy.head, the nn.Linear(256, 2H) flow read-out "
+            f"({HEAD_PARAMETERS} parameters)"
+        ),
+    )
+    parser.add_argument(
+        "--head-lr", type=float, default=None,
+        help=(
+            "learning rate for --train-scope head; default None reuses --lr. "
+            "Rejected under --train-scope full"
+        ),
+    )
+    parser.add_argument(
+        "--demo-frac", type=float, default=0.0,
+        help=(
+            "0 (default) is today's behaviour. F>0 composes every update "
+            "microbatch of BOTH trained populations from ceil((1-F)*batch) "
+            "acquired records plus floor(F*batch) gamma-balanced ID windows "
+            "drawn from the frozen pretraining TRAIN split under the same "
+            "CFM loss; the acquired rows keep their hierarchical mass and "
+            "are still exposed exactly once per pass"
+        ),
+    )
+    parser.add_argument(
+        "--demo-dataset", default=MR.DEFAULT_ID_ANCHOR_DATASET,
+        help="frozen ID window banks used by --demo-frac (digest-pinned)",
+    )
     parser.add_argument("--batch", type=int, default=DEFAULT_BATCH)
     parser.add_argument(
         "--include-dplus", choices=("yes", "no"), default="yes",
