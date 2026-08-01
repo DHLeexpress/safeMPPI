@@ -10,6 +10,10 @@ The collector keeps three deliberately separate stores:
 * ``neutral_round.pt``: opt-in guided verifier-negative executions, isolated
   from training D+/D-, GP, and replay while remaining exact-negative in the
   audit query sidecar.
+* ``guided_positive_round.pt``: opt-in (``guided_collect_until_step > 0``)
+  proactively harvested guided windows that the exact verifier certified
+  positive at early steps.  This ``G+`` population is collection-only: it
+  never changes execution, selection, repair triggering, D0, or the GP.
 
 No independent raw continuation and no privileged MPC proposal are used.
 """
@@ -40,6 +44,15 @@ import sfm_scene as SS
 
 
 STATUS = "SFM_B1_KAZUKI_REPAIR_AUDIT_COMPLETE"
+GUIDED_POSITIVE_STATUS = "SFM_B1_GUIDED_POSITIVE_ROUND_COMPLETE"
+GUIDED_POSITIVE_STORE = "guided_positive_round.pt"
+GUIDED_GENERATORS = ("same_latent", "kazuki_full")
+DEFAULT_GUIDED_GENERATOR = "same_latent"
+DEFAULT_GUIDED_TOPK = 2
+GUIDED_SOURCES = dict(
+    same_latent="guided_proactive",
+    kazuki_full="kazuki_full_proactive",
+)
 DEFAULT_SCENARIOS = (250_001, 250_003)
 DEFAULT_GAMMAS = (0.1, 0.5, 1.0)
 DEFAULT_ELL = 0.24210826720721101
@@ -60,7 +73,7 @@ def _query_row(
             None if parent_candidate_id is None else int(parent_candidate_id)
         ),
         controls=np.asarray(controls, np.float32),
-        x0=np.asarray(x0, np.float32),
+        x0=None if x0 is None else np.asarray(x0, np.float32),
         result=result,
         acquisition_step=int(acquisition_step),
         sigma=float(sigma),
@@ -267,6 +280,147 @@ def _save_neutral_records(path, records, *, round_i=1):
     return marker
 
 
+def _guided_positive_record(
+    guided_id,
+    replica,
+    prepared,
+    row,
+    *,
+    step,
+    round_i=1,
+    generator=DEFAULT_GUIDED_GENERATOR,
+    repair_trigger,
+    reused_from_repair,
+    selected_for_execution,
+):
+    """One proactively harvested, exact-verifier-certified guided window."""
+    if generator not in GUIDED_GENERATORS:
+        raise ValueError(f"generator must be one of {GUIDED_GENERATORS}")
+    result = row["result"]
+    if (
+        not result.get("resolved")
+        or int(result.get("y", -1)) != 1
+        or not bool(result.get("full_h"))
+        or int(result.get("terminal_step", -1)) != 10
+    ):
+        raise ValueError("G+ requires an exact full-H verifier positive")
+    components = (
+        bool(result.get("taskspace")),
+        bool(result.get("collision_free")),
+        bool(result.get("certificate")),
+    )
+    if int(result["y"]) != int(all(components)):
+        raise ValueError("verifier y disagrees with its exact components")
+    controls = np.asarray(row["controls"], np.float32)
+    if tuple(controls.shape) != (10, 2) or not np.isfinite(controls).all():
+        raise ValueError("guided-positive controls must be finite [10,2]")
+    x0 = row.get("x0")
+    if x0 is None:
+        # The full external controller returns MPPI-refined elite modes; they
+        # are averages of perturbed plans and therefore have no single
+        # generating latent.  Recording a fabricated x0 would be a lie, so the
+        # field stays empty and the row is never GP- or latent-replayed.
+        if generator != "kazuki_full":
+            raise ValueError("same-latent G+ rows must retain their x0")
+    else:
+        x0 = np.asarray(x0, np.float32)
+        if tuple(x0.shape) != (20,) or not np.isfinite(x0).all():
+            raise ValueError("guided-positive x0 must be finite [20]")
+    return dict(
+        guided_id=int(guided_id),
+        population="Gplus",
+        semantic_label="guided_positive",
+        round=int(round_i),
+        scenario_id=int(replica.scenario_id),
+        gamma=float(replica.gamma),
+        step=int(step),
+        state=np.asarray(prepared["state"], np.float32),
+        hp10=np.asarray(prepared["hp10"].numpy(), np.float32),
+        low5=np.asarray(prepared["low"].numpy(), np.float32),
+        hist=np.asarray(prepared["hist"].numpy(), np.float32),
+        ped_xy=np.asarray(prepared["ped_xy"], np.float32),
+        ped_vel=np.asarray(prepared["ped_vel"], np.float32),
+        controls=controls,
+        x0=x0,
+        x0_available=bool(x0 is not None),
+        generator=str(generator),
+        verifier_result=result,
+        verifier_y=1,
+        candidate_id=int(row["candidate_id"]),
+        parent_candidate_id=(
+            None
+            if row.get("parent_candidate_id") is None
+            else int(row["parent_candidate_id"])
+        ),
+        acquisition_step=int(row["acquisition_step"]),
+        sigma=float(row["sigma"]),
+        mode=str(row["mode"]),
+        query_id=row.get("query_id"),
+        source=GUIDED_SOURCES[str(generator)],
+        repair_trigger=(
+            None if repair_trigger is None else str(repair_trigger)
+        ),
+        reused_from_repair=bool(reused_from_repair),
+        selected_for_execution=bool(selected_for_execution),
+        train_eligible=True,
+        replay_default=False,
+        gp_eligible=False,
+    )
+
+
+def _save_guided_positive_records(
+    path, records, *, round_i=1, until_step,
+    generator=DEFAULT_GUIDED_GENERATOR,
+):
+    path = os.fspath(path)
+    contexts = set()
+    for expected, record in enumerate(records):
+        if int(record["guided_id"]) != expected:
+            raise AssertionError("guided-positive IDs are not dense")
+        if (
+            record["semantic_label"] != "guided_positive"
+            or record["population"] != "Gplus"
+            or record["generator"] != str(generator)
+            or record["source"] != GUIDED_SOURCES[str(generator)]
+            or not record["train_eligible"]
+            or record["replay_default"]
+            or record["gp_eligible"]
+            or int(record["verifier_y"]) != 1
+            or int(record["step"]) >= int(until_step)
+        ):
+            raise AssertionError("invalid guided-positive record")
+        contexts.add((
+            int(record["scenario_id"]),
+            round(float(record["gamma"]), 8),
+            int(record["step"]),
+        ))
+    payload = dict(
+        version=1,
+        status=GUIDED_POSITIVE_STATUS,
+        round=int(round_i),
+        guided_collect_until_step=int(until_step),
+        guided_generator=str(generator),
+        records=records,
+        summary=dict(
+            Gplus=len(records),
+            contexts=len(contexts),
+            train_eligible=len(records),
+            gp_eligible=0,
+        ),
+    )
+    FA._save_torch(path, payload)
+    marker = dict(
+        status=payload["status"],
+        file=os.path.abspath(path),
+        sha256=FA._sha256_file(path),
+        guided_collect_until_step=int(until_step),
+        guided_generator=str(generator),
+        **payload["summary"],
+    )
+    FA._write_json(path + ".COMPLETE.json", marker)
+    return marker
+
+
 def _gamma_balanced_gp(
     phi_policy,
     previous,
@@ -444,6 +598,11 @@ def collect(
     audit_seed=DEFAULT_AUDIT_SEED,
     ell=DEFAULT_ELL,
     neutral_continuation=False,
+    guided_collect_until_step=0,
+    guided_collect_store=None,
+    guided_generator=DEFAULT_GUIDED_GENERATOR,
+    guided_topk=DEFAULT_GUIDED_TOPK,
+    crunch_full_pool_until_step=0,
     round_i=1,
     expected_checkpoint_sha256=EXPECTED_CHECKPOINT_SHA256,
     previous_executed_path=None,
@@ -475,8 +634,40 @@ def collect(
         raise ValueError("repair audit is pinned to double-shift OOD")
     if int(T) != 180:
         raise ValueError("repair audit is scientifically pinned to T=180")
+    guided_collect_until_step = int(guided_collect_until_step)
+    if guided_collect_until_step < 0:
+        raise ValueError("guided_collect_until_step must be non-negative")
+    if guided_collect_until_step > int(T):
+        raise ValueError("guided_collect_until_step cannot exceed T")
+    guided_collect = guided_collect_until_step > 0
+    if guided_collect_store is not None and not guided_collect:
+        raise ValueError(
+            "guided_collect_store requires guided_collect_until_step > 0"
+        )
+    if guided_generator not in GUIDED_GENERATORS:
+        raise ValueError(f"guided_generator must be one of {GUIDED_GENERATORS}")
+    guided_topk = int(guided_topk)
+    if not 1 <= guided_topk <= 16:
+        raise ValueError("guided_topk must lie in [1, K]")
+    crunch_full_pool_until_step = int(crunch_full_pool_until_step)
+    if crunch_full_pool_until_step < 0:
+        raise ValueError("crunch_full_pool_until_step must be non-negative")
+    if crunch_full_pool_until_step > int(T):
+        raise ValueError("crunch_full_pool_until_step cannot exceed T")
+    crunch_full_pool = crunch_full_pool_until_step > 0
     checkpoint = os.path.abspath(checkpoint)
     outdir = os.path.abspath(outdir)
+    guided_positive_path = None
+    if guided_collect:
+        guided_positive_path = (
+            os.path.join(outdir, GUIDED_POSITIVE_STORE)
+            if guided_collect_store is None
+            else os.path.abspath(
+                guided_collect_store
+                if os.path.isabs(guided_collect_store)
+                else os.path.join(outdir, guided_collect_store)
+            )
+        )
     round_i = int(round_i)
     if round_i < 1:
         raise ValueError("round_i must be positive")
@@ -566,6 +757,7 @@ def collect(
     executed_shard = OS.ExecutedRoundShard(round_i)
     query_shard = BS.RoundShard(round_i)
     neutral_records = []
+    guided_positive_records = []
     traces = []
     counts = Counter()
     sigma_pool, sigma_selected, ess_values = [], [], []
@@ -603,6 +795,7 @@ def collect(
 
             selected_by_context = []
             acquisition_by_context = []
+            pool_sigma_by_context = []
             for context_index, replica in enumerate(live):
                 generator = torch.Generator(
                     device=features.device,
@@ -622,20 +815,40 @@ def collect(
                 )
                 selected_by_context.append(list(map(int, selected)))
                 acquisition_by_context.append(acquisition)
-                sigma_pool.extend(map(
-                    float,
-                    gp.acquisition_sigma(features[context_index])
-                    .detach().cpu(),
-                ))
+                pool_sigma = [
+                    float(value) for value in
+                    gp.acquisition_sigma(features[context_index]).detach().cpu()
+                ]
+                pool_sigma_by_context.append(pool_sigma)
+                sigma_pool.extend(pool_sigma)
                 sigma_selected.extend(
                     float(row["chosen_sigma"]) for row in acquisition
                 )
                 ess_values.extend(float(row["ess_norm"]) for row in acquisition)
 
+            # Crunch-band arm: verify the whole K pool instead of only the
+            # B=4 GP picks.  The executed selector is unchanged; the admissible
+            # set is simply no longer truncated by the acquisition budget.
+            full_pool_active = (
+                crunch_full_pool and step < crunch_full_pool_until_step
+            )
+            extra_by_context = [
+                (
+                    [
+                        candidate_id for candidate_id in range(cfg.K)
+                        if candidate_id not in set(selected_by_context[index])
+                    ]
+                    if full_pool_active else []
+                )
+                for index in range(len(live))
+            ]
             base_tasks = []
             for context_index, replica in enumerate(live):
                 prepared = replica.prepared
-                for candidate_id in selected_by_context[context_index]:
+                for candidate_id in (
+                    *selected_by_context[context_index],
+                    *extra_by_context[context_index],
+                ):
                     base_tasks.append((
                         context_index,
                         candidate_id,
@@ -645,6 +858,11 @@ def collect(
                         prepared["ped_vel"],
                         replica.gamma,
                     ))
+            if full_pool_active:
+                counts["crunch_full_pool_verifier_queries"] += sum(
+                    len(values) for values in extra_by_context
+                )
+                counts["crunch_full_pool_contexts"] += len(live)
             base_results = list(executor.map(SM.verify_in_worker, base_tasks))
             counts["base_verifier_queries"] += len(base_tasks)
             base_by_context = defaultdict(dict)
@@ -686,6 +904,20 @@ def collect(
                         mode=source["mode"],
                         source="base_B",
                     ))
+                for candidate_id in extra_by_context[context_index]:
+                    source = all_rows[candidate_id]
+                    base_rows.append(_query_row(
+                        candidate_id,
+                        source["controls"],
+                        source["x0"],
+                        base_by_context[context_index][candidate_id],
+                        acquisition_step=-1,
+                        sigma=pool_sigma_by_context[context_index][
+                            candidate_id
+                        ],
+                        mode=source["mode"],
+                        source="base_full_pool",
+                    ))
                 base_choice = _admissible(
                     base_rows, selector, prepared, replica.gamma,
                 )
@@ -697,6 +929,8 @@ def collect(
                     trigger=trigger,
                     repair_rows=[],
                     repair_diagnostics=None,
+                    proactive_rows=[],
+                    proactive_diagnostics=None,
                 ))
                 if trigger is not None:
                     repair_indices.append(context_index)
@@ -748,6 +982,105 @@ def collect(
                 for context_index, candidate_id, result in repair_results
             }
 
+            # Proactive early-step guided harvest (collection only).  Nothing
+            # below this point may change execution, selection, repair
+            # triggering, D0, or the GP; the block is skipped entirely when
+            # guided_collect_until_step == 0.
+            proactive_active = (
+                guided_collect and step < guided_collect_until_step
+            )
+            proactive_result_lookup = {}
+            if proactive_active:
+                proactive_tasks = []
+                for context_index, replica in enumerate(live):
+                    values = prepared_contexts[context_index]
+                    if (
+                        guided_generator == "same_latent"
+                        and values["trigger"] is not None
+                    ):
+                        # The trigger path already regenerated exactly these
+                        # latents through the identical frozen policy, so its
+                        # rows are reused instead of generating them twice.
+                        continue
+                    selected = selected_by_context[context_index]
+                    if guided_generator == "same_latent":
+                        guided, diagnostics = KR.same_latent_guided_controls(
+                            policy,
+                            contexts[context_index],
+                            replica.prepared["state"],
+                            replica.prepared["ped_xy"],
+                            replica.prepared["ped_vel"],
+                            replica.gamma,
+                            x0[context_index, selected],
+                            nfe=cfg.nfe,
+                            collect_diagnostics=False,
+                        )
+                        plans = guided.detach().cpu().numpy()
+                        parents = [int(value) for value in selected]
+                        offsets = list(map(int, selected))
+                        steps = list(range(len(parents)))
+                        sigmas = [
+                            float(
+                                acquisition_by_context[context_index][index][
+                                    "chosen_sigma"
+                                ]
+                            )
+                            for index in steps
+                        ]
+                    else:
+                        plans, diagnostics = KR.locked_full_kazuki_plans(
+                            policy,
+                            contexts[context_index],
+                            replica.prepared["state"],
+                            replica.prepared["ped_xy"],
+                            replica.prepared["ped_vel"],
+                            replica.gamma,
+                            topk=guided_topk,
+                            seed=FA._keyed_seed(
+                                int(audit_seed),
+                                round_i,
+                                replica.scenario_id,
+                                f"{replica.gamma:.8f}",
+                                step,
+                                "kazuki_full_proactive",
+                            ),
+                        )
+                        parents = [None] * len(plans)
+                        offsets = list(range(len(plans)))
+                        steps = [-1] * len(plans)
+                        sigmas = [0.0] * len(plans)
+                    values["proactive_diagnostics"] = diagnostics
+                    for offset, parent, acquisition_step, sigma, controls in zip(
+                        offsets, parents, steps, sigmas, plans,
+                    ):
+                        proactive_id = 2 * cfg.K + int(offset)
+                        proactive_tasks.append((
+                            context_index,
+                            proactive_id,
+                            replica.prepared["state"],
+                            controls,
+                            replica.prepared["ped_xy"],
+                            replica.prepared["ped_vel"],
+                            replica.gamma,
+                        ))
+                        values["proactive_rows"].append(dict(
+                            proactive_id=proactive_id,
+                            parent_candidate_id=parent,
+                            acquisition_step=int(acquisition_step),
+                            sigma=float(sigma),
+                            controls=controls,
+                        ))
+                proactive_results = list(
+                    executor.map(SM.verify_in_worker, proactive_tasks)
+                )
+                counts["guided_proactive_verifier_queries"] += len(
+                    proactive_tasks
+                )
+                proactive_result_lookup = {
+                    (int(context_index), int(candidate_id)): result
+                    for context_index, candidate_id, result in proactive_results
+                }
+
             for context_index, replica in enumerate(live):
                 prepared = replica.prepared
                 values = prepared_contexts[context_index]
@@ -764,7 +1097,11 @@ def collect(
                 )
                 for row in values["base_rows"]:
                     _add_sidecar_query(query_shard, sidecar_context_id, row)
-                    counts[f"base_{FA._result_label(row['result'])}"] += 1
+                    prefix = (
+                        "base" if row["source"] == "base_B"
+                        else "crunch_full_pool"
+                    )
+                    counts[f"{prefix}_{FA._result_label(row['result'])}"] += 1
 
                 repair_rows = []
                 for repair in values["repair_rows"]:
@@ -859,6 +1196,82 @@ def collect(
                     trap_fail_closed=False,
                     negative_reasons=[],
                 )
+                if proactive_active:
+                    reused = (
+                        guided_generator == "same_latent"
+                        and values["trigger"] is not None
+                    )
+                    if not reused:
+                        harvested = []
+                        for proactive in values["proactive_rows"]:
+                            parent = proactive["parent_candidate_id"]
+                            proactive_id = int(proactive["proactive_id"])
+                            row = _query_row(
+                                proactive_id,
+                                proactive["controls"],
+                                (
+                                    None if parent is None
+                                    else values["all_rows"][int(parent)]["x0"]
+                                ),
+                                proactive_result_lookup[
+                                    (context_index, proactive_id)
+                                ],
+                                acquisition_step=proactive["acquisition_step"],
+                                sigma=proactive["sigma"],
+                                mode=BE.classify_candidate(
+                                    SM.rollout_positions(
+                                        prepared["state"],
+                                        proactive["controls"],
+                                    ),
+                                    SM.predict_pedestrians(
+                                        prepared["ped_xy"],
+                                        prepared["ped_vel"],
+                                        cfg.H,
+                                    ),
+                                ),
+                                source=GUIDED_SOURCES[guided_generator],
+                                parent_candidate_id=parent,
+                            )
+                            harvested.append(row)
+                            counts[
+                                "guided_proactive_"
+                                f"{FA._result_label(row['result'])}"
+                            ] += 1
+                        values["proactive_rows"] = harvested
+                    else:
+                        harvested = repair_rows
+                        counts["guided_proactive_reused_repair_rows"] += len(
+                            harvested
+                        )
+                    for row in harvested:
+                        outcome = row["result"]
+                        if (
+                            not outcome.get("resolved")
+                            or int(outcome.get("y", -1)) != 1
+                            or not bool(outcome.get("full_h"))
+                            or int(outcome.get("terminal_step", -1)) != 10
+                        ):
+                            continue
+                        guided_positive_records.append(
+                            _guided_positive_record(
+                                len(guided_positive_records),
+                                replica,
+                                prepared,
+                                row,
+                                step=step,
+                                round_i=round_i,
+                                generator=guided_generator,
+                                repair_trigger=values["trigger"],
+                                reused_from_repair=bool(reused),
+                                selected_for_execution=row is chosen,
+                            )
+                        )
+                        counts["guided_positive_records"] += 1
+                    trace["guided_proactive_rows"] = (
+                        [] if reused else values["proactive_rows"]
+                    )
+                    trace["guided_proactive_generator"] = str(guided_generator)
+                    trace["guided_proactive_reused_repair"] = bool(reused)
                 if chosen is None:
                     replica.alive = False
                     replica.status = "repair_nvp"
@@ -1045,8 +1458,32 @@ def collect(
         raise RuntimeError("total executed-action accounting mismatch")
     if not bool(neutral_continuation) and neutral_records:
         raise RuntimeError("default fail-closed arm produced neutral records")
-    if int(counts["base_verifier_queries"]) != len(query_shard.contexts) * cfg.B:
+    if int(counts["base_verifier_queries"]) != (
+        len(query_shard.contexts) * cfg.B
+        + int(counts["crunch_full_pool_verifier_queries"])
+    ):
         raise RuntimeError("base B=4 accounting mismatch")
+    if not crunch_full_pool and int(
+        counts["crunch_full_pool_verifier_queries"]
+    ):
+        raise RuntimeError("full-pool queries issued while disabled")
+    if crunch_full_pool and int(
+        counts["crunch_full_pool_verifier_queries"]
+    ) != int(counts["crunch_full_pool_contexts"]) * (cfg.K - cfg.B):
+        raise RuntimeError("full-pool query accounting mismatch")
+    if not guided_collect and guided_positive_records:
+        raise RuntimeError("guided-positive rows collected while disabled")
+    if guided_collect:
+        if len(guided_positive_records) != int(
+            counts["guided_positive_records"]
+        ):
+            raise RuntimeError("guided-positive accounting mismatch")
+        if int(counts["guided_proactive_verifier_queries"]) != (
+            int(counts["guided_proactive_verifier_positive"])
+            + int(counts["guided_proactive_verifier_negative"])
+            + int(counts["guided_proactive_verifier_error"])
+        ):
+            raise RuntimeError("proactive guided query accounting mismatch")
 
     os.makedirs(outdir)
     executed_path = os.path.join(outdir, "executed_round.pt")
@@ -1056,6 +1493,16 @@ def collect(
     query_manifest = query_shard.save(query_path)
     neutral_manifest = _save_neutral_records(
         neutral_path, neutral_records, round_i=round_i,
+    )
+    guided_positive_manifest = (
+        _save_guided_positive_records(
+            guided_positive_path,
+            guided_positive_records,
+            round_i=round_i,
+            until_step=guided_collect_until_step,
+            generator=guided_generator,
+        )
+        if guided_collect else None
     )
     outcomes = [dict(
         scenario_id=int(replica.scenario_id),
@@ -1122,6 +1569,55 @@ def collect(
         neutral_shard=neutral_manifest,
         traces=traces,
     )
+    guided_collect_manifest = None
+    if guided_collect:
+        guided_collect_manifest = dict(
+            until_step=int(guided_collect_until_step),
+            store=os.path.abspath(guided_positive_path),
+            generator=str(guided_generator),
+            topk=(
+                int(cfg.B) if guided_generator == "same_latent"
+                else int(guided_topk)
+            ),
+            candidate_id_base=int(2 * cfg.K),
+            population="Gplus",
+            policy=(
+                "at every live step t < until_step the selected guided "
+                "generator proposes plans at the current context and the "
+                "exact verifier labels them; certified positives are stored "
+                "as G+ and never touch execution, selection, repair "
+                "triggering, D0, or the GP"
+            ),
+            trigger_reuse=(
+                "same_latent: contexts whose genuine repair trigger fired at "
+                "the same step reuse the identical trigger rows (same "
+                "latents, same frozen policy) instead of regenerating them; "
+                "kazuki_full: an independent external controller, so every "
+                "live context is harvested and no trigger row is reused"
+            ),
+            generator_manifest=(
+                KR.manifest() if guided_generator == "same_latent"
+                else KR.full_controller_manifest()
+            ),
+        )
+        bundle["guided_collect"] = guided_collect_manifest
+        bundle["guided_positive_shard"] = guided_positive_manifest
+    crunch_manifest = None
+    if crunch_full_pool:
+        crunch_manifest = dict(
+            until_step=int(crunch_full_pool_until_step),
+            K=int(cfg.K),
+            B=int(cfg.B),
+            extra_queries=int(counts["crunch_full_pool_verifier_queries"]),
+            policy=(
+                "for t < until_step every one of the K proposals is verified "
+                "and joins the admissible set; the GP still records its B "
+                "picks and the executed selector is unchanged, so this arm "
+                "removes only the acquisition-budget truncation"
+            ),
+            external_teacher=False,
+        )
+        bundle["crunch_full_pool"] = crunch_manifest
     trace_path = os.path.join(outdir, "repair_trace.pt")
     FA._save_torch(trace_path, bundle)
     marker = dict(
@@ -1143,6 +1639,11 @@ def collect(
         gp_diagnostics=gp.diagnostics(),
         acquisition=bundle["protocol"]["acquisition"],
     )
+    if guided_collect:
+        marker["guided_collect"] = guided_collect_manifest
+        marker["guided_positive_shard"] = guided_positive_manifest
+    if crunch_full_pool:
+        marker["crunch_full_pool"] = crunch_manifest
     FA._write_json(os.path.join(outdir, "COMPLETE.json"), marker)
     return trace_path
 
@@ -1172,6 +1673,45 @@ def main(argv=None):
     parser.add_argument("--ell", type=float, default=DEFAULT_ELL)
     parser.add_argument("--ess-target", type=float, default=0.5)
     parser.add_argument("--neutral-continuation", action="store_true")
+    parser.add_argument(
+        "--guided-collect-until-step", type=int, default=0,
+        help=(
+            "0 disables the proactive guided harvest entirely (byte-identical "
+            "control); a positive value runs the locked guidance on every "
+            "live context at steps t < value and stores the exact-verifier "
+            "certified positives as the collection-only G+ population"
+        ),
+    )
+    parser.add_argument(
+        "--guided-collect-store", default=None,
+        help=(
+            "optional G+ store path; relative names resolve inside --outdir "
+            f"(default {GUIDED_POSITIVE_STORE})"
+        ),
+    )
+    parser.add_argument(
+        "--guided-generator", choices=GUIDED_GENERATORS,
+        default=DEFAULT_GUIDED_GENERATOR,
+        help=(
+            "same_latent regenerates the selected B=4 latents under the "
+            "locked guidance; kazuki_full runs the complete locked external "
+            "Kazuki controller (200 samples, 10 elites, 200 MPPI copies) at "
+            "the context and keeps its top --guided-topk refined modes"
+        ),
+    )
+    parser.add_argument(
+        "--guided-topk", type=int, default=DEFAULT_GUIDED_TOPK,
+        help="kazuki_full only: refined elite modes verified per context",
+    )
+    parser.add_argument(
+        "--crunch-full-pool-until-step", type=int, default=0,
+        help=(
+            "0 disables the arm (byte-identical control); a positive value "
+            "verifies all K=16 proposals instead of the GP's B=4 for every "
+            "step below it, removing the finite-B acquisition truncation "
+            "without any external teacher"
+        ),
+    )
     args = parser.parse_args(argv)
     collect(
         args.checkpoint,
@@ -1186,6 +1726,11 @@ def main(argv=None):
         ell=args.ell,
         ess_target=args.ess_target,
         neutral_continuation=args.neutral_continuation,
+        guided_collect_until_step=args.guided_collect_until_step,
+        guided_collect_store=args.guided_collect_store,
+        guided_generator=args.guided_generator,
+        guided_topk=args.guided_topk,
+        crunch_full_pool_until_step=args.crunch_full_pool_until_step,
         T=180,
         outdir=args.outdir,
     )
