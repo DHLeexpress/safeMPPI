@@ -121,6 +121,50 @@ figure `/home/dohyun/projects/cfm_mppi/claude_fastlab_6c99a05/trackD_head_only_d
 new script `claude_head_only_offline.py`, pilot flags
 `--train-scope/--head-lr/--demo-frac/--demo-dataset` (defaults byte-identical).
 
+## Track E addendum: 2.5-h sprint — crunch harvest at scale, freeze-depth ×
+aggressive dose × dedup × demo grid, teacher-overlay figures (user-directed)
+
+**E1 harvest ×3** (topk 4, fresh scenario pairs 260014–19, pretrained policy,
+encoder+trunk SHAs unmoved): G+ pool 929 → **3,293** (2.5×), D+ 2,620,
+D0 1,278. Structure: crunch band is scenario-pair-specific (two pairs collapse
+to ~0 certified contexts at steps 10–19); teacher yield tracks base-policy
+competence (46.5%→26.7% as pairs get harder); topk-4 multiplicity nearly free
+(79% of certified contexts return all 4 elite modes; rank-0 not privileged).
+
+**E2 grid** (6 arms, per-microbatch Adam ×20 epochs = ~500 steps vs canonical
+1; scopes S1 head 5,140 → S2 +block1 137,236 → S3 +trunk 311,572 → S4
+full 317,060; G+ deduped to true Kazuki-rank-0 per context 929→491; demo_frac
+.5 vs 0; paired M20): **no arm beats r0 on any metric.** Best = E2b
+(S2+top1+demo50) SR .700/CR .300 — McNemar p=1.00/.875 vs r0 = exactly
+indistinguishable. Axis decomposition: **demo dominant** (E2f demo0: SR −.114
+p=.033, 4× ID-drift — demos are the only thing preventing significant damage);
+**dedup real but only protective** (removes ~2/3 of mode-averaging harm);
+**depth null** for outcomes — its extra fit converts monotonically into
+Validity loss (−.004→−.027, paired CI excluding 0 from S3). Aggressive dose
+worsens everything. The Track-D law generalizes across every surgery:
+stabilizers shrink updates toward zero; harmful → inert, never inert → useful.
+
+**E3 figures** (ESS-panel style + tested teacher samples): single-row r0
+`trackE_gplus_support_r0.png` and three-row
+`trackE_gplus_support_r0_E2b_E2f.png` (rows r0 / E2b inert-best / E2f
+unstabilized; columns γ 0.1/0.3/0.5/1.0; blue D+, magenta D0, hollow green
+triangles = certified teacher windows + their planned fans). Findings visible
+in the figure: green triangles sit directly on the magenta D0 chains (the
+teacher certifies exactly where finite-B acquisition failed); teacher fans
+splay outside every policy's executed support; E2b = r0 truncated to stubs
+(early collisions, steps 28–36); E2f = stalling/dithering (6 trap-fail-closed,
+1,128 executed steps, coverage by wandering); both trained arms LOWER the
+teacher-certifiability of their own visited states (44.1% → 37.5%/36.9%,
+halved at γ0.1).
+
+**Sprint conclusion.** With capacity, depth, dose, dedup, stability, and data
+volume all individually tested, distillation of certified windows into this
+policy is bounded at "indistinguishable from pretrained" — the training-side
+search is exhausted at the window-imitation objective itself. Remaining live
+branches unchanged: deployment-pivot (verifier-in-loop as the object) and a
+genuinely different objective (distributional/DAgger-style, or closed-loop
+returns), not more of this one.
+
 ## Branch options (decision needed)
 
 1. **Pivot the evaluated object to verifier-gated deployment** (the loop's
