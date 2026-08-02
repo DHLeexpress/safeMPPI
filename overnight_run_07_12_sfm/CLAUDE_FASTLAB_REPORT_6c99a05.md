@@ -240,3 +240,35 @@ Held ready but not launched (pre-registered, committed): the 4-arm 50-round
 campaign (control / pgm / noD0 / ID-anchor) from
 `CLAUDE_NEUTRAL_PREREGISTRATION_6c99a05.md` — superseded by the fast-lab
 findings unless the direction call revives it.
+
+## Track G addendum: closed-loop refit campaign — M50 confirmed double win
+
+Design: 2×2 arms {margin, progress_gated_margin} × {cold, warm pool}, 8 rounds
+each, per-round refit-from-pretrained on the cumulative executed-Dirac pool
+with the confirmed F1e recipe (byte-identity of the pool builder proven by
+reproducing F1e.pt sha-exactly from the warm shards). Milestone M20 at rounds
+2/5/8; pre-registered selection → winner cold_pgm round 8; confirmation on
+virgin bank ep0 850000 / noise 20260806 (350 paired episodes × 3 checkpoints).
+
+M50: r0 SR .6657/CR .3314/TO .0029/Val .5824/clr .1166/ttg 8.70;
+offline-F1e (r1) .7229/.2743/.0029/.6466/.1201/9.46;
+closed-loop r8 .6543/.3200/.0257/.7142/.1392/10.66.
+
+Paired r8 vs r0: **Validity +.132 [+.099,+.165] and clearance +.023
+[+.006,+.039] both CI-clean** — the first two-primary-metric confirmed win of
+the campaign — with SR/CR unchanged (p=.81/.81), timeout inside the liveness
+gate, γ-trend eligible 4/4. Confirmed cost: ttg +1.95 [+1.62,+2.30].
+Paired r8 vs r1: Val +.068 / clr +.019 CI-clean but SR −.069 (p=.048) —
+the loop buys certifiability partly with success rate.
+r1 vs r0 (second virgin-bank replication of offline-F1e): Val +.064
+[+.046,+.083]; SR +.057 (p=.057) / CR −.057 (p=.054) — same magnitudes as
+bank 840000 (p=.100); consistent across two independent banks, each just
+short of the pre-registered bar alone. ttg +0.76.
+
+Reading: rounds dial a Validity-vs-time frontier (~.07 Val per second of ttg;
+r2 +.065/+1.12 → r8 +.132/+1.95). Two confirmed operating points now exist:
+offline-F1e (liveness-preserving, thrice-replicated Val +.06, SR/CR favorable
+at p≈.05×2 banks) and closed-loop r8 (certifiability-maximal, Val+clr
+CI-clean, SR/CR flat). Time-to-goal remains structurally unpaid by
+certified-window imitation. Artifacts: fastlab/closed_loop/ (4 campaign roots,
+trackG_pids, m50_confirm/), driver claude_closed_loop_refit.py (committed).
