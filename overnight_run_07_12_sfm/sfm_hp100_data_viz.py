@@ -331,6 +331,17 @@ def _draw_world(axis, rows: dict, validated: dict, index: int, gamma: float) -> 
     axis.plot(target[:, 0], target[:, 1], color=ORANGE, lw=1.6, marker=".", ms=2.6, zorder=7)
 
     sensing = float(validated["sensing_radius"])
+    ray_theta = -np.pi + (np.arange(ANGULAR_RAYS) + .5) * (
+        2.0 * np.pi / ANGULAR_RAYS
+    )
+    ray_ends = state[:2][None] + sensing * np.stack(
+        (np.cos(ray_theta), np.sin(ray_theta)), axis=1
+    )
+    for endpoint in ray_ends:
+        axis.plot(
+            [state[0], endpoint[0]], [state[1], endpoint[1]],
+            color="#56B4E9", lw=.28, alpha=.14, zorder=1.8,
+        )
     base_A, base_b = _base_geometry(state[:2], sensing)
     base_polygon = BV.halfspace_polygon(base_A, base_b)
     nominal_polygon = BV.halfspace_polygon(geometry["A"], geometry["b"])
@@ -388,6 +399,7 @@ def _draw_world(axis, rows: dict, validated: dict, index: int, gamma: float) -> 
         Line2D([], [], color=BLUE, lw=1.6, label="velocity-aware nominal polytope"),
         Line2D([], [], color=BLUE, lw=.6, label="nominal level sets h=1..10"),
         Line2D([], [], color=GRAY, lw=1.0, ls="--", label="K=16 artificial outer support"),
+        Line2D([], [], color="#56B4E9", lw=.7, label="32 observation rays (not faces)"),
     ], loc="lower right", fontsize=6.6, framealpha=.92)
 
 
