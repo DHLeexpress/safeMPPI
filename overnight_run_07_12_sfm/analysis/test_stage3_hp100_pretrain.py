@@ -68,6 +68,34 @@ def test_loader_is_exact_500_lineage_disjoint_and_lazy_hp10(tmp_path):
     assert not hasattr(dataset, "hp10")
 
 
+def test_loader_uses_one_validation_scenario_bank_across_gammas(tmp_path):
+    _write_one_gamma_dataset(tmp_path)
+    first_path = tmp_path / "sfm_hp100_windows_g0.1.pt"
+    second_path = tmp_path / "sfm_hp100_windows_g0.2.pt"
+    second = torch.load(first_path, weights_only=False)
+    second["gamma"] = 0.2
+    second["episode"] = second["episode"] + 25
+    torch.save(second, second_path)
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    manifest["files"].append({
+        "gamma": 0.2, "file": second_path.name,
+        "sha256": P.sha256_file(second_path),
+    })
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+
+    train, val, metadata = P.load_split(
+        tmp_path, gammas=(0.1, 0.2),
+        expected_manifest_sha256=P.sha256_file(tmp_path / "manifest.json"),
+        require_canonical=False,
+    )
+    shared = set(metadata["shared_validation_episodes"])
+    assert len(shared) == 50 and shared <= set(range(25, 500))
+    assert set(val.episodes.tolist()) == shared
+    assert shared.isdisjoint(set(train.episodes.tolist()))
+    assert metadata["files"]["0.1"]["val_episodes"] == sorted(shared)
+    assert metadata["files"]["0.2"]["val_episodes"] == sorted(shared)
+
+
 def test_loader_rejects_less_than_500_successful_lineages(tmp_path):
     _write_one_gamma_dataset(tmp_path)
     path = tmp_path / "sfm_hp100_windows_g0.1.pt"

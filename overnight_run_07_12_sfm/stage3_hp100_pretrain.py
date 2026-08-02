@@ -360,7 +360,7 @@ def load_split(
     expected_manifest_sha256: str,
     require_canonical: bool = True,
 ):
-    """Load ID files and split successful lineages within each gamma 90/10."""
+    """Load ID files with one scenario-disjoint validation bank across gammas."""
     if not math.isclose(float(val_frac), 0.1, rel_tol=0.0, abs_tol=1.0e-12):
         raise ValueError("canonical HP100 pretraining requires a 90/10 trajectory split")
     manifest, manifest_path, manifest_sha = _manifest(dataset)
@@ -371,7 +371,8 @@ def load_split(
     if require_canonical:
         _validate_canonical_manifest(manifest, Path(dataset).resolve())
     file_rows = _manifest_files(manifest)
-    sources, train_gamma, train_rows, val_gamma, val_rows = [], [], [], [], []
+    sources, source_rows = [], []
+    train_gamma, train_rows, val_gamma, val_rows = [], [], [], []
     split_meta = {}
     for gamma_index, gamma in enumerate(map(float, gammas)):
         path = _gamma_path(dataset, gamma)
@@ -389,14 +390,34 @@ def load_split(
             _validate_source_manifest_binding(payload, row, path, gamma)
         payload["_history_indices"] = _history_indices(payload["episode"], payload["step"])
         sources.append(payload)
+        source_rows.append(dict(
+            gamma_index=gamma_index, gamma=gamma, path=path,
+            sha256=actual_hash, payload=payload,
+            unique=torch.unique(payload["episode"].to(torch.int64), sorted=True),
+        ))
 
-        unique = torch.unique(payload["episode"].to(torch.int64), sorted=True)
-        generator = torch.Generator().manual_seed(
-            int(seed) + 1009 * gamma_index + int(round(1000 * gamma))
+    common = set(source_rows[0]["unique"].tolist())
+    for source_row in source_rows[1:]:
+        common &= set(source_row["unique"].tolist())
+    n_val = int(round(SUCCESSFUL_LINEAGES_PER_GAMMA * float(val_frac)))
+    if len(common) < n_val:
+        raise RuntimeError(
+            f"only {len(common)} successful scenarios are shared across all gammas; "
+            f"need {n_val} for the globally disjoint validation bank"
         )
-        shuffled = unique[torch.randperm(len(unique), generator=generator)]
-        n_val = int(round(SUCCESSFUL_LINEAGES_PER_GAMMA * float(val_frac)))
-        val_episodes, train_episodes = shuffled[:n_val], shuffled[n_val:]
+    common = torch.as_tensor(sorted(common), dtype=torch.int64)
+    generator = torch.Generator().manual_seed(int(seed))
+    val_episodes = common[torch.randperm(len(common), generator=generator)[:n_val]]
+    val_episodes = torch.sort(val_episodes).values
+
+    for source_row in source_rows:
+        gamma_index = source_row["gamma_index"]
+        gamma = source_row["gamma"]
+        path = source_row["path"]
+        actual_hash = source_row["sha256"]
+        payload = source_row["payload"]
+        unique = source_row["unique"]
+        train_episodes = unique[~torch.isin(unique, val_episodes)]
         episodes = payload["episode"].to(torch.int64)
         is_val = torch.isin(episodes, val_episodes)
         local_val = torch.nonzero(is_val, as_tuple=False).flatten()
@@ -417,10 +438,11 @@ def load_split(
     metadata = {
         "manifest": str(manifest_path), "manifest_sha256": manifest_sha,
         "files": split_meta, "split_seed": int(seed), "val_fraction": float(val_frac),
+        "shared_validation_episodes": list(map(int, val_episodes.tolist())),
         "required_successful_lineages_per_gamma": SUCCESSFUL_LINEAGES_PER_GAMMA,
         "split_semantics": (
-            "successful-demonstration-lineage-disjoint within each gamma; "
-            "not claimed scenario-disjoint across gammas"
+            "one shared set of 50 successful scenario IDs is validation-only "
+            "for every gamma; no validation scenario appears in any training gamma"
         ),
     }
     return train, val, metadata
@@ -861,7 +883,7 @@ def main() -> None:
                 noise_seed=int(args.confirm_noise_seed), temperature=1.0,
             ),
             "semantics": (
-                "top within-gamma lineage-disjoint ID-validation checkpoints -> "
+                "top globally scenario-disjoint ID-validation checkpoints -> "
                 "matched-ID M10 screen -> disjoint matched-ID M50 second-stage selection "
                 "(not an untouched confirmation); OOD forbidden"
             ),
@@ -988,7 +1010,7 @@ def main() -> None:
         policy_out,
         extra={
             "selected_by": (
-                "within-gamma successful-lineage-disjoint ID validation + "
+                "globally scenario-disjoint ID validation + "
                 "fixed matched-ID raw-temp-1 M10 screen + disjoint M50 finalist selection"
             ),
             "selected_gate": selected,
