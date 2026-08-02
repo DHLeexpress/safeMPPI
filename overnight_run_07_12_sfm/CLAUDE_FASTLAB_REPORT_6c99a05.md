@@ -272,3 +272,48 @@ at p≈.05×2 banks) and closed-loop r8 (certifiability-maximal, Val+clr
 CI-clean, SR/CR flat). Time-to-goal remains structurally unpaid by
 certified-window imitation. Artifacts: fastlab/closed_loop/ (4 campaign roots,
 trackG_pids, m50_confirm/), driver claude_closed_loop_refit.py (committed).
+
+## Track H addendum: 30-round expansion campaign (3 arms, 90 rounds, M20-monitored)
+
+Arms (cold, refit-from-pretrained, F1e recipe, demo_frac .5 expert mixing,
+scenarios 260036-95, M20 milestones every 3 rounds): pgm_long (no filter),
+expertcost (safemppi_cost selector + success-only pool — first-ever run of
+that selector, verified end-to-end), pgm_successonly.
+
+Headlines:
+- Pre-registered winner: **expertcost r12** — the campaign's only 4/4-win row
+  (SR .7429/CR .2500/TO .0071/Val .6178/clr .1371/ttg 8.632, trend PASS) but
+  every delta inside noise (Val CI [−.007,+.027]; SR p=.405; CR p=.383) — a
+  statistical tie with r0 carrying clean timeouts and the best γ-monotonicity.
+- pgm_long: Validity CI-clean positive at **10/10 milestones** (+.031→+.142)
+  but liveness collapses: TO→.243 (r24), SR significantly down at r9
+  (p=.009) and r24 (p=.0001); ttg +2.3..+3.8 s. Collection dynamics show the
+  mechanism: in-gather successes 16→0→0, trap_fail_closed 98→139, verifier
+  purity .69→.88 — **the loop learns to stop, not to arrive**.
+- pgm_successonly: discovered failure mode — PGM's fail-closed behavior ×
+  success-only admission deadlocks the loop (zero successes from r4, pool
+  frozen at 676 contexts / 3.6% keep, one checkpoint measured 10×).
+- expertcost is the only arm whose **collection** improves in liveness
+  (successes 62→76→76, keep-rate .745→.835, D+ volume stable) and is 10/10
+  γ-trend-eligible — but its eval metrics never move beyond noise, and its
+  Validity is mildly negative at 3 milestones.
+- **The Validity-vs-time frontier is not broken by round count**: exchange
+  rate stable at ~.04–.07 Val/s; all long-run points at/below the 3-round
+  references; offline-F1e remains efficiency-optimal (.0686 Val/s); beyond
+  ~round 12 everything is dominated. Inverse law across arms: the more an arm
+  moves Validity, the more it breaks γ-trend families (clearance/time
+  ordering), and vice versa.
+- γ-trend eligibility: expertcost 10/10, pgm_successonly 10/10 (trivially),
+  pgm_long 5/10 degrading with rounds (fails clearance_falls/time_falls,
+  never the CR family).
+
+Figures: trackH_trajectories.png, trackH_frontier.png (both locations).
+Artifacts: fastlab/expansion/{pgm_long,expertcost,pgm_successonly}/ +
+figs/ + PIDS.txt. Driver at 2f88d8a.
+
+CAMPAIGN CONCLUSION. With 122 closed-loop rounds now run across Tracks G+H,
+the expansion's long-run behavior is fully characterized: certified-window
+imitation saturates at Validity +.14 for ruinous liveness; the balanced
+optima live at small round counts (offline-F1e; cold_pgm r8 = the confirmed
+Val+clr double win; expertcost r12 = the liveness-safe tie). Sufficient
+rounds have been run; more rounds are measured to be strictly dominated.
