@@ -349,16 +349,20 @@ def evaluate(
     return compact, summarize(compact)
 
 
-def id_raw_gate(policy, *, M: int, ep0: int, device: str) -> dict:
+def id_raw_gate(
+    policy, *, M: int, ep0: int, device: str,
+    seed: int = DEFAULT_NOISE_SEED,
+) -> dict:
     rows, summary = evaluate(
         policy, scene_profile="matched_id", ep0=ep0, M=M, device=device,
-        with_validity=False,
+        seed=int(seed), with_validity=False,
     )
     del rows
     return dict(
-        bank="fixed trajectory-disjoint matched-ID raw temp=1",
+        bank="fixed matched-ID scenario bank, raw temp=1",
         ep0=int(ep0), M_per_gamma=int(M), NFE=NFE,
-        temperature=TEMPERATURE, pooled_SR=summary["pooled"]["SR"],
+        noise_seed=int(seed), temperature=TEMPERATURE,
+        pooled_SR=summary["pooled"]["SR"],
         pooled_CR=summary["pooled"]["CR"],
         per_gamma={
             gamma: dict(SR=cell["SR"], CR=cell["CR"])

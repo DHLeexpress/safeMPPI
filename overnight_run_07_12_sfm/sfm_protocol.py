@@ -27,6 +27,10 @@ LEGACY_VELOCITY_OOD_ENVIRONMENT = SS.scene_profile("legacy_velocity_ood")
 
 # Demonstrations are below 8,000. Every named bank is mutually disjoint.
 PRETRAIN_GATE_EP0 = 12_000
+# A second matched-ID bank used only after the M10 pretraining screen.  Its
+# episode IDs are disjoint from both the demonstration attempts (< 5,000) and
+# the screen above.
+PRETRAIN_CONFIRM_EP0 = 14_000
 EXPANSION_EP0 = 20_000
 SCREEN_EP0 = 50_000
 CONFIRM_EP0 = 80_000

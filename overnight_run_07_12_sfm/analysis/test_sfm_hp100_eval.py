@@ -47,9 +47,10 @@ def test_id_gate_is_raw_unit_temperature_and_matched_id(monkeypatch):
         return [], {"pooled": {"SR": 0.8, "CR": 0.2}, "per_gamma": cells}
 
     monkeypatch.setattr(E, "evaluate", fake_evaluate)
-    result = E.id_raw_gate(object(), M=3, ep0=12000, device="cpu")
+    result = E.id_raw_gate(object(), M=3, ep0=12000, device="cpu", seed=99)
     assert called["scene_profile"] == "matched_id"
     assert called["with_validity"] is False
+    assert called["seed"] == result["noise_seed"] == 99
     assert result["temperature"] == 1.0
     assert result["NFE"] == 8
     assert set(result["per_gamma"]) == {str(gamma) for gamma in E.SS.GAMMAS}
