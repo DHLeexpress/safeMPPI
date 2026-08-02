@@ -787,7 +787,7 @@ def exact_sfm_horizon_filter_action(humans, state, nominal_plan, candidate_plans
 
 
 def guided_generate(policy, ctx, state, goal, ped_pred, ped_vel, r_col, z_init, taus, cfg,
-                    collect_diagnostics=False):
+                    collect_diagnostics=False, rollout_fn=di_rollout_t):
     """Add goal/CBF reward gradients to the frozen learned field at every ODE integration step.
 
     Diagnostic runs also integrate an unguided copy from the *same* initial latent samples and ODE knots.  The
@@ -812,7 +812,7 @@ def guided_generate(policy, ctx, state, goal, ped_pred, ped_vel, r_col, z_init, 
                              if collect_diagnostics else None)
         x1 = (z + (1.0 - tau) * base).detach().requires_grad_(True)
         U1 = x1.reshape(N, H, 2) * float(policy.u_max)
-        pos, vel = di_rollout_t(state, U1, SS.DT)
+        pos, vel = rollout_fn(state, U1, SS.DT)
         r_cbf, cbf_terms = cbf_reward(pos, vel, ped_pred, ped_vel, r_col, cfg)
         r_goal = goal_reward(pos, goal)
         g_cbf, = torch.autograd.grad(r_cbf.sum(), x1, retain_graph=True)
@@ -856,8 +856,9 @@ def guided_generate(policy, ctx, state, goal, ped_pred, ped_vel, r_col, z_init, 
 
 
 @torch.no_grad()
-def flow_mppi_refine(policy, state, goal, ped_pred, r_col, U_gen, prev_U, cfg, collect_diagnostics=False):
-    pos, _ = di_rollout_t(state, U_gen, SS.DT)
+def flow_mppi_refine(policy, state, goal, ped_pred, r_col, U_gen, prev_U, cfg,
+                     collect_diagnostics=False, rollout_fn=di_rollout_t):
+    pos, _ = rollout_fn(state, U_gen, SS.DT)
     generated_cost = stage_cost_batch(pos, U_gen, goal, ped_pred, r_col, cfg, prev_U)
     n_elite = min(int(cfg.n_elite), len(U_gen))
     top = torch.topk(generated_cost, k=n_elite, largest=False).indices
@@ -865,12 +866,12 @@ def flow_mppi_refine(policy, state, goal, ped_pred, r_col, U_gen, prev_U, cfg, c
     pert = elites.repeat_interleave(int(cfg.n_copy), dim=0)
     pert = torch.clamp(pert + float(cfg.mppi_sigma) * torch.randn_like(pert),
                        -float(policy.u_max), float(policy.u_max))
-    ppos, _ = di_rollout_t(state, pert, SS.DT)
+    ppos, _ = rollout_fn(state, pert, SS.DT)
     pcost = stage_cost_batch(ppos, pert, goal, ped_pred, r_col, cfg, prev_U).reshape(E, int(cfg.n_copy))
     shift = pcost.min(dim=1, keepdim=True).values
     weight = torch.softmax(-(pcost - shift) / float(cfg.mppi_lambda), dim=1)
     refined = (weight[:, :, None, None] * pert.reshape(E, int(cfg.n_copy), *pert.shape[1:])).sum(1)
-    rpos, _ = di_rollout_t(state, refined, SS.DT)
+    rpos, _ = rollout_fn(state, refined, SS.DT)
     refined_cost = stage_cost_batch(rpos, refined, goal, ped_pred, r_col, cfg, prev_U)
     rclear = torch.linalg.vector_norm(rpos.unsqueeze(2) - ped_pred.unsqueeze(0), dim=3) - r_col
     refined_min_clear = rclear.amin(dim=(1, 2))

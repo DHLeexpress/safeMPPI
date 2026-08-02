@@ -10,6 +10,7 @@ SafeMPPI expert in the matched training environment (20 pedestrians,
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict
 import hashlib
 import inspect
@@ -17,6 +18,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import multiprocessing as mp
 
 import numpy as np
 import torch
@@ -289,6 +291,13 @@ def _atomic_torch_save(payload, path: Path) -> None:
     os.replace(temporary, path)
 
 
+def _atomic_json_save(payload: dict, path: Path) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with open(temporary, "w") as stream:
+        json.dump(payload, stream, indent=2, sort_keys=True)
+    os.replace(temporary, path)
+
+
 def _source_hashes() -> dict[str, str]:
     paths = {
         "generator": Path(__file__).resolve(),
@@ -317,6 +326,81 @@ def _git_provenance() -> dict:
     return dict(root=str(root), head=head, clean=not bool(status), status=status)
 
 
+def _collect_gamma(payload, rollout_fn=rollout_episode) -> tuple[dict, list[dict]]:
+    """Worker-safe collection for one gamma; writes only its own tensor file."""
+    (
+        output_dir, gamma, episode_start, successes_per_gamma,
+        max_attempts_per_gamma, device, T_max,
+    ) = payload
+    output = Path(output_dir).resolve()
+    path = output / f"sfm_hp100_windows_g{float(gamma)}.pt"
+    progress_path = output / f"collection_progress_g{float(gamma)}.json"
+    if path.exists():
+        raise FileExistsError(f"refusing to overwrite existing data: {path}")
+    if progress_path.exists():
+        raise FileExistsError(f"refusing to overwrite existing progress: {progress_path}")
+    accepted, summaries, successful_ids = [], [], []
+    episode = int(episode_start)
+    while (
+        len(successful_ids) < int(successes_per_gamma)
+        and len(summaries) < int(max_attempts_per_gamma)
+    ):
+        records, summary = rollout_fn(
+            int(episode), float(gamma), device=device, T_max=int(T_max)
+        )
+        summaries.append(summary)
+        if summary["success"]:
+            accepted.extend(records)
+            successful_ids.append(int(episode))
+        _atomic_json_save(dict(
+            status="HP100_GAMMA_COLLECTION_IN_PROGRESS",
+            gamma=float(gamma), accepted_successes=len(successful_ids),
+            target_successes=int(successes_per_gamma), attempted_episodes=len(summaries),
+            max_attempts=int(max_attempts_per_gamma), latest_episode=int(episode),
+            latest_outcome={
+                key: summary[key]
+                for key in ("success", "collision", "timeout", "steps", "min_clearance")
+            },
+        ), progress_path)
+        episode += 1
+    if len(successful_ids) != int(successes_per_gamma):
+        raise RuntimeError(
+            f"gamma {gamma} obtained {len(successful_ids)}/{successes_per_gamma} "
+            f"successful trajectories in {max_attempts_per_gamma} attempts"
+        )
+    tensors = pack_records(accepted)
+    successful_episodes = sorted({int(value) for value in tensors["episode"].tolist()})
+    if successful_episodes != successful_ids:
+        raise RuntimeError(f"gamma {gamma} packed lineage IDs disagree with success ledger")
+    packed = dict(
+        schema_version=SCHEMA_VERSION, success_only=True, gamma=float(gamma),
+        n_traj=len(successful_episodes), n_seeds=len(summaries),
+        episode_start=int(episode_start), episode_stop_exclusive=int(episode),
+        dynamics=DYN.contract(), **tensors,
+    )
+    _atomic_torch_save(packed, path)
+    _atomic_json_save(dict(
+        status="HP100_GAMMA_COLLECTION_COMPLETE",
+        gamma=float(gamma), accepted_successes=len(successful_ids),
+        target_successes=int(successes_per_gamma), attempted_episodes=len(summaries),
+        episode_range=[int(episode_start), int(episode)], data_file=path.name,
+        data_sha256=sha256_file(path),
+    ), progress_path)
+    row = dict(
+        gamma=float(gamma), file=path.name, sha256=sha256_file(path),
+        bytes=path.stat().st_size, windows=len(tensors["episode"]),
+        n_traj=len(successful_episodes), successful_episodes=successful_episodes,
+        attempted_episodes=len(summaries),
+        rejected_episodes=[
+            int(item["episode"]) for item in summaries if not bool(item["success"])
+        ],
+        episode_range=[int(episode_start), int(episode)],
+        progress_file=progress_path.name,
+        progress_sha256=sha256_file(progress_path),
+    )
+    return row, summaries
+
+
 def generate_dataset(
     output_dir,
     *,
@@ -328,6 +412,7 @@ def generate_dataset(
     T_max: int = T,
     rollout_fn=rollout_episode,
     expected_source_commit: str | None = None,
+    jobs: int = 1,
 ) -> dict:
     """Generate per-gamma successful-only files and an authenticated manifest."""
     output = Path(output_dir).resolve()
@@ -354,62 +439,31 @@ def generate_dataset(
         raise RuntimeError("canonical HP100 collection requires a clean frozen worktree")
     if canonical_request and expected_source_commit is None:
         raise RuntimeError("canonical HP100 collection requires --expected-source-commit")
-    file_rows = []
-    rollout_summaries = {}
-    for gamma in map(float, gammas):
-        path = output / f"sfm_hp100_windows_g{gamma}.pt"
-        if path.exists():
-            raise FileExistsError(f"refusing to overwrite existing data: {path}")
-        accepted, summaries, successful_ids = [], [], []
-        episode = int(episode_start)
-        while (
-            len(successful_ids) < int(successes_per_gamma)
-            and len(summaries) < int(max_attempts_per_gamma)
-        ):
-            records, summary = rollout_fn(
-                int(episode), gamma, device=device, T_max=int(T_max)
-            )
-            summaries.append(summary)
-            if summary["success"]:
-                accepted.extend(records)
-                successful_ids.append(int(episode))
-            episode += 1
-        if len(successful_ids) != int(successes_per_gamma):
-            raise RuntimeError(
-                f"gamma {gamma} obtained {len(successful_ids)}/{successes_per_gamma} "
-                f"successful trajectories in {max_attempts_per_gamma} attempts"
-            )
-        tensors = pack_records(accepted)
-        successful_episodes = sorted({int(value) for value in tensors["episode"].tolist()})
-        if successful_episodes != successful_ids:
-            raise RuntimeError(f"gamma {gamma} packed lineage IDs disagree with success ledger")
-        payload = dict(
-            schema_version=SCHEMA_VERSION,
-            success_only=True,
-            gamma=float(gamma),
-            n_traj=len(successful_episodes),
-            n_seeds=len(summaries),
-            episode_start=int(episode_start),
-            episode_stop_exclusive=int(episode),
-            dynamics=DYN.contract(),
-            **tensors,
-        )
-        _atomic_torch_save(payload, path)
-        file_rows.append(dict(
-            gamma=float(gamma),
-            file=path.name,
-            sha256=sha256_file(path),
-            bytes=path.stat().st_size,
-            windows=len(tensors["episode"]),
-            n_traj=len(successful_episodes),
-            successful_episodes=successful_episodes,
-            attempted_episodes=len(summaries),
-            rejected_episodes=[
-                int(row["episode"]) for row in summaries if not bool(row["success"])
-            ],
-            episode_range=[int(episode_start), int(episode)],
-        ))
-        rollout_summaries[str(gamma)] = summaries
+    gamma_values = tuple(map(float, gammas))
+    if int(jobs) < 1:
+        raise ValueError("jobs must be positive")
+    worker_payloads = [(
+        str(output), gamma, int(episode_start), int(successes_per_gamma),
+        int(max_attempts_per_gamma), str(device), int(T_max),
+    ) for gamma in gamma_values]
+    if int(jobs) > 1:
+        if rollout_fn is not rollout_episode:
+            raise ValueError("parallel collection requires the canonical rollout function")
+        context = mp.get_context("spawn")
+        with ProcessPoolExecutor(
+            max_workers=min(int(jobs), len(worker_payloads)), mp_context=context,
+        ) as executor:
+            results = list(executor.map(_collect_gamma, worker_payloads))
+    else:
+        results = [
+            _collect_gamma(worker_payload, rollout_fn=rollout_fn)
+            for worker_payload in worker_payloads
+        ]
+    results.sort(key=lambda result: result[0]["gamma"])
+    file_rows = [result[0] for result in results]
+    rollout_summaries = {
+        str(result[0]["gamma"]): result[1] for result in results
+    }
     manifest = dict(
         status="HP100_ID_DATASET_COMPLETE",
         schema_version=SCHEMA_VERSION,
@@ -436,6 +490,7 @@ def generate_dataset(
             T=int(T_max),
             goal=np.asarray(SS.GOAL, float).tolist(),
             pedestrian_radius=float(SS.R_PED),
+            sensing_radius=float(SS.R_SENSE),
         ),
         expert=dict(
             name=EXPERT.EXPERT_NAME,
@@ -462,6 +517,10 @@ def generate_dataset(
         files=file_rows,
         source_hashes=_source_hashes(),
         source_git=git,
+        parallelism=dict(
+            jobs=int(jobs), start_method=("spawn" if int(jobs) > 1 else "none"),
+            device=str(device), gamma_workers_are_independent=True,
+        ),
         rollout_summaries=rollout_summaries,
     )
     temporary = manifest_path.with_suffix(".json.tmp")
@@ -483,6 +542,7 @@ def main() -> None:
     )
     parser.add_argument("--gammas", type=float, nargs="+", default=SS.GAMMAS)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument("--expected-source-commit", default=None)
     parser.add_argument(
         "--smoke",
@@ -503,6 +563,7 @@ def main() -> None:
         gammas=args.gammas,
         device=args.device,
         expected_source_commit=args.expected_source_commit,
+        jobs=args.jobs,
     )
     print(json.dumps({
         "status": manifest["status"],

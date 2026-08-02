@@ -113,6 +113,12 @@ def test_small_cpu_dataset_smoke_writes_auditable_manifest(tmp_path):
     assert manifest["files"][0]["successful_episodes"] == [1]
     assert manifest["files"][0]["rejected_episodes"] == [0]
     assert manifest["files"][0]["episode_range"] == [0, 2]
+    progress_path = tmp_path / manifest["files"][0]["progress_file"]
+    progress = json.loads(progress_path.read_text())
+    assert progress["status"] == "HP100_GAMMA_COLLECTION_COMPLETE"
+    assert progress["accepted_successes"] == progress["target_successes"] == 1
+    assert progress["attempted_episodes"] == 2
+    assert manifest["files"][0]["progress_sha256"] == S.sha256_file(progress_path)
     data_path = tmp_path / "sfm_hp100_windows_g0.5.pt"
     payload = torch.load(data_path, map_location="cpu", weights_only=False)
     assert payload["hp"].shape == (1, 32, 100)
