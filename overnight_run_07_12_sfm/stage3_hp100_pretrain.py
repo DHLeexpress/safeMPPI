@@ -561,6 +561,8 @@ def _source_hashes() -> dict:
         "flow_policy": inspect.getmodule(GPS.FlowPolicy),
         "id_evaluator": importlib.import_module("sfm_hp100_eval"),
         "raw_integrator": importlib.import_module("sfm_b1_eval"),
+        "validity_evaluator": importlib.import_module("sfm_metrics2"),
+        "exact_verifier_polytope": importlib.import_module("verifier_polytope"),
     }
     result = {}
     for name, module in modules.items():

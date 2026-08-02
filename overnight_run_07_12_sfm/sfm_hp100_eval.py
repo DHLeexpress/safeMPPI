@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, field
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -396,6 +397,15 @@ def main(argv=None):
         checkpoint=os.path.abspath(args.checkpoint),
         checkpoint_sha256=sha256_file(args.checkpoint),
         architecture=checkpoint["config"], dynamics=DYN.contract(),
+        verifier=dict(
+            contract=VERIFY.verifier_manifest(),
+            evaluator_source=os.path.abspath(inspect.getsourcefile(VERIFY)),
+            evaluator_sha256=sha256_file(inspect.getsourcefile(VERIFY)),
+            polytope_source=os.path.abspath(
+                inspect.getsourcefile(VERIFY.VP)
+            ),
+            polytope_sha256=sha256_file(inspect.getsourcefile(VERIFY.VP)),
+        ),
         observation=HPF.contract() if hasattr(HPF, "contract") else dict(
             shape=[10, 32, 100], polytope_n_base=16,
         ),
