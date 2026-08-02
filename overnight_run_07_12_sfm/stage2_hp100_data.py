@@ -98,7 +98,9 @@ def _obstacles(ped_xy) -> np.ndarray:
     )
 
 
-def _assert_feature_matches_planner(hp, feature_geometry, planner_polytope, robot_xy):
+def _assert_feature_matches_planner(
+    hp, feature_geometry, planner_polytope, robot_xy, *, provenance="unknown"
+):
     """Fail closed unless the stored Hp raster is the planner's exact geometry."""
     if planner_polytope is None:
         raise RuntimeError("locked SafeMPPI expert did not expose its nominal polytope")
@@ -114,24 +116,33 @@ def _assert_feature_matches_planner(hp, feature_geometry, planner_polytope, robo
                 if actual.shape == expected.shape else float("inf")
             )
             raise RuntimeError(
-                f"Hp100/planner nominal polytope mismatch at {key}: max_delta={delta}"
+                "Hp100/planner nominal polytope mismatch "
+                f"at {key} ({provenance}): max_delta={delta}"
             )
 
+    # Raster provenance and planner provenance are separate checks.  The
+    # planner tuple and the persisted feature geometry are independently
+    # rounded to float32; normalizing by a very narrow face margin can amplify
+    # their sub-micrometre difference.  Reconstruct the raster from the exact
+    # geometry stored beside it, after proving above that this geometry matches
+    # the planner before normalization.
     center = np.asarray(robot_xy, np.float64).reshape(2)
     n_theta, n_r = HPF.HP100_SHAPE
     theta = -np.pi + (np.arange(n_theta) + 0.5) * 2.0 * np.pi / n_theta
     radius = (np.arange(n_r) + 0.5) * SS.R_SENSE / n_r
     directions = np.stack((np.cos(theta), np.sin(theta)), axis=1)
     points = center[None, None] + directions[:, None] * radius[None, :, None]
-    A = np.asarray(planner_geometry["A"], np.float64)
-    b = np.asarray(planner_geometry["b"], np.float64)
-    margins = np.asarray(planner_geometry["margins"], np.float64)
+    A = np.asarray(feature_geometry["A"], np.float64)
+    b = np.asarray(feature_geometry["b"], np.float64)
+    margins = np.asarray(feature_geometry["margins"], np.float64)
     expected_hp = ((b[None] - points.reshape(-1, 2) @ A.T) / margins[None]).min(axis=1)
-    expected_hp = np.clip(expected_hp, -1.0, 1.0).reshape(n_theta, n_r)
-    if not np.allclose(np.asarray(hp), expected_hp, rtol=1.0e-5, atol=1.0e-5):
-        delta = float(np.max(np.abs(np.asarray(hp) - expected_hp)))
+    expected_hp = np.clip(expected_hp, -1.0, 1.0).reshape(n_theta, n_r).astype(np.float32)
+    actual_hp = np.asarray(hp, np.float32)
+    if not np.array_equal(actual_hp, expected_hp):
+        delta = float(np.max(np.abs(actual_hp - expected_hp)))
         raise RuntimeError(
-            f"stored Hp100 raster disagrees with planner geometry: max_delta={delta}"
+            "stored Hp100 raster disagrees with its persisted geometry "
+            f"({provenance}): max_delta={delta}"
         )
 
 
@@ -205,7 +216,11 @@ def rollout_episode(
             return_rollouts=False,
         )
         _assert_feature_matches_planner(
-            hp, feature_geometry, info.get("polytope"), state[:2]
+            hp,
+            feature_geometry,
+            info.get("polytope"),
+            state[:2],
+            provenance=f"gamma={float(gamma):g},episode={int(episode)},step={int(step)}",
         )
         action = DYN.clip_action_numpy(
             action.detach().cpu().numpy().astype(np.float32).reshape(2)

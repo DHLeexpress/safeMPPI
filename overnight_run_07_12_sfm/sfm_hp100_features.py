@@ -78,16 +78,27 @@ def hp100_frame(
     A = _numpy(polytope.A).astype(np.float64, copy=False)
     b = _numpy(polytope.b).astype(np.float64, copy=False)
     margins = np.maximum(b - A @ center, 1.0e-3)
+    # The float32 geometry below is the persisted provenance contract.  Build
+    # the raster from exactly those persisted values so even very narrow faces
+    # remain reproducible; independently compare this geometry with the
+    # planner's tuple in the dataset collector.
+    stored_A = A.astype(np.float32, copy=False)
+    stored_b = b.astype(np.float32, copy=False)
+    stored_margins = margins.astype(np.float32, copy=False)
     flat = points.reshape(-1, 2)
-    hp = ((b[None] - flat @ A.T) / margins[None]).min(axis=1)
+    hp = (
+        (stored_b.astype(np.float64)[None]
+         - flat @ stored_A.astype(np.float64).T)
+        / stored_margins.astype(np.float64)[None]
+    ).min(axis=1)
     frame = np.clip(hp, -1.0, 1.0).reshape(HP100_SHAPE).astype(np.float32)
     if not return_geometry:
         return frame
     geometry = dict(
-        A=A.astype(np.float32, copy=False),
-        b=b.astype(np.float32, copy=False),
+        A=stored_A,
+        b=stored_b,
         ref=np.asarray(_numpy(polytope.ref), dtype=np.float32),
-        margins=margins.astype(np.float32, copy=False),
+        margins=stored_margins,
     )
     return frame, geometry
 

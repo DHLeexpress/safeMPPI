@@ -46,6 +46,30 @@ def test_hp100_raster_reproduces_velocity_predictive_face_retreat():
     assert np.allclose(geometry["ref"], center)
 
 
+def test_hp100_raster_is_bitwise_reproducible_from_persisted_narrow_geometry():
+    center = np.array([3.434889, 3.678803], np.float32)
+    obstacles = np.array([[3.64, 3.68, 0.2]], np.float32)
+    frame, geometry = HF.hp100_frame(
+        center,
+        obstacles,
+        obstacle_velocities=np.array([[-2.0, 0.0]], np.float32),
+        robot_velocity=np.array([2.0, 0.0], np.float32),
+        return_geometry=True,
+    )
+    theta = -np.pi + (np.arange(32) + 0.5) * 2.0 * np.pi / 32
+    radius = (np.arange(100) + 0.5) * HF.R_SENSE / 100
+    directions = np.stack((np.cos(theta), np.sin(theta)), axis=1)
+    points = center.astype(np.float64)[None, None] + (
+        directions[:, None] * radius[None, :, None]
+    )
+    A = geometry["A"].astype(np.float64)
+    b = geometry["b"].astype(np.float64)
+    margins = geometry["margins"].astype(np.float64)
+    rebuilt = ((b[None] - points.reshape(-1, 2) @ A.T) / margins[None]).min(1)
+    rebuilt = np.clip(rebuilt, -1.0, 1.0).reshape(32, 100).astype(np.float32)
+    assert np.array_equal(frame, rebuilt)
+
+
 def test_low5_and_control_history_use_shared_two_unit_limits():
     low = HF.low5([0, 0, 2, -2], [5, 5], 0.5)
     assert np.allclose(low, [1, 1, 1, -1, 0.5])
