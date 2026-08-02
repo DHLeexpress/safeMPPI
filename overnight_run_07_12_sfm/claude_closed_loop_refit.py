@@ -116,21 +116,68 @@ DEFAULT_ELL = RA.DEFAULT_ELL
 
 
 # ------------------------------------------------------------------- dataset
-def _shard_records(path, round_label):
+def _episode_success_keys(gather_dir):
+    """``(scenario_id, gamma)`` keys whose gather episode ended in SUCCESS.
+
+    The gatherer records one outcome per executed episode in its
+    ``COMPLETE.json`` ``outcomes`` list (``scenario_id``, ``gamma``,
+    ``status``, ``success``).  ``--success-only-pool 1`` keeps only the windows
+    whose episode reached the goal; a collision / timeout / repair-NVP /
+    trap-fail-closed episode contributes nothing to the refit pool, however
+    many individually verifier-positive windows it executed on the way.
+    """
+    marker = os.path.join(os.path.abspath(gather_dir), "COMPLETE.json")
+    with open(marker) as stream:
+        payload = json.load(stream)
+    outcomes = payload.get("outcomes")
+    if not outcomes:
+        raise RuntimeError(
+            f"{marker} carries no episode outcomes; the success-only pool "
+            "filter cannot be applied to this shard"
+        )
+    keys = set()
+    for outcome in outcomes:
+        success = outcome.get("success")
+        if success is None:
+            success = str(outcome.get("status")) == "success"
+        if bool(success):
+            keys.add((
+                int(outcome["scenario_id"]),
+                round(float(outcome["gamma"]), 8),
+            ))
+    return keys, len(outcomes)
+
+
+def _shard_records(path, round_label, success_only=False):
     """One ``executed_round.pt`` -> canonical multipos context records.
 
     The executed store holds at most one exact full-H window per context, so
     the record's target set is the single Dirac ``executed`` window and both
     ``base`` and ``teacher`` are empty -- which is precisely what the F1e
     ``target_set="executed"`` recipe consumes.
+
+    With ``success_only`` the shard's windows are additionally restricted to
+    contexts whose ``(scenario_id, gamma)`` episode ended in success.  The
+    filter is applied at POOL-BUILD time only: collection is untouched, so the
+    executed shards on disk stay complete and the choice is reversible.
     """
     path = os.path.abspath(path)
     shard = OS.ExecutedRoundShard.load(path)
     if shard.Dminus:
         raise RuntimeError(f"{path} contains verifier-negative executed windows")
+    success_keys = None
+    episodes = None
+    if success_only:
+        success_keys, episodes = _episode_success_keys(os.path.dirname(path))
     records = []
+    dropped = 0
     for window in shard.Dplus:
         context = shard.contexts[int(window["context_id"])]
+        if success_keys is not None and (
+            int(context["scenario_id"]), round(float(context["gamma"]), 8)
+        ) not in success_keys:
+            dropped += 1
+            continue
         records.append(dict(
             round=int(round_label),
             gather=os.path.dirname(path),
@@ -170,15 +217,24 @@ def _shard_records(path, round_label):
         sha256=FA._sha256_file(path),
         shard_contexts=len(shard.contexts),
         executed_windows=len(shard.D),
-        executed_positive=len(shard.Dplus),
+        # ``executed_positive`` is what the refit actually consumes, so under
+        # the success-only filter it is the KEPT count; the unfiltered count is
+        # kept beside it as ``executed_positive_raw``.
+        executed_positive=len(records),
+        executed_positive_raw=len(shard.Dplus),
         executed_negative=len(shard.Dminus),
+        success_only=bool(success_only),
+        success_kept=len(records),
+        success_dropped=int(dropped),
+        success_episodes=(None if success_keys is None else len(success_keys)),
+        episodes=episodes,
         base_windows=0,
         teacher_windows=0,
     )
     return records, diagnostics
 
 
-def build_executed_pool(shards, round_labels):
+def build_executed_pool(shards, round_labels, success_only=False):
     """``claude_multipos_offline.build_dataset`` stand-in for the closed loop."""
     shards = [os.path.abspath(path) for path in shards]
     round_labels = [int(label) for label in round_labels]
@@ -189,7 +245,9 @@ def build_executed_pool(shards, round_labels):
     dataset = []
     per_shard = []
     for path, label in zip(shards, round_labels):
-        records, diagnostics = _shard_records(path, label)
+        records, diagnostics = _shard_records(
+            path, label, success_only=bool(success_only)
+        )
         per_shard.append(diagnostics)
         dataset.extend(records)
     if len({record["key"] for record in dataset}) != len(dataset):
@@ -198,15 +256,18 @@ def build_executed_pool(shards, round_labels):
 
 
 def refit(shards, round_labels, output_dir, *, device, seed,
-          checkpoint=PRETRAINED, epochs=20, batch=128, demo_frac=0.5):
+          checkpoint=PRETRAINED, epochs=20, batch=128, demo_frac=0.5,
+          success_only=False):
     """Run the frozen F1e trainer on a pooled executed-Dirac shard list."""
     captured = {}
 
     def _builder(gathers, labels=None):
         dataset, per_shard = build_executed_pool(
-            gathers, round_labels if labels is None else labels
+            gathers, round_labels if labels is None else labels,
+            success_only=bool(success_only),
         )
         captured["dataset"] = dataset
+        captured["per_shard"] = per_shard
         return dataset, per_shard
 
     original = MP.build_dataset
@@ -240,9 +301,30 @@ def refit(shards, round_labels, output_dir, *, device, seed,
     dataset = captured["dataset"]
     per_gamma = Counter(f"{record['gamma']:g}" for record in dataset)
     per_shard = Counter(str(record["round"]) for record in dataset)
+    diagnostics = captured.get("per_shard", [])
     payload["closed_loop"] = dict(
         per_gamma_contexts={key: int(per_gamma[key]) for key in sorted(per_gamma)},
         per_shard_contexts={key: int(per_shard[key]) for key in sorted(per_shard)},
+        success_only_pool=bool(success_only),
+        success_filter=dict(
+            kept=int(sum(int(entry["success_kept"]) for entry in diagnostics)),
+            dropped=int(
+                sum(int(entry["success_dropped"]) for entry in diagnostics)
+            ),
+            raw=int(
+                sum(int(entry["executed_positive_raw"]) for entry in diagnostics)
+            ),
+            per_shard={
+                str(entry["round_label"]): dict(
+                    kept=int(entry["success_kept"]),
+                    dropped=int(entry["success_dropped"]),
+                    raw=int(entry["executed_positive_raw"]),
+                    success_episodes=entry["success_episodes"],
+                    episodes=entry["episodes"],
+                )
+                for entry in diagnostics
+            },
+        ),
     )
     return payload
 
@@ -271,10 +353,25 @@ def _run_milestone_eval(round_checkpoint, round_i, output_dir, *, eval_gpu,
     environment["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     environment["CUDA_VISIBLE_DEVICES"] = str(int(eval_gpu))
     started = time.perf_counter()
-    completed = subprocess.run(
-        command, cwd=HERE, env=environment, text=True, capture_output=True,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            command, cwd=HERE, env=environment, text=True, capture_output=True,
+            check=False,
+        )
+    except Exception as error:  # noqa: BLE001 - a measurement, not the run
+        # A milestone must never be able to kill a multi-hour training chain:
+        # anything that stops the subprocess from producing a result is
+        # recorded loudly with status "failed" and the campaign continues.
+        seconds = float(time.perf_counter() - started)
+        print(f"[eval r{round_i}] FAILED to launch: {error!r}", flush=True)
+        return dict(
+            round=int(round_i), label=label, command=command,
+            eval_gpu=int(eval_gpu), workers=int(workers),
+            m_per_gamma=int(m_per_gamma),
+            output_dir=os.path.abspath(output_dir), log=None,
+            seconds=seconds, returncode=None, status="failed",
+            error=repr(error),
+        )
     log_path = os.path.join(output_dir, "eval.log")
     with open(log_path, "w") as stream:
         stream.write(" ".join(command) + "\n")
@@ -303,9 +400,16 @@ def _run_milestone_eval(round_checkpoint, round_i, output_dir, *, eval_gpu,
         print(f"[eval r{round_i}] FAILED rc={completed.returncode}; see "
               f"{log_path}", flush=True)
         return record
-    cells = PF._read_eval(metrics)
-    r0_cell = cells["r0"]
-    arm_cell = cells[label]
+    try:
+        cells = PF._read_eval(metrics)
+        r0_cell = cells["r0"]
+        arm_cell = cells[label]
+    except Exception as error:  # noqa: BLE001 - a measurement, not the run
+        record["status"] = "failed"
+        record["error"] = repr(error)
+        print(f"[eval r{round_i}] FAILED to parse {metrics}: {error!r}",
+              flush=True)
+        return record
     record.update(
         status="ok",
         metrics_json=metrics,
@@ -361,14 +465,35 @@ def _parse_eval_rounds(text):
     })
 
 
+def _eval_schedule(rounds, eval_rounds_text, eval_every):
+    """Milestone rounds: ``--eval-every k`` overrides the explicit list.
+
+    ``k > 0`` schedules rounds ``k, 2k, 3k, ...`` plus the final round (so a
+    30-round arm with ``k=3`` measures ten times and always ends on a
+    measurement).  ``k == 0`` keeps the historical ``--eval-rounds`` list, so
+    the default reproduces the Track G behaviour exactly.
+    """
+    rounds = int(rounds)
+    eval_every = int(eval_every)
+    if eval_every < 0:
+        raise ValueError("--eval-every must be non-negative")
+    if eval_every > 0:
+        schedule = set(range(eval_every, rounds + 1, eval_every))
+        schedule.add(rounds)
+    else:
+        schedule = set(_parse_eval_rounds(eval_rounds_text))
+    return sorted(index for index in schedule if 1 <= index <= rounds)
+
+
 def run_campaign(args):
     started = time.perf_counter()
     name = str(args.name)
     output_root = os.path.abspath(args.output_root)
     rounds = int(args.rounds)
-    eval_rounds = _parse_eval_rounds(args.eval_rounds)
+    eval_rounds = _eval_schedule(rounds, args.eval_rounds, args.eval_every)
     gammas = tuple(map(float, args.gammas))
     workers = int(args.workers)
+    success_only = bool(int(args.success_only_pool))
 
     complete_path = os.path.join(output_root, "CAMPAIGN_COMPLETE.json")
     if os.path.isfile(complete_path):
@@ -411,6 +536,19 @@ def run_campaign(args):
                 "the cumulative pool; weights never compound, only data"
             ),
         ),
+        pool=dict(
+            success_only=success_only,
+            success_only_semantics=(
+                "POOL-BUILD filter only: with success_only, a pooled shard "
+                "contributes only the windows whose (scenario_id, gamma) "
+                "episode ended in success per the gather's COMPLETE.json "
+                "outcomes; collection is unchanged and the shards on disk "
+                "stay complete, so the choice is reversible"
+                if success_only else
+                "every verifier-positive executed window in every pooled "
+                "shard is used, regardless of how its episode ended"
+            ),
+        ),
         collect=dict(
             selector=str(args.selector),
             gammas=list(gammas),
@@ -449,6 +587,7 @@ def run_campaign(args):
         initial_checkpoint_sha256=initial_sha,
         rounds=rounds,
         eval_rounds=eval_rounds,
+        eval_every=int(args.eval_every),
         eval=dict(
             script=EVAL_SCRIPT, r0=os.path.abspath(R0_CHECKPOINT),
             ep0=EVAL_EP0, noise_seed=EVAL_NOISE_SEED,
@@ -466,7 +605,9 @@ def run_campaign(args):
     FA._write_json(os.path.join(output_root, "campaign_config.json"), config)
     print(
         f"[{name}] selector={args.selector} warm={args.warm_start} "
-        f"rounds={rounds} eval_rounds={eval_rounds} workers={workers} "
+        f"success_only_pool={int(success_only)} "
+        f"rounds={rounds} eval_rounds={eval_rounds} "
+        f"(eval_every={args.eval_every}) workers={workers} "
         f"eval_gpu={args.eval_gpu} pool0={len(pool)} shards\n"
         f"[{name}] initial checkpoint {initial_checkpoint} "
         f"({initial_sha[:12]})",
@@ -539,6 +680,7 @@ def run_campaign(args):
                 epochs=int(args.epochs),
                 batch=int(args.batch),
                 demo_frac=float(args.demo_frac),
+                success_only=success_only,
             )
             refit_seconds = float(time.perf_counter() - refit_started)
             round_checkpoint = os.path.join(
@@ -578,6 +720,8 @@ def run_campaign(args):
                 },
                 per_gamma_contexts=train["closed_loop"]["per_gamma_contexts"],
                 per_shard_contexts=train["closed_loop"]["per_shard_contexts"],
+                success_only_pool=success_only,
+                success_filter=train["closed_loop"]["success_filter"],
                 refit_dir=refit_dir,
                 refit_seconds=refit_seconds,
                 refit_train_json=os.path.join(refit_dir, f"{ARM}_train.json"),
@@ -609,11 +753,17 @@ def run_campaign(args):
             )
             history.append(record)
             current_checkpoint = round_checkpoint
+            filtered = record["success_filter"]
+            filter_note = (
+                f" | success-filter kept {filtered['kept']} / dropped "
+                f"{filtered['dropped']} of {filtered['raw']}"
+                if success_only else ""
+            )
             print(
                 f"[{name}] round {round_i}/{rounds} scenarios={list(scenarios)} "
                 f"gather {gather_seconds:.1f}s (+{pool[-1]['label']}: "
                 f"{record['pool_contexts_by_shard'].get(str(pool[-1]['label']))}"
-                f" ctx) pool {record['pool_shards']} shards / "
+                f" ctx){filter_note} pool {record['pool_shards']} shards / "
                 f"{record['pool_contexts']} contexts | refit "
                 f"{refit_seconds:.1f}s train "
                 f"{record['loss']['train_first']:.5f}->"
@@ -740,7 +890,15 @@ def build_parser():
     campaign.add_argument("--name", required=True)
     campaign.add_argument(
         "--selector", default="margin",
-        choices=("margin", "progress_gated_margin"),
+        choices=("margin", "progress_gated_margin", "safemppi_cost"),
+    )
+    campaign.add_argument(
+        "--success-only-pool", type=int, default=0, choices=(0, 1),
+        help=(
+            "1 = pool only the executed windows whose (scenario, gamma) "
+            "episode ended in success (pool-build filter; collection is "
+            "unchanged).  0 (default) reproduces Track G."
+        ),
     )
     campaign.add_argument(
         "--warm-start", default="none", choices=("none", "fastlab5"),
@@ -754,6 +912,13 @@ def build_parser():
     campaign.add_argument("--workers", type=int, default=30)
     campaign.add_argument("--eval-gpu", type=int, default=3)
     campaign.add_argument("--eval-rounds", default=DEFAULT_EVAL_ROUNDS)
+    campaign.add_argument(
+        "--eval-every", type=int, default=0,
+        help=(
+            "k > 0 = milestone at rounds k, 2k, 3k, ... plus the final round, "
+            "overriding --eval-rounds.  0 (default) uses --eval-rounds."
+        ),
+    )
     campaign.add_argument("--eval-workers", type=int, default=20)
     campaign.add_argument("--eval-m", type=int, default=EVAL_M)
     campaign.add_argument("--eval-cache", default=EVAL_CACHE)
@@ -781,6 +946,13 @@ SUBCOMMANDS = ("campaign", "verify-warm")
 
 
 def main(argv=None):
+    # A multi-hour detached run is only observable if its log lines land as
+    # they are produced: under nohup redirection stdout is block-buffered.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError):  # pragma: no cover - tty/pipe
+            pass
     argv = list(sys.argv[1:] if argv is None else argv)
     # `campaign` is the default: the driver's flat flag form
     # (`--name ... --output-root ...`) is what the launchers use.
