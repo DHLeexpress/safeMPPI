@@ -326,6 +326,22 @@ def _git_provenance() -> dict:
     return dict(root=str(root), head=head, clean=not bool(status), status=status)
 
 
+def _assert_provenance_unchanged(initial_git: dict, initial_hashes: dict) -> dict:
+    final_git = _git_provenance()
+    final_hashes = _source_hashes()
+    if final_git != initial_git:
+        raise RuntimeError(
+            "source Git provenance changed during HP100 collection; "
+            "refusing to publish a manifest"
+        )
+    if final_hashes != initial_hashes:
+        raise RuntimeError(
+            "source file hashes changed during HP100 collection; "
+            "refusing to publish a manifest"
+        )
+    return final_git
+
+
 def _collect_gamma(payload, rollout_fn=rollout_episode) -> tuple[dict, list[dict]]:
     """Worker-safe collection for one gamma; writes only its own tensor file."""
     (
@@ -425,6 +441,7 @@ def generate_dataset(
     if int(max_attempts_per_gamma) < int(successes_per_gamma):
         raise ValueError("max_attempts_per_gamma must be at least successes_per_gamma")
     git = _git_provenance()
+    source_hashes = _source_hashes()
     if expected_source_commit is not None and git["head"] != str(expected_source_commit):
         raise RuntimeError(
             f"source commit {git['head']} != expected {expected_source_commit}"
@@ -460,6 +477,7 @@ def generate_dataset(
             for worker_payload in worker_payloads
         ]
     results.sort(key=lambda result: result[0]["gamma"])
+    final_git = _assert_provenance_unchanged(git, source_hashes)
     file_rows = [result[0] for result in results]
     rollout_summaries = {
         str(result[0]["gamma"]): result[1] for result in results
@@ -489,6 +507,7 @@ def generate_dataset(
             horizon=HORIZON,
             T=int(T_max),
             goal=np.asarray(SS.GOAL, float).tolist(),
+            task_bounds=[float(SS.TASK_LO), float(SS.TASK_HI)],
             pedestrian_radius=float(SS.R_PED),
             sensing_radius=float(SS.R_SENSE),
         ),
@@ -515,8 +534,13 @@ def generate_dataset(
         ),
         dynamics=DYN.contract(),
         files=file_rows,
-        source_hashes=_source_hashes(),
+        source_hashes=source_hashes,
         source_git=git,
+        source_completion_audit=dict(
+            git=final_git,
+            source_hashes_equal=True,
+            manifest_published_only_after_all_workers_completed=True,
+        ),
         parallelism=dict(
             jobs=int(jobs), start_method=("spawn" if int(jobs) > 1 else "none"),
             device=str(device), gamma_workers_are_independent=True,

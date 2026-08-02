@@ -1,11 +1,13 @@
 import inspect
 from dataclasses import replace
+import json
 
 import numpy as np
 import pytest
 import torch
 
 import sfm_hp100_kazuki as K
+import sfm_hp100_kazuki_eval as EVAL
 import sfm_kazuki as LEGACY
 
 
@@ -74,6 +76,10 @@ def test_explicit_legacy_rollout_hook_is_numerically_identical_to_default():
 
 def test_locked_comparator_has_no_shield_or_gamma_retuning():
     config = K.locked_config()
+    assert tuple(dict(K.LOCKED_CONFIG_ITEMS)) == tuple(
+        LEGACY.KazukiConfig.__dataclass_fields__
+    )
+    assert config.to_dict() == dict(K.LOCKED_CONFIG_ITEMS)
     assert config.safe_coefs == (0.3,)
     assert config.goal_coef == 0.5
     assert not config.output_filter
@@ -82,6 +88,67 @@ def test_locked_comparator_has_no_shield_or_gamma_retuning():
     assert config.safe_coef_gamma_span == 0.0
     assert config.goal_coef_gamma_span == 0.0
     assert config.controller_gammas == ()
+
+
+def test_locked_comparator_fails_closed_on_config_schema_drift(monkeypatch):
+    drifted = dict(LEGACY.KazukiConfig.__dataclass_fields__)
+    drifted["new_unreviewed_default"] = object()
+    monkeypatch.setattr(LEGACY.KazukiConfig, "__dataclass_fields__", drifted)
+    with pytest.raises(RuntimeError, match="schema changed"):
+        K.locked_config()
+
+
+def test_kazuki_eval_preflight_authenticates_checkpoint_and_refuses_overwrite(
+    tmp_path, monkeypatch,
+):
+    checkpoint = tmp_path / "policy.pt"
+    checkpoint.write_bytes(b"fixed checkpoint")
+    checkpoint_sha = EVAL.RAW.sha256_file(checkpoint)
+    git = dict(root="/frozen", head="a" * 40, clean=True, status="")
+    monkeypatch.setattr(EVAL, "_git_provenance", lambda: git)
+    monkeypatch.setattr(EVAL, "_source_hashes", lambda: {"evaluator": {"sha256": "b" * 64}})
+
+    inputs = EVAL._preflight(
+        checkpoint, checkpoint_sha, tmp_path / "result.json", "a" * 40,
+    )
+    assert inputs["checkpoint_sha256"] == checkpoint_sha
+    assert inputs["git"] == git
+    with pytest.raises(RuntimeError, match="checkpoint SHA-256 mismatch"):
+        EVAL._preflight(checkpoint, "0" * 64, tmp_path / "other.json", "a" * 40)
+
+    (tmp_path / "result.json").write_text("old")
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        EVAL._preflight(
+            checkpoint, checkpoint_sha, tmp_path / "result.json", "a" * 40,
+        )
+
+
+def test_kazuki_eval_records_pins_and_second_run_refuses_output(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "policy.pt"
+    checkpoint.write_bytes(b"fixed checkpoint")
+    checkpoint_sha = EVAL.RAW.sha256_file(checkpoint)
+    git = dict(root="/frozen", head="c" * 40, clean=True, status="")
+    sources = {"evaluator": {"path": "/frozen/eval.py", "sha256": "d" * 64}}
+    monkeypatch.setattr(EVAL, "_git_provenance", lambda: git)
+    monkeypatch.setattr(EVAL, "_source_hashes", lambda: sources)
+    monkeypatch.setattr(
+        EVAL, "evaluate",
+        lambda *args, **kwargs: ([], {"pooled": {"n": 0}, "per_gamma": {}}),
+    )
+    output = tmp_path / "result.json"
+    argv = [
+        "--checkpoint", str(checkpoint),
+        "--expected-checkpoint-sha256", checkpoint_sha,
+        "--expected-source-commit", "c" * 40,
+        "--scene-profile", "matched_id", "--ep0", "10", "--M", "1",
+        "--device", "cpu", "--out", str(output),
+    ]
+    EVAL.main(argv)
+    payload = json.loads(output.read_text())
+    assert payload["checkpoint_sha256"] == checkpoint_sha
+    assert payload["source"] == {"git": git, "files": sources}
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        EVAL.main(argv)
 
 
 def test_deploy_uses_hp100_observation_and_caps_actual_execution(monkeypatch):

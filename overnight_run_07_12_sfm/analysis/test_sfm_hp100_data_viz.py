@@ -9,6 +9,7 @@ import sfm_hp100_data_viz as V
 import sfm_hp100_dynamics as D
 import sfm_hp100_features as F
 import sfm_scene as SS
+import stage2_hp100_data as DATA
 
 
 def _write_dataset(root: Path, *, corrupt_hp=False):
@@ -57,12 +58,16 @@ def _write_dataset(root: Path, *, corrupt_hp=False):
     torch.save(payload, path)
     manifest = dict(
         status=V.EXPECTED_DATA_STATUS, schema_version=V.EXPECTED_SCHEMA,
+        dynamics=D.contract(), source_hashes=DATA._source_hashes(),
         feature=dict(
             shape=[32, 100], nominal_polytope_n_base=16, velocity_aware=True,
             predict_gain=F.PREDICT_GAIN, predict_tau=F.PREDICT_TAU,
+            contract=F.contract(),
         ),
         environment=dict(
             n_ped=20, pedestrian_radius=SS.R_PED, sensing_radius=SS.R_SENSE,
+            goal=np.asarray(SS.GOAL, float).tolist(),
+            task_bounds=[float(SS.TASK_LO), float(SS.TASK_HI)],
         ),
         files=[dict(
             gamma=gamma, file=filename, sha256=V._sha256(path),
@@ -94,6 +99,16 @@ def test_episode_audit_fails_closed_on_changed_stored_hp(tmp_path):
     manifest, rows, _ = V.load_episode(tmp_path, gamma, episode)
     with pytest.raises(RuntimeError, match="not bitwise equal"):
         V.validate_episode(manifest, rows)
+
+
+def test_loader_fails_closed_on_changed_feature_source(tmp_path):
+    gamma, episode = _write_dataset(tmp_path)
+    path = tmp_path / "manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["source_hashes"]["features"]["sha256"] = "0" * 64
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(RuntimeError, match="source hash differs at features"):
+        V.load_episode(tmp_path, gamma, episode)
 
 
 def test_renderer_writes_mp4_selected_png_pdf_and_contract(tmp_path):

@@ -146,3 +146,15 @@ def test_success_quota_fails_closed_at_attempt_cap(tmp_path):
             T_max=2,
             rollout_fn=rejected,
         )
+
+
+def test_completion_provenance_fails_closed_on_source_change(monkeypatch):
+    initial_git = {"root": "/repo", "head": "abc", "clean": True, "status": ""}
+    initial_hashes = {"generator": {"path": "/repo/g.py", "sha256": "old"}}
+    monkeypatch.setattr(S, "_git_provenance", lambda: dict(initial_git))
+    monkeypatch.setattr(
+        S, "_source_hashes",
+        lambda: {"generator": {"path": "/repo/g.py", "sha256": "new"}},
+    )
+    with pytest.raises(RuntimeError, match="source file hashes changed"):
+        S._assert_provenance_unchanged(initial_git, initial_hashes)

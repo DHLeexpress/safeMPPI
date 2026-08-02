@@ -25,23 +25,88 @@ SAFE_COEF = 0.3
 GOAL_COEF = 0.5
 SAMPLE_SEED = 700_000
 
+# Every Kazuki knob is listed here intentionally.  The HP100 comparator must
+# not change when a default in the much broader legacy controller evolves.
+# ``locked_config`` also checks the dataclass schema so a newly added default
+# fails closed until it is reviewed and pinned here.
+LOCKED_CONFIG_ITEMS = (
+    ("ode_times", (0.0, 0.5, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0)),
+    ("warm_s", 0.8),
+    ("safe_coefs", (SAFE_COEF,)),
+    ("goal_coef", GOAL_COEF),
+    ("safe_coef_gamma_span", 0.0),
+    ("goal_coef_gamma_span", 0.0),
+    ("a_cbf", 1.0),
+    ("k_worst", 5),
+    ("markup", 1.01),
+    ("collision_weight", 20.0),
+    ("goal_weight", 2.0),
+    ("beta_mppi", 20.0),
+    ("n_sample", 200),
+    ("n_elite", 10),
+    ("n_copy", 200),
+    ("mppi_lambda", 0.1),
+    ("mppi_sigma", 0.4),
+    ("warm_consistency_weight", 0.1),
+    ("collision_margin", 0.05),
+    ("hard_clearance_select", False),
+    ("refined_clearance_margin", 0.0),
+    ("exact_sfm_step_filter", False),
+    ("step_filter_margin", 0.03),
+    ("step_filter_gamma_margin_span", 0.0),
+    ("step_filter_horizon", 10),
+    ("step_filter_goal_plans", 0),
+    ("step_filter_avoid_plans", 0),
+    ("step_filter_always_select", False),
+    ("step_filter_min_progress", 0.0),
+    ("step_filter_goal_score_weight", 1.0),
+    ("step_filter_clearance_weight", 0.05),
+    ("step_filter_gamma_clearance_target_span", 0.0),
+    ("step_filter_clearance_target_weight", 0.0),
+    ("step_filter_escape_patience", 0),
+    ("step_filter_escape_burst", 0),
+    ("step_filter_fallback_lookahead", 0),
+    ("step_filter_viability_lookahead", 0),
+    ("step_filter_viability_band", 0.05),
+    ("step_filter_viability_goal_weight", 0.0),
+    ("step_filter_viability_escalate", False),
+    ("step_filter_viability_escalation_band", 0.05),
+    ("step_filter_viability_escalation_min_progress", 0.0),
+    ("step_filter_viability_escalation_entry_progress", 0.0),
+    ("step_filter_viability_escalation_burst", 0),
+    ("step_filter_release_steps", 0),
+    ("step_filter_stagnation_gamma_max", 0.0),
+    ("step_filter_stagnation_window", 0),
+    ("step_filter_stagnation_progress", 0.0),
+    ("step_filter_stagnation_horizon", 0),
+    ("step_filter_stagnation_burst", 0),
+    ("output_filter", False),
+    ("filter_eta", 0.6),
+    ("filter_margin", 0.05),
+    ("filter_iters", 5),
+    ("filter_solver", "jacobi"),
+    ("controller_gammas", ()),
+    ("safe_coef_by_gamma", ()),
+    ("goal_coef_by_gamma", ()),
+    ("step_filter_margin_by_gamma", ()),
+    ("step_filter_goal_score_weight_by_gamma", ()),
+    ("step_filter_clearance_weight_by_gamma", ()),
+    ("step_filter_clearance_target_weight_by_gamma", ()),
+)
+
 
 def locked_config() -> BASE.KazukiConfig:
     """Return and audit the immutable, non-privileged comparator recipe."""
-    config = BASE.KazukiConfig(
-        safe_coefs=(SAFE_COEF,),
-        goal_coef=GOAL_COEF,
-    ).validate()
-    disabled = {
-        "output_filter": config.output_filter,
-        "exact_sfm_step_filter": config.exact_sfm_step_filter,
-        "hard_clearance_select": config.hard_clearance_select,
-        "safe_coef_gamma_span": config.safe_coef_gamma_span,
-        "goal_coef_gamma_span": config.goal_coef_gamma_span,
-        "controller_gammas": config.controller_gammas,
-    }
-    if any(bool(value) for value in disabled.values()):
-        raise RuntimeError(f"locked HP100 Kazuki comparator enabled an extra mechanism: {disabled}")
+    expected = dict(LOCKED_CONFIG_ITEMS)
+    declared_fields = tuple(BASE.KazukiConfig.__dataclass_fields__)
+    if tuple(expected) != declared_fields:
+        raise RuntimeError(
+            "KazukiConfig schema changed; review and fully repin the HP100 comparator: "
+            f"locked={tuple(expected)}, current={declared_fields}"
+        )
+    config = BASE.KazukiConfig(**expected).validate()
+    if config.to_dict() != expected:
+        raise RuntimeError("locked HP100 Kazuki config does not match its declared contract")
     return config
 
 
@@ -241,4 +306,3 @@ def kazuki_hp100_deploy(
         config=config.to_dict(), dynamics=DYN.contract(),
         trace=trace if collect_diagnostics else None,
     )
-

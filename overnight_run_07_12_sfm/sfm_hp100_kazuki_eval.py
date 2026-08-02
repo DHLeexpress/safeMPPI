@@ -6,6 +6,8 @@ from concurrent.futures import ProcessPoolExecutor
 import json
 import multiprocessing as mp
 import os
+from pathlib import Path
+import subprocess
 
 import numpy as np
 
@@ -18,6 +20,73 @@ import sfm_scene as SS
 
 
 VERSION = "sfm_hp100_kazuki_fixed_bank_v1"
+
+
+def _git_provenance() -> dict:
+    root = Path(__file__).resolve().parents[1]
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=root, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    return dict(root=str(root), head=head, clean=not bool(status), status=status)
+
+
+def _source_hashes() -> dict:
+    modules = {
+        "evaluator": __file__,
+        "hp100_kazuki": KZ.__file__,
+        "legacy_kazuki": KZ.BASE.__file__,
+        "raw_evaluator": RAW.__file__,
+        "dynamics": DYN.__file__,
+        "features": HPF.__file__,
+        "scene": SS.__file__,
+    }
+    return {
+        name: dict(path=str(Path(path).resolve()), sha256=RAW.sha256_file(path))
+        for name, path in modules.items()
+    }
+
+
+def _preflight(checkpoint, expected_checkpoint_sha256, output, expected_source_commit):
+    checkpoint = Path(checkpoint).resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(checkpoint)
+    observed_checkpoint_sha256 = RAW.sha256_file(checkpoint)
+    if observed_checkpoint_sha256 != str(expected_checkpoint_sha256):
+        raise RuntimeError(
+            "checkpoint SHA-256 mismatch: "
+            f"{observed_checkpoint_sha256} != {expected_checkpoint_sha256}"
+        )
+    output = Path(output).resolve()
+    temporary = Path(str(output) + ".tmp")
+    for candidate in (output, temporary):
+        if os.path.lexists(candidate):
+            raise FileExistsError(f"refusing to overwrite existing output: {candidate}")
+    git = _git_provenance()
+    if git["head"] != str(expected_source_commit):
+        raise RuntimeError(
+            f"source commit {git['head']} != expected {expected_source_commit}"
+        )
+    if not git["clean"]:
+        raise RuntimeError("HP100 Kazuki evaluation requires a clean frozen worktree")
+    return dict(
+        checkpoint=str(checkpoint), checkpoint_sha256=observed_checkpoint_sha256,
+        output=str(output), temporary=str(temporary), git=git,
+        source_hashes=_source_hashes(),
+    )
+
+
+def _assert_inputs_unchanged(initial: dict) -> None:
+    if _git_provenance() != initial["git"]:
+        raise RuntimeError("source Git provenance changed during HP100 Kazuki evaluation")
+    if _source_hashes() != initial["source_hashes"]:
+        raise RuntimeError("source files changed during HP100 Kazuki evaluation")
+    if RAW.sha256_file(initial["checkpoint"]) != initial["checkpoint_sha256"]:
+        raise RuntimeError("checkpoint changed during HP100 Kazuki evaluation")
 
 
 def _rollout_gamma(payload):
@@ -81,6 +150,8 @@ def evaluate(
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--expected-checkpoint-sha256", required=True)
+    parser.add_argument("--expected-source-commit", required=True)
     parser.add_argument(
         "--scene-profile", required=True,
         choices=SS.SCIENTIFIC_EVAL_PROFILES,
@@ -94,16 +165,23 @@ def main(argv=None):
     if args.M <= 0 or args.workers <= 0:
         parser.error("--M and --workers must be positive")
 
+    inputs = _preflight(
+        args.checkpoint, args.expected_checkpoint_sha256, args.out,
+        args.expected_source_commit,
+    )
+
     rows, summary = evaluate(
-        args.checkpoint, scene_profile=args.scene_profile, ep0=args.ep0,
+        inputs["checkpoint"], scene_profile=args.scene_profile, ep0=args.ep0,
         M=args.M, device=args.device, workers=args.workers,
     )
+    _assert_inputs_unchanged(inputs)
     config = KZ.locked_config()
     payload = dict(
         status="SFM_HP100_KAZUKI_EVAL_COMPLETE", version=VERSION,
         method="locked Kazuki generate-guide-refine on HP100 prior",
-        checkpoint=os.path.abspath(args.checkpoint),
-        checkpoint_sha256=RAW.sha256_file(args.checkpoint),
+        checkpoint=inputs["checkpoint"],
+        checkpoint_sha256=inputs["checkpoint_sha256"],
+        source=dict(git=inputs["git"], files=inputs["source_hashes"]),
         scene=SS.scene_profile(args.scene_profile),
         bank=dict(
             ep0=int(args.ep0), M_per_gamma=int(args.M),
@@ -128,12 +206,18 @@ def main(argv=None):
             ),
         ),
     )
-    path = os.path.abspath(args.out)
+    path = inputs["output"]
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    temporary = path + ".tmp"
-    with open(temporary, "w") as stream:
-        json.dump(payload, stream, indent=2, allow_nan=False)
-    os.replace(temporary, path)
+    temporary = inputs["temporary"]
+    try:
+        with open(temporary, "x") as stream:
+            json.dump(payload, stream, indent=2, allow_nan=False)
+        # link(2) creates the destination only if it is still absent.  Unlike
+        # os.replace, it cannot silently overwrite a result created mid-run.
+        os.link(temporary, path)
+    finally:
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
     print(json.dumps({
         "status": payload["status"], "out": path,
         "pooled": summary["pooled"],
@@ -142,4 +226,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
-

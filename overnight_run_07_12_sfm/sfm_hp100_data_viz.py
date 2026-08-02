@@ -37,6 +37,7 @@ import sfm_hp100_dynamics as DYN
 import sfm_hp100_features as HPF
 import sfm_hp100_history as HPH
 import sfm_scene as SS
+import stage2_hp100_data as DATA
 
 
 STATUS = "SFM_HP100_DATA_PROVENANCE_VIZ_COMPLETE"
@@ -70,6 +71,29 @@ def _torch_load(path: Path):
         return torch.load(path, map_location="cpu", weights_only=False, mmap=True)
     except TypeError:  # pragma: no cover - only for older supported torch builds
         return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def _assert_manifest_contract(manifest: dict) -> None:
+    if manifest.get("dynamics") != DYN.contract():
+        raise RuntimeError("dataset dynamics contract differs from the renderer")
+    feature = manifest.get("feature", {})
+    if feature.get("contract") != HPF.contract():
+        raise RuntimeError("dataset Hp100 feature contract differs from the renderer")
+    recorded_hashes = manifest.get("source_hashes")
+    current_hashes = DATA._source_hashes()
+    if not isinstance(recorded_hashes, dict):
+        raise RuntimeError("dataset manifest is missing authenticated source hashes")
+    for name, current in current_hashes.items():
+        recorded = recorded_hashes.get(name)
+        if not isinstance(recorded, dict) or recorded.get("sha256") != current["sha256"]:
+            raise RuntimeError(f"dataset source hash differs at {name}")
+    environment = manifest.get("environment", {})
+    required = (
+        "n_ped", "pedestrian_radius", "sensing_radius", "goal", "task_bounds",
+    )
+    missing = [name for name in required if name not in environment]
+    if missing:
+        raise RuntimeError(f"dataset manifest is missing scene constants: {missing}")
 
 
 def _file_row(manifest: dict, gamma: float) -> dict:
@@ -121,6 +145,7 @@ def load_episode(dataset_dir, gamma: float, episode: int) -> tuple[dict, dict, P
         raise ValueError("input directory is not a completed Hp100 demonstration dataset")
     if manifest.get("schema_version") != EXPECTED_SCHEMA:
         raise ValueError(f"unexpected dataset schema: {manifest.get('schema_version')}")
+    _assert_manifest_contract(manifest)
     feature = manifest.get("feature", {})
     if feature.get("shape") != [ANGULAR_RAYS, RADIAL_BINS]:
         raise ValueError("manifest does not declare the exact [32,100] Hp raster")
@@ -179,7 +204,9 @@ def validate_episode(manifest: dict, rows: dict[str, np.ndarray]) -> dict:
             raise ValueError(f"stored {key} has shape {rows[key].shape}, expected {expected}")
 
     feature = manifest["feature"]
-    sensing = float(manifest["environment"].get("sensing_radius", SS.R_SENSE))
+    environment = manifest["environment"]
+    sensing = float(environment["sensing_radius"])
+    pedestrian_radius = float(environment["pedestrian_radius"])
     predict_gain = float(feature["predict_gain"])
     predict_tau = float(feature["predict_tau"])
     geometries = []
@@ -188,7 +215,7 @@ def validate_episode(manifest: dict, rows: dict[str, np.ndarray]) -> dict:
     for index in range(count):
         ped_xy = np.asarray(rows["ped_xy"][index], np.float32)
         obstacles = np.concatenate(
-            (ped_xy, np.full((len(ped_xy), 1), float(manifest["environment"]["pedestrian_radius"]), np.float32)),
+            (ped_xy, np.full((len(ped_xy), 1), pedestrian_radius, np.float32)),
             axis=1,
         )
         reconstructed, geometry = HPF.hp100_frame(
@@ -238,6 +265,9 @@ def validate_episode(manifest: dict, rows: dict[str, np.ndarray]) -> dict:
         geometries=geometries,
         histories=histories,
         sensing_radius=float(sensing),
+        pedestrian_radius=pedestrian_radius,
+        goal=np.asarray(environment["goal"], np.float64),
+        task_bounds=tuple(map(float, environment["task_bounds"])),
         audit=dict(
             contexts=count,
             hp_bitwise_matches=bitwise_matches,
@@ -305,25 +335,27 @@ def _draw_world(axis, rows: dict, validated: dict, index: int, gamma: float) -> 
     ))
     for position, velocity in zip(ped_xy, ped_vel):
         axis.add_patch(Circle(
-            position, float(SS.R_PED), facecolor="#777777", edgecolor="#333333",
+            position, validated["pedestrian_radius"], facecolor="#777777", edgecolor="#333333",
             linewidth=.5, alpha=.72, zorder=6,
         ))
         predicted = position[None] + np.arange(11)[:, None] * DYN.DT * velocity[None]
         axis.plot(predicted[:, 0], predicted[:, 1], ".--", color=GRAY,
                   lw=.45, ms=1.6, alpha=.55, zorder=4)
-    axis.plot(SS.GOAL[0], SS.GOAL[1], marker="*", color="#F0C419", ms=13,
+    goal = validated["goal"]
+    axis.plot(goal[0], goal[1], marker="*", color="#F0C419", ms=13,
               mec="black", mew=.45, zorder=10)
     axis.plot(state[0], state[1], "o", color=BLUE, ms=7, zorder=10)
     # Keep the complete two-metre outer support visible even at the start and
     # goal corners; clipping it to the nominal task box would obscure the
     # exact K=16 provenance this figure is meant to audit.
+    task_lo, task_hi = validated["task_bounds"]
     axis.set_xlim(
-        min(float(SS.TASK_LO), float(full[:, 0].min() - sensing - .1)),
-        max(float(SS.TASK_HI), float(full[:, 0].max() + sensing + .1)),
+        min(task_lo, float(full[:, 0].min() - sensing - .1)),
+        max(task_hi, float(full[:, 0].max() + sensing + .1)),
     )
     axis.set_ylim(
-        min(float(SS.TASK_LO), float(full[:, 1].min() - sensing - .1)),
-        max(float(SS.TASK_HI), float(full[:, 1].max() + sensing + .1)),
+        min(task_lo, float(full[:, 1].min() - sensing - .1)),
+        max(task_hi, float(full[:, 1].max() + sensing + .1)),
     )
     axis.set_aspect("equal")
     axis.grid(alpha=.13)
@@ -486,7 +518,7 @@ def render(dataset_dir, gamma: float, episode: int, output_dir, *,
         provenance_audit=validated["audit"],
         render=dict(
             frame_stride=int(frame_stride), fps=int(fps), rendered_frames=len(indices),
-            level_sets=10, pedestrian_radius=float(SS.R_PED),
+            level_sets=10, pedestrian_radius=float(validated["pedestrian_radius"]),
             history_diagnostic=(
                 "min over 32 angles for each of the exact ten stored/reconstructed "
                 "history frames; diagnostic only"
