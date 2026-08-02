@@ -19,12 +19,15 @@ import os
 from pathlib import Path
 import subprocess
 import multiprocessing as mp
+import sys
 
 import numpy as np
 import torch
 
 import _paths  # noqa: F401
 from cfm_mppi.safegpc_adapter.safemppi import SafeMPPIAdapter
+import cfm_mppi.safegpc_adapter.barrier as SAFETY_BARRIER
+import cfm_mppi.safegpc_adapter.polytope_v2 as NOMINAL_POLYTOPE
 import sfm_b1_expert as EXPERT
 import sfm_hp100_dynamics as DYN
 import sfm_hp100_features as HPF
@@ -298,14 +301,18 @@ def _atomic_json_save(payload: dict, path: Path) -> None:
     os.replace(temporary, path)
 
 
-def _source_hashes() -> dict[str, str]:
+def _source_hashes() -> dict[str, dict[str, str]]:
     paths = {
         "generator": Path(__file__).resolve(),
         "dynamics": Path(inspect.getsourcefile(DYN)).resolve(),
         "features": Path(inspect.getsourcefile(HPF)).resolve(),
         "expert_config": Path(inspect.getsourcefile(EXPERT)).resolve(),
         "safemppi_adapter": Path(inspect.getsourcefile(SafeMPPIAdapter)).resolve(),
+        "safemppi_barrier": Path(inspect.getsourcefile(SAFETY_BARRIER)).resolve(),
+        "nominal_polytope": Path(inspect.getsourcefile(NOMINAL_POLYTOPE)).resolve(),
         "scene": Path(inspect.getsourcefile(SS)).resolve(),
+        "human_agent": Path(inspect.getsourcefile(SS.HumanAgent)).resolve(),
+        "human_advance": Path(inspect.getsourcefile(SS._advance_humans)).resolve(),
     }
     return {
         name: dict(path=str(path), sha256=sha256_file(path))
@@ -324,6 +331,36 @@ def _git_provenance() -> dict:
         capture_output=True, text=True,
     ).stdout.strip()
     return dict(root=str(root), head=head, clean=not bool(status), status=status)
+
+
+def _runtime_provenance(device: str) -> dict:
+    payload = dict(
+        requested_device=str(device), python=sys.version,
+        numpy=np.__version__, torch=torch.__version__,
+        torch_cuda=torch.version.cuda,
+        cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
+        cuda_device_order=os.environ.get("CUDA_DEVICE_ORDER"),
+    )
+    if str(device).startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA collection requested but torch.cuda is unavailable")
+        index = torch.device(device).index
+        index = torch.cuda.current_device() if index is None else int(index)
+        properties = torch.cuda.get_device_properties(index)
+        inventory = subprocess.run(
+            [
+                "nvidia-smi", "--query-gpu=index,uuid,name,driver_version",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip().splitlines()
+        payload["cuda"] = dict(
+            logical_index=int(index), name=str(properties.name),
+            total_memory_bytes=int(properties.total_memory),
+            capability=list(torch.cuda.get_device_capability(index)),
+            nvidia_smi_inventory=inventory,
+        )
+    return payload
 
 
 def _assert_provenance_unchanged(initial_git: dict, initial_hashes: dict) -> dict:
@@ -442,6 +479,7 @@ def generate_dataset(
         raise ValueError("max_attempts_per_gamma must be at least successes_per_gamma")
     git = _git_provenance()
     source_hashes = _source_hashes()
+    runtime = _runtime_provenance(device)
     if expected_source_commit is not None and git["head"] != str(expected_source_commit):
         raise RuntimeError(
             f"source commit {git['head']} != expected {expected_source_commit}"
@@ -541,6 +579,7 @@ def generate_dataset(
             source_hashes_equal=True,
             manifest_published_only_after_all_workers_completed=True,
         ),
+        runtime=runtime,
         parallelism=dict(
             jobs=int(jobs), start_method=("spawn" if int(jobs) > 1 else "none"),
             device=str(device), gamma_workers_are_independent=True,

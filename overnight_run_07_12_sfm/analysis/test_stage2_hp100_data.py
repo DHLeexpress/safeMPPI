@@ -126,6 +126,10 @@ def test_small_cpu_dataset_smoke_writes_auditable_manifest(tmp_path):
     assert payload["ped_xy"].shape == (1, 20, 2)
     assert payload["ped_vel"].shape == (1, 20, 2)
     assert manifest["files"][0]["sha256"] == S.sha256_file(data_path)
+    assert manifest["runtime"]["requested_device"] == "cpu"
+    assert {"human_agent", "human_advance", "nominal_polytope", "safemppi_barrier"} <= set(
+        manifest["source_hashes"]
+    )
     disk_manifest = json.loads((tmp_path / "manifest.json").read_text())
     assert disk_manifest["source_hashes"]["dynamics"]["sha256"]
 
