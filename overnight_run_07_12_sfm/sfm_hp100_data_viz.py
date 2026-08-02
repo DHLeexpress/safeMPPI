@@ -298,6 +298,22 @@ def _target_segment(state: np.ndarray, controls: np.ndarray) -> np.ndarray:
     return np.asarray(states, np.float32)
 
 
+def _geometry_condition(geometry: dict) -> dict:
+    A = np.asarray(geometry["A"], np.float64)
+    b = np.asarray(geometry["b"], np.float64)
+    ref = np.asarray(geometry["ref"], np.float64)
+    margins = np.asarray(geometry["margins"], np.float64)
+    scale = np.abs(b) + np.sum(np.abs(A * ref[None]), axis=1)
+    face = int(np.argmin(margins))
+    condition = scale[face] / max(abs(margins[face]), np.finfo(float).tiny)
+    return dict(
+        minimum_margin_face=face,
+        minimum_margin=float(margins[face]),
+        cancellation_scale=float(scale[face]),
+        cancellation_condition=float(condition),
+    )
+
+
 def _full_rollout(rows: dict[str, np.ndarray]) -> np.ndarray:
     terminal = DYN.step_numpy(rows["state"][-1], rows["executed_action"][-1])
     return np.concatenate((rows["state"], terminal[None]), axis=0)
@@ -427,9 +443,12 @@ def _draw_frame(figure, axes, rows, validated, index: int, gamma: float, episode
         axis.clear()
     _draw_world(axes[0], rows, validated, int(index), float(gamma))
     _draw_rasters(axes[1], axes[2], rows, validated, int(index))
+    condition = _geometry_condition(validated["geometries"][int(index)])
     figure.suptitle(
         f"Hp100 provenance audit | successful episode {episode} | gamma={gamma:g}\n"
-        "K=16 nominal outer faces are independent of 32 observation rays",
+        "K=16 nominal outer faces are independent of 32 observation rays | "
+        f"min face margin={condition['minimum_margin']:.4g} m, "
+        f"cancellation κ={condition['cancellation_condition']:.1f}",
         fontsize=12, y=.975,
     )
     return axes
@@ -491,6 +510,7 @@ def render(dataset_dir, gamma: float, episode: int, output_dir, *,
     plt.close(figure)
 
     selected_geometry = validated["geometries"][selected_index]
+    selected_condition = _geometry_condition(selected_geometry)
     np.savez_compressed(
         geometry_npz,
         A=np.asarray(selected_geometry["A"], np.float32),
@@ -525,6 +545,7 @@ def render(dataset_dir, gamma: float, episode: int, output_dir, *,
             selected_step=int(selected_step), stored_row_index=int(selected_index),
             rendered_frame_index=int(indices.index(selected_index)),
             geometry_sidecar=str(geometry_npz),
+            geometry_condition=selected_condition,
         ),
         provenance_distinction=dict(
             stored=(

@@ -129,6 +129,9 @@ def test_renderer_writes_mp4_selected_png_pdf_and_contract(tmp_path):
     }
     assert report["selected_frame"]["selected_step"] == 1
     assert report["selected_frame"]["rendered_frame_index"] == 1
+    condition = report["selected_frame"]["geometry_condition"]
+    assert condition["minimum_margin"] > 0.0
+    assert condition["cancellation_condition"] >= 1.0
     for kind in ("mp4", "png", "pdf", "geometry_npz"):
         artifact = Path(report["outputs"][kind]["path"])
         assert artifact.is_file() and artifact.stat().st_size > 0
