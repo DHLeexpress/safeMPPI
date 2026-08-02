@@ -129,10 +129,14 @@ def test_renderer_writes_mp4_selected_png_pdf_and_contract(tmp_path):
     }
     assert report["selected_frame"]["selected_step"] == 1
     assert report["selected_frame"]["rendered_frame_index"] == 1
-    for kind in ("mp4", "png", "pdf"):
+    for kind in ("mp4", "png", "pdf", "geometry_npz"):
         artifact = Path(report["outputs"][kind]["path"])
         assert artifact.is_file() and artifact.stat().st_size > 0
         assert V._sha256(artifact) == report["outputs"][kind]["sha256"]
+    sidecar = np.load(report["outputs"]["geometry_npz"]["path"])
+    assert sidecar["A"].shape[1:] == (2,)
+    assert sidecar["stored_hp100"].shape == (32, 100)
+    assert sidecar["executed_H10"].shape == (10, 2)
     disk = json.loads(Path(report["contract_path"]).read_text())
     assert disk["provenance_audit"]["all_hp_bitwise_equal"] is True
     assert disk["render"]["rendered_frames"] == 2

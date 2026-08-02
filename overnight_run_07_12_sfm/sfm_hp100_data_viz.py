@@ -438,7 +438,7 @@ def _draw_frame(figure, axes, rows, validated, index: int, gamma: float, episode
 def render(dataset_dir, gamma: float, episode: int, output_dir, *,
            selected_step: int | None = None, frame_stride: int = 1,
            fps: int = 8, dpi: int = 115) -> dict:
-    """Render MP4, selected PNG/PDF, and an authenticated JSON contract."""
+    """Render MP4, PNG/PDF, geometry sidecar, and an authenticated contract."""
     if int(frame_stride) <= 0 or int(fps) <= 0 or int(dpi) <= 0:
         raise ValueError("frame_stride, fps, and dpi must be positive")
     manifest, rows, data_path = load_episode(dataset_dir, float(gamma), int(episode))
@@ -463,8 +463,9 @@ def render(dataset_dir, gamma: float, episode: int, output_dir, *,
     mp4 = output / f"{stem}.mp4"
     png = output / f"{stem}_step{int(selected_step):03d}.png"
     pdf = output / f"{stem}_step{int(selected_step):03d}.pdf"
+    geometry_npz = output / f"{stem}_step{int(selected_step):03d}_geometry.npz"
     contract_path = output / f"{stem}.json"
-    for path in (mp4, png, pdf, contract_path):
+    for path in (mp4, png, pdf, geometry_npz, contract_path):
         if path.exists():
             raise FileExistsError(f"refusing to overwrite output: {path}")
 
@@ -489,6 +490,21 @@ def render(dataset_dir, gamma: float, episode: int, output_dir, *,
     figure.savefig(pdf)
     plt.close(figure)
 
+    selected_geometry = validated["geometries"][selected_index]
+    np.savez_compressed(
+        geometry_npz,
+        A=np.asarray(selected_geometry["A"], np.float32),
+        b=np.asarray(selected_geometry["b"], np.float32),
+        ref=np.asarray(selected_geometry["ref"], np.float32),
+        margins=np.asarray(selected_geometry["margins"], np.float32),
+        state=np.asarray(rows["state"][selected_index], np.float32),
+        pedestrian_positions=np.asarray(rows["ped_xy"][selected_index], np.float32),
+        pedestrian_velocities=np.asarray(rows["ped_vel"][selected_index], np.float32),
+        stored_hp100=np.asarray(rows["hp"][selected_index], np.float32),
+        executed_H10=np.asarray(rows["U"][selected_index], np.float32),
+        full_executed_rollout=np.asarray(_full_rollout(rows), np.float32),
+    )
+
     file_row = _file_row(manifest, float(gamma))
     source = Path(inspect.getsourcefile(HPF)).resolve()
     contract = dict(
@@ -508,6 +524,18 @@ def render(dataset_dir, gamma: float, episode: int, output_dir, *,
         selected_frame=dict(
             selected_step=int(selected_step), stored_row_index=int(selected_index),
             rendered_frame_index=int(indices.index(selected_index)),
+            geometry_sidecar=str(geometry_npz),
+        ),
+        provenance_distinction=dict(
+            stored=(
+                "Hp100 raster, robot state, pedestrian positions/velocities, "
+                "executed action, and H10 target"
+            ),
+            recomputed=(
+                "canonical float32 A,b,ref,margins from the stored state/pedestrians "
+                "under the manifest-pinned feature source"
+            ),
+            equality_check="recomputed Hp100 is bitwise equal to the stored raster",
         ),
         geometry_observation_separation=dict(
             nominal_artificial_outer_faces=BASE_FACES,
@@ -528,6 +556,10 @@ def render(dataset_dir, gamma: float, episode: int, output_dir, *,
             "mp4": dict(path=str(mp4), sha256=_sha256(mp4), bytes=mp4.stat().st_size),
             "png": dict(path=str(png), sha256=_sha256(png), bytes=png.stat().st_size),
             "pdf": dict(path=str(pdf), sha256=_sha256(pdf), bytes=pdf.stat().st_size),
+            "geometry_npz": dict(
+                path=str(geometry_npz), sha256=_sha256(geometry_npz),
+                bytes=geometry_npz.stat().st_size,
+            ),
         },
         source=dict(path=str(Path(__file__).resolve()), sha256=_sha256(Path(__file__).resolve())),
         feature_source=dict(path=str(source), sha256=_sha256(source)),
