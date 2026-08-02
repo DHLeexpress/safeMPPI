@@ -27,6 +27,49 @@ class _FakePlanner:
         return torch.tensor([9.0, -9.0]), {"polytope": polytope}
 
 
+def _planner_tuple_from_feature_geometry(geometry):
+    A = torch.as_tensor(geometry["A"], dtype=torch.float32)
+    b = torch.as_tensor(geometry["b"], dtype=torch.float32)
+    ref = torch.as_tensor(geometry["ref"], dtype=torch.float32)
+    margins = torch.clamp(b - A @ ref, min=1.0e-3)
+    return tuple(
+        value.detach().cpu().numpy()
+        for value in (A, b, ref, margins)
+    )
+
+
+def test_planner_geometry_audit_uses_derived_float32_margin_envelope():
+    center = np.array([3.434889, 3.678803], np.float32)
+    obstacles = np.array([[3.64, 3.68, 0.2]], np.float32)
+    frame, geometry = S.HPF.hp100_frame(
+        center,
+        obstacles,
+        obstacle_velocities=np.array([[-2.0, 0.0]], np.float32),
+        robot_velocity=np.array([2.0, 0.0], np.float32),
+        return_geometry=True,
+    )
+    planner = _planner_tuple_from_feature_geometry(geometry)
+    S._assert_feature_matches_planner(
+        frame, geometry, planner, center, provenance="narrow-face-test"
+    )
+
+    bad_A = planner[0].copy()
+    bad_A.flat[0] = np.nextafter(bad_A.flat[0], np.float32(np.inf))
+    with pytest.raises(RuntimeError, match="mismatch at A"):
+        S._assert_feature_matches_planner(
+            frame, geometry, (bad_A, *planner[1:]), center,
+            provenance="one-ulp-test",
+        )
+
+    bad_margins = planner[3].copy()
+    bad_margins[0] += np.float32(1.0e-3)
+    with pytest.raises(RuntimeError, match="roundoff envelope"):
+        S._assert_feature_matches_planner(
+            frame, geometry, (*planner[:3], bad_margins), center,
+            provenance="bad-margin-test",
+        )
+
+
 def test_rollout_collects_fresh_hp_and_future_executed_windows(monkeypatch):
     monkeypatch.setattr(S.SS, "make_humans", lambda *args, **kwargs: [object()] * S.N_PED)
     monkeypatch.setattr(

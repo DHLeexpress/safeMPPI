@@ -105,12 +105,10 @@ def _assert_feature_matches_planner(
     if planner_polytope is None:
         raise RuntimeError("locked SafeMPPI expert did not expose its nominal polytope")
     planner_geometry = dict(zip(("A", "b", "ref", "margins"), planner_polytope))
-    for key, expected_value in planner_geometry.items():
-        expected = np.asarray(expected_value, np.float32)
+    for key in ("A", "b", "ref"):
+        expected = np.asarray(planner_geometry[key], np.float32)
         actual = np.asarray(feature_geometry[key], np.float32)
-        if expected.shape != actual.shape or not np.allclose(
-            actual, expected, rtol=1.0e-6, atol=1.0e-6
-        ):
+        if expected.shape != actual.shape or not np.array_equal(actual, expected):
             delta = (
                 float(np.max(np.abs(actual - expected)))
                 if actual.shape == expected.shape else float("inf")
@@ -120,11 +118,48 @@ def _assert_feature_matches_planner(
                 f"at {key} ({provenance}): max_delta={delta}"
             )
 
+    A32 = np.asarray(feature_geometry["A"], np.float32)
+    b32 = np.asarray(feature_geometry["b"], np.float32)
+    ref32 = np.asarray(feature_geometry["ref"], np.float32)
+    canonical_m64 = np.maximum(
+        b32.astype(np.float64)
+        - A32.astype(np.float64) @ ref32.astype(np.float64),
+        1.0e-3,
+    )
+    feature_m32 = np.asarray(feature_geometry["margins"], np.float32)
+    if not np.array_equal(feature_m32, canonical_m64.astype(np.float32)):
+        raise RuntimeError(
+            "Hp100 feature margins are not canonical float32 geometry "
+            f"({provenance})"
+        )
+
+    planner_m64 = np.asarray(planner_geometry["margins"], np.float32).astype(np.float64)
+    if planner_m64.shape != canonical_m64.shape:
+        raise RuntimeError(f"Hp100/planner margin shape mismatch ({provenance})")
+    unit_roundoff = 2.0 ** -24
+    gamma3 = (3.0 * unit_roundoff) / (1.0 - 3.0 * unit_roundoff)
+    scale = np.abs(b32.astype(np.float64)) + np.sum(
+        np.abs(A32.astype(np.float64) * ref32.astype(np.float64)[None]), axis=1
+    )
+    floor_error = abs(float(np.float32(1.0e-3)) - 1.0e-3)
+    bound = np.nextafter(gamma3 * scale + floor_error, np.inf)
+    margin_delta = np.abs(planner_m64 - canonical_m64)
+    if np.any(margin_delta > bound):
+        face = int(np.argmax(margin_delta - bound))
+        condition = scale[face] / max(abs(canonical_m64[face]), np.finfo(float).tiny)
+        raise RuntimeError(
+            "Hp100/planner margin exceeds IEEE-float32 roundoff envelope "
+            f"({provenance}): face={face}, planner={planner_m64[face]}, "
+            f"canonical={canonical_m64[face]}, delta={margin_delta[face]}, "
+            f"bound={bound[face]}, min_margin={canonical_m64.min()}, "
+            f"condition={condition}"
+        )
+
     # Raster provenance and planner provenance are separate checks.  The
-    # planner tuple and the persisted feature geometry are independently
+    # planner tuple and the canonical feature geometry are independently
     # rounded to float32; normalizing by a very narrow face margin can amplify
     # their sub-micrometre difference.  Reconstruct the raster from the exact
-    # geometry stored beside it, after proving above that this geometry matches
+    # recomputed geometry, after proving above that this geometry matches
     # the planner before normalization.
     center = np.asarray(robot_xy, np.float64).reshape(2)
     n_theta, n_r = HPF.HP100_SHAPE
