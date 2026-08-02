@@ -163,8 +163,15 @@ def _validate_canonical_manifest(manifest: dict, dataset_dir: Path) -> None:
     _require_equal("source_git.clean", source_git.get("clean"), True)
     _require_equal("source_completion_audit.git", completion.get("git"), source_git)
     _require_equal("source_completion_audit.source_hashes_equal", completion.get("source_hashes_equal"), True)
-    if not manifest.get("source_hashes") or not manifest.get("runtime"):
+    recorded_hashes = manifest.get("source_hashes")
+    if not recorded_hashes or not manifest.get("runtime"):
         raise ValueError("canonical HP100 manifest lacks source/runtime provenance")
+    for name, current in DATA._source_hashes().items():
+        recorded = recorded_hashes.get(name)
+        if not isinstance(recorded, dict) or recorded.get("sha256") != current["sha256"]:
+            raise RuntimeError(
+                f"canonical HP100 data-generation source differs at {name}"
+            )
 
     file_rows = _manifest_files(manifest)
     _require_equal("files.gammas", sorted(file_rows), sorted(map(float, SP.GAMMAS)))

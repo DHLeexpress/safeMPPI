@@ -277,7 +277,7 @@ def test_canonical_manifest_contract_accepts_only_declared_collection(tmp_path):
         "source_completion_audit": {
             "git": source_git, "source_hashes_equal": True,
         },
-        "source_hashes": {"collector": {"sha256": "abc"}},
+        "source_hashes": P.DATA._source_hashes(),
         "runtime": {"python": "test"}, "files": files,
     }
     P._validate_canonical_manifest(manifest, tmp_path)
