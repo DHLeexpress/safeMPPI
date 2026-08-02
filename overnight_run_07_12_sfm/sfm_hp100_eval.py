@@ -355,17 +355,22 @@ def id_raw_gate(
 ) -> dict:
     rows, summary = evaluate(
         policy, scene_profile="matched_id", ep0=ep0, M=M, device=device,
-        seed=int(seed), with_validity=False,
+        seed=int(seed), with_validity=True,
     )
     del rows
     return dict(
         bank="fixed matched-ID scenario bank, raw temp=1",
         ep0=int(ep0), M_per_gamma=int(M), NFE=NFE,
         noise_seed=int(seed), temperature=TEMPERATURE,
-        pooled_SR=summary["pooled"]["SR"],
-        pooled_CR=summary["pooled"]["CR"],
+        pooled=summary["pooled"],
         per_gamma={
-            gamma: dict(SR=cell["SR"], CR=cell["CR"])
+            gamma: {
+                key: cell[key]
+                for key in (
+                    "SR", "CR", "timeout", "Validity",
+                    "successful_clearance", "successful_time_to_goal",
+                )
+            }
             for gamma, cell in summary["per_gamma"].items()
         },
     )

@@ -363,7 +363,10 @@ def test_promotion_gate_rejects_non_id_or_non_unit_temperature():
     good = {
         "distribution": "ID",
         "temperature": 1.0,
-        "per_gamma": {"0.1": {"SR": 0.8, "CR": 0.2}},
+        "per_gamma": {"0.1": {
+            "SR": 0.8, "CR": 0.2, "timeout": 0.0, "Validity": 0.7,
+            "successful_clearance": 0.1, "successful_time_to_goal": 8.0,
+        }},
     }
     good.update(M_per_gamma=10, ep0=12000, noise_seed=17)
     P._validate_gate(good, (0.1,), M=10, ep0=12000, noise_seed=17)

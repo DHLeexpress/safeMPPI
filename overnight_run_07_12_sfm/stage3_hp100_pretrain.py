@@ -734,15 +734,23 @@ def _validate_gate(result: dict, gammas, *, M: int, ep0: int, noise_seed: int) -
     if set(result.get("per_gamma", {})) != required:
         raise RuntimeError("HP100 ID gate did not return every declared gamma")
     for gamma, row in result["per_gamma"].items():
-        if not {"SR", "CR"}.issubset(row):
-            raise RuntimeError(f"HP100 ID gate lacks SR/CR for gamma {gamma}")
+        required_metrics = {
+            "SR", "CR", "timeout", "Validity",
+            "successful_clearance", "successful_time_to_goal",
+        }
+        if not required_metrics.issubset(row):
+            raise RuntimeError(f"HP100 ID gate lacks full raw metrics for gamma {gamma}")
 
 
 def _gate_score(result: dict, validation_cfm: float, gammas) -> tuple:
     rows = [result["per_gamma"][str(float(gamma))] for gamma in gammas]
     return (
+        max(1.0 - float(row["SR"]) for row in rows),
+        float(np.mean([1.0 - float(row["SR"]) for row in rows])),
         max(float(row["CR"]) for row in rows),
         float(np.mean([row["CR"] for row in rows])),
+        -min(float(row["Validity"]) for row in rows),
+        -float(np.mean([row["Validity"] for row in rows])),
         -min(float(row["SR"]) for row in rows),
         -float(np.mean([row["SR"] for row in rows])),
         float(validation_cfm),
