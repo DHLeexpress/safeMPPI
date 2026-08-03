@@ -354,7 +354,7 @@ def _draw_h_audit(axis, frame: dict, gamma: float) -> None:
     axis.axhline(0.0, color="#555555", lw=.7, alpha=.6)
     axis.set_xticks(np.arange(0, 11, 2)); axis.set_xlim(0, 10)
     axis.grid(alpha=.15); axis.set_xlabel("plan horizon h"); axis.set_ylabel(r"normalized $H_P$")
-    axis.set_title("Weighted output rechecked under the same frozen nominal polytope")
+    axis.set_title("Weighted output · same-polytope H10 audit")
     axis.legend(loc="best", fontsize=7, framealpha=.88)
 
 
