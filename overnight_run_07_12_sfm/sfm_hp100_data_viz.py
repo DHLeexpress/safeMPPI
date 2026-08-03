@@ -41,6 +41,7 @@ import stage2_hp100_data as DATA
 
 
 STATUS = "SFM_HP100_DATA_PROVENANCE_VIZ_COMPLETE"
+COUNTERFACTUAL_STATUS = "SFM_HP100_COUNTERFACTUAL_NO_RETREAT_VIZ_COMPLETE"
 EXPECTED_DATA_STATUS = "HP100_ID_DATASET_COMPLETE"
 EXPECTED_SCHEMA = "sfm_hp100_id_demonstrations_v1"
 BASE_FACES = 16
@@ -264,6 +265,10 @@ def validate_episode(manifest: dict, rows: dict[str, np.ndarray]) -> dict:
     return dict(
         geometries=geometries,
         histories=histories,
+        hp_frames=np.asarray(rows["hp"], np.float32),
+        geometry_label="velocity-aware nominal polytope",
+        raster_label="Exact stored $H_P$ raster",
+        counterfactual=None,
         sensing_radius=float(sensing),
         pedestrian_radius=pedestrian_radius,
         goal=np.asarray(environment["goal"], np.float64),
@@ -283,6 +288,68 @@ def validate_episode(manifest: dict, rows: dict[str, np.ndarray]) -> dict:
             detected_obstacle_faces_max=int(max(len(row["A"]) - BASE_FACES for row in geometries)),
         ),
     )
+
+
+def counterfactual_no_retreat(manifest: dict, rows: dict[str, np.ndarray]) -> dict:
+    """Re-render stored states with current-position tangent faces.
+
+    The original feature and rollout are authenticated first.  This function
+    changes neither the stored controls nor the expert trajectory, so its
+    output is a geometry counterfactual rather than replacement training data.
+    """
+    validated = validate_episode(manifest, rows)
+    feature = manifest["feature"]
+    environment = manifest["environment"]
+    sensing = float(environment["sensing_radius"])
+    pedestrian_radius = float(environment["pedestrian_radius"])
+    predict_tau = float(feature["predict_tau"])
+    frames, geometries = [], []
+    for index in range(len(rows["step"])):
+        ped_xy = np.asarray(rows["ped_xy"][index], np.float32)
+        obstacles = np.concatenate(
+            (ped_xy, np.full((len(ped_xy), 1), pedestrian_radius, np.float32)),
+            axis=1,
+        )
+        frame, geometry = HPF.hp100_frame(
+            rows["state"][index, :2], obstacles,
+            sensing=sensing, n_base=BASE_FACES,
+            obstacle_velocities=rows["ped_vel"][index],
+            robot_velocity=rows["state"][index, 2:4],
+            predict_gain=0.0, predict_tau=predict_tau,
+            return_geometry=True,
+        )
+        raw_margins = (
+            np.asarray(geometry["b"], np.float64)
+            - np.asarray(geometry["A"], np.float64)
+            @ np.asarray(geometry["ref"], np.float64)
+        )
+        if np.any(raw_margins <= 0.0):
+            raise RuntimeError("current-tangent counterfactual does not contain its robot reference")
+        _assert_base_faces(geometry, rows["state"][index, :2], sensing)
+        frames.append(np.asarray(frame, np.float32))
+        geometries.append(geometry)
+    frames = np.stack(frames)
+    histories = HPH.build_hp100(
+        torch.from_numpy(frames),
+        torch.from_numpy(np.asarray(rows["episode"], np.int64)),
+        torch.from_numpy(np.asarray(rows["step"], np.int64)),
+    ).numpy()
+    validated.update(
+        geometries=geometries,
+        histories=histories,
+        hp_frames=frames,
+        geometry_label="current-position tangent nominal polytope",
+        raster_label="Counterfactual current-tangent $H_P$ raster",
+        counterfactual=dict(
+            enabled=True,
+            predict_gain=0.0,
+            source_predict_gain=float(feature["predict_gain"]),
+            stored_trajectory_reused=True,
+            expert_rerun=False,
+            training_data=False,
+        ),
+    )
+    return validated
 
 
 def _level_polygons(geometry: dict, center: np.ndarray, gamma: float):
@@ -396,7 +463,7 @@ def _draw_world(axis, rows: dict, validated: dict, index: int, gamma: float) -> 
     axis.legend(handles=[
         Line2D([], [], color="black", lw=1.8, label="executed rollout to current state"),
         Line2D([], [], color=ORANGE, lw=1.6, label="stored H=10 executed-control target"),
-        Line2D([], [], color=BLUE, lw=1.6, label="velocity-aware nominal polytope"),
+        Line2D([], [], color=BLUE, lw=1.6, label=validated["geometry_label"]),
         Line2D([], [], color=BLUE, lw=.6, label="nominal level sets h=1..10"),
         Line2D([], [], color=GRAY, lw=1.0, ls="--", label="K=16 artificial outer support"),
         Line2D([], [], color="#56B4E9", lw=.7, label="32 observation rays (not faces)"),
@@ -404,7 +471,7 @@ def _draw_world(axis, rows: dict, validated: dict, index: int, gamma: float) -> 
 
 
 def _draw_rasters(current_axis, history_axis, rows: dict, validated: dict, index: int) -> None:
-    current = np.asarray(rows["hp"][index], float)
+    current = np.asarray(validated["hp_frames"][index], float)
     current_axis.imshow(
         current, origin="lower", aspect="auto", cmap="coolwarm", vmin=-1.0, vmax=1.0,
         extent=(.0, validated["sensing_radius"], -np.pi, np.pi), interpolation="nearest",
@@ -414,7 +481,7 @@ def _draw_rasters(current_axis, history_axis, rows: dict, validated: dict, index
         f"radius [m] · 100 bins ({cell_width:.2f} m)"
     )
     current_axis.set_ylabel(r"observation angle $\theta$ [rad]")
-    current_axis.set_title("Exact stored $H_P$ raster · 32 observation rays")
+    current_axis.set_title(f"{validated['raster_label']} · 32 observation rays")
     current_axis.set_yticks((-np.pi, -np.pi / 2, 0.0, np.pi / 2, np.pi),
                            (r"$-\pi$", r"$-\pi/2$", "0", r"$\pi/2$", r"$\pi$"))
 
@@ -456,8 +523,12 @@ def _draw_frame(figure, axes, rows, validated, index: int, gamma: float, episode
     _draw_world(axes[0], rows, validated, int(index), float(gamma))
     _draw_rasters(axes[1], axes[2], rows, validated, int(index))
     condition = _geometry_condition(validated["geometries"][int(index)])
+    role = (
+        "Hp100 current-tangent counterfactual"
+        if validated["counterfactual"] else "Hp100 provenance audit"
+    )
     figure.suptitle(
-        f"Hp100 provenance audit | successful episode {episode} | gamma={gamma:g}\n"
+        f"{role} | successful episode {episode} | gamma={gamma:g}\n"
         "K=16 nominal outer faces are independent of 32 observation rays | "
         f"min face margin={condition['minimum_margin']:.4g} m, "
         f"cancellation κ={condition['cancellation_condition']:.1f}",
@@ -468,12 +539,16 @@ def _draw_frame(figure, axes, rows, validated, index: int, gamma: float, episode
 
 def render(dataset_dir, gamma: float, episode: int, output_dir, *,
            selected_step: int | None = None, frame_stride: int = 1,
-           fps: int = 8, dpi: int = 115) -> dict:
+           fps: int = 8, dpi: int = 115,
+           current_tangent_counterfactual: bool = False) -> dict:
     """Render MP4, PNG/PDF, geometry sidecar, and an authenticated contract."""
     if int(frame_stride) <= 0 or int(fps) <= 0 or int(dpi) <= 0:
         raise ValueError("frame_stride, fps, and dpi must be positive")
     manifest, rows, data_path = load_episode(dataset_dir, float(gamma), int(episode))
-    validated = validate_episode(manifest, rows)
+    validated = (
+        counterfactual_no_retreat(manifest, rows)
+        if current_tangent_counterfactual else validate_episode(manifest, rows)
+    )
     available_steps = rows["step"].astype(int).tolist()
     if selected_step is None:
         selected_step = available_steps[len(available_steps) // 2]
@@ -490,7 +565,8 @@ def render(dataset_dir, gamma: float, episode: int, output_dir, *,
     output = Path(output_dir).resolve()
     output.mkdir(parents=True, exist_ok=True)
     gamma_tag = f"{float(gamma):g}".replace(".", "p")
-    stem = f"hp100_expert_g{gamma_tag}_ep{int(episode)}"
+    suffix = "_current_tangent_counterfactual" if current_tangent_counterfactual else ""
+    stem = f"hp100_expert_g{gamma_tag}_ep{int(episode)}{suffix}"
     mp4 = output / f"{stem}.mp4"
     png = output / f"{stem}_step{int(selected_step):03d}.png"
     pdf = output / f"{stem}_step{int(selected_step):03d}.pdf"
@@ -533,6 +609,7 @@ def render(dataset_dir, gamma: float, episode: int, output_dir, *,
         pedestrian_positions=np.asarray(rows["ped_xy"][selected_index], np.float32),
         pedestrian_velocities=np.asarray(rows["ped_vel"][selected_index], np.float32),
         stored_hp100=np.asarray(rows["hp"][selected_index], np.float32),
+        rendered_hp100=np.asarray(validated["hp_frames"][selected_index], np.float32),
         executed_H10=np.asarray(rows["U"][selected_index], np.float32),
         full_executed_rollout=np.asarray(_full_rollout(rows), np.float32),
     )
@@ -540,8 +617,11 @@ def render(dataset_dir, gamma: float, episode: int, output_dir, *,
     file_row = _file_row(manifest, float(gamma))
     source = Path(inspect.getsourcefile(HPF)).resolve()
     contract = dict(
-        status=STATUS,
+        status=(COUNTERFACTUAL_STATUS if current_tangent_counterfactual else STATUS),
         role=(
+            "counterfactual current-tangent geometry on an authenticated stored "
+            "trajectory; no expert rerun and not replacement training data"
+            if current_tangent_counterfactual else
             "post-collection provenance visualization; no expert rerun, no data "
             "selection, and no approximate geometry"
         ),
@@ -577,6 +657,7 @@ def render(dataset_dir, gamma: float, episode: int, output_dir, *,
             statement="K=16 nominal support geometry is independent of 32 raster rays",
         ),
         provenance_audit=validated["audit"],
+        counterfactual=validated["counterfactual"],
         render=dict(
             frame_stride=int(frame_stride), fps=int(fps), rendered_frames=len(indices),
             level_sets=10, pedestrian_radius=float(validated["pedestrian_radius"]),
@@ -611,11 +692,13 @@ def main() -> None:
     parser.add_argument("--frame-stride", type=int, default=1)
     parser.add_argument("--fps", type=int, default=8)
     parser.add_argument("--dpi", type=int, default=115)
+    parser.add_argument("--current-tangent-counterfactual", action="store_true")
     args = parser.parse_args()
     report = render(
         args.dataset_dir, args.gamma, args.episode, args.output_dir,
         selected_step=args.selected_step, frame_stride=args.frame_stride,
         fps=args.fps, dpi=args.dpi,
+        current_tangent_counterfactual=args.current_tangent_counterfactual,
     )
     print(json.dumps({
         "status": report["status"], "contract": report["contract_path"],
