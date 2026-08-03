@@ -21,7 +21,7 @@ def test_hp100_raster_is_decoupled_from_nominal_polytope_faces():
         HF.hp100_frame(center, empty, n_base=3)
 
 
-def test_hp100_raster_reproduces_velocity_predictive_face_retreat():
+def test_hp100_raster_supports_only_explicit_predictive_counterfactual():
     center = np.zeros(2, np.float32)
     obstacles = np.array([[1.0, 0.0, 0.2]], np.float32)
     static = HF.hp100_frame(
@@ -29,21 +29,38 @@ def test_hp100_raster_reproduces_velocity_predictive_face_retreat():
         obstacle_velocities=np.zeros((1, 2)), robot_velocity=np.array([1.0, 0.0]),
     )
     predictive = HF.hp100_frame(
-        center, obstacles,
+        center, obstacles, predict_gain=0.25,
         obstacle_velocities=np.zeros((1, 2)), robot_velocity=np.array([1.0, 0.0]),
     )
     assert predictive.shape == static.shape == (32, 100)
     assert np.any(predictive < static - 1.0e-5)
-    assert HF.PREDICT_GAIN == 0.25 and HF.PREDICT_TAU == 1.0
+    assert HF.PREDICT_GAIN == 0.0 and HF.PREDICT_TAU == 1.0
+    assert HF.contract()["pedestrian_velocity_in_geometry"] is False
     frame, geometry = HF.hp100_frame(
         center, obstacles, obstacle_velocities=np.zeros((1, 2)),
         robot_velocity=np.array([1.0, 0.0]), return_geometry=True,
     )
-    assert np.array_equal(frame, predictive)
+    assert np.array_equal(frame, static)
     assert geometry["A"].shape[0] >= 16
     assert geometry["A"].shape[1:] == (2,)
     assert geometry["b"].shape == geometry["margins"].shape
     assert np.allclose(geometry["ref"], center)
+
+
+def test_current_tangent_hp_is_invariant_to_closing_velocity():
+    center = np.array([0.0, 0.0], np.float32)
+    obstacles = np.array([[0.8, 0.0, 0.2]], np.float32)
+    still = HF.hp100_frame(
+        center, obstacles,
+        obstacle_velocities=np.zeros((1, 2), np.float32),
+        robot_velocity=np.zeros(2, np.float32),
+    )
+    closing = HF.hp100_frame(
+        center, obstacles,
+        obstacle_velocities=np.array([[-2.0, 0.0]], np.float32),
+        robot_velocity=np.array([2.0, 0.0], np.float32),
+    )
+    np.testing.assert_array_equal(still, closing)
 
 
 def test_hp100_raster_is_bitwise_reproducible_from_persisted_narrow_geometry():
@@ -137,6 +154,7 @@ def test_hp100_policy_strict_config_params_and_round_trip(tmp_path):
     assert config["gru_dim"] == 16 and config["low_token"] == 48
     assert config["width"] == 256 and config["output_dim"] == 20
     assert config["u_max"] == 2.0 and config["v_max"] == 2.0
+    assert config["predict_gain"] == 0.0
     assert sum(parameter.numel() for parameter in policy.parameters()) == 1_978_068
 
     path = tmp_path / "hp100.pt"

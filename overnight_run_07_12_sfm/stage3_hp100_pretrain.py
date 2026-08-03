@@ -35,7 +35,7 @@ import stage2_hp100_data as DATA
 
 
 SUCCESSFUL_LINEAGES_PER_GAMMA = 500
-SCHEMA_VERSION = "sfm_hp100_id_demonstrations_v1"
+SCHEMA_VERSION = DATA.SCHEMA_VERSION
 HISTORY_LENGTH = 10
 DEFAULT_EPOCHS = 120
 DEFAULT_BATCH = 256
@@ -137,11 +137,12 @@ def _validate_canonical_manifest(manifest: dict, dataset_dir: Path) -> None:
     )
     _require_equal("environment", environment, expected_environment)
     expert = manifest.get("expert", {})
-    _require_equal("expert.name", expert.get("name"), DATA.EXPERT.EXPERT_NAME)
+    _require_equal("expert.name", expert.get("name"), DATA.HP100_EXPERT_NAME)
     _require_equal("expert.config", expert.get("config"), DATA.locked_expert_config())
     _require_equal(
         "expert.execution", expert.get("execution"),
-        "CappedSafeMPPIAdapter using sfm_hp100_dynamics for internal and real steps",
+        "CappedSafeMPPIAdapter using sfm_hp100_dynamics for internal and real "
+        "steps; current-position tangent nominal geometry (predict_gain=0)",
     )
     _require_equal(
         "expert.supervised_target", expert.get("supervised_target"),
@@ -155,7 +156,13 @@ def _validate_canonical_manifest(manifest: dict, dataset_dir: Path) -> None:
     _require_equal("feature.radial_pooling", feature.get("radial_pooling"), "none")
     _require_equal("feature.contract", feature.get("contract"), HPF.contract())
     _require_equal("feature.nominal_polytope_n_base", feature.get("nominal_polytope_n_base"), 16)
-    _require_equal("feature.velocity_aware", feature.get("velocity_aware"), True)
+    _require_equal("feature.predict_gain", feature.get("predict_gain"), HPF.PREDICT_GAIN)
+    _require_equal("feature.predict_tau", feature.get("predict_tau"), HPF.PREDICT_TAU)
+    _require_equal("feature.velocity_aware", feature.get("velocity_aware"), False)
+    _require_equal(
+        "feature.current_position_tangent",
+        feature.get("current_position_tangent"), True,
+    )
     _require_equal("dynamics", manifest.get("dynamics"), DYN.contract())
 
     source_git = manifest.get("source_git", {})

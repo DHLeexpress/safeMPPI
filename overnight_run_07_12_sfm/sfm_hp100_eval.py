@@ -3,7 +3,7 @@
 The learned policy is evaluated without acquisition, verifier selection,
 guidance, or fallback: one temperature-one flow window is generated at each
 context, its first action is executed, and the system replans.  The same
-velocity-aware nominal ``H_P`` observation and componentwise action/velocity
+current-position tangent nominal ``H_P`` observation and componentwise action/velocity
 caps used by HP100 demonstration collection are used here.
 """
 from __future__ import annotations

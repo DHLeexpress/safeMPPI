@@ -1,5 +1,6 @@
 import json
 
+import pytest
 import torch
 
 import sfm_hp100_dynamics as DYN
@@ -258,10 +259,11 @@ def test_canonical_manifest_contract_accepts_only_declared_collection(tmp_path):
             "sensing_radius": float(P.SS.R_SENSE),
         },
         "expert": {
-            "name": P.DATA.EXPERT.EXPERT_NAME,
+            "name": P.DATA.HP100_EXPERT_NAME,
             "config": P.DATA.locked_expert_config(),
             "execution": (
-                "CappedSafeMPPIAdapter using sfm_hp100_dynamics for internal and real steps"
+                "CappedSafeMPPIAdapter using sfm_hp100_dynamics for internal and real "
+                "steps; current-position tangent nominal geometry (predict_gain=0)"
             ),
             "supervised_target": (
                 "next H=10 executed controls; repeat final action at terminal prefix"
@@ -271,7 +273,9 @@ def test_canonical_manifest_contract_accepts_only_declared_collection(tmp_path):
             "shape": [32, 100], "contract": P.HPF.contract(),
             "dtype": "float32", "radial_bins": 100, "angular_bins": 32,
             "radial_pooling": "none",
-            "nominal_polytope_n_base": 16, "velocity_aware": True,
+            "nominal_polytope_n_base": 16, "velocity_aware": False,
+            "current_position_tangent": True,
+            "predict_gain": 0.0, "predict_tau": P.HPF.PREDICT_TAU,
         },
         "dynamics": P.DYN.contract(), "source_git": source_git,
         "source_completion_audit": {
@@ -288,6 +292,10 @@ def test_canonical_manifest_contract_accepts_only_declared_collection(tmp_path):
         assert "nominal_polytope_n_base" in str(error)
     else:
         raise AssertionError("noncanonical 32-face nominal polytope was accepted")
+    manifest["feature"]["nominal_polytope_n_base"] = 16
+    manifest["feature"]["predict_gain"] = 0.25
+    with pytest.raises(ValueError, match="feature.predict_gain"):
+        P._validate_canonical_manifest(manifest, tmp_path)
 
 
 def test_tensor_lineages_are_bound_to_manifest_ledger(tmp_path):

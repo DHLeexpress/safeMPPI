@@ -2,7 +2,7 @@
 
 The renderer is deliberately data-only: it loads one successful trajectory
 from a completed ``stage2_hp100_data`` directory and never reruns the expert.
-For every stored context it reconstructs the velocity-aware nominal polytope
+For every stored context it reconstructs the declared nominal polytope
 from the stored robot/pedestrian state, then requires the resulting float32
 ``[32,100]`` raster to match the stored training feature bit for bit.
 
@@ -43,7 +43,7 @@ import stage2_hp100_data as DATA
 STATUS = "SFM_HP100_DATA_PROVENANCE_VIZ_COMPLETE"
 COUNTERFACTUAL_STATUS = "SFM_HP100_COUNTERFACTUAL_NO_RETREAT_VIZ_COMPLETE"
 EXPECTED_DATA_STATUS = "HP100_ID_DATASET_COMPLETE"
-EXPECTED_SCHEMA = "sfm_hp100_id_demonstrations_v1"
+EXPECTED_SCHEMA = DATA.SCHEMA_VERSION
 BASE_FACES = 16
 ANGULAR_RAYS = 32
 RADIAL_BINS = 100
@@ -152,8 +152,9 @@ def load_episode(dataset_dir, gamma: float, episode: int) -> tuple[dict, dict, P
         raise ValueError("manifest does not declare the exact [32,100] Hp raster")
     if int(feature.get("nominal_polytope_n_base", -1)) != BASE_FACES:
         raise ValueError("manifest does not declare exactly 16 nominal outer faces")
-    if feature.get("velocity_aware") is not True:
-        raise ValueError("manifest Hp feature is not velocity-aware")
+    expected_velocity_aware = bool(HPF.PREDICT_GAIN > 0.0)
+    if feature.get("velocity_aware") is not expected_velocity_aware:
+        raise ValueError("manifest Hp feature has the wrong predictive-retreat contract")
     row = _file_row(manifest, float(gamma))
     data_path = root / row["file"]
     if not data_path.is_file():
@@ -266,7 +267,11 @@ def validate_episode(manifest: dict, rows: dict[str, np.ndarray]) -> dict:
         geometries=geometries,
         histories=histories,
         hp_frames=np.asarray(rows["hp"], np.float32),
-        geometry_label="velocity-aware nominal polytope",
+        geometry_label=(
+            "velocity-aware nominal polytope"
+            if float(feature["predict_gain"]) > 0.0
+            else "current-position tangent nominal polytope"
+        ),
         raster_label="Exact stored $H_P$ raster",
         counterfactual=None,
         sensing_radius=float(sensing),
@@ -297,8 +302,10 @@ def counterfactual_no_retreat(manifest: dict, rows: dict[str, np.ndarray]) -> di
     changes neither the stored controls nor the expert trajectory, so its
     output is a geometry counterfactual rather than replacement training data.
     """
-    validated = validate_episode(manifest, rows)
     feature = manifest["feature"]
+    if float(feature["predict_gain"]) == 0.0:
+        raise ValueError("source dataset already uses current-position tangent geometry")
+    validated = validate_episode(manifest, rows)
     environment = manifest["environment"]
     sensing = float(environment["sensing_radius"])
     pedestrian_radius = float(environment["pedestrian_radius"])

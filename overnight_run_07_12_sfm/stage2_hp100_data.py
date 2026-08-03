@@ -34,7 +34,8 @@ import sfm_hp100_features as HPF
 import sfm_scene as SS
 
 
-SCHEMA_VERSION = "sfm_hp100_id_demonstrations_v1"
+SCHEMA_VERSION = "sfm_hp100_id_demonstrations_v2_current_tangent"
+HP100_EXPERT_NAME = "hp100_current_tangent_r2_n2048_nv3_pg0"
 HORIZON = 10
 N_BASE = 16
 N_PED = 20
@@ -71,6 +72,9 @@ class CappedSafeMPPIAdapter(SafeMPPIAdapter):
 
 def locked_expert_config() -> dict:
     config = asdict(EXPERT.demonstration_config())
+    # Preserve the historical B1 expert module as a comparator, but the fresh
+    # Hp100 demonstrations use the faithful current-position tangent geometry.
+    config["predict_gain"] = HPF.PREDICT_GAIN
     required = dict(
         horizon=HORIZON,
         dt=DYN.DT,
@@ -600,9 +604,12 @@ def generate_dataset(
             sensing_radius=float(SS.R_SENSE),
         ),
         expert=dict(
-            name=EXPERT.EXPERT_NAME,
+            name=HP100_EXPERT_NAME,
             config=locked_expert_config(),
-            execution="CappedSafeMPPIAdapter using sfm_hp100_dynamics for internal and real steps",
+            execution=(
+                "CappedSafeMPPIAdapter using sfm_hp100_dynamics for internal and real "
+                "steps; current-position tangent nominal geometry (predict_gain=0)"
+            ),
             supervised_target="next H=10 executed controls; repeat final action at terminal prefix",
         ),
         feature=dict(
@@ -613,7 +620,8 @@ def generate_dataset(
             angular_bins=32,
             radial_pooling="none",
             nominal_polytope_n_base=N_BASE,
-            velocity_aware=True,
+            velocity_aware=False,
+            current_position_tangent=True,
             predict_gain=float(locked_expert_config()["predict_gain"]),
             predict_tau=float(HORIZON * DYN.DT),
             planner_geometry_runtime_assertion="A,b,ref,margins and raster checked at every context",

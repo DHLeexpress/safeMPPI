@@ -10,6 +10,12 @@ import stage2_hp100_data as S
 _ORIGINAL_HP100_FRAME = S.HPF.hp100_frame
 
 
+def test_hp100_expert_overrides_retreat_without_mutating_historical_comparator():
+    assert S.EXPERT.demonstration_config().predict_gain == 0.25
+    assert S.locked_expert_config()["predict_gain"] == 0.0
+    assert S.HPF.PREDICT_GAIN == 0.0
+
+
 class _FakePlanner:
     def plan(self, state, goal, obstacles, **kwargs):
         _, geometry = _ORIGINAL_HP100_FRAME(
@@ -91,6 +97,7 @@ def test_rollout_collects_fresh_hp_and_future_executed_windows(monkeypatch):
             kwargs["sensing"], kwargs["n_base"],
             np.asarray(kwargs["obstacle_velocities"]).copy(),
             np.asarray(kwargs["robot_velocity"]).copy(),
+            kwargs["predict_gain"],
         ))
         return original_hp(robot_xy, obstacles, **kwargs)
 
@@ -102,6 +109,7 @@ def test_rollout_collects_fresh_hp_and_future_executed_windows(monkeypatch):
     assert len(hp_calls) == 2
     assert all(call[3] == 16 for call in hp_calls)
     assert all(call[4].shape == (S.N_PED, 2) for call in hp_calls)
+    assert all(call[6] == 0.0 for call in hp_calls)
     assert records[0]["hp"].shape == (32, 100)
     assert records[0]["hp"].dtype == np.float32
     np.testing.assert_allclose(records[0]["executed_action"], [2.0, -2.0])
@@ -149,7 +157,10 @@ def test_small_cpu_dataset_smoke_writes_auditable_manifest(tmp_path):
     assert manifest["dynamics"]["action_cap"]["maximum"] == 2.0
     assert manifest["dynamics"]["velocity_cap"]["maximum"] == 2.0
     assert manifest["feature"]["nominal_polytope_n_base"] == 16
-    assert manifest["feature"]["velocity_aware"] is True
+    assert manifest["feature"]["velocity_aware"] is False
+    assert manifest["feature"]["current_position_tangent"] is True
+    assert manifest["feature"]["predict_gain"] == 0.0
+    assert manifest["expert"]["name"] == S.HP100_EXPERT_NAME
     assert manifest["feature"]["predict_tau"] == 1.0
     assert manifest["total_successful_lineages"] == 1
     assert "old-grid upsample" in manifest["feature"]["construction"]

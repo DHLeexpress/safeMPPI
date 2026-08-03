@@ -60,7 +60,8 @@ def _write_dataset(root: Path, *, corrupt_hp=False):
         status=V.EXPECTED_DATA_STATUS, schema_version=V.EXPECTED_SCHEMA,
         dynamics=D.contract(), source_hashes=DATA._source_hashes(),
         feature=dict(
-            shape=[32, 100], nominal_polytope_n_base=16, velocity_aware=True,
+            shape=[32, 100], nominal_polytope_n_base=16, velocity_aware=False,
+            current_position_tangent=True,
             predict_gain=F.PREDICT_GAIN, predict_tau=F.PREDICT_TAU,
             contract=F.contract(),
         ),
@@ -145,32 +146,8 @@ def test_renderer_writes_mp4_selected_png_pdf_and_contract(tmp_path):
     assert disk["render"]["rendered_frames"] == 2
 
 
-def test_counterfactual_no_retreat_authenticates_source_but_renders_new_geometry(
-        tmp_path, monkeypatch):
+def test_counterfactual_rejects_dataset_that_is_already_current_tangent(tmp_path):
     gamma, episode = _write_dataset(tmp_path)
     manifest, rows, _ = V.load_episode(tmp_path, gamma, episode)
-    original = V.validate_episode(manifest, rows)
-    calls = []
-    hp100_frame = V.HPF.hp100_frame
-
-    def capture(*args, **kwargs):
-        calls.append(kwargs["predict_gain"])
-        return hp100_frame(*args, **kwargs)
-
-    monkeypatch.setattr(V.HPF, "hp100_frame", capture)
-    counterfactual = V.counterfactual_no_retreat(manifest, rows)
-    assert counterfactual["counterfactual"] == {
-        "enabled": True,
-        "predict_gain": 0.0,
-        "source_predict_gain": F.PREDICT_GAIN,
-        "stored_trajectory_reused": True,
-        "expert_rerun": False,
-        "training_data": False,
-    }
-    assert calls[-len(rows["step"]):] == [0.0] * len(rows["step"])
-    assert counterfactual["audit"]["all_hp_bitwise_equal"] is True
-    assert counterfactual["hp_frames"].shape == rows["hp"].shape
-    assert original["counterfactual"] is None
-    for geometry in counterfactual["geometries"]:
-        raw = geometry["b"] - geometry["A"] @ geometry["ref"]
-        assert np.all(raw > 0.0)
+    with pytest.raises(ValueError, match="already uses current-position tangent"):
+        V.counterfactual_no_retreat(manifest, rows)

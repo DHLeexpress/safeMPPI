@@ -1,4 +1,4 @@
-"""Faithful high-resolution nominal-:math:`H_P` features for the SFM policy.
+"""Faithful current-tangent high-resolution :math:`H_P` features.
 
 The raster resolution and the nominal-polytope geometry are deliberately
 independent: the policy observes 32 angular samples, while SafeMPPI continues
@@ -17,7 +17,7 @@ R_SENSE = 2.0
 POLYTOPE_N_BASE = 16
 K_HIST = 16
 R_GOAL = 5.0
-PREDICT_GAIN = 0.25
+PREDICT_GAIN = 0.0
 PREDICT_TAU = 10 * DT
 
 
@@ -45,7 +45,9 @@ def hp100_frame(
     spaced every 0.02 m over the two-metre sensing disk.  ``n_base`` controls
     only the nominal-polytope outer boundary; it never changes the 32-angle
     observation raster.  Passing the live robot/pedestrian velocities exactly
-    reproduces the demonstration expert's predictive face retreat.
+    is accepted for interface compatibility, but the locked feature contract
+    uses ``predict_gain=0``: pedestrian faces are tangent to their current
+    positions and never retreat from relative velocity.
     """
     center = np.asarray(_numpy(robot_xy), dtype=np.float64).reshape(-1)[:2]
     obs = np.asarray(_numpy(obstacles), dtype=np.float64)
@@ -85,11 +87,13 @@ def hp100_frame(
     stored_A = A.astype(np.float32, copy=False)
     stored_b = b.astype(np.float32, copy=False)
     stored_ref = np.asarray(_numpy(polytope.ref), dtype=np.float32)
-    stored_margins = np.maximum(
+    raw_margins = (
         stored_b.astype(np.float64)
-        - stored_A.astype(np.float64) @ stored_ref.astype(np.float64),
-        1.0e-3,
-    ).astype(np.float32)
+        - stored_A.astype(np.float64) @ stored_ref.astype(np.float64)
+    )
+    if np.any(raw_margins <= 0.0):
+        raise RuntimeError("nominal current-tangent polytope does not contain its robot reference")
+    stored_margins = np.maximum(raw_margins, 1.0e-3).astype(np.float32)
     flat = points.reshape(-1, 2)
     hp = (
         (stored_b.astype(np.float64)[None]
@@ -140,7 +144,7 @@ def hist_pad(control_history, K=K_HIST, *, u_max=U_MAX):
 def contract():
     """JSON-native observation contract pinned by data and checkpoints."""
     return dict(
-        name="velocity_aware_nominal_hp100_v1",
+        name="current_tangent_nominal_hp100_v2",
         temporal_frames=10,
         frame_shape=list(HP100_SHAPE),
         tensor_shape=[10, *HP100_SHAPE],
@@ -152,6 +156,8 @@ def contract():
         nominal_polytope_n_base=int(POLYTOPE_N_BASE),
         predict_gain=float(PREDICT_GAIN),
         predict_tau=float(PREDICT_TAU),
+        pedestrian_velocity_in_geometry=False,
+        face_definition="current-position tangent; no predictive retreat",
         value="clip(min_k (b_k-a_k^T x)/(b_k-a_k^T robot), -1, 1)",
         history_order="newest-to-oldest; pre-episode slots repeat first frame",
         radial_pooling="none",

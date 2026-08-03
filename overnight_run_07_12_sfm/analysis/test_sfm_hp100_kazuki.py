@@ -199,6 +199,7 @@ def test_deploy_uses_hp100_observation_and_caps_actual_execution(monkeypatch):
     )
     assert calls["context_shapes"] == ((1, 10, 32, 100), (1, 5), (1, 16, 2))
     assert calls["hp_kwargs"]["n_base"] == 16
+    assert calls["hp_kwargs"]["predict_gain"] == 0.0
     np.testing.assert_allclose(calls["hp_kwargs"]["robot_velocity"], [0.0, 0.0])
     np.testing.assert_allclose(
         calls["hp_kwargs"]["obstacle_velocities"], [[0.25, -0.25]],
