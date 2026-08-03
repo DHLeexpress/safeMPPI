@@ -759,6 +759,9 @@ class SafeMPPIAdapter:
         state_seq = [x.clone()]
         costs = torch.zeros(sample_count, device=device, dtype=dtype)
         infeasible = torch.zeros(sample_count, device=device, dtype=torch.bool)
+        first_violation_step = torch.full(
+            (sample_count,), -1, device=device, dtype=torch.int16
+        )
         min_h = torch.full((sample_count,), float("inf"), device=device, dtype=dtype)
         initial_goal_distance = torch.linalg.norm(x[:, :2] - goal[:2].to(device=device, dtype=dtype), dim=1)
         previous_goal_distance = initial_goal_distance
@@ -803,8 +806,10 @@ class SafeMPPIAdapter:
                 violation = h_new < (1.0 - gamma_value) * h_old
             if self.config.check_first_control_only:
                 if t == 0:
+                    first_violation_step[(first_violation_step < 0) & violation] = t + 1
                     infeasible |= violation
             else:
+                first_violation_step[(first_violation_step < 0) & violation] = t + 1
                 infeasible |= violation
             goal_distance = torch.linalg.norm(x_next[:, :2] - goal[:2].to(device=device, dtype=dtype), dim=1)
             goal_cost = self.config.running_goal_weight * goal_distance**2
@@ -879,6 +884,15 @@ class SafeMPPIAdapter:
             "min_clearance": float(clearance.detach().cpu()),
             "num_barrier_violations": int(infeasible.sum().detach().cpu()),
             "infeasibility_rate": float(infeasible.float().mean().detach().cpu()),
+            "num_candidates": int(sample_count),
+            "num_accepted": int((~infeasible).sum().detach().cpu()),
+            "num_rejected": int(infeasible.sum().detach().cpu()),
+            "best_candidate_index": int(best.detach().cpu()),
+            "selection_semantics": (
+                "all_rejected_safest_fallback_weighted_mean"
+                if bool(infeasible.all().detach().cpu()) else
+                "accepted_temperature_weighted_mean"
+            ),
             "correction_magnitude": float(torch.linalg.norm(action - nominal).detach().cpu()),
             "num_backup_branches": int(branch_indices.numel()),
             "selected_backup_branch": None,
@@ -930,10 +944,14 @@ class SafeMPPIAdapter:
             else:
                 draw_idx = torch.nonzero(sample_mask, as_tuple=False).flatten()
             info["debug_rollouts"] = {
+                "sample_indices": draw_idx.numpy(),
                 "states": state_seq_t[draw_idx].numpy(),
                 "controls": controls.detach().cpu()[draw_idx].numpy(),
                 "feasible": feasible[draw_idx].numpy(),
+                "weights": w.detach().cpu()[draw_idx].numpy(),
+                "first_violation_step": first_violation_step.detach().cpu()[draw_idx].numpy(),
                 "best_state": state_seq_t[best].numpy(),
+                "best_candidate_index": int(best.detach().cpu()),
             }
             if branch_indices_cpu.numel():
                 info["debug_rollouts"]["branch_states"] = state_seq_t[branch_indices_cpu].numpy()
