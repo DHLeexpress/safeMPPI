@@ -48,6 +48,16 @@ def sha256_file(path) -> str:
     return digest.hexdigest()
 
 
+def array_sha256(value: np.ndarray) -> str:
+    """Content hash used to authenticate a reconstructed CRN noise bank."""
+    array = np.ascontiguousarray(value)
+    digest = hashlib.sha256()
+    digest.update(str(array.dtype).encode())
+    digest.update(json.dumps(list(array.shape), separators=(",", ":")).encode())
+    digest.update(memoryview(array).cast("B"))
+    return digest.hexdigest()
+
+
 def noise_bank(*, M: int, d: int, seed: int = DEFAULT_NOISE_SEED) -> np.ndarray:
     generator = np.random.default_rng(int(seed))
     return generator.standard_normal(
@@ -65,6 +75,7 @@ class Episode:
     state: np.ndarray = field(default_factory=lambda: np.zeros(4, np.float32))
     hp_history: HPH.Hp100History = field(default_factory=HPH.Hp100History)
     controls: list[np.ndarray] = field(default_factory=list)
+    proposals: list[np.ndarray] = field(default_factory=list)
     states: list[np.ndarray] = field(
         default_factory=lambda: [np.zeros(4, np.float32)]
     )
@@ -114,6 +125,7 @@ def run_batched_raw(
     M: int,
     noise: np.ndarray,
     device: str,
+    retain_proposals: bool = False,
 ) -> list[dict]:
     """Run the fixed CRN bank using the canonical unguided HP100 policy."""
     if tuple(noise.shape) != (len(SS.GAMMAS), int(M), T, int(policy.d)):
@@ -187,6 +199,8 @@ def run_batched_raw(
             active, windows
         ):
             action = DYN.clip_action_numpy(window[0]).astype(np.float32, copy=False)
+            if retain_proposals:
+                episode.proposals.append(window.copy())
             episode.ped_xy.append(pedestrian_xy)
             episode.ped_vel.append(pedestrian_velocity)
             episode.controls.append(action.copy())
@@ -203,7 +217,7 @@ def run_batched_raw(
             if not _terminal_check(episode, pedestrian_xy):
                 episode.status = "timeout"
         success = episode.status == "success"
-        rows.append(dict(
+        row = dict(
             episode=int(episode.episode), gamma=float(episode.gamma),
             status=str(episode.status), success=bool(success),
             collision=episode.status == "collision",
@@ -214,10 +228,21 @@ def run_batched_raw(
                 float(episode.minimum_clearance) if success else None
             ),
             states=np.asarray(episode.states, np.float32),
-            controls=np.asarray(episode.controls, np.float32),
-            ped_xy=np.asarray(episode.ped_xy, np.float32),
-            ped_vel=np.asarray(episode.ped_vel, np.float32),
-        ))
+            controls=np.asarray(episode.controls, np.float32).reshape(-1, 2),
+            ped_xy=np.asarray(episode.ped_xy, np.float32).reshape(
+                len(episode.controls), int(environment["n_ped"]), 2,
+            ),
+            ped_vel=np.asarray(episode.ped_vel, np.float32).reshape(
+                len(episode.controls), int(environment["n_ped"]), 2,
+            ),
+        )
+        if retain_proposals:
+            row["proposals"] = np.asarray(
+                episode.proposals, np.float32,
+            ).reshape(-1, H, 2)
+            if row["proposals"].shape != (len(episode.controls), H, 2):
+                raise RuntimeError("retained raw proposals do not align with executed contexts")
+        rows.append(row)
     return rows
 
 
@@ -413,8 +438,11 @@ def main(argv=None):
             device=args.device, seed=args.noise_seed, with_validity=True,
             validity_executor=validity_executor,
         )
+    declared_noise = noise_bank(M=args.M, d=policy.d, seed=args.noise_seed)
     payload = dict(
         status="SFM_HP100_RAW_EVAL_COMPLETE", version=VERSION,
+        evaluator_source=os.path.abspath(__file__),
+        evaluator_sha256=sha256_file(__file__),
         checkpoint=os.path.abspath(args.checkpoint),
         checkpoint_sha256=sha256_file(args.checkpoint),
         architecture=checkpoint["config"], dynamics=DYN.contract(),
@@ -432,6 +460,11 @@ def main(argv=None):
         ),
         scene=SS.scene_profile(args.scene_profile), ep0=args.ep0,
         M_per_gamma=args.M, temperature=TEMPERATURE, NFE=NFE,
+        noise_seed=int(args.noise_seed),
+        noise_bank=dict(
+            seed=int(args.noise_seed), shape=list(declared_noise.shape),
+            dtype=str(declared_noise.dtype), sha256=array_sha256(declared_noise),
+        ),
         validity_parallelism=dict(
             workers=int(args.verifier_workers), start_method="spawn",
             task="one complete episode; ordered executor.map",

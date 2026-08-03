@@ -102,3 +102,26 @@ def test_parallel_and_serial_validity_both_fail_closed():
     ) as executor:
         with pytest.raises(RuntimeError, match="executed HP100 window"):
             E.attach_validity([malformed], executor=executor)
+
+
+def test_retained_proposals_keep_declared_ranks_for_zero_step_cells(monkeypatch):
+    def initial_collision(episode, pedestrian_xy):
+        episode.status = "collision"
+        episode.minimum_clearance = -0.01
+        return True
+
+    monkeypatch.setattr(E, "_terminal_check", initial_collision)
+    policy = type("Policy", (), {"d": 4})()
+    rows = E.run_batched_raw(
+        policy, scene_profile="matched_id", ep0=910_000, M=1,
+        noise=E.noise_bank(M=1, d=4, seed=7), device="cpu",
+        retain_proposals=True,
+    )
+    assert len(rows) == len(E.SS.GAMMAS)
+    for row in rows:
+        assert row["steps"] == 0
+        assert row["states"].shape == (1, 4)
+        assert row["controls"].shape == (0, 2)
+        assert row["ped_xy"].shape == (0, 20, 2)
+        assert row["ped_vel"].shape == (0, 20, 2)
+        assert row["proposals"].shape == (0, E.H, 2)
