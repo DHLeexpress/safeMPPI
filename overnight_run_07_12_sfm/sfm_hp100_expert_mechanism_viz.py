@@ -495,10 +495,7 @@ def render(episode: int, gamma: float, output_dir, *, selected_step=26,
                 "the planner's declared safest-fallback weights all rejected candidates"
             ),
         ),
-        stored_target_excluded=(
-            "dataset U is ten first actions from ten successive replans; it is a post-hoc "
-            "closed-loop behavior-cloning target, not a current-plan certificate"
-        ),
+        dataset_target_contract=DATA.target_contract(),
         selected_frame=dict(
             step=int(selected_step), frame_index=int(selected_index),
             accepted=int(selected["accepted"]), rejected=int(selected["rejected"]),
