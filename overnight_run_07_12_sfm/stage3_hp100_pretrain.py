@@ -146,8 +146,9 @@ def _validate_canonical_manifest(manifest: dict, dataset_dir: Path) -> None:
     )
     _require_equal(
         "expert.supervised_target", expert.get("supervised_target"),
-        "next H=10 executed controls; repeat final action at terminal prefix",
+        DATA.SUPERVISED_TARGET,
     )
+    _require_equal("target_contract", manifest.get("target_contract"), DATA.target_contract())
     feature = manifest.get("feature", {})
     _require_equal("feature.shape", feature.get("shape"), [32, 100])
     _require_equal("feature.dtype", feature.get("dtype"), "float32")
@@ -181,14 +182,26 @@ def _validate_canonical_manifest(manifest: dict, dataset_dir: Path) -> None:
             )
 
     file_rows = _manifest_files(manifest)
+    gamma_device_map = manifest.get("parallelism", {}).get("gamma_device_map", {})
     _require_equal("files.gammas", sorted(file_rows), sorted(map(float, SP.GAMMAS)))
     _require_equal(
         "episode_allocation.terminal_ranges",
         allocation.get("terminal_ranges"),
         {str(gamma): file_rows[gamma].get("episode_range") for gamma in map(float, SP.GAMMAS)},
     )
+    _require_equal(
+        "total_context_rows", manifest.get("total_context_rows"),
+        sum(int(row.get("windows", -1)) for row in file_rows.values()),
+    )
+    _require_equal(
+        "total_eligible_windows", manifest.get("total_eligible_windows"),
+        sum(int(row.get("eligible_windows", -1)) for row in file_rows.values()),
+    )
     for gamma in map(float, SP.GAMMAS):
         row = file_rows[gamma]
+        expected_device = gamma_device_map.get(str(gamma))
+        if not expected_device or row.get("runtime", {}).get("requested_device") != expected_device:
+            raise ValueError(f"gamma {gamma} worker runtime/device provenance is missing")
         _require_equal(f"files[{gamma}].n_traj", row.get("n_traj"), DATA.SUCCESSES_PER_GAMMA)
         successful = list(map(int, row.get("successful_episodes", [])))
         if (
@@ -246,6 +259,15 @@ def _validate_canonical_manifest(manifest: dict, dataset_dir: Path) -> None:
             f"progress[{gamma}].data_sha256",
             progress_payload.get("data_sha256"), row.get("sha256"),
         )
+        for key in (
+            "windows", "eligible_windows", "excluded_all_rejected_windows",
+            "excluded_weighted_h10_failed_windows",
+        ):
+            _require_equal(
+                f"progress[{gamma}].{key}", progress_payload.get(key), row.get(key),
+            )
+        if int(row.get("eligible_windows", 0)) <= 0:
+            raise ValueError(f"gamma {gamma} contains no eligible weighted-plan targets")
 
 
 def _history_indices(episodes: torch.Tensor, steps: torch.Tensor) -> torch.Tensor:
@@ -280,6 +302,7 @@ def _validate_source(payload: dict, path: Path, gamma: float) -> None:
         raise ValueError(f"gamma mismatch in {path}")
     required = {
         "hp": (32, 100), "low5": (5,), "hist": (16, 2), "U": (10, 2),
+        "plan_weighted_h": (11,),
     }
     size = None
     for key, trailing in required.items():
@@ -296,6 +319,65 @@ def _validate_source(payload: dict, path: Path, gamma: float) -> None:
     for key in ("episode", "step"):
         if key not in payload or len(payload[key]) != size:
             raise ValueError(f"missing or mis-sized {key} in {path}")
+    typed = {
+        "target_eligible": torch.bool,
+        "target_reason_code": torch.int8,
+        "plan_candidate_count": torch.int32,
+        "plan_accepted_count": torch.int32,
+        "plan_rejected_count": torch.int32,
+        "plan_first_violation": torch.int16,
+        "action_mean_max_abs_error": torch.float32,
+    }
+    for key, dtype in typed.items():
+        if key not in payload or len(payload[key]) != size:
+            raise ValueError(f"missing or mis-sized {key} in {path}")
+        if payload[key].dtype != dtype:
+            raise ValueError(f"{key} must be {dtype} in {path}, got {payload[key].dtype}")
+    eligible = payload["target_eligible"]
+    logical = (
+        (payload["plan_accepted_count"] > 0)
+        & (payload["plan_first_violation"] == -1)
+    )
+    if not torch.equal(eligible, logical):
+        raise ValueError(f"target eligibility identity fails in {path}")
+    if not torch.equal(
+        eligible, payload["target_reason_code"] == DATA.TARGET_ELIGIBLE
+    ):
+        raise ValueError(f"target reason codes disagree with eligibility in {path}")
+    reason = payload["target_reason_code"]
+    if torch.any(
+        ~torch.isin(reason, torch.tensor(
+            [DATA.TARGET_ELIGIBLE, DATA.TARGET_ALL_REJECTED,
+             DATA.TARGET_WEIGHTED_H10_FAILED], dtype=reason.dtype
+        ))
+    ):
+        raise ValueError(f"unknown target reason code in {path}")
+    if torch.any((reason == DATA.TARGET_ALL_REJECTED) & (payload["plan_accepted_count"] != 0)):
+        raise ValueError(f"all-rejected target has accepted candidates in {path}")
+    if torch.any(
+        (reason == DATA.TARGET_WEIGHTED_H10_FAILED)
+        & ((payload["plan_accepted_count"] <= 0) | (payload["plan_first_violation"] < 1))
+    ):
+        raise ValueError(f"weighted-plan failure reason is inconsistent in {path}")
+    if torch.any(
+        payload["plan_accepted_count"] + payload["plan_rejected_count"]
+        != payload["plan_candidate_count"]
+    ):
+        raise ValueError(f"planner candidate accounting fails in {path}")
+    if payload.get("target_contract") != DATA.target_contract():
+        raise ValueError(f"dataset target contract differs in {path}")
+    counts = {
+        "eligible_windows": int(eligible.sum().item()),
+        "excluded_all_rejected_windows": int(
+            (reason == DATA.TARGET_ALL_REJECTED).sum().item()
+        ),
+        "excluded_weighted_h10_failed_windows": int(
+            (reason == DATA.TARGET_WEIGHTED_H10_FAILED).sum().item()
+        ),
+    }
+    for key, expected in counts.items():
+        if int(payload.get(key, -1)) != expected:
+            raise ValueError(f"dataset {key} count differs in {path}")
     unique = torch.unique(payload["episode"].to(torch.int64), sorted=True)
     declared = int(payload.get("n_traj", -1))
     if declared != SUCCESSFUL_LINEAGES_PER_GAMMA or len(unique) != declared:
@@ -303,6 +385,10 @@ def _validate_source(payload: dict, path: Path, gamma: float) -> None:
             f"gamma {gamma} requires exactly {SUCCESSFUL_LINEAGES_PER_GAMMA} "
             f"successful lineages, found declared={declared}, unique={len(unique)}"
         )
+    for episode in unique.tolist():
+        mask = payload["episode"].to(torch.int64) == int(episode)
+        if not bool(eligible[mask].any()):
+            raise ValueError(f"successful lineage {episode} has no eligible target in {path}")
     if payload.get("dynamics") != DYN.contract():
         raise ValueError(f"dataset dynamics differ from the HP100 training contract: {path}")
 
@@ -327,6 +413,22 @@ def _validate_source_manifest_binding(
         raise RuntimeError(f"gamma {gamma} tensor episode range disagrees with manifest")
     if len(payload["episode"]) != int(row.get("windows", -1)):
         raise RuntimeError(f"gamma {gamma} tensor window count disagrees with manifest")
+    if int(payload["target_eligible"].sum().item()) != int(
+        row.get("eligible_windows", -1)
+    ):
+        raise RuntimeError(f"gamma {gamma} eligible window count disagrees with manifest")
+    reason = payload["target_reason_code"]
+    excluded_counts = {
+        "excluded_all_rejected_windows": int(
+            (reason == DATA.TARGET_ALL_REJECTED).sum().item()
+        ),
+        "excluded_weighted_h10_failed_windows": int(
+            (reason == DATA.TARGET_WEIGHTED_H10_FAILED).sum().item()
+        ),
+    }
+    for key, actual in excluded_counts.items():
+        if actual != int(row.get(key, -1)):
+            raise RuntimeError(f"gamma {gamma} {key} count disagrees with manifest")
     if path.stat().st_size != int(row.get("bytes", -1)):
         raise RuntimeError(f"gamma {gamma} tensor byte count disagrees with manifest")
 
@@ -434,8 +536,9 @@ def load_split(
         train_episodes = unique[~torch.isin(unique, val_episodes)]
         episodes = payload["episode"].to(torch.int64)
         is_val = torch.isin(episodes, val_episodes)
-        local_val = torch.nonzero(is_val, as_tuple=False).flatten()
-        local_train = torch.nonzero(~is_val, as_tuple=False).flatten()
+        eligible = payload["target_eligible"].to(torch.bool)
+        local_val = torch.nonzero(is_val & eligible, as_tuple=False).flatten()
+        local_train = torch.nonzero((~is_val) & eligible, as_tuple=False).flatten()
         train_gamma.append(torch.full_like(local_train, gamma_index))
         train_rows.append(local_train)
         val_gamma.append(torch.full_like(local_val, gamma_index))
@@ -446,6 +549,8 @@ def load_split(
             "val_episodes": sorted(map(int, val_episodes.tolist())),
             "train_lineages": len(train_episodes), "val_lineages": len(val_episodes),
             "train_windows": len(local_train), "val_windows": len(local_val),
+            "context_rows": len(payload["episode"]),
+            "eligible_windows": int(eligible.sum().item()),
         }
     train = HP100WindowDataset(sources, torch.cat(train_gamma), torch.cat(train_rows))
     val = HP100WindowDataset(sources, torch.cat(val_gamma), torch.cat(val_rows))

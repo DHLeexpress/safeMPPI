@@ -34,8 +34,8 @@ import sfm_hp100_features as HPF
 import sfm_scene as SS
 
 
-SCHEMA_VERSION = "sfm_hp100_id_demonstrations_v2_current_tangent"
-HP100_EXPERT_NAME = "hp100_current_tangent_r2_n2048_nv3_pg0"
+SCHEMA_VERSION = "sfm_hp100_id_demonstrations_v3_certified_weighted_plan"
+HP100_EXPERT_NAME = "hp100_current_tangent_r3_n2048_certified_weighted_h10"
 HORIZON = 10
 N_BASE = 16
 N_PED = 20
@@ -45,6 +45,35 @@ SUCCESSES_PER_GAMMA = 500
 MAX_ATTEMPTS_PER_GAMMA = 5000
 T = 180
 REACH = 0.5
+TARGET_ELIGIBLE = 0
+TARGET_ALL_REJECTED = 1
+TARGET_WEIGHTED_H10_FAILED = 2
+SUPERVISED_TARGET = (
+    "current SafeMPPI accepted-set weighted H=10 plan, admitted only when at "
+    "least one candidate survives and the weighted plan independently passes "
+    "the same frozen nominal-polytope H=10 contraction recheck"
+)
+
+
+def target_contract() -> dict:
+    return dict(
+        stored_rows="every context from each retained task-successful lineage",
+        target_tensor="U = current planner mean_sequence [10,2]",
+        eligible_identity=(
+            "target_eligible == (plan_accepted_count > 0 and "
+            "plan_first_violation == -1)"
+        ),
+        recheck=(
+            "shared capped double-integrator rollout against the single nominal "
+            "A,b,margins tuple persisted with the current Hp100 context after "
+            "its planner-equivalence assertion"
+        ),
+        excluded_rows=(
+            "all-rejected fallback means and accepted-set weighted means that fail "
+            "the frozen-set H10 recheck remain provenance/history rows but never "
+            "enter the CFM objective"
+        ),
+    )
 
 
 def sha256_file(path) -> str:
@@ -136,7 +165,6 @@ def _assert_feature_matches_planner(
             "Hp100 feature margins are not canonical float32 geometry "
             f"({provenance})"
         )
-
     planner_m64 = np.asarray(planner_geometry["margins"], np.float32).astype(np.float64)
     if planner_m64.shape != canonical_m64.shape:
         raise RuntimeError(f"Hp100/planner margin shape mismatch ({provenance})")
@@ -185,6 +213,42 @@ def _assert_feature_matches_planner(
         )
 
 
+def audit_weighted_plan(state, controls, planner_polytope, gamma: float) -> dict:
+    """Recheck the MPPI weighted H10 under the planner's frozen nominal set."""
+    controls = np.asarray(controls, np.float32)
+    if controls.shape != (HORIZON, 2):
+        raise ValueError(f"weighted plan must be [{HORIZON},2], got {controls.shape}")
+    if planner_polytope is None or len(planner_polytope) < 4:
+        raise ValueError("weighted-plan audit requires planner A,b,ref,margins")
+    A = np.asarray(planner_polytope[0], np.float32)
+    b = np.asarray(planner_polytope[1], np.float32)
+    margins = np.asarray(planner_polytope[3], np.float32)
+    state_t = torch.as_tensor(state, dtype=torch.float32).reshape(1, 4)
+    states_t = [state_t[0]]
+    for action in torch.as_tensor(controls, dtype=torch.float32):
+        state_t = DYN.step_torch(
+            state_t, action.reshape(1, 2), dt=DYN.DT,
+            u_max=DYN.U_MAX, v_max=DYN.V_MAX,
+        )
+        states_t.append(state_t[0])
+    states_t = torch.stack(states_t)
+    h_t = CappedSafeMPPIAdapter._polytope_H(
+        states_t[:, :2], torch.as_tensor(A), torch.as_tensor(b),
+        torch.as_tensor(margins),
+    )
+    states = states_t.numpy()
+    h = h_t.numpy()
+    violations = h[1:] < np.float32(1.0 - float(gamma)) * h[:-1]
+    first = None if not bool(violations.any()) else int(np.flatnonzero(violations)[0] + 1)
+    return dict(
+        states=states,
+        h=h.astype(np.float32, copy=False),
+        violations=violations,
+        full_h_pass=bool(not violations.any()),
+        first_violation_step=first,
+    )
+
+
 def rollout_episode(
     episode: int,
     gamma: float,
@@ -193,7 +257,7 @@ def rollout_episode(
     planner=None,
     T_max: int = T,
 ) -> tuple[list[dict], dict]:
-    """Collect current-context H10 targets from one fresh expert rollout."""
+    """Collect current weighted H10 plans and their same-polytope eligibility."""
     expert_config = locked_expert_config()
     if planner is None:
         planner = CappedSafeMPPIAdapter(**expert_config)
@@ -261,9 +325,34 @@ def rollout_episode(
             state[:2],
             provenance=f"gamma={float(gamma):g},episode={int(episode)},step={int(step)}",
         )
+        mean_sequence = np.asarray(info["mean_sequence"], np.float32)
+        persisted_polytope = tuple(
+            feature_geometry[key] for key in ("A", "b", "ref", "margins")
+        )
+        plan_audit = audit_weighted_plan(
+            state, mean_sequence, persisted_polytope, float(gamma)
+        )
+        accepted_count = int(info["num_accepted"])
+        rejected_count = int(info["num_rejected"])
+        candidate_count = int(info["num_candidates"])
+        if candidate_count != int(expert_config["num_samples"]):
+            raise RuntimeError("planner candidate count differs from locked N")
+        if accepted_count + rejected_count != candidate_count:
+            raise RuntimeError("planner acceptance accounting differs from N")
+        if accepted_count == 0:
+            reason_code = TARGET_ALL_REJECTED
+        elif not plan_audit["full_h_pass"]:
+            reason_code = TARGET_WEIGHTED_H10_FAILED
+        else:
+            reason_code = TARGET_ELIGIBLE
         action = DYN.clip_action_numpy(
             action.detach().cpu().numpy().astype(np.float32).reshape(2)
         ).astype(np.float32, copy=False)
+        action_mean_error = float(np.max(np.abs(action - mean_sequence[0])))
+        if action_mean_error > 2.0e-6:
+            raise RuntimeError(
+                "executed first action differs from the current MPPI weighted plan"
+            )
         records.append(dict(
             hp=hp.copy(),
             low5=low5.copy(),
@@ -274,6 +363,18 @@ def rollout_episode(
             ped_xy=ped_xy.copy(),
             ped_vel=ped_vel.copy(),
             executed_action=action.copy(),
+            U=mean_sequence.copy(),
+            target_eligible=np.bool_(reason_code == TARGET_ELIGIBLE),
+            target_reason_code=np.int8(reason_code),
+            plan_candidate_count=np.int32(candidate_count),
+            plan_accepted_count=np.int32(accepted_count),
+            plan_rejected_count=np.int32(rejected_count),
+            plan_weighted_h=plan_audit["h"].copy(),
+            plan_first_violation=np.int16(
+                -1 if plan_audit["first_violation_step"] is None
+                else plan_audit["first_violation_step"]
+            ),
+            action_mean_max_abs_error=np.float32(action_mean_error),
         ))
         state = DYN.step_numpy(state, action).astype(np.float32, copy=False)
         control_history.append(action.copy())
@@ -290,19 +391,14 @@ def rollout_episode(
         reached = bool(
             not collision and float(np.linalg.norm(state[:2] - SS.GOAL)) < REACH
         )
-    # Match the original SafeMPPI demonstration contract: U is the future
-    # *executed* receding-horizon control window, not the planner's current
-    # reward-weighted mean sequence.  The final available action is repeated
-    # to keep every supervised target exactly H=10.
-    controls = np.asarray(control_history, np.float32)
-    for index, record in enumerate(records):
-        target = controls[index:index + HORIZON]
-        if len(target) < HORIZON:
-            target = np.concatenate(
-                (target, np.repeat(target[-1:], HORIZON - len(target), axis=0)),
-                axis=0,
-            )
-        record["U"] = target.astype(np.float32, copy=False)
+    eligible = sum(bool(row["target_eligible"]) for row in records)
+    all_rejected = sum(
+        int(row["target_reason_code"]) == TARGET_ALL_REJECTED for row in records
+    )
+    weighted_failed = sum(
+        int(row["target_reason_code"]) == TARGET_WEIGHTED_H10_FAILED
+        for row in records
+    )
     return records, dict(
         episode=int(episode),
         gamma=float(gamma),
@@ -311,6 +407,9 @@ def rollout_episode(
         timeout=bool(not reached and not collision),
         steps=len(records),
         min_clearance=float(minimum_clearance),
+        eligible_weighted_h10_contexts=int(eligible),
+        excluded_all_rejected_contexts=int(all_rejected),
+        excluded_weighted_h10_failed_contexts=int(weighted_failed),
     )
 
 
@@ -319,7 +418,7 @@ def pack_records(records: list[dict]) -> dict[str, torch.Tensor]:
         raise ValueError("cannot pack an empty Hp100 demonstration set")
     array_keys = (
         "hp", "low5", "hist", "U", "state", "ped_xy", "ped_vel",
-        "executed_action",
+        "executed_action", "plan_weighted_h",
     )
     payload = {
         key: torch.from_numpy(np.stack([row[key] for row in records])).to(torch.float32)
@@ -331,14 +430,50 @@ def pack_records(records: list[dict]) -> dict[str, torch.Tensor]:
     payload["step"] = torch.as_tensor(
         [row["step"] for row in records], dtype=torch.int64
     )
+    payload["target_eligible"] = torch.as_tensor(
+        [row["target_eligible"] for row in records], dtype=torch.bool
+    )
+    payload["target_reason_code"] = torch.as_tensor(
+        [row["target_reason_code"] for row in records], dtype=torch.int8
+    )
+    payload["plan_accepted_count"] = torch.as_tensor(
+        [row["plan_accepted_count"] for row in records], dtype=torch.int32
+    )
+    payload["plan_candidate_count"] = torch.as_tensor(
+        [row["plan_candidate_count"] for row in records], dtype=torch.int32
+    )
+    payload["plan_rejected_count"] = torch.as_tensor(
+        [row["plan_rejected_count"] for row in records], dtype=torch.int32
+    )
+    payload["plan_first_violation"] = torch.as_tensor(
+        [row["plan_first_violation"] for row in records], dtype=torch.int16
+    )
+    payload["action_mean_max_abs_error"] = torch.as_tensor(
+        [row["action_mean_max_abs_error"] for row in records], dtype=torch.float32
+    )
     expected = dict(
         hp=(32, 100), low5=(5,), hist=(16, 2), U=(HORIZON, 2),
         state=(4,), ped_xy=(N_PED, 2), ped_vel=(N_PED, 2),
-        executed_action=(2,),
+        executed_action=(2,), plan_weighted_h=(HORIZON + 1,),
     )
     for key, trailing in expected.items():
         if tuple(payload[key].shape[1:]) != trailing:
             raise ValueError(f"packed {key} has shape {tuple(payload[key].shape)}")
+    if not torch.equal(payload["target_eligible"], payload["target_reason_code"] == TARGET_ELIGIBLE):
+        raise RuntimeError("target eligibility differs from its reason code")
+    if torch.any(payload["plan_candidate_count"] != 2048):
+        raise RuntimeError("packed planner candidate count differs from 2048")
+    if torch.any(
+        payload["plan_accepted_count"] + payload["plan_rejected_count"]
+        != payload["plan_candidate_count"]
+    ):
+        raise RuntimeError("packed planner candidate counts differ from 2048")
+    logical_eligible = (
+        (payload["plan_accepted_count"] > 0)
+        & (payload["plan_first_violation"] == -1)
+    )
+    if not torch.equal(payload["target_eligible"], logical_eligible):
+        raise RuntimeError("target mask does not match the declared logical identity")
     return payload
 
 
@@ -440,6 +575,7 @@ def _collect_gamma(payload, rollout_fn=rollout_episode) -> tuple[dict, list[dict
         max_attempts_per_gamma, device, T_max,
     ) = payload
     output = Path(output_dir).resolve()
+    worker_runtime = _runtime_provenance(device)
     path = output / f"sfm_hp100_windows_g{float(gamma)}.pt"
     progress_path = output / f"collection_progress_g{float(gamma)}.json"
     if path.exists():
@@ -455,8 +591,36 @@ def _collect_gamma(payload, rollout_fn=rollout_episode) -> tuple[dict, list[dict
         records, summary = rollout_fn(
             int(episode), float(gamma), device=device, T_max=int(T_max)
         )
+        summary = dict(summary)
+        eligible_count = int(summary.get(
+            "eligible_weighted_h10_contexts",
+            sum(bool(row["target_eligible"]) for row in records),
+        ))
+        all_rejected_count = int(summary.get(
+            "excluded_all_rejected_contexts",
+            sum(
+                int(row["target_reason_code"]) == TARGET_ALL_REJECTED
+                for row in records
+            ),
+        ))
+        weighted_failed_count = int(summary.get(
+            "excluded_weighted_h10_failed_contexts",
+            sum(
+                int(row["target_reason_code"]) == TARGET_WEIGHTED_H10_FAILED
+                for row in records
+            ),
+        ))
+        if eligible_count + all_rejected_count + weighted_failed_count != len(records):
+            raise RuntimeError("episode target accounting differs from its context count")
+        accepted_for_dataset = bool(summary["success"] and eligible_count > 0)
+        summary.update(
+            eligible_weighted_h10_contexts=eligible_count,
+            excluded_all_rejected_contexts=all_rejected_count,
+            excluded_weighted_h10_failed_contexts=weighted_failed_count,
+            accepted_for_dataset=accepted_for_dataset,
+        )
         summaries.append(summary)
-        if summary["success"]:
+        if accepted_for_dataset:
             accepted.extend(records)
             successful_ids.append(int(episode))
         _atomic_json_save(dict(
@@ -466,23 +630,47 @@ def _collect_gamma(payload, rollout_fn=rollout_episode) -> tuple[dict, list[dict
             max_attempts=int(max_attempts_per_gamma), latest_episode=int(episode),
             latest_outcome={
                 key: summary[key]
-                for key in ("success", "collision", "timeout", "steps", "min_clearance")
+                for key in (
+                    "success", "collision", "timeout", "steps", "min_clearance",
+                    "accepted_for_dataset", "eligible_weighted_h10_contexts",
+                    "excluded_all_rejected_contexts",
+                    "excluded_weighted_h10_failed_contexts",
+                )
             },
         ), progress_path)
         episode += 1
     if len(successful_ids) != int(successes_per_gamma):
         raise RuntimeError(
             f"gamma {gamma} obtained {len(successful_ids)}/{successes_per_gamma} "
-            f"successful trajectories in {max_attempts_per_gamma} attempts"
+            f"eligible successful trajectories in {max_attempts_per_gamma} attempts"
         )
     tensors = pack_records(accepted)
     successful_episodes = sorted({int(value) for value in tensors["episode"].tolist()})
     if successful_episodes != successful_ids:
         raise RuntimeError(f"gamma {gamma} packed lineage IDs disagree with success ledger")
+    eligible_windows = int(tensors["target_eligible"].sum().item())
+    all_rejected_windows = int(
+        (tensors["target_reason_code"] == TARGET_ALL_REJECTED).sum().item()
+    )
+    weighted_failed_windows = int(
+        (tensors["target_reason_code"] == TARGET_WEIGHTED_H10_FAILED).sum().item()
+    )
+    support = {
+        episode_id: int(tensors["target_eligible"][
+            tensors["episode"] == int(episode_id)
+        ].sum().item())
+        for episode_id in successful_episodes
+    }
+    if any(value <= 0 for value in support.values()):
+        raise RuntimeError(f"gamma {gamma} retained a lineage without eligible targets")
     packed = dict(
         schema_version=SCHEMA_VERSION, success_only=True, gamma=float(gamma),
         n_traj=len(successful_episodes), n_seeds=len(summaries),
         episode_start=int(episode_start), episode_stop_exclusive=int(episode),
+        target_contract=target_contract(),
+        eligible_windows=eligible_windows,
+        excluded_all_rejected_windows=all_rejected_windows,
+        excluded_weighted_h10_failed_windows=weighted_failed_windows,
         dynamics=DYN.contract(), **tensors,
     )
     _atomic_torch_save(packed, path)
@@ -492,18 +680,38 @@ def _collect_gamma(payload, rollout_fn=rollout_episode) -> tuple[dict, list[dict
         target_successes=int(successes_per_gamma), attempted_episodes=len(summaries),
         episode_range=[int(episode_start), int(episode)], data_file=path.name,
         data_sha256=sha256_file(path),
+        windows=len(tensors["episode"]), eligible_windows=eligible_windows,
+        excluded_all_rejected_windows=all_rejected_windows,
+        excluded_weighted_h10_failed_windows=weighted_failed_windows,
     ), progress_path)
     row = dict(
         gamma=float(gamma), file=path.name, sha256=sha256_file(path),
         bytes=path.stat().st_size, windows=len(tensors["episode"]),
+        eligible_windows=eligible_windows,
+        excluded_all_rejected_windows=all_rejected_windows,
+        excluded_weighted_h10_failed_windows=weighted_failed_windows,
         n_traj=len(successful_episodes), successful_episodes=successful_episodes,
         attempted_episodes=len(summaries),
         rejected_episodes=[
-            int(item["episode"]) for item in summaries if not bool(item["success"])
+            int(item["episode"])
+            for item in summaries if not bool(item["accepted_for_dataset"])
+        ],
+        rejected_outcomes=[
+            dict(
+                episode=int(item["episode"]),
+                success=bool(item["success"]),
+                collision=bool(item["collision"]),
+                timeout=bool(item["timeout"]),
+                eligible_weighted_h10_contexts=int(
+                    item["eligible_weighted_h10_contexts"]
+                ),
+            )
+            for item in summaries if not bool(item["accepted_for_dataset"])
         ],
         episode_range=[int(episode_start), int(episode)],
         progress_file=progress_path.name,
         progress_sha256=sha256_file(progress_path),
+        runtime=worker_runtime,
     )
     return row, summaries
 
@@ -516,6 +724,7 @@ def generate_dataset(
     max_attempts_per_gamma: int = MAX_ATTEMPTS_PER_GAMMA,
     gammas=SS.GAMMAS,
     device: str = "cpu",
+    devices=None,
     T_max: int = T,
     rollout_fn=rollout_episode,
     expected_source_commit: str | None = None,
@@ -533,7 +742,14 @@ def generate_dataset(
         raise ValueError("max_attempts_per_gamma must be at least successes_per_gamma")
     git = _git_provenance()
     source_hashes = _source_hashes()
-    runtime = _runtime_provenance(device)
+    device_values = tuple(map(str, devices)) if devices is not None else (str(device),)
+    if not device_values:
+        raise ValueError("at least one collection device is required")
+    runtime_devices = [_runtime_provenance(value) for value in device_values]
+    runtime = dict(
+        requested_devices=list(device_values), devices=runtime_devices,
+        requested_device=(device_values[0] if len(device_values) == 1 else None),
+    )
     if expected_source_commit is not None and git["head"] != str(expected_source_commit):
         raise RuntimeError(
             f"source commit {git['head']} != expected {expected_source_commit}"
@@ -551,9 +767,13 @@ def generate_dataset(
     gamma_values = tuple(map(float, gammas))
     if int(jobs) < 1:
         raise ValueError("jobs must be positive")
+    gamma_device_map = {
+        str(gamma): device_values[index % len(device_values)]
+        for index, gamma in enumerate(gamma_values)
+    }
     worker_payloads = [(
         str(output), gamma, int(episode_start), int(successes_per_gamma),
-        int(max_attempts_per_gamma), str(device), int(T_max),
+        int(max_attempts_per_gamma), gamma_device_map[str(gamma)], int(T_max),
     ) for gamma in gamma_values]
     if int(jobs) > 1:
         if rollout_fn is not rollout_episode:
@@ -584,6 +804,9 @@ def generate_dataset(
         ),
         role="successful SafeMPPI ID demonstrations for fresh Hp100 pretraining",
         total_successful_lineages=sum(row["n_traj"] for row in file_rows),
+        total_context_rows=sum(row["windows"] for row in file_rows),
+        total_eligible_windows=sum(row["eligible_windows"] for row in file_rows),
+        target_contract=target_contract(),
         episode_allocation=dict(
             start=int(episode_start),
             successful_trajectories_per_gamma=int(successes_per_gamma),
@@ -610,7 +833,7 @@ def generate_dataset(
                 "CappedSafeMPPIAdapter using sfm_hp100_dynamics for internal and real "
                 "steps; current-position tangent nominal geometry (predict_gain=0)"
             ),
-            supervised_target="next H=10 executed controls; repeat final action at terminal prefix",
+            supervised_target=SUPERVISED_TARGET,
         ),
         feature=dict(
             shape=[32, 100],
@@ -640,7 +863,8 @@ def generate_dataset(
         runtime=runtime,
         parallelism=dict(
             jobs=int(jobs), start_method=("spawn" if int(jobs) > 1 else "none"),
-            device=str(device), gamma_workers_are_independent=True,
+            devices=list(device_values), gamma_device_map=gamma_device_map,
+            gamma_workers_are_independent=True,
         ),
         rollout_summaries=rollout_summaries,
     )
@@ -663,6 +887,10 @@ def main() -> None:
     )
     parser.add_argument("--gammas", type=float, nargs="+", default=SS.GAMMAS)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--devices", nargs="+", default=None,
+        help="round-robin gamma workers over these logical devices",
+    )
     parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument("--expected-source-commit", default=None)
     parser.add_argument(
@@ -683,6 +911,7 @@ def main() -> None:
         max_attempts_per_gamma=args.max_attempts_per_gamma,
         gammas=args.gammas,
         device=args.device,
+        devices=args.devices,
         expected_source_commit=args.expected_source_commit,
         jobs=args.jobs,
     )

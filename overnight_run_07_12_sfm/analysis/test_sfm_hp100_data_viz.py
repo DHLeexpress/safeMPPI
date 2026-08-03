@@ -24,34 +24,51 @@ def _write_dataset(root: Path, *, corrupt_hp=False):
     ])
     peds = [ped0, ped0 + np.array([.01, -.005], np.float32)]
     velocities = np.tile(np.array([.1, -.05], np.float32), (20, 1))
-    frames = []
+    frames, geometries = [], []
     for state, ped_xy in zip(states, peds):
         obstacles = np.concatenate(
             (ped_xy, np.full((20, 1), SS.R_PED, np.float32)), axis=1
         )
-        frames.append(F.hp100_frame(
+        frame, geometry = F.hp100_frame(
             state[:2], obstacles, sensing=SS.R_SENSE, n_base=16,
             obstacle_velocities=velocities, robot_velocity=state[2:4],
             predict_gain=F.PREDICT_GAIN, predict_tau=F.PREDICT_TAU,
-        ))
+            return_geometry=True,
+        )
+        frames.append(frame)
+        geometries.append(geometry)
     frames = np.stack(frames).astype(np.float32)
     if corrupt_hp:
         frames[1, 3, 9] += np.float32(.01)
     controls = np.stack(actions)
-    U = np.stack([
-        np.repeat(controls[index:index + 1], 10, axis=0)
-        for index in range(2)
-    ])
+    U = np.zeros((2, 10, 2), np.float32)
+    audits = [
+        DATA.audit_weighted_plan(
+            state, target,
+            tuple(geometry[key] for key in ("A", "b", "ref", "margins")),
+            gamma,
+        )
+        for state, target, geometry in zip(states, U, geometries)
+    ]
+    low5 = torch.zeros((2, 5))
+    low5[:, 4] = gamma
     payload = dict(
         schema_version=V.EXPECTED_SCHEMA, success_only=True, gamma=gamma,
         n_traj=1, n_seeds=1, episode_start=7, episode_stop_exclusive=8,
         dynamics=D.contract(), hp=torch.from_numpy(frames),
-        low5=torch.zeros((2, 5)), hist=torch.zeros((2, 16, 2)),
+        low5=low5, hist=torch.zeros((2, 16, 2)),
         U=torch.from_numpy(U), state=torch.from_numpy(np.stack(states)),
         ped_xy=torch.from_numpy(np.stack(peds)),
         ped_vel=torch.from_numpy(np.stack([velocities, velocities])),
         executed_action=torch.from_numpy(controls),
         episode=torch.tensor([episode, episode]), step=torch.tensor([0, 1]),
+        target_eligible=torch.ones(2, dtype=torch.bool),
+        target_reason_code=torch.zeros(2, dtype=torch.int8),
+        plan_candidate_count=torch.full((2,), 2048, dtype=torch.int32),
+        plan_accepted_count=torch.ones(2, dtype=torch.int32),
+        plan_rejected_count=torch.full((2,), 2047, dtype=torch.int32),
+        plan_weighted_h=torch.from_numpy(np.stack([row["h"] for row in audits])),
+        plan_first_violation=torch.full((2,), -1, dtype=torch.int16),
     )
     filename = "sfm_hp100_windows_g0.5.pt"
     path = root / filename
@@ -59,6 +76,7 @@ def _write_dataset(root: Path, *, corrupt_hp=False):
     manifest = dict(
         status=V.EXPECTED_DATA_STATUS, schema_version=V.EXPECTED_SCHEMA,
         dynamics=D.contract(), source_hashes=DATA._source_hashes(),
+        target_contract=DATA.target_contract(),
         feature=dict(
             shape=[32, 100], nominal_polytope_n_base=16, velocity_aware=False,
             current_position_tangent=True,
@@ -140,7 +158,7 @@ def test_renderer_writes_mp4_selected_png_pdf_and_contract(tmp_path):
     sidecar = np.load(report["outputs"]["geometry_npz"]["path"])
     assert sidecar["A"].shape[1:] == (2,)
     assert sidecar["stored_hp100"].shape == (32, 100)
-    assert sidecar["executed_H10"].shape == (10, 2)
+    assert sidecar["weighted_plan_H10"].shape == (10, 2)
     disk = json.loads(Path(report["contract_path"]).read_text())
     assert disk["provenance_audit"]["all_hp_bitwise_equal"] is True
     assert disk["render"]["rendered_frames"] == 2

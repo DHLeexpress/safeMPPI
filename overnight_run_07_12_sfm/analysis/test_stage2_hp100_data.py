@@ -17,6 +17,11 @@ def test_hp100_expert_overrides_retreat_without_mutating_historical_comparator()
 
 
 class _FakePlanner:
+    def __init__(self, *, accepted=1, violating=False):
+        self.accepted = int(accepted)
+        self.violating = bool(violating)
+        self.calls = 0
+
     def plan(self, state, goal, obstacles, **kwargs):
         _, geometry = _ORIGINAL_HP100_FRAME(
             state[:2],
@@ -30,7 +35,18 @@ class _FakePlanner:
             return_geometry=True,
         )
         polytope = tuple(geometry[key] for key in ("A", "b", "ref", "margins"))
-        return torch.tensor([9.0, -9.0]), {"polytope": polytope}
+        sequence = np.zeros((S.HORIZON, 2), np.float32)
+        sequence[0, 0] = 0.2 if self.calls == 0 else -0.2
+        if self.violating:
+            sequence[:, 0] = 2.0
+        self.calls += 1
+        return torch.from_numpy(sequence[0]), {
+            "polytope": polytope,
+            "mean_sequence": sequence,
+            "num_candidates": 2048,
+            "num_accepted": self.accepted,
+            "num_rejected": 2048 - self.accepted,
+        }
 
 
 def _planner_tuple_from_feature_geometry(geometry):
@@ -76,7 +92,7 @@ def test_planner_geometry_audit_uses_derived_float32_margin_envelope():
         )
 
 
-def test_rollout_collects_fresh_hp_and_future_executed_windows(monkeypatch):
+def test_rollout_collects_current_certified_weighted_plan(monkeypatch):
     monkeypatch.setattr(S.SS, "make_humans", lambda *args, **kwargs: [object()] * S.N_PED)
     monkeypatch.setattr(
         S.SS,
@@ -112,11 +128,51 @@ def test_rollout_collects_fresh_hp_and_future_executed_windows(monkeypatch):
     assert all(call[6] == 0.0 for call in hp_calls)
     assert records[0]["hp"].shape == (32, 100)
     assert records[0]["hp"].dtype == np.float32
-    np.testing.assert_allclose(records[0]["executed_action"], [2.0, -2.0])
-    np.testing.assert_allclose(records[1]["state"][2:], [0.2, -0.2])
+    np.testing.assert_allclose(records[0]["executed_action"], [0.2, 0.0])
+    np.testing.assert_allclose(records[1]["state"][2:], [0.02, 0.0])
     assert records[0]["U"].shape == (10, 2)
-    np.testing.assert_allclose(records[0]["U"], np.tile([2.0, -2.0], (10, 1)))
+    np.testing.assert_allclose(records[0]["U"][0], [0.2, 0.0])
+    np.testing.assert_allclose(records[0]["U"][1:], 0.0)
+    assert records[0]["target_eligible"]
+    assert records[0]["target_reason_code"] == S.TARGET_ELIGIBLE
     assert np.max(np.abs(records[0]["U"])) <= D.U_MAX
+
+
+def test_all_rejected_weighted_plan_remains_ledger_only(monkeypatch):
+    monkeypatch.setattr(S.SS, "make_humans", lambda *args, **kwargs: [object()] * S.N_PED)
+    monkeypatch.setattr(
+        S.SS, "collect_humans",
+        lambda humans: (
+            np.full((S.N_PED, 2), 20.0, np.float32),
+            np.zeros((S.N_PED, 2), np.float32),
+        ),
+    )
+    monkeypatch.setattr(S.SS, "advance_humans", lambda humans, state: None)
+    records, _ = S.rollout_episode(
+        3, 0.5, device="cpu", planner=_FakePlanner(accepted=0), T_max=1
+    )
+    assert len(records) == 1
+    assert not records[0]["target_eligible"]
+    assert records[0]["target_reason_code"] == S.TARGET_ALL_REJECTED
+
+
+def test_accepted_weighted_plan_that_fails_recheck_is_excluded(monkeypatch):
+    monkeypatch.setattr(S.SS, "make_humans", lambda *args, **kwargs: [object()] * S.N_PED)
+    monkeypatch.setattr(
+        S.SS, "collect_humans",
+        lambda humans: (
+            np.full((S.N_PED, 2), 20.0, np.float32),
+            np.zeros((S.N_PED, 2), np.float32),
+        ),
+    )
+    monkeypatch.setattr(S.SS, "advance_humans", lambda humans, state: None)
+    records, _ = S.rollout_episode(
+        3, 0.1, device="cpu", planner=_FakePlanner(accepted=1, violating=True), T_max=1
+    )
+    assert len(records) == 1
+    assert not records[0]["target_eligible"]
+    assert records[0]["target_reason_code"] == S.TARGET_WEIGHTED_H10_FAILED
+    assert records[0]["plan_first_violation"] >= 1
 
 
 def _record(episode=0, step=0):
@@ -131,6 +187,14 @@ def _record(episode=0, step=0):
         ped_xy=np.zeros((20, 2), np.float32),
         ped_vel=np.zeros((20, 2), np.float32),
         executed_action=np.zeros(2, np.float32),
+        target_eligible=np.bool_(True),
+        target_reason_code=np.int8(S.TARGET_ELIGIBLE),
+        plan_candidate_count=np.int32(2048),
+        plan_accepted_count=np.int32(1),
+        plan_rejected_count=np.int32(2047),
+        plan_weighted_h=np.ones(11, np.float32),
+        plan_first_violation=np.int16(-1),
+        action_mean_max_abs_error=np.float32(0.0),
     )
 
 
@@ -163,6 +227,9 @@ def test_small_cpu_dataset_smoke_writes_auditable_manifest(tmp_path):
     assert manifest["expert"]["name"] == S.HP100_EXPERT_NAME
     assert manifest["feature"]["predict_tau"] == 1.0
     assert manifest["total_successful_lineages"] == 1
+    assert manifest["total_eligible_windows"] == 1
+    assert manifest["target_contract"] == S.target_contract()
+    assert manifest["expert"]["supervised_target"] == S.SUPERVISED_TARGET
     assert "old-grid upsample" in manifest["feature"]["construction"]
     assert manifest["files"][0]["successful_episodes"] == [1]
     assert manifest["files"][0]["rejected_episodes"] == [0]
@@ -179,6 +246,8 @@ def test_small_cpu_dataset_smoke_writes_auditable_manifest(tmp_path):
     assert payload["state"].shape == (1, 4)
     assert payload["ped_xy"].shape == (1, 20, 2)
     assert payload["ped_vel"].shape == (1, 20, 2)
+    assert payload["target_eligible"].tolist() == [True]
+    assert manifest["files"][0]["eligible_windows"] == 1
     assert manifest["files"][0]["sha256"] == S.sha256_file(data_path)
     assert manifest["runtime"]["requested_device"] == "cpu"
     assert {"human_agent", "human_advance", "nominal_polytope", "safemppi_barrier"} <= set(
@@ -195,7 +264,7 @@ def test_success_quota_fails_closed_at_attempt_cap(tmp_path):
             timeout=False, steps=1, min_clearance=-0.1,
         )
 
-    with pytest.raises(RuntimeError, match="0/1 successful trajectories in 2 attempts"):
+    with pytest.raises(RuntimeError, match="0/1 eligible successful trajectories in 2 attempts"):
         S.generate_dataset(
             tmp_path,
             successes_per_gamma=1,
@@ -216,3 +285,24 @@ def test_completion_provenance_fails_closed_on_source_change(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="source file hashes changed"):
         S._assert_provenance_unchanged(initial_git, initial_hashes)
+
+
+def test_device_assignment_is_round_robin_in_one_parent_manifest(tmp_path):
+    seen = []
+
+    def fake_rollout(episode, gamma, **kwargs):
+        seen.append((float(gamma), kwargs["device"]))
+        return [_record(episode, 0)], dict(
+            episode=episode, gamma=gamma, success=True, collision=False,
+            timeout=False, steps=1, min_clearance=1.0,
+        )
+
+    manifest = S.generate_dataset(
+        tmp_path, successes_per_gamma=1, max_attempts_per_gamma=1,
+        gammas=(0.1, 0.2, 0.3), devices=("dev0", "dev1"),
+        T_max=1, rollout_fn=fake_rollout,
+    )
+    assert seen == [(0.1, "dev0"), (0.2, "dev1"), (0.3, "dev0")]
+    assert manifest["parallelism"]["gamma_device_map"] == {
+        "0.1": "dev0", "0.2": "dev1", "0.3": "dev0",
+    }

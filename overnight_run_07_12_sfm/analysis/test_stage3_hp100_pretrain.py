@@ -15,6 +15,13 @@ def _write_one_gamma_dataset(root):
     hp = torch.zeros(len(episodes), 32, 100)
     hp[0].fill_(10.0)
     hp[1].fill_(11.0)
+    eligible = torch.ones(len(episodes), dtype=torch.bool)
+    eligible[0] = False
+    reason = torch.zeros(len(episodes), dtype=torch.int8)
+    reason[0] = P.DATA.TARGET_ALL_REJECTED
+    accepted = torch.ones(len(episodes), dtype=torch.int32)
+    accepted[0] = 0
+    rejected = 2048 - accepted
     payload = {
         "schema_version": P.SCHEMA_VERSION,
         "success_only": True,
@@ -27,6 +34,18 @@ def _write_one_gamma_dataset(root):
         "U": torch.zeros(len(episodes), 10, 2),
         "episode": episodes,
         "step": steps,
+        "plan_weighted_h": torch.ones(len(episodes), 11),
+        "target_eligible": eligible,
+        "target_reason_code": reason,
+        "plan_candidate_count": torch.full((len(episodes),), 2048, dtype=torch.int32),
+        "plan_accepted_count": accepted,
+        "plan_rejected_count": rejected,
+        "plan_first_violation": torch.full((len(episodes),), -1, dtype=torch.int16),
+        "action_mean_max_abs_error": torch.zeros(len(episodes)),
+        "target_contract": P.DATA.target_contract(),
+        "eligible_windows": int(eligible.sum()),
+        "excluded_all_rejected_windows": 1,
+        "excluded_weighted_h10_failed_windows": 0,
     }
     path = root / "sfm_hp100_windows_g0.1.pt"
     torch.save(payload, path)
@@ -66,6 +85,9 @@ def test_loader_is_exact_500_lineage_disjoint_and_lazy_hp10(tmp_path):
     position = torch.nonzero(dataset.episodes == 0, as_tuple=False).flatten()[-1]
     hp10 = dataset[int(position)][0]
     assert hp10.shape == (10, 32, 100)
+    assert float(hp10[0, 0, 0]) == 11.0
+    assert float(hp10[1, 0, 0]) == 10.0
+    assert len(train) + len(val) == 500
     assert not hasattr(dataset, "hp10")
 
 
@@ -226,6 +248,9 @@ def test_canonical_manifest_contract_accepts_only_declared_collection(tmp_path):
             "attempted_episodes": P.DATA.SUCCESSES_PER_GAMMA,
             "episode_range": [0, P.DATA.SUCCESSES_PER_GAMMA],
             "data_file": data_file, "data_sha256": data_sha,
+            "windows": 600, "eligible_windows": 500,
+            "excluded_all_rejected_windows": 80,
+            "excluded_weighted_h10_failed_windows": 20,
         }))
         files.append({
             "gamma": gamma, "n_traj": P.DATA.SUCCESSES_PER_GAMMA,
@@ -236,12 +261,19 @@ def test_canonical_manifest_contract_accepts_only_declared_collection(tmp_path):
             "episode_range": [0, P.DATA.SUCCESSES_PER_GAMMA],
             "progress_file": progress.name,
             "progress_sha256": P.sha256_file(progress),
+            "windows": 600, "eligible_windows": 500,
+            "excluded_all_rejected_windows": 80,
+            "excluded_weighted_h10_failed_windows": 20,
+            "runtime": {"requested_device": "cpu"},
         })
         ranges[str(gamma)] = [0, P.DATA.SUCCESSES_PER_GAMMA]
     manifest = {
         "canonical_full_run": True,
         "role": "successful SafeMPPI ID demonstrations for fresh Hp100 pretraining",
         "total_successful_lineages": P.DATA.SUCCESSES_PER_GAMMA * len(P.SP.GAMMAS),
+        "total_context_rows": 600 * len(P.SP.GAMMAS),
+        "total_eligible_windows": 500 * len(P.SP.GAMMAS),
+        "target_contract": P.DATA.target_contract(),
         "episode_allocation": {
             "start": P.DATA.EPISODE_START,
             "successful_trajectories_per_gamma": P.DATA.SUCCESSES_PER_GAMMA,
@@ -266,7 +298,7 @@ def test_canonical_manifest_contract_accepts_only_declared_collection(tmp_path):
                 "steps; current-position tangent nominal geometry (predict_gain=0)"
             ),
             "supervised_target": (
-                "next H=10 executed controls; repeat final action at terminal prefix"
+                P.DATA.SUPERVISED_TARGET
             ),
         },
         "feature": {
@@ -283,6 +315,9 @@ def test_canonical_manifest_contract_accepts_only_declared_collection(tmp_path):
         },
         "source_hashes": P.DATA._source_hashes(),
         "runtime": {"python": "test"}, "files": files,
+        "parallelism": {
+            "gamma_device_map": {str(gamma): "cpu" for gamma in map(float, P.SP.GAMMAS)},
+        },
     }
     P._validate_canonical_manifest(manifest, tmp_path)
     manifest["feature"]["nominal_polytope_n_base"] = 32

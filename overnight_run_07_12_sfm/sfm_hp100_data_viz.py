@@ -77,6 +77,8 @@ def _torch_load(path: Path):
 def _assert_manifest_contract(manifest: dict) -> None:
     if manifest.get("dynamics") != DYN.contract():
         raise RuntimeError("dataset dynamics contract differs from the renderer")
+    if manifest.get("target_contract") != DATA.target_contract():
+        raise RuntimeError("dataset weighted-plan target contract differs")
     feature = manifest.get("feature", {})
     if feature.get("contract") != HPF.contract():
         raise RuntimeError("dataset Hp100 feature contract differs from the renderer")
@@ -110,7 +112,9 @@ def _file_row(manifest: dict, gamma: float) -> dict:
 def _episode_arrays(payload: dict, episode: int) -> dict[str, np.ndarray]:
     required = (
         "hp", "low5", "hist", "U", "state", "ped_xy", "ped_vel",
-        "executed_action", "episode", "step",
+        "executed_action", "episode", "step", "target_eligible",
+        "target_reason_code", "plan_candidate_count", "plan_accepted_count",
+        "plan_rejected_count", "plan_weighted_h", "plan_first_violation",
     )
     missing = [key for key in required if key not in payload]
     if missing:
@@ -240,10 +244,37 @@ def validate_episode(manifest: dict, rows: dict[str, np.ndarray]) -> dict:
         _assert_base_faces(geometry, rows["state"][index, :2], sensing)
         geometries.append(geometry)
 
-    target_first = np.asarray(rows["U"][:, 0], np.float32)
-    if not np.array_equal(target_first, np.asarray(rows["executed_action"], np.float32)):
-        delta = float(np.max(np.abs(target_first - rows["executed_action"])))
-        raise RuntimeError(f"U[:,0] is not the stored executed action: max_delta={delta}")
+    target_eligible = np.asarray(rows["target_eligible"], bool)
+    for index, geometry in enumerate(geometries):
+        planner_polytope = tuple(
+            np.asarray(geometry[key], np.float32)
+            for key in ("A", "b", "ref", "margins")
+        )
+        plan_audit = DATA.audit_weighted_plan(
+            rows["state"][index], rows["U"][index], planner_polytope,
+            float(rows["low5"][index, -1]),
+        )
+        stored_first = int(rows["plan_first_violation"][index])
+        actual_first = (
+            -1 if plan_audit["first_violation_step"] is None
+            else int(plan_audit["first_violation_step"])
+        )
+        if actual_first != stored_first:
+            raise RuntimeError(
+                f"stored weighted-plan audit differs at step {index}: "
+                f"{stored_first} != {actual_first}"
+            )
+        stored_h = np.asarray(rows["plan_weighted_h"][index], np.float32)
+        if not np.array_equal(stored_h, np.asarray(plan_audit["h"], np.float32)):
+            delta = float(np.max(np.abs(stored_h - plan_audit["h"])))
+            raise RuntimeError(
+                f"stored weighted-plan H differs at step {index}: max_delta={delta}"
+            )
+        logical = bool(
+            int(rows["plan_accepted_count"][index]) > 0 and actual_first == -1
+        )
+        if logical != bool(target_eligible[index]):
+            raise RuntimeError(f"stored target eligibility differs at step {index}")
     rollout_max_abs_error = 0.0
     rollout_bitwise = True
     if count > 1:
@@ -289,6 +320,8 @@ def validate_episode(manifest: dict, rows: dict[str, np.ndarray]) -> dict:
             observation_angular_rays=ANGULAR_RAYS,
             radial_bins=RADIAL_BINS,
             radial_cell_width=float(sensing / RADIAL_BINS),
+            eligible_weighted_plan_contexts=int(target_eligible.sum()),
+            excluded_weighted_plan_contexts=int((~target_eligible).sum()),
             detected_obstacle_faces_min=int(min(len(row["A"]) - BASE_FACES for row in geometries)),
             detected_obstacle_faces_max=int(max(len(row["A"]) - BASE_FACES for row in geometries)),
         ),
@@ -402,7 +435,11 @@ def _draw_world(axis, rows: dict, validated: dict, index: int, gamma: float) -> 
     axis.plot(full[:, 0], full[:, 1], color="#B7B7B7", lw=1.0, alpha=.75, zorder=1)
     axis.plot(full[:index + 1, 0], full[:index + 1, 1], color="black", lw=1.8, zorder=5)
     target = _target_segment(state, rows["U"][index])
-    axis.plot(target[:, 0], target[:, 1], color=ORANGE, lw=1.6, marker=".", ms=2.6, zorder=7)
+    target_color = BLUE if bool(rows["target_eligible"][index]) else "#D62728"
+    axis.plot(
+        target[:, 0], target[:, 1], color=target_color,
+        lw=1.6, marker=".", ms=2.6, zorder=7,
+    )
 
     sensing = float(validated["sensing_radius"])
     ray_theta = -np.pi + (np.arange(ANGULAR_RAYS) + .5) * (
@@ -469,7 +506,8 @@ def _draw_world(axis, rows: dict, validated: dict, index: int, gamma: float) -> 
     )
     axis.legend(handles=[
         Line2D([], [], color="black", lw=1.8, label="executed rollout to current state"),
-        Line2D([], [], color=ORANGE, lw=1.6, label="stored H=10 executed-control target"),
+        Line2D([], [], color=BLUE, lw=1.6, label="eligible current weighted H=10 target"),
+        Line2D([], [], color="#D62728", lw=1.6, label="excluded weighted/fallback plan"),
         Line2D([], [], color=BLUE, lw=1.6, label=validated["geometry_label"]),
         Line2D([], [], color=BLUE, lw=.6, label="nominal level sets h=1..10"),
         Line2D([], [], color=GRAY, lw=1.0, ls="--", label="K=16 artificial outer support"),
@@ -617,7 +655,7 @@ def render(dataset_dir, gamma: float, episode: int, output_dir, *,
         pedestrian_velocities=np.asarray(rows["ped_vel"][selected_index], np.float32),
         stored_hp100=np.asarray(rows["hp"][selected_index], np.float32),
         rendered_hp100=np.asarray(validated["hp_frames"][selected_index], np.float32),
-        executed_H10=np.asarray(rows["U"][selected_index], np.float32),
+        weighted_plan_H10=np.asarray(rows["U"][selected_index], np.float32),
         full_executed_rollout=np.asarray(_full_rollout(rows), np.float32),
     )
 
@@ -649,7 +687,8 @@ def render(dataset_dir, gamma: float, episode: int, output_dir, *,
         provenance_distinction=dict(
             stored=(
                 "Hp100 raster, robot state, pedestrian positions/velocities, "
-                "executed action, and H10 target"
+                "executed action, current weighted H10 plan, acceptance counts, "
+                "and target eligibility"
             ),
             recomputed=(
                 "canonical float32 A,b,ref,margins from the stored state/pedestrians "
