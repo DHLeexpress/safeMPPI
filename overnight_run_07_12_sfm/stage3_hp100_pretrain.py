@@ -8,12 +8,14 @@ materializes a second ``[N,10,32,100]`` dataset.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager
 import hashlib
 import importlib
 import inspect
 import json
 import math
+import multiprocessing as mp
 import os
 from pathlib import Path
 import random
@@ -55,6 +57,7 @@ DEFAULT_CONFIRM_EP0 = SP.PRETRAIN_CONFIRM_EP0
 DEFAULT_VALIDATION_NOISE_SEED = 41017
 DEFAULT_SCREEN_NOISE_SEED = 2_026_080_2
 DEFAULT_CONFIRM_NOISE_SEED = 2_026_080_3
+DEFAULT_VERIFIER_WORKERS = 32
 
 
 def sha256_file(path) -> str:
@@ -904,6 +907,9 @@ def main() -> None:
     parser.add_argument("--validation-noise-seed", type=int, default=DEFAULT_VALIDATION_NOISE_SEED)
     parser.add_argument("--gate-noise-seed", type=int, default=DEFAULT_SCREEN_NOISE_SEED)
     parser.add_argument("--confirm-noise-seed", type=int, default=DEFAULT_CONFIRM_NOISE_SEED)
+    parser.add_argument(
+        "--verifier-workers", type=int, default=DEFAULT_VERIFIER_WORKERS,
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--expected-source-commit", required=True)
     parser.add_argument("--expected-manifest-sha256", required=True)
@@ -941,6 +947,8 @@ def main() -> None:
             raise ValueError(f"canonical HP100 pretraining knobs are frozen; changed={changed}")
     if int(args.num_workers) < 0:
         raise ValueError("num-workers must be nonnegative")
+    if int(args.verifier_workers) <= 0:
+        raise ValueError("verifier-workers must be positive")
     if int(args.gate_finalists) > int(args.gate_top):
         raise ValueError("gate-finalists cannot exceed gate-top")
     screen_range = set(range(int(args.gate_episode_start), int(args.gate_episode_start) + int(args.gate_m)))
@@ -1001,6 +1009,10 @@ def main() -> None:
         "validation_macro": "gamma -> successful demonstration lineage -> window",
         "validation_noise_seed": int(args.validation_noise_seed),
         "promotion": {
+            "validity_parallelism": dict(
+                workers=int(args.verifier_workers), start_method="spawn",
+                task="one complete episode; ordered executor.map",
+            ),
             "validation_candidates": int(args.gate_top),
             "screen": dict(
                 M_per_gamma=int(args.gate_m), ep0=int(args.gate_episode_start),
@@ -1069,6 +1081,9 @@ def main() -> None:
         print(json.dumps(row, sort_keys=True), flush=True)
 
     _assert_inputs_unchanged(initial_inputs, dataset_meta, args.device)
+    validity_executor = ProcessPoolExecutor(
+        max_workers=int(args.verifier_workers), mp_context=mp.get_context("spawn"),
+    )
     screen_gates = []
     for validation_cfm, path in sorted(candidates)[:max(1, int(args.gate_top))]:
         candidate, _, checkpoint_sha = load_authenticated_checkpoint(
@@ -1080,6 +1095,7 @@ def main() -> None:
             ep0=int(args.gate_episode_start),
             device=args.device,
             seed=int(args.gate_noise_seed),
+            validity_executor=validity_executor,
         )
         # The imported hook is, by construction, the matched-ID-only entry
         # point.  Record that constraint explicitly in the promoted payload.
@@ -1109,6 +1125,7 @@ def main() -> None:
             candidate, M=int(args.confirm_m),
             ep0=int(args.confirm_episode_start), device=args.device,
             seed=int(args.confirm_noise_seed),
+            validity_executor=validity_executor,
         )
         result = {"distribution": "ID", **result}
         _validate_gate(
@@ -1125,6 +1142,7 @@ def main() -> None:
                 screen_row, screen_row["val_macro_cfm"], SP.GAMMAS,
             ),
         })
+    validity_executor.shutdown(wait=True, cancel_futures=True)
     selected = min(
         confirmation_gates,
         key=lambda row: _gate_score(row, row["val_macro_cfm"], SP.GAMMAS),

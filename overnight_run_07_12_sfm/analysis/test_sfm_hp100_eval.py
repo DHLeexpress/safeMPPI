@@ -1,3 +1,6 @@
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
+
 import numpy as np
 import pytest
 
@@ -50,11 +53,52 @@ def test_id_gate_is_raw_unit_temperature_and_matched_id(monkeypatch):
         return [], {"pooled": next(iter(cells.values())), "per_gamma": cells}
 
     monkeypatch.setattr(E, "evaluate", fake_evaluate)
-    result = E.id_raw_gate(object(), M=3, ep0=12000, device="cpu", seed=99)
+    sentinel = object()
+    result = E.id_raw_gate(
+        object(), M=3, ep0=12000, device="cpu", seed=99,
+        validity_executor=sentinel,
+    )
     assert called["scene_profile"] == "matched_id"
     assert called["with_validity"] is True
+    assert called["validity_executor"] is sentinel
     assert called["seed"] == result["noise_seed"] == 99
     assert result["temperature"] == 1.0
     assert result["NFE"] == 8
     assert result["pooled"]["Validity"] == 0.7
     assert set(result["per_gamma"]) == {str(gamma) for gamma in E.SS.GAMMAS}
+
+
+def _episode_row(episode, *, steps=2):
+    controls = np.zeros((steps, 2), np.float32)
+    states = np.zeros((steps + 1, 4), np.float32)
+    peds = np.full((steps, 1, 2), 20.0, np.float32)
+    velocities = np.zeros_like(peds)
+    return dict(
+        episode=int(episode), gamma=0.5, status="timeout", success=False,
+        collision=False, timeout=True, steps=int(steps), time_to_goal=None,
+        min_clearance=1.0, successful_clearance=None,
+        states=states, controls=controls, ped_xy=peds, ped_vel=velocities,
+    )
+
+
+def test_parallel_validity_is_ordered_and_identical_to_serial():
+    rows = [_episode_row(7), _episode_row(3), _episode_row(9, steps=0)]
+    serial = E.attach_validity(rows)
+    with ProcessPoolExecutor(
+        max_workers=2, mp_context=mp.get_context("spawn")
+    ) as executor:
+        parallel = E.attach_validity(rows, executor=executor)
+    assert parallel == serial
+    assert [row["episode"] for row in parallel] == [7, 3, 9]
+
+
+def test_parallel_and_serial_validity_both_fail_closed():
+    malformed = _episode_row(7, steps=1)
+    malformed["controls"] = np.zeros((0, 2), np.float32)
+    with pytest.raises(RuntimeError, match="executed HP100 window"):
+        E.attach_validity([malformed])
+    with ProcessPoolExecutor(
+        max_workers=2, mp_context=mp.get_context("spawn")
+    ) as executor:
+        with pytest.raises(RuntimeError, match="executed HP100 window"):
+            E.attach_validity([malformed], executor=executor)

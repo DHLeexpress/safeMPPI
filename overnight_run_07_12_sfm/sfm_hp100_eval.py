@@ -9,11 +9,13 @@ caps used by HP100 demonstration collection are used here.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 import hashlib
 import inspect
 import json
 import math
+import multiprocessing as mp
 import os
 
 import numpy as np
@@ -35,6 +37,7 @@ H = 10
 NFE = 8
 TEMPERATURE = 1.0
 DEFAULT_NOISE_SEED = 2_026_080_2
+DEFAULT_VERIFIER_WORKERS = 32
 
 
 def sha256_file(path) -> str:
@@ -250,31 +253,36 @@ def verify_executed_window(state, controls, ped_xy, ped_vel, gamma) -> dict:
         return dict(resolved=False, error=f"{type(error).__name__}: {error}")
 
 
-def attach_validity(rows: list[dict]) -> list[dict]:
-    compact = []
-    for row in rows:
-        valid = 0
-        controls = row["controls"]
-        for start in range(int(row["steps"])):
-            stop = min(start + H, int(row["steps"]))
-            result = verify_executed_window(
-                row["states"][start], controls[start:stop], row["ped_xy"][start],
-                row["ped_vel"][start], row["gamma"],
-            )
-            if not result.get("resolved", False):
-                raise RuntimeError(result.get("error", "HP100 verifier failed"))
-            valid += int(result["y"])
-        count = int(row["steps"])
-        value = {
-            key: item for key, item in row.items()
-            if key not in ("states", "controls", "ped_xy", "ped_vel")
-        }
-        value.update(
-            validity=(valid / count if count else 0.0),
-            valid_windows=int(valid), evaluated_windows=count, verifier_errors=0,
+def _verify_executed_episode(row: dict) -> dict:
+    """Verify one complete episode; top-level for spawn-process pickling."""
+    valid = 0
+    controls = row["controls"]
+    for start in range(int(row["steps"])):
+        stop = min(start + H, int(row["steps"]))
+        result = verify_executed_window(
+            row["states"][start], controls[start:stop], row["ped_xy"][start],
+            row["ped_vel"][start], row["gamma"],
         )
-        compact.append(value)
-    return compact
+        if not result.get("resolved", False):
+            raise RuntimeError(result.get("error", "HP100 verifier failed"))
+        valid += int(result["y"])
+    count = int(row["steps"])
+    value = {
+        key: item for key, item in row.items()
+        if key not in ("states", "controls", "ped_xy", "ped_vel")
+    }
+    value.update(
+        validity=(valid / count if count else 0.0),
+        valid_windows=int(valid), evaluated_windows=count, verifier_errors=0,
+    )
+    return value
+
+
+def attach_validity(rows: list[dict], *, executor=None) -> list[dict]:
+    """Attach exact window validity, optionally ordered by episode workers."""
+    if executor is None:
+        return [_verify_executed_episode(row) for row in rows]
+    return list(executor.map(_verify_executed_episode, rows, chunksize=1))
 
 
 def _wilson(successes: int, total: int, z=1.959963984540054):
@@ -334,13 +342,14 @@ def evaluate(
     device: str,
     seed: int = DEFAULT_NOISE_SEED,
     with_validity: bool = True,
+    validity_executor=None,
 ) -> tuple[list[dict], dict]:
     noise = noise_bank(M=M, d=policy.d, seed=seed)
     rows = run_batched_raw(
         policy, scene_profile=scene_profile, ep0=ep0, M=M,
         noise=noise, device=device,
     )
-    compact = attach_validity(rows) if with_validity else [
+    compact = attach_validity(rows, executor=validity_executor) if with_validity else [
         {
             key: value for key, value in row.items()
             if key not in ("states", "controls", "ped_xy", "ped_vel")
@@ -353,10 +362,12 @@ def evaluate(
 def id_raw_gate(
     policy, *, M: int, ep0: int, device: str,
     seed: int = DEFAULT_NOISE_SEED,
+    validity_executor=None,
 ) -> dict:
     rows, summary = evaluate(
         policy, scene_profile="matched_id", ep0=ep0, M=M, device=device,
         seed=int(seed), with_validity=True,
+        validity_executor=validity_executor,
     )
     del rows
     return dict(
@@ -385,13 +396,23 @@ def main(argv=None):
     parser.add_argument("--M", required=True, type=int)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--noise-seed", type=int, default=DEFAULT_NOISE_SEED)
+    parser.add_argument(
+        "--verifier-workers", type=int, default=DEFAULT_VERIFIER_WORKERS,
+    )
     parser.add_argument("--out", required=True)
     args = parser.parse_args(argv)
     policy, checkpoint = GPS.load_sfm_hp100_policy(args.checkpoint, device=args.device)
-    rows, summary = evaluate(
-        policy, scene_profile=args.scene_profile, ep0=args.ep0, M=args.M,
-        device=args.device, seed=args.noise_seed, with_validity=True,
-    )
+    if int(args.verifier_workers) <= 0:
+        raise ValueError("verifier-workers must be positive")
+    context = mp.get_context("spawn")
+    with ProcessPoolExecutor(
+        max_workers=int(args.verifier_workers), mp_context=context,
+    ) as validity_executor:
+        rows, summary = evaluate(
+            policy, scene_profile=args.scene_profile, ep0=args.ep0, M=args.M,
+            device=args.device, seed=args.noise_seed, with_validity=True,
+            validity_executor=validity_executor,
+        )
     payload = dict(
         status="SFM_HP100_RAW_EVAL_COMPLETE", version=VERSION,
         checkpoint=os.path.abspath(args.checkpoint),
@@ -411,6 +432,10 @@ def main(argv=None):
         ),
         scene=SS.scene_profile(args.scene_profile), ep0=args.ep0,
         M_per_gamma=args.M, temperature=TEMPERATURE, NFE=NFE,
+        validity_parallelism=dict(
+            workers=int(args.verifier_workers), start_method="spawn",
+            task="one complete episode; ordered executor.map",
+        ),
         summary=summary, rows=rows,
         semantics=(
             "unguided raw flow; temp=1; NFE=8; one H10 window/context; "
