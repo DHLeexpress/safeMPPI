@@ -364,7 +364,7 @@ def rollout_episode(
             ped_vel=ped_vel.copy(),
             executed_action=action.copy(),
             U=mean_sequence.copy(),
-            target_eligible=np.bool_(reason_code == TARGET_ELIGIBLE),
+            target_eligible=bool(reason_code == TARGET_ELIGIBLE),
             target_reason_code=np.int8(reason_code),
             plan_candidate_count=np.int32(candidate_count),
             plan_accepted_count=np.int32(accepted_count),
@@ -431,7 +431,7 @@ def pack_records(records: list[dict]) -> dict[str, torch.Tensor]:
         [row["step"] for row in records], dtype=torch.int64
     )
     payload["target_eligible"] = torch.as_tensor(
-        [row["target_eligible"] for row in records], dtype=torch.bool
+        [bool(row["target_eligible"]) for row in records], dtype=torch.bool
     )
     payload["target_reason_code"] = torch.as_tensor(
         [row["target_reason_code"] for row in records], dtype=torch.int8

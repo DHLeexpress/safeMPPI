@@ -187,7 +187,7 @@ def _record(episode=0, step=0):
         ped_xy=np.zeros((20, 2), np.float32),
         ped_vel=np.zeros((20, 2), np.float32),
         executed_action=np.zeros(2, np.float32),
-        target_eligible=np.bool_(True),
+        target_eligible=True,
         target_reason_code=np.int8(S.TARGET_ELIGIBLE),
         plan_candidate_count=np.int32(2048),
         plan_accepted_count=np.int32(1),
